@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hearth_budget  # noqa: E402
 import hearth_notify  # noqa: E402
+import hearth_paths  # noqa: E402
 import hearth_router  # noqa: E402
 import hearth_tools  # noqa: E402
 import permissions  # noqa: E402
@@ -34,7 +35,12 @@ try:
 except Exception:  # noqa: BLE001
     hearth_state = None
 
-DEFAULT_DB = "/var/lib/hearth/runs/audit.db"
+
+def _db_path():
+    """The audit database, resolved per platform and overridable by HEARTH_DB."""
+    return hearth_paths.db_path()
+
+
 DEFAULT_OLLAMA = "http://127.0.0.1:11434"
 MAX_ITERS = 12
 MAX_EVENT_OUT = 4000  # cap tool output included in an event
@@ -98,15 +104,26 @@ def _emit(agent_id, state, detail, db):
             pass
 
 
+def _usage_from_response(data):
+    """(prompt_tokens, completion_tokens) from an Ollama response.
+
+    prompt_eval_count was previously ignored, so tokens_in was written as 0 and
+    the spend breaker undercounted every run by the whole prompt.
+    """
+    d = data or {}
+    return int(d.get("prompt_eval_count") or 0), int(d.get("eval_count") or 0)
+
+
 def chat(base_url, model, messages, tools, timeout=300):
-    """One Ollama chat call with tools. Returns the assistant message dict."""
+    """One Ollama chat call with tools. Returns (message, tokens_in, tokens_out)."""
     body = json.dumps({"model": model, "messages": messages, "tools": tools,
                        "stream": False}).encode()
     req = urllib.request.Request(base_url.rstrip("/") + "/api/chat", data=body,
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = json.loads(resp.read().decode())
-    return data.get("message") or {}, int(data.get("eval_count", 0) or 0)
+    tokens_in, tokens_out = _usage_from_response(data)
+    return data.get("message") or {}, tokens_in, tokens_out
 
 
 def _balanced_obj(s, start):
@@ -650,7 +667,7 @@ def _resolve_auto_model(model, goal, allowed_tools, emit, db, agent_name):
     return chosen
 
 
-def run_loop(goal, model, workspace, db=DEFAULT_DB, agent_name="agent",
+def run_loop(goal, model, workspace, db=_db_path(), agent_name="agent",
              ollama_url=DEFAULT_OLLAMA, max_iters=MAX_ITERS, chat_fn=None,
              mode="auto", auto_allow=(), emit_fn=None, control_fn=None, recall=True,
              allowed_tools=None):
@@ -665,15 +682,25 @@ def run_loop(goal, model, workspace, db=DEFAULT_DB, agent_name="agent",
     # resolve model "auto" via the router before the first model call, so the
     # chat_fn closure and the audit row both use the model actually chosen.
     model = _resolve_auto_model(model, goal, allowed_tools, emit, db, agent_name)
-    chat_fn = chat_fn or (lambda msgs: chat(ollama_url, model, msgs,
-                                            hearth_tools.ollama_tool_specs(allowed_tools)))
+    # tokens_in is accumulated by the default chat_fn as a side effect, since the
+    # chat_fn(msgs) -> (message, tokens_out) contract stays 2-tuple for callers
+    # that inject their own chat_fn (tests, mainly).
+    usage = {"tokens_in": 0}
+
+    def _default_chat_fn(msgs):
+        msg, tin, tout = chat(ollama_url, model, msgs,
+                              hearth_tools.ollama_tool_specs(allowed_tools))
+        usage["tokens_in"] += tin
+        return msg, tout
+
+    chat_fn = chat_fn or _default_chat_fn
     os.environ["HEARTH_AGENT_ID"] = agent_name  # attribution for the egress log
     notified = {}
     st = _budget_breach(db)
     if st is not None:
         # circuit breaker: today's spend is already at the cap; refuse to start
         _budget_halt(st, emit, _budget_prestep(db, agent_name), notified, agent_name)
-        _record(db, agent_name, model, 0, 0, BUDGET_ERROR)
+        _record(db, agent_name, model, 0, 0, 0, BUDGET_ERROR)
         _emit(agent_name, "ERRORED", BUDGET_ERROR, db)
         emit({"type": "done", "error": BUDGET_ERROR, "final": ""})
         return "", BUDGET_ERROR
@@ -696,7 +723,7 @@ def run_loop(goal, model, workspace, db=DEFAULT_DB, agent_name="agent",
                                           auto_allow, allowed_tools=allowed_tools,
                                           decoys=decoys, notified=notified)
     latency_ms = int((time.monotonic() - t0) * 1000)
-    _record(db, agent_name, model, tokens_out, latency_ms, error)
+    _record(db, agent_name, model, usage["tokens_in"], tokens_out, latency_ms, error)
     _notify_run_end(agent_name, error)
     final_state = "TRIPPED" if (error or "").startswith("tripwire:") else ("ERRORED" if error else "DONE")
     _emit(agent_name, final_state, error or "task complete", db)
@@ -704,7 +731,7 @@ def run_loop(goal, model, workspace, db=DEFAULT_DB, agent_name="agent",
     return final, error
 
 
-def run_session(model, workspace, db=DEFAULT_DB, agent_name="session",
+def run_session(model, workspace, db=_db_path(), agent_name="session",
                 ollama_url=DEFAULT_OLLAMA, max_iters=MAX_ITERS, chat_fn=None,
                 mode="auto", auto_allow=(), emit_fn=None, control_fn=None,
                 allowed_tools=None):
@@ -719,15 +746,25 @@ def run_session(model, workspace, db=DEFAULT_DB, agent_name="session",
     # chat_fn closure and the audit row both use the model actually chosen. A
     # session has no upfront goal text, so route on the granted tools alone.
     model = _resolve_auto_model(model, "", allowed_tools, emit, db, agent_name)
-    chat_fn = chat_fn or (lambda msgs: chat(ollama_url, model, msgs,
-                                            hearth_tools.ollama_tool_specs(allowed_tools)))
+    # tokens_in is accumulated by the default chat_fn as a side effect, since the
+    # chat_fn(msgs) -> (message, tokens_out) contract stays 2-tuple for callers
+    # that inject their own chat_fn (tests, mainly). Reset per turn below.
+    usage = {"tokens_in": 0}
+
+    def _default_chat_fn(msgs):
+        msg, tin, tout = chat(ollama_url, model, msgs,
+                              hearth_tools.ollama_tool_specs(allowed_tools))
+        usage["tokens_in"] += tin
+        return msg, tout
+
+    chat_fn = chat_fn or _default_chat_fn
     os.environ["HEARTH_AGENT_ID"] = agent_name  # attribution for the egress log
     notified = {}
     st = _budget_breach(db)
     if st is not None:
         # circuit breaker: today's spend is already at the cap; refuse to start
         _budget_halt(st, emit, _budget_prestep(db, agent_name), notified, agent_name)
-        _record(db, agent_name, model, 0, 0, BUDGET_ERROR)
+        _record(db, agent_name, model, 0, 0, 0, BUDGET_ERROR)
         _emit(agent_name, "ERRORED", BUDGET_ERROR, db)
         emit({"type": "done", "error": BUDGET_ERROR, "final": ""})
         return
@@ -752,13 +789,14 @@ def run_session(model, workspace, db=DEFAULT_DB, agent_name="session",
         if ctype != "user_message":
             continue
         messages.append({"role": "user", "content": cmd.get("text", "")})
+        usage["tokens_in"] = 0  # per turn, like tokens_out below
         t0 = time.monotonic()
         final, error, tokens_out = _run_turns(messages, model, workspace, chat_fn, emit,
                                                control, state, db, agent_name, max_iters,
                                                auto_allow, allowed_tools=allowed_tools,
                                                decoys=decoys, notified=notified)
         latency_ms = int((time.monotonic() - t0) * 1000)
-        _record(db, agent_name, model, tokens_out, latency_ms, error)
+        _record(db, agent_name, model, usage["tokens_in"], tokens_out, latency_ms, error)
         if error:
             _notify_run_end(agent_name, error)
         emit({"type": "turn_done", "error": error, "final": final})
@@ -778,7 +816,7 @@ def run_session(model, workspace, db=DEFAULT_DB, agent_name="session",
     _notify_run_end(agent_name, None)
 
 
-def _record(db, agent_name, model, tokens_out, latency_ms, error):
+def _record(db, agent_name, model, tokens_in, tokens_out, latency_ms, error):
     run_id = uuid.uuid4().hex
     ts = _now_iso()
     schema = getattr(hearth_state, "SCHEMA", "")
@@ -795,7 +833,7 @@ def _record(db, agent_name, model, tokens_out, latency_ms, error):
             "INSERT INTO agent_runs (agent_name, run_id, started_at, finished_at, "
             "tokens_in, tokens_out, cost_usd, latency_ms, error, model) "
             "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (agent_name, run_id, ts, ts, 0, tokens_out, 0.0, latency_ms, error, model))
+            (agent_name, run_id, ts, ts, tokens_in, tokens_out, 0.0, latency_ms, error, model))
         con.commit()
         con.close()
     except sqlite3.Error:
@@ -1270,6 +1308,28 @@ def _self_test():
         else:
             os.environ["HEARTH_ROUTER"] = saved_router_env
 
+    # The audit DB location resolves through hearth_paths, so it is correct on
+    # Windows and overridable in a test.
+    import hearth_paths as _hp
+    _old = os.environ.get("HEARTH_DB")
+    try:
+        os.environ["HEARTH_DB"] = os.path.join("Z:" if _hp.is_windows() else "/tmp", "probe.db")
+        assert _db_path() == os.environ["HEARTH_DB"], _db_path()
+        os.environ.pop("HEARTH_DB", None)
+        assert not _db_path().startswith("/var/lib/hearth") or not _hp.is_windows()
+        assert "\\var\\lib" not in _db_path(), _db_path()
+    finally:
+        if _old is None:
+            os.environ.pop("HEARTH_DB", None)
+        else:
+            os.environ["HEARTH_DB"] = _old
+
+    # Prompt tokens are captured, not assumed zero.
+    _usage = _usage_from_response({"eval_count": 42, "prompt_eval_count": 17})
+    assert _usage == (17, 42), _usage
+    _usage = _usage_from_response({})
+    assert _usage == (0, 0), _usage
+
     print("hearth-loop self-test OK:", final)
     return 0
 
@@ -1280,7 +1340,7 @@ def main(argv=None):
     p.add_argument("--model", default="qwen2.5-coder")
     p.add_argument("--agent-name", default="agent")
     p.add_argument("--workspace", default=".")
-    p.add_argument("--db", default=DEFAULT_DB)
+    p.add_argument("--db", default=_db_path())
     p.add_argument("--ollama-url", default=DEFAULT_OLLAMA)
     p.add_argument("--max-iters", type=int, default=MAX_ITERS)
     p.add_argument("--mode", choices=list(permissions.MODES), default="auto",

@@ -21,11 +21,12 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hearth_state  # noqa: E402
 import hearth_loop  # noqa: E402
+import hearth_paths  # noqa: E402
 import hearth_tools  # noqa: E402
 import hearth_telegram  # noqa: E402
 import hearth_memory  # noqa: E402
 
-DEFAULT_DB = "/var/lib/hearth/runs/audit.db"
+DEFAULT_DB = hearth_paths.db_path()
 DEFAULT_OLLAMA = "http://127.0.0.1:11434"
 MAX_ROUNDS = 8
 

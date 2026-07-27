@@ -26,7 +26,10 @@ import sqlite3
 import sys
 import urllib.request
 
-DEFAULT_DB = "/var/lib/hearth/runs/audit.db"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import hearth_paths  # noqa: E402
+
+DEFAULT_DB = hearth_paths.db_path()
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "llama3.2:3b"
 

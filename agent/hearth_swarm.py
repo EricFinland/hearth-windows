@@ -28,10 +28,11 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hearth_state  # noqa: E402
 import hearth_loop  # noqa: E402  (reused for make_db_transport + TRANSCRIPT_SCHEMA)
+import hearth_paths  # noqa: E402
 
 DEFAULT_QUEUE = "/var/lib/hearth/queue"
 DEFAULT_OLLAMA = "http://127.0.0.1:11434"
-DEFAULT_DB = "/var/lib/hearth/runs/audit.db"
+DEFAULT_DB = hearth_paths.db_path()
 MAX_SUBTASKS = 5
 
 DECOMPOSE_SYS = (

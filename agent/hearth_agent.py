@@ -24,18 +24,19 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 
-DEFAULT_DB = "/var/lib/hearth/runs/audit.db"
-DEFAULT_RUNS_DIR = "/var/lib/hearth/runs"
-DEFAULT_OLLAMA = "http://127.0.0.1:11434"
-
 # Live runtime state for the tycoon map (agent/hearth_state.py). Optional: if it
 # is not importable, state emission is a no-op and auditing still works. Visual
 # state is driven only by these calls in the runtime, never by model output.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import hearth_paths  # noqa: E402
 try:
     import hearth_state
 except Exception:  # noqa: BLE001
     hearth_state = None
+
+DEFAULT_DB = hearth_paths.db_path()
+DEFAULT_RUNS_DIR = os.path.join(hearth_paths.data_dir(), "runs")
+DEFAULT_OLLAMA = "http://127.0.0.1:11434"
 
 
 def _emit(agent_id, state, detail, db):
