@@ -13,6 +13,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import hearth_contain  # noqa: E402
 import hearth_knowledge  # noqa: E402
 
 DEFAULT_DB = hearth_knowledge.DEFAULT_DB
@@ -37,7 +38,7 @@ def index_dir(db, name, root, embed_fn=None, globs=None, max_files=MAX_FILES, ma
     if not os.path.isdir(root):
         return {"files": 0, "chunks": 0, "skipped": 0, "truncated": False, "error": "not a directory"}
     for dirpath, dirs, names in os.walk(root):
-        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
+        hearth_contain.prune(dirpath, dirs, SKIP_DIRS)
         for fn in sorted(names):
             if not any(fnmatch.fnmatch(fn, g) for g in globs):
                 continue

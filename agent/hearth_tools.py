@@ -176,11 +176,15 @@ def tool_search_files(args, workspace):
     root = os.path.realpath(workspace)
     hits = []
     for dirpath, dirs, files in os.walk(base):
-        dirs[:] = [d for d in dirs if d not in _TREE_SKIP]
+        hearth_contain.prune(dirpath, dirs, _TREE_SKIP)
         for fn in sorted(files):
             if pattern and not fnmatch.fnmatch(fn, pattern):
                 continue
             fp = os.path.join(dirpath, fn)
+            try:
+                hearth_contain.safe_join(root, os.path.relpath(fp, root))
+            except ValueError:
+                continue  # a link or an odd name that resolves outside the workspace
             try:
                 if os.path.getsize(fp) > 2_000_000:
                     continue
@@ -213,7 +217,7 @@ def tool_list_tree(args, workspace):
         if depth >= max_depth:
             dirs[:] = []
             continue
-        dirs[:] = sorted(d for d in dirs if d not in _TREE_SKIP)
+        dirs[:] = sorted(hearth_contain.prune(dirpath, dirs, _TREE_SKIP))
         rel = os.path.relpath(dirpath, root)
         indent = "  " * depth
         lines.append("{}{}/".format(indent, "." if rel == "." else os.path.basename(dirpath)))
@@ -716,14 +720,19 @@ def tool_replace_in_files(args, workspace):
         base = hearth_contain.safe_join(workspace, args.get("path", "."))
     except ValueError as exc:
         return "error: {}".format(exc)
+    root = os.path.realpath(workspace)
     files_changed = 0
     total = 0
     for dirpath, dirs, files in os.walk(base):
-        dirs[:] = [d for d in dirs if d not in _TREE_SKIP]
+        hearth_contain.prune(dirpath, dirs, _TREE_SKIP)
         for fn in sorted(files):
             if pattern and not fnmatch.fnmatch(fn, pattern):
                 continue
             fp = os.path.join(dirpath, fn)
+            try:
+                hearth_contain.safe_join(root, os.path.relpath(fp, root))
+            except ValueError:
+                continue  # a link or an odd name that resolves outside the workspace
             try:
                 if os.path.getsize(fp) > 2_000_000:
                     continue
@@ -1232,6 +1241,40 @@ def _self_test():
         assert "escapes workspace" in tool_search_files({"query": "x", "path": ".."}, _ws)
     finally:
         _shutil.rmtree(_ws, ignore_errors=True)
+
+    # A junction inside the workspace must not be walked. Creating one needs no
+    # admin rights, and the agent can create one through run_command, so the
+    # walking tools cannot assume the workspace tree is free of them.
+    _ws2 = os.path.realpath(_tempfile.mkdtemp(prefix="hearth-walk-"))
+    _out = os.path.realpath(_tempfile.mkdtemp(prefix="hearth-secret-"))
+    try:
+        with open(os.path.join(_out, "secret.txt"), "w", encoding="utf-8") as fh:
+            fh.write("SENTINEL_VALUE_DO_NOT_LEAK\n")
+        with open(os.path.join(_ws2, "inside.txt"), "w", encoding="utf-8") as fh:
+            fh.write("ordinary\n")
+
+        _linked = False
+        _link = os.path.join(_ws2, "escape")
+        if hearth_paths.is_windows():
+            _linked = os.system('mklink /J "{}" "{}" >nul 2>&1'.format(_link, _out)) == 0
+        else:
+            os.symlink(_out, _link)
+            _linked = True
+
+        if _linked:
+            hits = tool_search_files({"query": "SENTINEL_VALUE_DO_NOT_LEAK"}, _ws2)
+            assert "SENTINEL" not in hits, "search_files walked through the link: {}".format(hits)
+
+            tree = tool_list_tree({"path": "."}, _ws2)
+            assert "secret.txt" not in tree, "list_tree walked through the link"
+
+            res = tool_replace_in_files({"find": "SENTINEL_VALUE_DO_NOT_LEAK", "replace": "PWNED"}, _ws2)
+            with open(os.path.join(_out, "secret.txt"), encoding="utf-8") as fh:
+                assert "SENTINEL_VALUE_DO_NOT_LEAK" in fh.read(), \
+                    "replace_in_files rewrote a file outside the workspace: {}".format(res)
+    finally:
+        _shutil.rmtree(_ws2, ignore_errors=True)
+        _shutil.rmtree(_out, ignore_errors=True)
 
     print("hearth-tools self-test OK")
     return 0
