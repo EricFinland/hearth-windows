@@ -31,12 +31,19 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import hearth_contain
 import hearth_paths
+import hearth_proc
 
 
 def _bin(name, fallback):
     """Resolve a system binary by PATH, falling back to its NixOS stable path
     (agents may run as a systemd unit with a minimal PATH)."""
     return shutil.which(name) or fallback
+
+
+def _q(path):
+    """Quote a path for a shell command line. Git on Windows commonly lives
+    under 'C:\\Program Files\\Git\\...', which contains a space."""
+    return '"{}"'.format(path) if " " in path else path
 
 
 HEARTH_REPO = os.environ.get("HEARTH_REPO", "/home/operator/hearth-desktop")
@@ -711,27 +718,29 @@ def tool_read_self_config(args, workspace):
 
 
 def tool_git_status(args, workspace):
-    """Show git status of hearth's configuration repo."""
-    git = _bin("git", "/run/current-system/sw/bin/git")
-    try:
-        r = subprocess.run([git, "-C", HEARTH_REPO, "status", "--short", "--branch"],
-                           capture_output=True, text=True, timeout=15)
-        return (r.stdout or r.stderr or "(clean)")[:MAX_OUT]
-    except (OSError, subprocess.SubprocessError) as exc:
-        return "error: {}".format(exc)
+    """Show git status of the run workspace. Read-only."""
+    git = shutil.which("git")
+    if not git:
+        return "git is not installed or not on PATH"
+    rc, out, err, _to = hearth_proc.run_contained(
+        "{} status --short --branch".format(_q(git)), workspace, timeout=60)
+    if rc != 0:
+        return "error: {}".format((err or out or "git failed").strip()[:500])
+    return out.strip() or "(clean)"
 
 
 def tool_git_diff(args, workspace):
-    """Show git diff of hearth's configuration repo (optionally for one path)."""
-    git = _bin("git", "/run/current-system/sw/bin/git")
-    cmd = [git, "-C", HEARTH_REPO, "diff"]
+    """Show git diff of the run workspace (optionally for one path). Read-only."""
+    git = shutil.which("git")
+    if not git:
+        return "git is not installed or not on PATH"
+    cmd = "{} diff --stat".format(_q(git))
     if args.get("path"):
-        cmd += ["--", args["path"]]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        return (r.stdout or "(no changes)")[:MAX_OUT]
-    except (OSError, subprocess.SubprocessError) as exc:
-        return "error: {}".format(exc)
+        cmd += " -- {}".format(_q(args["path"]))
+    rc, out, err, _to = hearth_proc.run_contained(cmd, workspace, timeout=60)
+    if rc != 0:
+        return "error: {}".format((err or out or "git failed").strip()[:500])
+    return out.strip() or "(no changes)"
 
 
 def tool_write_self_config(args, workspace):
@@ -909,6 +918,20 @@ def tool_kb_search(args, workspace):
                        for h in hits)
 
 
+# The capability manifest for the Windows desktop app. Passed as `allowed_tools`,
+# which permissions.decide treats as a hard cap in every mode including bypass.
+#
+# Deliberately excluded: the NixOS tools (nix_check, current_generation,
+# list_generations, read_self_config, write_self_config, system_health) which
+# have no Windows meaning and burn a turn each when a small model tries them;
+# the knowledge and memory tools, which are M5; and the network tools
+# (web_fetch, web_search, http_request, fetch_to_kb), which are portable but not
+# part of a local coding agent's job and which would reopen the egress question.
+WINDOWS_TOOLS = (
+    "read_file", "write_file", "edit_file", "list_files", "list_tree",
+    "search_files", "replace_in_files", "run_command", "git_status", "git_diff",
+)
+
 TOOLS = [
     {
         "name": "run_command",
@@ -1014,13 +1037,13 @@ TOOLS = [
     },
     {
         "name": "git_status",
-        "description": "Show git status of hearth's configuration repo. Read-only.",
+        "description": "Show git status of the workspace. Read-only.",
         "parameters": {"type": "object", "properties": {}},
         "fn": tool_git_status,
     },
     {
         "name": "git_diff",
-        "description": "Show git diff of hearth's configuration repo, optionally for one path. Read-only.",
+        "description": "Show git diff (stat) of the workspace, optionally for one path. Read-only.",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
         "fn": tool_git_diff,
     },
@@ -1485,6 +1508,31 @@ def _self_test():
         assert _dominant_newline("no newlines") == ""
     finally:
         _shutil.rmtree(_ws4, ignore_errors=True)
+
+    # The Windows manifest is exactly the ten tools a coding agent needs.
+    assert set(WINDOWS_TOOLS) == {
+        "read_file", "write_file", "edit_file", "list_files", "list_tree",
+        "search_files", "replace_in_files", "run_command", "git_status", "git_diff",
+    }, WINDOWS_TOOLS
+    # Every name in the manifest is a registered tool. (TOOLS is a list of dicts,
+    # not names, so the check goes through the name->tool registry _BY_NAME.)
+    for _t in WINDOWS_TOOLS:
+        assert _t in _BY_NAME, "manifest names an unregistered tool: {}".format(_t)
+    # NixOS-only tools are absent.
+    for _t in ("nix_check", "current_generation", "list_generations", "read_self_config"):
+        assert _t not in WINDOWS_TOOLS
+    # The manifest filters the specs handed to the model.
+    _specs = ollama_tool_specs(WINDOWS_TOOLS)
+    assert len(_specs) == len(WINDOWS_TOOLS), len(_specs)
+
+    # git tools read the run workspace, not HEARTH_REPO.
+    _ws6 = os.path.realpath(_tempfile.mkdtemp(prefix="hearth-git-"))
+    try:
+        r = tool_git_status({}, _ws6)
+        assert "/home/operator" not in r, r
+        assert "not a git repository" in r.lower() or "git is not installed" in r.lower(), r
+    finally:
+        _shutil.rmtree(_ws6, ignore_errors=True)
 
     print("hearth-tools self-test OK")
     return 0
