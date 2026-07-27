@@ -47,7 +47,7 @@ def _chat(ollama_url, model, messages, timeout=300):
 
 # Output/artifact file extensions: when a goal names a file like these, it is a
 # deliverable we can deterministically verify exists before believing "DONE".
-# Source-ish extensions (.py/.nix/.sh) are intentionally excluded — they are
+# Source-ish extensions (.py/.nix/.sh) are intentionally excluded, they are
 # often inputs the agent only reads, so requiring them would cause false vetoes.
 _ARTIFACT_EXT = ("png", "ppm", "pgm", "jpg", "jpeg", "gif", "svg", "webp", "mp4",
                  "mov", "mkv", "webm", "mp3", "wav", "flac", "md", "txt", "csv",
