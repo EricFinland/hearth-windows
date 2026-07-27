@@ -6,6 +6,7 @@
 <br/>
 
 [![build](https://img.shields.io/github/actions/workflow/status/EricFinland/hearth/build.yml?style=flat-square&logo=githubactions&logoColor=white&label=build&labelColor=211c16&color=cc785c)](https://github.com/EricFinland/hearth/actions/workflows/build.yml)
+![Windows](https://img.shields.io/badge/Windows-in%20development-cc785c?style=flat-square&logo=windows&logoColor=white&labelColor=211c16)
 ![NixOS](https://img.shields.io/badge/NixOS-flake-cc785c?style=flat-square&logo=nixos&logoColor=white&labelColor=211c16)
 ![Ollama](https://img.shields.io/badge/LLMs-Ollama-cc785c?style=flat-square&logo=ollama&logoColor=white&labelColor=211c16)
 ![Sandboxed](https://img.shields.io/badge/agents-sandboxed-cc785c?style=flat-square&logo=linux&logoColor=white&labelColor=211c16)
@@ -13,21 +14,85 @@
 ![License](https://img.shields.io/badge/license-MIT-cc785c?style=flat-square&labelColor=211c16)
 [![release](https://img.shields.io/github/v/release/EricFinland/hearth?style=flat-square&labelColor=211c16&color=cc785c)](https://github.com/EricFinland/hearth/releases)
 
-### Local LLMs and autonomous agents, sandboxed by default. Every run audited. The whole OS reproducible from one flake.
+### Local LLMs and autonomous coding agents on your own hardware, at zero cost.
 
-[**📖 Documentation**](https://ericfinland.github.io/hearth/) &nbsp;·&nbsp; [**🚀 Quickstart**](#quickstart) &nbsp;·&nbsp; [**🧠 Architecture**](https://ericfinland.github.io/hearth/concepts/architecture/)
+[**📖 Documentation**](https://ericfinland.github.io/hearth/) &nbsp;·&nbsp; [**🪟 Hearth for Windows**](docs/windows.md) &nbsp;·&nbsp; [**🐧 NixOS quickstart**](#the-nixos-system) &nbsp;·&nbsp; [**🧠 Architecture**](https://ericfinland.github.io/hearth/concepts/architecture/)
 
 </div>
 
 ---
 
-Most people run local agents with full system privileges and no record of what they did. **hearth flips that.** Agents are contained at the operating-system level, every run records its tokens, cost, latency, and errors to a local database, and the entire system is defined in one `flake.nix` you can rebuild identically and roll back in a single command.
+Hearth runs local models on your own machine and gives them tools: files, a
+shell, an agent loop that can be turned loose on a task. It comes in two
+forms today.
 
-> It is not a custom kernel or a remastered distro. It is a declarative NixOS system you `nixos-rebuild switch` into existence.
+**Hearth is a Windows desktop application.** Point it at a model through
+[Ollama](https://ollama.com) and it works the way a hosted AI assistant
+does, except every token comes from your own GPU at no cost, and it tells
+you honestly what your hardware can actually run instead of leaving you to
+guess. **Hearth Code** is the agentic coding surface inside Hearth: the part
+that reads your repo, proposes edits, runs commands, and can be handed a
+task to work on while you do something else. Two names, used consistently
+throughout this repo: Hearth is the application, Hearth Code is the coding
+agent inside it.
 
-> **Status: v1.5, stable.** The whole stack runs on real hardware: sandboxed agents, the audit log, the reproducible flake, the web cockpit, an OpenAI-compatible API, a local knowledge base, a standing-missions scheduler, and the self-improvement loop (which only ever produces reviewable, gated branches, never auto-changing a running system). Since 1.0, per-run containment (tool and host allowlists, with hosts enforced at the kernel), honeyfile tripwires, a flight recorder with a replay viewer, and a governor (a daily spend breaker plus push alerts) have landed on top. Local model quality is the honest ceiling. See the [CHANGELOG](CHANGELOG.md).
+**Hearth is also a fully declarative NixOS system.** The same agent engine
+runs as sandboxed systemd units on a machine defined entirely by one
+`flake.nix`, with every run audited to a local database and the whole OS
+reproducible and reversible with a single command.
 
-## What makes it different
+Windows is the newer, larger surface, and the one most people will meet
+first. NixOS users, skip ahead to [the NixOS system](#the-nixos-system).
+
+> **NixOS system: v1.6, stable.** The whole stack runs on real hardware:
+> sandboxed agents, the audit log, the reproducible flake, the web cockpit,
+> an OpenAI-compatible API, a local knowledge base, a standing-missions
+> scheduler, a declarative model router, a natural-language audit query, and
+> a self-improvement loop that only ever produces reviewable, gated
+> branches, never auto-changing a running system. Local model quality is the
+> honest ceiling. See the [CHANGELOG](CHANGELOG.md).
+
+> **Windows desktop app: in development, nothing published yet.** The agent
+> engine underneath Hearth Code, hardware detection, the model shop's fit
+> calculator, workspace containment, and git-backed checkpoint/undo, is
+> built and self-tested on Windows. The desktop shell, the UI, the
+> installer, and the model shop's actual interface are not built yet. There
+> is no download. [Hearth for Windows](docs/windows.md) says exactly what
+> exists today; [the Windows threat model](docs/security/windows-threat-model.md)
+> says exactly what does not.
+
+## Hearth for Windows
+
+Read the full page: **[docs/windows.md](docs/windows.md)**. It covers what
+Hearth and Hearth Code are, what you need today (Ollama, installed and with
+a model already pulled), how a model and a context length get chosen for
+your specific GPU, what the permission modes (`plan`, `edit`, `auto`,
+`bypass`) mean, and how undo works.
+
+Also worth reading before you trust it with anything real:
+
+- **[docs/model-shop.md](docs/model-shop.md)**: how the model shop's fit
+  verdicts work, why they're based on KV-cache math rather than parameter
+  count, and why it deliberately does not predict tokens per second.
+- **[docs/limitations.md](docs/limitations.md)**: the honest one. Local
+  models are weak compared to hosted ones, `run_command` is not contained,
+  and approving a command by reading its text is not a security control.
+  Read this before running Hearth Code against anything you care about.
+- **[docs/security/windows-threat-model.md](docs/security/windows-threat-model.md)**:
+  the full threat model this was distilled from.
+
+## The NixOS system
+
+Most people run local agents with full system privileges and no record of
+what they did. **hearth flips that.** Agents are contained at the
+operating-system level, every run records its tokens, cost, latency, and
+errors to a local database, and the entire system is defined in one
+`flake.nix` you can rebuild identically and roll back in a single command.
+
+> It is not a custom kernel or a remastered distro. It is a declarative
+> NixOS system you `nixos-rebuild switch` into existence.
+
+### What makes it different
 
 |  |  |
 | --- | --- |
@@ -36,7 +101,7 @@ Most people run local agents with full system privileges and no record of what t
 | ♻️ **Reproducible from boot** | One flake builds the whole OS. Atomic, bootloader-level rollback. Two builds from the same lock are identical. |
 | 🧠 **Local and private** | Ollama on your own GPU, agents that actually use tools, a web command center. Zero cloud, nothing leaves the box. |
 
-## Architecture
+### Architecture
 
 ```mermaid
 flowchart LR
@@ -55,7 +120,7 @@ flowchart LR
   end
 ```
 
-## See it run
+### See it run
 
 ```console
 $ hearth-status
@@ -70,7 +135,7 @@ build   qwen2.5-coder    2.1k    14s      $0.00
 chat    mistral:7b       430     3.2s     $0.00
 ```
 
-## How a run stays contained
+### How a run stays contained
 
 ```mermaid
 sequenceDiagram
@@ -91,7 +156,7 @@ sequenceDiagram
   Agent-->>You: result + receipt
 ```
 
-## Quickstart
+### NixOS quickstart
 
 ```sh
 git clone https://github.com/EricFinland/hearth
@@ -103,9 +168,9 @@ bash scripts/build-image.sh   # build a bootable image
 
 Full install paths (existing NixOS host, fresh VM, or a Linux primer) live in the docs:
 
-### → **[ericfinland.github.io/hearth](https://ericfinland.github.io/hearth/)**
+#### → **[ericfinland.github.io/hearth](https://ericfinland.github.io/hearth/)**
 
-### Use it
+#### Use it
 
 ```sh
 # Point any OpenAI client at your local models (audited):
@@ -120,7 +185,7 @@ curl http://your-hearth:8770/metrics
 ```
 
 <details>
-<summary><b>The full feature set</b></summary>
+<summary><b>The full NixOS feature set</b></summary>
 
 <br/>
 
@@ -140,6 +205,8 @@ curl http://your-hearth:8770/metrics
 - **Spend circuit breaker:** a hard daily token budget across all runs; at the cap, running agents halt gracefully and new runs refuse to start until local midnight.
 - **Unified alerting:** one fan-out pushes every alert to Telegram and ntfy, firing on errors, tripwire trips, and budget breaches so the box can reach your phone.
 - **Declarative missions:** scheduled cron-as-flake missions you define in the flake, rendered read-only and merged with cockpit-created ones, each launch carrying its capability manifest and egress allowlist.
+- **Declarative model router:** `hearth.router` in the flake picks the right model per launch from keyword and tool-based rules, with the decision recorded in the flight recorder.
+- **Natural-language audit query:** ask the audit database a question in plain English; a local model translates it to a validated, read-only `SELECT` and summarizes the result.
 - **Observability:** a Prometheus `/metrics` endpoint, a usage-over-time stats view, and `hearth-doctor` for a one-command health check.
 - **Agent credentials by name:** keys are substituted at request time via systemd credentials, so the model never sees the secret value.
 - **More agent tools:** grep, multi-file edit, directory tree, web-to-knowledge, and more.
@@ -153,9 +220,12 @@ curl http://your-hearth:8770/metrics
 
 Contributions are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md) for the build
 and self-test workflow. Found a security issue? Please follow
-[SECURITY.md](SECURITY.md) rather than opening a public issue.
+[SECURITY.md](SECURITY.md) rather than opening a public issue. The Windows
+build has its own threat model at
+[docs/security/windows-threat-model.md](docs/security/windows-threat-model.md),
+since the containment story there is different from the NixOS system's.
 
-> **First-boot note:** the config ships a default console password for the very
+> **First-boot note (NixOS):** the config ships a default console password for the very
 > first local login (SSH is key-only). Change it immediately with `passwd`. See
 > [SECURITY.md](SECURITY.md).
 
