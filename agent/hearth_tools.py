@@ -4,8 +4,10 @@ a description, a JSON-schema for its parameters, and a `fn(args, workspace)` tha
 runs it and returns a short string result. Adding a capability means adding a
 tool here (or registering one at runtime). Standard library only.
 
-All file/command tools operate inside the per-run workspace and refuse paths that
-escape it, as defence in depth on top of the systemd sandbox.
+All file tools operate inside the per-run workspace and refuse paths that escape
+it. On NixOS this sits behind a systemd sandbox and an nftables egress wall. On
+Windows there is no such backstop, so hearth_contain is the boundary itself. Note
+that run_command is scoped by working directory only and is not contained by it.
 """
 
 import fnmatch
@@ -26,6 +28,9 @@ from html.parser import HTMLParser
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import hearth_contain
+import hearth_paths
+
 
 def _bin(name, fallback):
     """Resolve a system binary by PATH, falling back to its NixOS stable path
@@ -35,6 +40,12 @@ def _bin(name, fallback):
 
 HEARTH_REPO = os.environ.get("HEARTH_REPO", "/home/operator/hearth-desktop")
 _SYSTEM_PROFILES = "/nix/var/nix/profiles"
+
+
+def _repo_join(path):
+    """Resolve a path inside HEARTH_REPO. Kept for the Linux self-config tools,
+    which operate on hearth's own flake rather than on a run workspace."""
+    return hearth_contain.safe_join(HEARTH_REPO, path)
 
 
 def _meminfo_summary(text):
@@ -55,14 +66,6 @@ def _meminfo_summary(text):
     avail = kb("MemAvailable")
     return (max(total - avail, 0)) // 1024, total // 1024
 
-
-def _repo_join(path):
-    """Resolve a path inside HEARTH_REPO, refusing escapes."""
-    root = os.path.realpath(HEARTH_REPO)
-    full = os.path.realpath(os.path.join(root, (path or "").lstrip("/")))
-    if full != root and not full.startswith(root + os.sep):
-        raise ValueError("path escapes the hearth repo: {}".format(path))
-    return full
 
 class _TextExtractor(HTMLParser):
     _SKIP = {"script", "style", "head", "noscript"}
@@ -99,15 +102,6 @@ HTTP_TIMEOUT = 30
 MAX_OUT = 4000
 
 
-def _safe_join(workspace, path):
-    path = (path or "").lstrip("/")
-    full = os.path.realpath(os.path.join(workspace, path))
-    root = os.path.realpath(workspace)
-    if full != root and not full.startswith(root + os.sep):
-        raise ValueError("path escapes workspace: {}".format(path))
-    return full
-
-
 def tool_run_command(args, workspace):
     cmd = args.get("command", "")
     if not cmd:
@@ -126,7 +120,7 @@ def tool_run_command(args, workspace):
 
 def tool_write_file(args, workspace):
     try:
-        full = _safe_join(workspace, args.get("path"))
+        full = hearth_contain.safe_join(workspace, args.get("path"))
     except ValueError as exc:
         return "error: {}".format(exc)
     content = args.get("content", "")
@@ -140,7 +134,7 @@ def tool_write_file(args, workspace):
 
 def tool_read_file(args, workspace):
     try:
-        full = _safe_join(workspace, args.get("path"))
+        full = hearth_contain.safe_join(workspace, args.get("path"))
     except ValueError as exc:
         return "error: {}".format(exc)
     try:
@@ -152,7 +146,7 @@ def tool_read_file(args, workspace):
 
 def tool_list_files(args, workspace):
     try:
-        full = _safe_join(workspace, args.get("path", "."))
+        full = hearth_contain.safe_join(workspace, args.get("path", "."))
     except ValueError as exc:
         return "error: {}".format(exc)
     try:
@@ -171,7 +165,7 @@ def tool_search_files(args, workspace):
     if not query:
         return "error: no query"
     try:
-        base = _safe_join(workspace, args.get("path", "."))
+        base = hearth_contain.safe_join(workspace, args.get("path", "."))
     except ValueError as exc:
         return "error: {}".format(exc)
     try:
@@ -204,7 +198,7 @@ def tool_search_files(args, workspace):
 def tool_list_tree(args, workspace):
     """Render an indented directory tree under a path (common build/VCS dirs skipped)."""
     try:
-        base = _safe_join(workspace, args.get("path", "."))
+        base = hearth_contain.safe_join(workspace, args.get("path", "."))
     except ValueError as exc:
         return "error: {}".format(exc)
     try:
@@ -236,7 +230,7 @@ def tool_edit_file(args, workspace):
     match, or every match when all=true. Errors (no change) if find is absent, so
     the model knows to re-read the file. More reliable for local models than diffs."""
     try:
-        full = _safe_join(workspace, args.get("path"))
+        full = hearth_contain.safe_join(workspace, args.get("path"))
     except ValueError as exc:
         return "error: {}".format(exc)
     find = args.get("find")
@@ -302,7 +296,7 @@ def plant_decoys(workspace):
     planted = set()
     for rel, template in _DECOY_TEMPLATES.items():
         try:
-            full = _safe_join(workspace, rel)
+            full = hearth_contain.safe_join(workspace, rel)
         except ValueError:
             continue
         parent = os.path.dirname(full)
@@ -700,7 +694,7 @@ def tool_kb_add(args, workspace):
     text = args.get("text")
     if not text and args.get("path"):
         try:
-            with open(_safe_join(workspace, args.get("path")), errors="replace") as fh:
+            with open(hearth_contain.safe_join(workspace, args.get("path")), errors="replace") as fh:
                 text = fh.read()
         except (OSError, ValueError) as exc:
             return "error: {}".format(exc)
@@ -719,7 +713,7 @@ def tool_replace_in_files(args, workspace):
     replace = args.get("replace", "")
     pattern = args.get("glob")
     try:
-        base = _safe_join(workspace, args.get("path", "."))
+        base = hearth_contain.safe_join(workspace, args.get("path", "."))
     except ValueError as exc:
         return "error: {}".format(exc)
     files_changed = 0
@@ -771,7 +765,7 @@ def tool_index_dir(args, workspace):
     if not name:
         return "error: a project 'name' is required"
     try:
-        root = _safe_join(workspace, args.get("path", "."))
+        root = hearth_contain.safe_join(workspace, args.get("path", "."))
     except ValueError as exc:
         return "error: {}".format(exc)
     globs = None
@@ -1220,6 +1214,24 @@ def _self_test():
             os.environ.pop("HEARTH_DB", None)
         else:
             os.environ["HEARTH_DB"] = _oldhdb
+
+    # Containment is delegated to hearth_contain, and the old private
+    # helper is gone. A tool must refuse an escaping path rather than
+    # resolving it.
+    assert not hasattr(sys.modules[__name__], "_safe_join"), "_safe_join should be deleted"
+
+    import shutil as _shutil
+    import tempfile as _tempfile
+    _ws = os.path.realpath(_tempfile.mkdtemp(prefix="hearth-tools-"))
+    try:
+        assert "escapes workspace" in tool_write_file({"path": "../evil.txt", "content": "x"}, _ws)
+        assert "refusing path" in tool_write_file({"path": "NUL", "content": "x"}, _ws)
+        assert "refusing path" in tool_write_file({"path": "a.txt:hidden", "content": "x"}, _ws)
+        assert "escapes workspace" in tool_read_file({"path": "../../etc/passwd"}, _ws)
+        assert "escapes workspace" in tool_list_files({"path": ".."}, _ws)
+        assert "escapes workspace" in tool_search_files({"query": "x", "path": ".."}, _ws)
+    finally:
+        _shutil.rmtree(_ws, ignore_errors=True)
 
     print("hearth-tools self-test OK")
     return 0
