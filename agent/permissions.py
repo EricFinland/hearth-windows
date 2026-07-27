@@ -5,6 +5,8 @@ by every drive path (interactive sessions and background workers).
 
 Permission modes:
   plan   - read-only; the agent may look but change nothing, then must produce a plan.
+  edit   - reads run automatically; every file change and every dangerous action
+           is shown to the user for approval. The desktop default.
   auto   - safe reads and file edits run automatically; dangerous actions are gated
            (the user must approve each one).
   bypass - everything runs, no prompts.
@@ -17,7 +19,7 @@ Decision values:
 
 import sys
 
-MODES = ("plan", "auto", "bypass")
+MODES = ("plan", "edit", "auto", "bypass")
 
 # Risk class per tool: "safe" (reads), "edit" (file writes), "dangerous"
 # (shell, network, sudo). Unknown tools are treated as dangerous (fail closed).
@@ -55,8 +57,31 @@ def risk_of(tool):
 
 
 def _command_head(args):
+    """The executable name at the head of a shell command, without directory or
+    extension.
+
+    A naive cmd.split()[0] breaks on Windows in two ways: a quoted path
+    containing a space yields '"C:\\Program', and a full path yields something
+    that never matches a bare allowlist entry like 'git'.
+
+    This is allowlist matching for convenience, not a security control. String
+    inspection of a shell command cannot be one: cmd.exe strips carets, so
+    's^e^t' runs 'set', and %VAR:~n,m% substring expansion assembles an
+    executable name that never appears in the approved string.
+    """
     cmd = ((args or {}).get("command") or "").strip()
-    return cmd.split()[0] if cmd else ""
+    if not cmd:
+        return ""
+    if cmd[0] in "\"'":
+        quote = cmd[0]
+        end = cmd.find(quote, 1)
+        head = cmd[1:end] if end > 0 else cmd[1:]
+    else:
+        head = cmd.split()[0]
+    head = head.replace("\\", "/").rsplit("/", 1)[-1]
+    if head.lower().endswith((".exe", ".cmd", ".bat", ".com", ".ps1")):
+        head = head.rsplit(".", 1)[0]
+    return head
 
 
 def decide(mode, tool, args=None, auto_allow=(), allowed_tools=None):
@@ -81,6 +106,10 @@ def decide(mode, tool, args=None, auto_allow=(), allowed_tools=None):
         return "allow"
     if mode == "plan":
         return "allow" if risk == "safe" else "deny"
+    if mode == "edit":
+        # Reads run freely; anything that changes state or leaves the box is
+        # shown to the user first.
+        return "allow" if risk == "safe" else "gate"
     # auto
     if risk in ("safe", "edit"):
         return "allow"
@@ -146,6 +175,29 @@ def _self_test():
     assert decide("bypass", "web_fetch", allowed_tools=set()) == "deny"  # empty manifest denies everything
     assert decide("bypass", "web_fetch", allowed_tools=None) == "allow"  # None = no manifest (back-compat)
     assert decide("auto", "run_command", {"command": "git status"}, auto_allow={"git"}, allowed_tools={"run_command"}) == "allow"
+    # A quoted executable path containing a space must still match the
+    # allowlist. cmd.split()[0] returned '"C:\\Program' and never matched.
+    assert _command_head({"command": '"C:\\Program Files\\Git\\bin\\git.exe" status'}) == "git"
+    assert _command_head({"command": "git status"}) == "git"
+    assert _command_head({"command": "  git   status  "}) == "git"
+    assert _command_head({"command": "C:\\tools\\ripgrep\\rg.exe -n foo"}) == "rg"
+    assert _command_head({"command": "/usr/bin/git status"}) == "git"
+    assert _command_head({"command": ""}) == ""
+    assert decide("auto", "run_command",
+                  {"command": '"C:\\Program Files\\Git\\bin\\git.exe" status'},
+                  auto_allow={"git"}) == "allow"
+    # 'edit' mode: reads run, writes are gated, dangerous stays gated. This is
+    # the mode the desktop UI defaults to, so a weak local model cannot rewrite
+    # a file without the user seeing a diff first.
+    assert "edit" in MODES
+    assert decide("edit", "read_file") == "allow"
+    assert decide("edit", "list_tree") == "allow"
+    assert decide("edit", "write_file") == "gate"
+    assert decide("edit", "edit_file") == "gate"
+    assert decide("edit", "replace_in_files") == "gate"
+    assert decide("edit", "run_command") == "gate"
+    assert decide("edit", "mystery") == "gate"
+    assert decide("edit", "write_file", allowed_tools={"read_file"}) == "deny"
     print("hearth-permissions self-test OK")
     return 0
 
