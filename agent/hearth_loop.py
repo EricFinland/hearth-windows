@@ -1282,10 +1282,13 @@ def _self_test():
     # --- Tripwire: an agent that reads a planted decoy trips the alarm, the run
     # dies with a tripwire error, a tripwires row is written, and the state is
     # TRIPPED. Two cases: direct read-by-path (layer 1) and a shell cat surfacing
-    # the canary in output (layer 2).
+    # the canary in output (layer 2). "cat" is spelled per-platform: Windows has
+    # no cat on a clean PATH, so this uses "type" there. Either way the tripwire
+    # must fire off the shell's output, not off tool_read_file.
+    _cat_cmd = "type .env.production" if hearth_paths.is_windows() else "cat .env.production"
     for label, tool_call in (
         ("read", {"name": "read_file", "arguments": {"path": ".aws/credentials"}}),
-        ("cat", {"name": "run_command", "arguments": {"command": "cat .env.production"}}),
+        ("cat", {"name": "run_command", "arguments": {"command": _cat_cmd}}),
     ):
         events_t = []
         tsteps = iter([

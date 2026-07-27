@@ -1416,8 +1416,12 @@ def _self_test():
     assert len(tokens) == len(planted), ("each decoy gets a unique token", tokens)
     assert find_canary("nothing to see here") is None
     assert find_canary("leak: HEARTH-CANARY-0123456789abcdef done") == "HEARTH-CANARY-0123456789abcdef"
-    # a decoy is a real readable file that a shell cat would surface
-    catout = execute_tool("run_command", {"command": "cat .env.production"}, dws)
+    # a decoy is a real readable file that a shell "cat"-equivalent would
+    # surface. Windows has no cat on a clean PATH, so use the platform's
+    # native file-dump command; either way this exercises the shell path,
+    # not tool_read_file.
+    _cat_cmd = "type .env.production" if hearth_paths.is_windows() else "cat .env.production"
+    catout = execute_tool("run_command", {"command": _cat_cmd}, dws)
     assert find_canary(catout), ("shell cat surfaces the canary", catout)
 
     # current_generation: parse the generation number, and confirm the tool
