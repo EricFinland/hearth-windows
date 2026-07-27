@@ -9,6 +9,44 @@ Endpoints:
   POST /session   create or replace the live session: {"workspace", "model",
                   "mode"?}. Replacing drops the previous session's event log
                   and any turn in flight for it.
+
+                  SECURITY: "mode" accepts "plan", "edit", or "auto" only.
+                  "bypass" is rejected with 400 -- permissions.decide still
+                  implements it (the Linux CLI can still use it directly),
+                  but it is not settable over this HTTP transport. In bypass
+                  mode, permissions.decide allows every manifest tool with no
+                  approval gate, and run_command is not contained by the
+                  workspace at all (the workspace is only the subprocess cwd,
+                  which is not a security boundary): one authenticated
+                  request would otherwise turn a bearer token into
+                  unconfirmed arbitrary code execution anywhere the OS user
+                  can reach. Nothing in the product needs that reachable
+                  remotely yet; a future desktop shell can grant it through a
+                  deliberate local action instead of an HTTP field.
+
+                  SECURITY: "workspace" is caller-controlled and NOT
+                  restricted to any particular root -- there is no "projects
+                  root" UI concept yet to restrict it to. Whoever holds the
+                  bearer token can point a session at any directory the OS
+                  user can reach. File tools (read_file, write_file, etc.)
+                  are contained to that workspace via
+                  hearth_contain.safe_join; run_command is NOT contained by
+                  it in any mode -- the workspace is only the subprocess's
+                  cwd, and `cd ..` (or an absolute path) reaches anywhere the
+                  OS user can. This is an accepted, documented exposure, not
+                  an oversight: closing it needs a workspace allowlist tied
+                  to a real UI concept, which does not exist yet.
+
+                  Replacing a session whose old session is still busy (a
+                  turn running, or a previous turn's cancelled-but-abandoned
+                  worker still executing -- see Session.is_workspace_busy)
+                  AND targets the exact same workspace directory is refused
+                  with 409, so a still-writing abandoned worker from the old
+                  session can never race the new session's own turns in the
+                  same directory. A different workspace is always accepted
+                  immediately; the old session (and its abandoned worker, if
+                  any) simply keeps running against its own, different,
+                  workspace path, unaffected.
   GET  /session   the current session's state, or 404 if none exists yet.
   POST /prompt    submit a user turn: {"message"}. Returns {"turn_id"}
                   immediately; the turn runs on a background thread.
@@ -27,6 +65,17 @@ Endpoints:
                   hearth_checkpoint.restore() reports, unmodified -- in
                   particular "skipped_gitlinks" is always passed through, so
                   a UI can never present a partial restore as a complete one.
+
+                  Refused with 409 whenever Session.is_workspace_busy() is
+                  true: not only while a turn is actively running, but also
+                  while a previous turn's cancelled-but-abandoned worker
+                  (see engine.py's _run_cancellable) is still executing.
+                  Cancellation flips `status` back to idle within about a
+                  second while that abandoned call can keep writing to the
+                  workspace for as long as 1800s (run_command) behind it; a
+                  restore that only checked `status` could run `git
+                  read-tree -u --reset` while that worker was still mutating
+                  the same files underneath it.
 
 Every route except GET /healthz requires, in this order: a valid Host header
 (the DNS-rebinding defence), a valid Origin header when one is present, and a
@@ -47,13 +96,28 @@ import engine as engine_mod
 import session as session_mod
 
 
+MAX_SSE_CONNECTIONS = 16  # bound on concurrent GET /events streams; see acquire_sse_slot
+
+
+class WorkspaceBusyError(RuntimeError):
+    """Raised by SidecarState.create_session when the requested workspace is
+    the same directory as the session being replaced, and that session is
+    still busy (Session.is_workspace_busy(): a turn running, or a previous
+    turn's cancelled-but-abandoned worker still executing). Replacing blind
+    here would let the old session's abandoned worker race the new
+    session's own writes in the same directory -- the same hazard POST
+    /restore has, just via a different route. _post_session in
+    SidecarHandler turns this into a 409."""
+
+
 class SidecarState:
     """Shared state behind every request. One instance per server process;
     ThreadingHTTPServer runs each request on its own thread, so mutation of
     `session` goes through a lock rather than relying on request isolation.
     """
 
-    def __init__(self, token, engine_factory=None, port=0, models_fetcher=None):
+    def __init__(self, token, engine_factory=None, port=0, models_fetcher=None,
+                 max_sse_connections=None):
         self.token = token
         self.port = port  # main.py sets this to the real bound port after listen
         self.engine_factory = engine_factory or (lambda: session_mod.NullEngine())
@@ -62,20 +126,58 @@ class SidecarState:
         self.models_fetcher = models_fetcher or engine_mod.list_installed_models
         self._lock = threading.Lock()
         self.session = None
+        # ThreadingHTTPServer spawns one thread per connection, and GET
+        # /events holds its connection open for as long as the client keeps
+        # reading (or forever, if it never reads). A client opening many and
+        # reading none would accumulate threads without bound, so concurrent
+        # SSE streams are capped; see acquire_sse_slot/release_sse_slot.
+        self.max_sse_connections = max_sse_connections or MAX_SSE_CONNECTIONS
+        self._sse_count = 0
 
     def get_session(self):
         with self._lock:
             return self.session
+
+    def acquire_sse_slot(self):
+        """True and reserves a slot if under max_sse_connections, else False
+        (no slot reserved). Always paired with release_sse_slot in a
+        finally, from _get_events."""
+        with self._lock:
+            if self._sse_count >= self.max_sse_connections:
+                return False
+            self._sse_count += 1
+            return True
+
+    def release_sse_slot(self):
+        with self._lock:
+            self._sse_count = max(0, self._sse_count - 1)
 
     def create_session(self, workspace, model, mode):
         """Build a fresh Session and make it the live one. If a turn is still
         running on the session being replaced, cancel it first -- otherwise
         its background thread would keep running with nothing left able to
         reach it (POST /cancel and GET /events only ever see the current
-        `self.session`), silently orphaning it."""
+        `self.session`), silently orphaning it.
+
+        But if the new workspace is the exact same directory as the one
+        being replaced, and that old session is still busy (running, or a
+        cancelled turn's abandoned worker still executing against it),
+        replacing it is refused with WorkspaceBusyError instead: cancelling
+        and moving on would leave the abandoned worker free to race the new
+        session's own turns in that same directory. A different workspace
+        is always safe to replace immediately -- the old session's abandoned
+        worker, if any, keeps running against its own, different, path."""
         with self._lock:
             old = self.session
         if old is not None:
+            try:
+                same_workspace = os.path.realpath(workspace) == os.path.realpath(old.workspace)
+            except (OSError, ValueError):
+                same_workspace = False
+            if same_workspace and old.is_workspace_busy():
+                raise WorkspaceBusyError(
+                    "cannot replace session: this workspace has running or abandoned "
+                    "work in progress; wait for it to finish and try again")
             old.cancel()
         s = session_mod.Session(workspace, model, mode, engine=self.engine_factory())
         with self._lock:
@@ -212,10 +314,19 @@ class SidecarHandler(BaseHTTPRequestHandler):
         if not isinstance(model, str) or not model:
             self._send_json(400, {"error": "model is required"})
             return
+        # "bypass" is a settled product decision, not an oversight: see the
+        # module docstring. permissions.py keeps supporting it for the Linux
+        # CLI; this transport simply never accepts it as an input.
+        if mode == "bypass":
+            self._send_json(400, {"error": "mode 'bypass' cannot be set over HTTP"})
+            return
         try:
             s = self.state.create_session(workspace, model, mode)
         except ValueError as exc:
             self._send_json(400, {"error": str(exc)})
+            return
+        except WorkspaceBusyError as exc:
+            self._send_json(409, {"error": str(exc)})
             return
         self._send_json(200, s.to_dict())
 
@@ -286,23 +397,34 @@ class SidecarHandler(BaseHTTPRequestHandler):
             except ValueError:
                 pass
 
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        try:
-            while True:
-                events = s.events_after(since, timeout=15)
-                if not events:
-                    self.wfile.write(b": keep-alive\n\n")
-                    self.wfile.flush()
-                    continue
-                for ev in events:
-                    since = ev["id"]
-                    self._write_sse(ev)
-        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
+        # Bound concurrent SSE connections: ThreadingHTTPServer spawns one
+        # thread per connection and this handler holds its thread for as
+        # long as the client keeps the connection open (or forever, if it
+        # never reads), so a client opening many and reading none would
+        # otherwise accumulate threads without limit.
+        if not self.state.acquire_sse_slot():
+            self._send_json(429, {"error": "too_many_event_streams"})
             return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                while True:
+                    events = s.events_after(since, timeout=15)
+                    if not events:
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                        continue
+                    for ev in events:
+                        since = ev["id"]
+                        self._write_sse(ev)
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
+                return
+        finally:
+            self.state.release_sse_slot()
 
     def _get_models(self):
         """Best-effort: an unreachable Ollama must not take the whole route
@@ -344,8 +466,10 @@ class SidecarHandler(BaseHTTPRequestHandler):
         if not isinstance(checkpoint_id, str) or not checkpoint_id:
             self._send_json(400, {"error": "checkpoint_id is required"})
             return
-        if s.to_dict()["status"] == session_mod.STATUS_RUNNING:
-            self._send_json(409, {"error": "cannot restore while a turn is running; cancel it first"})
+        if s.is_workspace_busy():
+            self._send_json(409, {
+                "error": "cannot restore while the workspace has running or abandoned work "
+                         "in progress; wait for it to finish and try again"})
             return
         try:
             result = engine_mod.hearth_checkpoint.restore(s.workspace, checkpoint_id)
@@ -607,6 +731,245 @@ def _self_test():
         finally:
             server2.shutdown()
             server2.server_close()
+
+        # === Finding 3: "bypass" is not settable over HTTP =====================
+        # === plan / edit / auto are; the default stays edit ====================
+
+        server_modes, state_modes = _start(engine_factory=lambda: _FakeEngine())
+        try:
+            port_m, token_m = state_modes.port, state_modes.token
+            headers_m = {"Host": "127.0.0.1:{}".format(port_m), "Authorization": "Bearer " + token_m,
+                        "Content-Type": "application/json"}
+
+            status, data = _raw_request(port_m, "POST", "/session", headers=headers_m,
+                                        body=json.dumps({"workspace": "/tmp/ws-bypass",
+                                                         "model": "m", "mode": "bypass"}))
+            assert status == 400, (status, data)
+            assert "bypass" in json.loads(data)["error"], data
+            # the rejected request must never have taken effect
+            status, data = _raw_request(port_m, "GET", "/session", headers=headers_m)
+            assert status == 404, (status, data)  # still no session at all
+
+            for allowed_mode in ("plan", "edit", "auto"):
+                status, data = _raw_request(port_m, "POST", "/session", headers=headers_m,
+                                            body=json.dumps({"workspace": "/tmp/ws-" + allowed_mode,
+                                                             "model": "m", "mode": allowed_mode}))
+                assert status == 200, (allowed_mode, status, data)
+                assert json.loads(data)["mode"] == allowed_mode, (allowed_mode, data)
+
+            # omitting mode entirely still defaults to edit
+            status, data = _raw_request(port_m, "POST", "/session", headers=headers_m,
+                                        body=json.dumps({"workspace": "/tmp/ws-default", "model": "m"}))
+            assert status == 200, (status, data)
+            assert json.loads(data)["mode"] == "edit", data
+        finally:
+            server_modes.shutdown()
+            server_modes.server_close()
+
+        # === Finding 1, the actual pin: cancel a turn whose tool call is =====
+        # === still running (via the REAL RealEngine, not a cooperative fake =
+        # === that checks ctx.cancelled() itself), confirm status reports ====
+        # === idle, then confirm POST /restore does NOT proceed as though ====
+        # === the workspace were quiet =========================================
+
+        def _f1_checkpoint(workspace, label=None, timestamp=None):
+            return {"id": "cp-f1", "label": label, "file_count": 0, "sub_repos": [], "warning": None}
+
+        f1_tool_release = threading.Event()
+
+        def _f1_slow_tool(name, args, workspace):
+            f1_tool_release.wait(timeout=10)
+            return "finished after being abandoned"
+
+        def _f1_chat(messages):
+            # mode "auto" + auto_allow=("sleepforever",) reaches an "allow"
+            # verdict for run_command without a gate -- this deliberately
+            # exercises the actually-dangerous case the review named
+            # (run_command, unbounded up to 1800s), while going through the
+            # real POST /session HTTP endpoint (which can no longer be asked
+            # for "bypass" at all, per Finding 3).
+            return ({"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "run_command", "arguments": {"command": "sleepforever --now"}}}]}, 1, 1)
+
+        f1_engine = engine_mod.RealEngine(chat_fn=_f1_chat, execute_tool_fn=_f1_slow_tool,
+                                          checkpoint_fn=_f1_checkpoint, auto_allow=("sleepforever",))
+        server_f1, state_f1 = _start(engine_factory=lambda: f1_engine)
+        import shutil as _shutil_f1
+        import tempfile as _tempfile_f1
+        ws_f1 = _tempfile_f1.mkdtemp(prefix="hearth-app-f1-")
+        try:
+            port_f1 = state_f1.port
+            headers_f1 = {"Host": "127.0.0.1:{}".format(port_f1),
+                         "Authorization": "Bearer " + state_f1.token,
+                         "Content-Type": "application/json"}
+            status, data = _raw_request(port_f1, "POST", "/session", headers=headers_f1,
+                                        body=json.dumps({"workspace": ws_f1, "model": "m", "mode": "auto"}))
+            assert status == 200, (status, data)
+            status, data = _raw_request(port_f1, "POST", "/prompt", headers=headers_f1,
+                                        body=json.dumps({"message": "run something that hangs"}))
+            assert status == 200, (status, data)
+
+            sess_f1 = state_f1.get_session()
+            deadline_f1 = time.monotonic() + 5
+            while sess_f1.to_dict()["status"] != "running" and time.monotonic() < deadline_f1:
+                time.sleep(0.01)
+            time.sleep(0.1)  # let the worker thread actually enter _f1_slow_tool's wait
+
+            status, data = _raw_request(port_f1, "POST", "/cancel", headers=headers_f1)
+            assert status == 200 and json.loads(data)["cancelled"] is True, (status, data)
+
+            deadline_f1 = time.monotonic() + 5
+            while sess_f1.to_dict()["status"] != "idle" and time.monotonic() < deadline_f1:
+                time.sleep(0.01)
+            assert sess_f1.to_dict()["status"] == "idle", "turn never reported idle after cancel"
+
+            # THE PIN. status reads idle, but the tool call _f1_slow_tool is
+            # still blocked (f1_tool_release has not been set) -- a restore
+            # here would run git read-tree -u --reset while that abandoned
+            # call could still be writing into the same workspace.
+            status, data = _raw_request(port_f1, "POST", "/restore", headers=headers_f1,
+                                        body=json.dumps({"checkpoint_id": "cp-f1"}))
+            assert status == 409, \
+                (status, data, "restore must refuse while an abandoned worker is still live, "
+                               "even though status already reads idle")
+            err_msg = json.loads(data)["error"]
+            assert "abandoned" in err_msg or "progress" in err_msg, data
+
+            # release the abandoned worker and confirm the hazard actually
+            # clears -- this is not a permanent wedge, only a live one.
+            f1_tool_release.set()
+            deadline_f1 = time.monotonic() + 5
+            while sess_f1.is_workspace_busy() and time.monotonic() < deadline_f1:
+                time.sleep(0.01)
+            assert not sess_f1.is_workspace_busy(), "abandoned worker never reported finished"
+        finally:
+            server_f1.shutdown()
+            server_f1.server_close()
+            _shutil_f1.rmtree(ws_f1, ignore_errors=True)
+
+        # === Finding 1, session-replacement side: replacing a session that ==
+        # === targets the SAME workspace while it is busy (running or has ===
+        # === an abandoned worker) is refused with 409, not silently allowed =
+
+        f2_tool_release = threading.Event()
+
+        def _f2_slow_tool(name, args, workspace):
+            f2_tool_release.wait(timeout=10)
+            return "finished"
+
+        def _f2_chat(messages):
+            return ({"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "run_command", "arguments": {"command": "sleepforever --now"}}}]}, 1, 1)
+
+        f2_engine = engine_mod.RealEngine(chat_fn=_f2_chat, execute_tool_fn=_f2_slow_tool,
+                                          checkpoint_fn=_f1_checkpoint, auto_allow=("sleepforever",))
+        server_f2, state_f2 = _start(engine_factory=lambda: f2_engine)
+        ws_f2 = _tempfile_f1.mkdtemp(prefix="hearth-app-f2-")
+        ws_f2_other = _tempfile_f1.mkdtemp(prefix="hearth-app-f2-other-")
+        try:
+            port_f2 = state_f2.port
+            headers_f2 = {"Host": "127.0.0.1:{}".format(port_f2),
+                         "Authorization": "Bearer " + state_f2.token,
+                         "Content-Type": "application/json"}
+            status, data = _raw_request(port_f2, "POST", "/session", headers=headers_f2,
+                                        body=json.dumps({"workspace": ws_f2, "model": "m", "mode": "auto"}))
+            assert status == 200, (status, data)
+            status, data = _raw_request(port_f2, "POST", "/prompt", headers=headers_f2,
+                                        body=json.dumps({"message": "run something that hangs"}))
+            assert status == 200, (status, data)
+            sess_f2 = state_f2.get_session()
+            deadline_f2 = time.monotonic() + 5
+            while sess_f2.to_dict()["status"] != "running" and time.monotonic() < deadline_f2:
+                time.sleep(0.01)
+            time.sleep(0.1)
+            status, data = _raw_request(port_f2, "POST", "/cancel", headers=headers_f2)
+            assert status == 200, (status, data)
+            deadline_f2 = time.monotonic() + 5
+            while sess_f2.to_dict()["status"] != "idle" and time.monotonic() < deadline_f2:
+                time.sleep(0.01)
+            assert sess_f2.is_workspace_busy() is True, "abandoned worker should still be live here"
+
+            # same workspace, still busy -> refused
+            status, data = _raw_request(port_f2, "POST", "/session", headers=headers_f2,
+                                        body=json.dumps({"workspace": ws_f2, "model": "m2"}))
+            assert status == 409, \
+                (status, data, "replacing a session with the SAME workspace while it is busy "
+                               "must be refused, not silently allowed")
+            # it must genuinely not have replaced anything
+            assert state_f2.get_session() is sess_f2, "a refused replacement must not swap the session"
+
+            # a DIFFERENT workspace is always safe to replace immediately,
+            # even while the old session is still busy: the abandoned worker
+            # keeps running against its own, different, directory.
+            status, data = _raw_request(port_f2, "POST", "/session", headers=headers_f2,
+                                        body=json.dumps({"workspace": ws_f2_other, "model": "m2"}))
+            assert status == 200, (status, data, "a different workspace must not be blocked by "
+                                                  "another workspace's abandoned worker")
+            assert state_f2.get_session() is not sess_f2
+
+            f2_tool_release.set()  # let the abandoned worker finish, don't leak the thread
+        finally:
+            server_f2.shutdown()
+            server_f2.server_close()
+            _shutil_f1.rmtree(ws_f2, ignore_errors=True)
+            _shutil_f1.rmtree(ws_f2_other, ignore_errors=True)
+
+        # === minor: GET /events is bounded to state.max_sse_connections; ====
+        # === a client opening more than that gets 429, not an accumulating ==
+        # === pile of server threads =========================================
+
+        server_sse, state_sse = _start(engine_factory=lambda: _FakeEngine())
+        state_sse.max_sse_connections = 2
+        try:
+            port_sse = state_sse.port
+            status, _ = _raw_request(port_sse, "POST", "/session", headers={
+                "Host": "127.0.0.1:{}".format(port_sse),
+                "Authorization": "Bearer " + state_sse.token,
+                "Content-Type": "application/json",
+            }, body=json.dumps({"workspace": "/tmp/ws-sse", "model": "m"}))
+            assert status == 200, status
+
+            def _open_sse():
+                req = urllib.request.Request(
+                    "http://127.0.0.1:{}/events".format(port_sse),
+                    headers={"Authorization": "Bearer " + state_sse.token,
+                            "Host": "127.0.0.1:{}".format(port_sse)})
+                return urllib.request.urlopen(req, timeout=10)
+
+            conn1 = _open_sse()
+            conn2 = _open_sse()
+            deadline_sse = time.monotonic() + 5
+            while state_sse._sse_count < 2 and time.monotonic() < deadline_sse:
+                time.sleep(0.01)
+            assert state_sse._sse_count == 2, "both real connections should have acquired a slot"
+            try:
+                # a third concurrent stream must be refused, not accepted
+                # and left to accumulate a thread forever
+                status3, data3 = _raw_request(port_sse, "GET", "/events", headers={
+                    "Host": "127.0.0.1:{}".format(port_sse),
+                    "Authorization": "Bearer " + state_sse.token,
+                })
+                assert status3 == 429, (status3, data3)
+            finally:
+                conn1.close()
+                conn2.close()
+
+            # The bound is not a permanent lockout: releasing a slot (exactly
+            # what a finished connection's own `finally` does in _get_events)
+            # frees it up for the next one. Simulated directly here rather
+            # than waiting on the ~15s keep-alive tick the server would
+            # otherwise need to notice these particular sockets closed --
+            # the mechanism under test is the counter, not socket teardown
+            # latency.
+            state_sse.release_sse_slot()
+            state_sse.release_sse_slot()
+            assert state_sse._sse_count == 0
+            conn3 = _open_sse()
+            conn3.close()
+            state_sse.release_sse_slot()
+        finally:
+            server_sse.shutdown()
+            server_sse.server_close()
 
         # === GET /models: works with an injected fetcher, no live Ollama ===
         # === required, and the catalog survives a broken fetcher too ======

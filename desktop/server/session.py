@@ -27,10 +27,32 @@ is wired up here -- app.py's self-test drives this seam with a fake engine
 so the transport, streaming, approval flow, and cancellation are all proven
 before hearth_loop exists in the picture.
 
+Two properties added after the first security pass:
+
+  1. Cancellation abandons rather than kills the engine's in-flight blocking
+     call (see engine.py's _run_cancellable): Session.status flips back to
+     "idle" as soon as engine.run() returns, which can be well before that
+     abandoned call actually finishes. A Session therefore also tracks how
+     many such calls are still live, independently of `status`, via
+     _worker_started()/_worker_finished(); is_workspace_busy() is the
+     combined signal ("running" OR "an abandoned worker is still going") that
+     anything about to touch the workspace on disk (POST /restore, replacing
+     the session) must check instead of `status` alone.
+
+  2. `_events` is a bounded ring (events_cap, default EVENTS_CAP), not an
+     unbounded list -- a session that runs for a long time must not grow
+     memory forever just from its own event log. A client that reconnects
+     with a `since`/Last-Event-ID older than anything still retained gets an
+     explicit synthetic "events_dropped" event instead of a silently
+     truncated history, so it can tell "I'm caught up" apart from "I missed
+     something and don't know what".
+
 Standard library only.
 """
 
+import collections
 import itertools
+import secrets
 import sys
 import threading
 import time
@@ -41,6 +63,8 @@ DEFAULT_MODE = "edit"
 
 STATUS_IDLE = "idle"
 STATUS_RUNNING = "running"
+
+EVENTS_CAP = 500  # bounded ring for Session._events; see module docstring
 
 
 class Approval:
@@ -94,7 +118,7 @@ class Session:
     does not try to migrate state from the session it replaces.
     """
 
-    def __init__(self, workspace, model, mode=DEFAULT_MODE, engine=None):
+    def __init__(self, workspace, model, mode=DEFAULT_MODE, engine=None, events_cap=None):
         if not workspace:
             raise ValueError("workspace is required")
         if not model:
@@ -110,12 +134,14 @@ class Session:
 
         self._lock = threading.Lock()
         self._new_event = threading.Condition(self._lock)
-        self._events = []  # list of dicts: id, turn_id, kind, data, ts
+        self._events_cap = events_cap or EVENTS_CAP
+        self._events = collections.deque(maxlen=self._events_cap)  # dicts: id, turn_id, kind, data, ts
+        self._dropped_count = 0  # events evicted from the ring so far
         self._event_id_seq = itertools.count(1)
         self._approvals = {}  # approval_id -> Approval
-        self._approval_id_seq = itertools.count(1)
         self._cancel_flags = {}  # turn_id -> threading.Event
         self._thread = None
+        self._live_workers = 0  # abandoned/in-flight _run_cancellable calls; see is_workspace_busy()
 
     def to_dict(self):
         with self._lock:
@@ -180,11 +206,42 @@ class Session:
             flag = self._cancel_flags.get(turn_id)
         return bool(flag and flag.is_set())
 
+    # ---- abandoned-worker tracking (see module docstring, point 1) ----
+
+    def _worker_started(self):
+        """Called by engine._run_cancellable when it starts a blocking call
+        on its own worker thread -- including one that later gets abandoned
+        because cancellation wins the race. Paired with _worker_finished()."""
+        with self._lock:
+            self._live_workers += 1
+
+    def _worker_finished(self):
+        """Called when that worker thread's blocking call actually returns,
+        whether or not the turn that started it was cancelled in the
+        meantime. This is what lets is_workspace_busy() stay true after
+        `status` has already gone back to idle."""
+        with self._lock:
+            self._live_workers = max(0, self._live_workers - 1)
+
+    def is_workspace_busy(self):
+        """True if a turn is actively running, OR a previous turn's
+        cancelled-but-abandoned model/tool call is still executing against
+        this session's workspace. `status == STATUS_RUNNING` alone is not
+        enough: cancellation flips status back to idle within about a
+        second while the abandoned call can keep writing to the workspace
+        for as long as 1800s (run_command) behind it. Anything that is about
+        to act on the workspace on disk -- POST /restore, replacing the
+        session -- must check this, not `status`."""
+        with self._lock:
+            return self.status == STATUS_RUNNING or self._live_workers > 0
+
     # ---- events (GET /events) ----
 
     def _emit(self, turn_id, kind, data):
         with self._lock:
             event_id = next(self._event_id_seq)
+            if len(self._events) >= self._events.maxlen:
+                self._dropped_count += 1
             self._events.append({
                 "id": event_id, "turn_id": turn_id, "kind": kind,
                 "data": data, "ts": time.time(),
@@ -192,14 +249,39 @@ class Session:
             self._new_event.notify_all()
         return event_id
 
+    def _gap_marker_locked(self, last_id):
+        """If events have been evicted from the ring since `last_id`, and the
+        caller's bookmark falls into that gap, build a synthetic
+        "events_dropped" marker to return ahead of whatever is still
+        retained. Returns None when there is nothing to signal: either
+        nothing has ever been dropped, or the caller's bookmark is already
+        within (or ahead of) the retained window. Must be called with
+        self._lock held."""
+        if self._dropped_count <= 0 or not self._events:
+            return None
+        oldest_id = self._events[0]["id"]
+        if last_id >= oldest_id - 1:
+            return None
+        return {
+            "id": oldest_id - 1, "turn_id": None, "kind": "events_dropped",
+            "data": {"missed_at_least": self._dropped_count, "resume_from_id": oldest_id},
+            "ts": time.time(),
+        }
+
     def events_after(self, last_id, timeout=None):
         """Block until at least one event with id > last_id exists or
         `timeout` seconds elapse, then return the (possibly empty, on
-        timeout) list of such events in order."""
+        timeout) list of such events in order. If the caller's bookmark
+        (`last_id`) has fallen behind the retained ring, the first item
+        returned is a synthetic "events_dropped" marker rather than a
+        silent gap -- see _gap_marker_locked."""
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._lock:
             while True:
                 pending = [e for e in self._events if e["id"] > last_id]
+                marker = self._gap_marker_locked(last_id)
+                if marker is not None:
+                    return [marker] + pending
                 if pending:
                     return pending
                 if deadline is not None and time.monotonic() >= deadline:
@@ -210,7 +292,11 @@ class Session:
     # ---- approvals (POST /approve) ----
 
     def _request_approval(self, turn_id, tool, args):
-        appr_id = "appr-{}".format(next(self._approval_id_seq))
+        # secrets.token_urlsafe rather than a sequential counter: an approval
+        # id must not be guessable from a previous one (defense in depth --
+        # nothing today lets an unauthenticated party race an approval, but
+        # a predictable id is a needless foothold if that ever changes).
+        appr_id = "appr-{}".format(secrets.token_urlsafe(9))
         appr = Approval(appr_id, tool, args)
         with self._lock:
             self._approvals[appr_id] = appr
@@ -338,6 +424,107 @@ def _self_test():
     deadline = time.monotonic() + 5
     while s4.to_dict()["status"] != STATUS_IDLE and time.monotonic() < deadline:
         time.sleep(0.01)
+
+    # --- approval ids are unguessable, not a sequential counter ---
+    class TwoApprovalsEngine:
+        def run(self, ctx):
+            ids = []
+            ids.append(ctx.request_approval("write_file", {"path": "a"}))
+            ids.append(ctx.request_approval("write_file", {"path": "b"}))
+            ctx.emit("done", {})
+
+    captured_ids = []
+    s_appr = Session("/tmp/ws-appr", "m", "edit", engine=TwoApprovalsEngine())
+    s_appr.submit_prompt("go")
+    deadline = time.monotonic() + 5
+    while len(captured_ids) < 2 and time.monotonic() < deadline:
+        pending = s_appr.pending_approvals()
+        for pid in pending:
+            if pid not in captured_ids:
+                captured_ids.append(pid)
+                s_appr.resolve_approval(pid, True)
+        time.sleep(0.01)
+    assert len(captured_ids) == 2, "expected two approval ids, got {}".format(captured_ids)
+    for appr_id in captured_ids:
+        assert appr_id.startswith("appr-"), appr_id
+        suffix = appr_id[len("appr-"):]
+        # a plain incrementing counter would make this suffix pure digits
+        # ("1", "2", ...); secrets.token_urlsafe never produces that.
+        assert not suffix.isdigit(), "approval id looks sequential, not random: {}".format(appr_id)
+        assert len(suffix) >= 8, "approval id suffix too short to be unguessable: {}".format(appr_id)
+    assert captured_ids[0] != captured_ids[1]
+    s_appr.cancel()
+
+    # --- is_workspace_busy(): tracks abandoned workers independently of ---
+    # --- `status`, which is exactly what POST /restore must consult -----
+    worker_release = threading.Event()
+    worker_entered = threading.Event()
+
+    class AbandonedWorkerEngine:
+        """Simulates engine.py's _run_cancellable: starts a blocking call on
+        its own thread, registers it with the session, and returns to the
+        caller (as if cancellation won the race) while that thread is still
+        live -- without waiting for it."""
+
+        def run(self, ctx):
+            def _blocking():
+                ctx.session._worker_started()
+                try:
+                    worker_entered.set()
+                    worker_release.wait(timeout=10)
+                finally:
+                    ctx.session._worker_finished()
+
+            t = threading.Thread(target=_blocking, daemon=True)
+            t.start()
+            # return immediately, exactly like a cancelled _run_cancellable call
+
+    s_busy = Session("/tmp/ws-busy", "m", "edit", engine=AbandonedWorkerEngine())
+    assert s_busy.is_workspace_busy() is False, "a fresh session must not report busy"
+    s_busy.submit_prompt("go")
+    assert worker_entered.wait(timeout=5), "abandoned worker never started"
+    deadline = time.monotonic() + 5
+    while s_busy.to_dict()["status"] != STATUS_IDLE and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert s_busy.to_dict()["status"] == STATUS_IDLE, "engine.run() returned, so status must be idle"
+    # THE PIN: status is idle, but the abandoned worker is still running --
+    # is_workspace_busy() must still say True.
+    assert s_busy.is_workspace_busy() is True, \
+        "is_workspace_busy() must stay true while an abandoned worker is still live, even once status is idle"
+    worker_release.set()
+    deadline = time.monotonic() + 5
+    while s_busy.is_workspace_busy() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert s_busy.is_workspace_busy() is False, "is_workspace_busy() never cleared after the worker finished"
+
+    # --- bounded event ring: capped size, and a stale reconnect gets an ---
+    # --- explicit "events_dropped" marker instead of a silent gap --------
+    class QuietEngine:
+        def run(self, ctx):
+            for i in range(6):
+                ctx.emit("delta", {"text": "chunk-{}".format(i)})
+            ctx.emit("done", {})
+
+    s5 = Session("/tmp/ws5", "m", "edit", engine=QuietEngine(), events_cap=3)
+    s5.submit_prompt("go")
+    deadline = time.monotonic() + 5
+    while s5.to_dict()["status"] != STATUS_IDLE and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(s5._events) <= 3, "event ring must stay bounded by events_cap"
+    assert len(s5._events) == 3, s5._events  # exactly 7 events emitted, cap 3
+    # a stale bookmark (id 1, long since evicted) must surface an explicit
+    # gap marker, not a silently-truncated history
+    stale = s5.events_after(1, timeout=1)
+    assert stale and stale[0]["kind"] == "events_dropped", stale
+    assert stale[0]["data"]["missed_at_least"] >= 1, stale
+    # once the caller resumes from the marker's own id, no repeat marker,
+    # and it sees exactly what is still retained, in order
+    resumed = s5.events_after(stale[0]["id"], timeout=1)
+    assert all(e["kind"] != "events_dropped" for e in resumed), resumed
+    assert [e["id"] for e in resumed] == [e["id"] for e in s5._events], resumed
+    # a bookmark that is already caught up sees no gap marker at all
+    fresh = s5.events_after(s5._events[-1]["id"], timeout=1)
+    assert fresh == [], fresh
 
     print("hearth-desktop-session self-test OK")
     return 0

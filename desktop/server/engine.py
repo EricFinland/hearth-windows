@@ -62,7 +62,6 @@ if _AGENT_DIR not in sys.path:
     sys.path.insert(0, _AGENT_DIR)
 
 import hearth_checkpoint  # noqa: E402
-import hearth_hw  # noqa: E402
 import hearth_loop  # noqa: E402
 import hearth_shop  # noqa: E402
 import hearth_tools  # noqa: E402
@@ -72,6 +71,13 @@ import permissions  # noqa: E402
 POLL_INTERVAL = 0.1  # seconds between cancellation checks while a blocking call runs
 MAX_ITERS = hearth_loop.MAX_ITERS
 MAX_EVENT_OUT = hearth_loop.MAX_EVENT_OUT
+
+# Cap on RealEngine._messages: the full conversation (including every tool
+# call and result, each up to MAX_EVENT_OUT chars) is kept for the life of a
+# session and resent to Ollama in full on every turn, so it must not grow
+# without bound. See _trim_messages for how the cap is enforced without ever
+# splitting a turn's tool_call/tool_result messages apart.
+MAX_MESSAGES = 200
 
 _DONE = "done"
 _CANCELLED = "cancelled"
@@ -94,7 +100,7 @@ def _system_prompt(mode):
     return base
 
 
-def _run_cancellable(fn, is_cancelled, poll_interval=POLL_INTERVAL):
+def _run_cancellable(fn, is_cancelled, poll_interval=POLL_INTERVAL, session=None):
     """Run fn() on its own worker thread. Returns (_DONE, value) once fn()
     finishes, or (_CANCELLED, None) as soon as is_cancelled() becomes true --
     whichever happens first. Re-raises whatever fn() raised, but only when
@@ -108,16 +114,27 @@ def _run_cancellable(fn, is_cancelled, poll_interval=POLL_INTERVAL):
     result is then discarded. This is what makes cancellation prompt: the
     turn and the HTTP server stop waiting on it immediately, even though the
     call itself is still technically in flight somewhere in the background.
+
+    When `session` is given, the worker thread is registered with it
+    (Session._worker_started/_worker_finished) for its entire lifetime, not
+    just while this function is still waiting on it. That is what lets
+    Session.is_workspace_busy() stay true after cancellation has already
+    returned control here and the turn's status has flipped back to idle --
+    see the module docstring's point 1 and session.py's is_workspace_busy.
     """
     box = {}
     finished = threading.Event()
 
     def _worker():
+        if session is not None:
+            session._worker_started()
         try:
             box["value"] = fn()
         except Exception as exc:  # noqa: BLE001 - reported to the caller, not swallowed
             box["error"] = exc
         finally:
+            if session is not None:
+                session._worker_finished()
             finished.set()
 
     t = threading.Thread(target=_worker, daemon=True)
@@ -180,7 +197,7 @@ class RealEngine:
 
     def __init__(self, ollama_url=None, chat_fn=None, execute_tool_fn=None,
                  checkpoint_fn=None, auto_allow=(), max_iters=None,
-                 poll_interval=POLL_INTERVAL):
+                 poll_interval=POLL_INTERVAL, max_messages=None):
         self.ollama_url = ollama_url or hearth_loop.DEFAULT_OLLAMA
         self._chat_fn = chat_fn
         self._execute_tool_fn = execute_tool_fn or hearth_tools.execute_tool
@@ -188,7 +205,9 @@ class RealEngine:
         self.auto_allow = tuple(auto_allow)
         self.max_iters = max_iters or MAX_ITERS
         self.poll_interval = poll_interval
+        self.max_messages = max_messages or MAX_MESSAGES
         self._messages = None  # built on the first turn, persists across turns
+        self._turn_starts = []  # indices into self._messages where each turn's user message begins
 
     def _chat(self, ctx, messages):
         if self._chat_fn is not None:
@@ -212,9 +231,27 @@ class RealEngine:
             "warning": cp.get("warning"),
         })
 
+    def _trim_messages(self):
+        """Keep self._messages bounded at self.max_messages without ever
+        splitting a turn's messages apart (a tool-call message separated
+        from its tool-result reply would send Ollama a malformed history).
+        self._messages[0] is always the system prompt and is never dropped;
+        whole turns are dropped from the oldest end, using self._turn_starts
+        (the index of each turn's leading "user" message) as the only valid
+        cut points. Stops once under the cap or down to the single
+        most-recent turn, whichever comes first -- this trims the middle,
+        keeping the system prompt and the most recent turns, per the fix
+        called for in the security review."""
+        while len(self._messages) > self.max_messages and len(self._turn_starts) > 1:
+            cut = self._turn_starts[1]
+            self._messages = [self._messages[0]] + self._messages[cut:]
+            offset = cut - 1
+            self._turn_starts = [i - offset for i in self._turn_starts[1:]]
+
     def run(self, ctx):
         if self._messages is None:
             self._messages = [{"role": "system", "content": _system_prompt(ctx.mode)}]
+            self._turn_starts = []
 
         self._checkpoint(ctx)
         if ctx.cancelled():
@@ -222,99 +259,109 @@ class RealEngine:
             return
 
         self._messages.append({"role": "user", "content": ctx.message})
+        self._turn_starts.append(len(self._messages) - 1)
+        self._trim_messages()
 
-        tokens_in = 0
-        tokens_out = 0
+        try:
+            tokens_in = 0
+            tokens_out = 0
 
-        for _ in range(self.max_iters):
-            if ctx.cancelled():
-                ctx.emit("cancelled", {"tokens_in": tokens_in, "tokens_out": tokens_out})
-                return
-
-            status, result = _run_cancellable(
-                lambda msgs=list(self._messages): self._chat(ctx, msgs),
-                ctx.cancelled, self.poll_interval)
-            if status == _CANCELLED:
-                ctx.emit("cancelled", {"tokens_in": tokens_in, "tokens_out": tokens_out})
-                return
-
-            msg, tin, tout = result
-            tokens_in += tin
-            tokens_out += tout
-            self._messages.append(msg)
-
-            content = msg.get("content") or ""
-            if content:
-                ctx.emit("delta", {"text": content})
-
-            calls = msg.get("tool_calls") or []
-            if not calls:
-                parsed = hearth_loop.parse_content_tool_calls(content, allowed=hearth_tools.WINDOWS_TOOLS)
-                if parsed:
-                    calls = [{"function": c} for c in parsed]
-                else:
-                    ctx.emit("done", {"tokens_in": tokens_in, "tokens_out": tokens_out, "final": content})
-                    return
-
-            for call in calls:
+            for _ in range(self.max_iters):
                 if ctx.cancelled():
                     ctx.emit("cancelled", {"tokens_in": tokens_in, "tokens_out": tokens_out})
                     return
 
-                fn = call.get("function") or {}
-                name = fn.get("name", "")
-                raw_args = fn.get("arguments")
-                if isinstance(raw_args, dict):
-                    cargs = raw_args
-                elif raw_args:
-                    try:
-                        cargs = json.loads(raw_args)
-                    except (ValueError, TypeError):
-                        cargs = {}
-                else:
-                    cargs = {}
-
-                verdict = permissions.decide(ctx.mode, name, cargs, self.auto_allow,
-                                              allowed_tools=hearth_tools.WINDOWS_TOOLS)
-
-                if verdict == "deny":
-                    if name not in hearth_tools.WINDOWS_TOOLS:
-                        result_text = ("denied: {} is not in this run's capability manifest; "
-                                       "use only the tools you were given".format(name))
-                    else:
-                        result_text = "denied: permission mode '{}' does not allow {}".format(
-                            ctx.mode, name)
-                    ctx.emit("tool_call", {"tool": name, "args": cargs, "decision": "deny"})
-                    ctx.emit("tool_result", {"tool": name, "denied": True, "output": result_text})
-                    self._messages.append({"role": "tool", "content": result_text})
-                    continue
-
-                if verdict == "gate":
-                    decision = ctx.request_approval(name, cargs)  # emits approval_request itself
-                    if decision != "allow":
-                        cancelled_now = ctx.cancelled()
-                        result_text = "denied: turn cancelled" if cancelled_now else "denied by user"
-                        ctx.emit("tool_call", {"tool": name, "args": cargs, "decision": "deny"})
-                        ctx.emit("tool_result", {"tool": name, "denied": True, "output": result_text})
-                        self._messages.append({"role": "tool", "content": result_text})
-                        if cancelled_now:
-                            ctx.emit("cancelled", {"tokens_in": tokens_in, "tokens_out": tokens_out})
-                            return
-                        continue
-
-                ctx.emit("tool_call", {"tool": name, "args": cargs, "decision": "allow"})
                 status, result = _run_cancellable(
-                    lambda nm=name, ar=cargs: self._execute_tool_fn(nm, ar, ctx.workspace),
-                    ctx.cancelled, self.poll_interval)
+                    lambda msgs=list(self._messages): self._chat(ctx, msgs),
+                    ctx.cancelled, self.poll_interval, session=ctx.session)
                 if status == _CANCELLED:
                     ctx.emit("cancelled", {"tokens_in": tokens_in, "tokens_out": tokens_out})
                     return
-                output = result if isinstance(result, str) else str(result)
-                truncated = output[:MAX_EVENT_OUT]
-                ctx.emit("tool_result", {"tool": name, "output": truncated})
-                self._messages.append({"role": "tool", "content": truncated})
 
-        ctx.emit("error", {"message": "hit iteration cap ({})".format(self.max_iters)})
+                msg, tin, tout = result
+                tokens_in += tin
+                tokens_out += tout
+                self._messages.append(msg)
+
+                content = msg.get("content") or ""
+                if content:
+                    ctx.emit("delta", {"text": content})
+
+                calls = msg.get("tool_calls") or []
+                if not calls:
+                    parsed = hearth_loop.parse_content_tool_calls(content, allowed=hearth_tools.WINDOWS_TOOLS)
+                    if parsed:
+                        calls = [{"function": c} for c in parsed]
+                    else:
+                        ctx.emit("done", {"tokens_in": tokens_in, "tokens_out": tokens_out, "final": content})
+                        return
+
+                for call in calls:
+                    if ctx.cancelled():
+                        ctx.emit("cancelled", {"tokens_in": tokens_in, "tokens_out": tokens_out})
+                        return
+
+                    fn = call.get("function") or {}
+                    name = fn.get("name", "")
+                    raw_args = fn.get("arguments")
+                    if isinstance(raw_args, dict):
+                        cargs = raw_args
+                    elif raw_args:
+                        try:
+                            cargs = json.loads(raw_args)
+                        except (ValueError, TypeError):
+                            cargs = {}
+                    else:
+                        cargs = {}
+
+                    verdict = permissions.decide(ctx.mode, name, cargs, self.auto_allow,
+                                                  allowed_tools=hearth_tools.WINDOWS_TOOLS)
+
+                    if verdict == "deny":
+                        if name not in hearth_tools.WINDOWS_TOOLS:
+                            result_text = ("denied: {} is not in this run's capability manifest; "
+                                           "use only the tools you were given".format(name))
+                        else:
+                            result_text = "denied: permission mode '{}' does not allow {}".format(
+                                ctx.mode, name)
+                        ctx.emit("tool_call", {"tool": name, "args": cargs, "decision": "deny"})
+                        ctx.emit("tool_result", {"tool": name, "denied": True, "output": result_text})
+                        self._messages.append({"role": "tool", "content": result_text})
+                        continue
+
+                    if verdict == "gate":
+                        decision = ctx.request_approval(name, cargs)  # emits approval_request itself
+                        if decision != "allow":
+                            cancelled_now = ctx.cancelled()
+                            result_text = "denied: turn cancelled" if cancelled_now else "denied by user"
+                            ctx.emit("tool_call", {"tool": name, "args": cargs, "decision": "deny"})
+                            ctx.emit("tool_result", {"tool": name, "denied": True, "output": result_text})
+                            self._messages.append({"role": "tool", "content": result_text})
+                            if cancelled_now:
+                                ctx.emit("cancelled", {"tokens_in": tokens_in, "tokens_out": tokens_out})
+                                return
+                            continue
+
+                    ctx.emit("tool_call", {"tool": name, "args": cargs, "decision": "allow"})
+                    status, result = _run_cancellable(
+                        lambda nm=name, ar=cargs: self._execute_tool_fn(nm, ar, ctx.workspace),
+                        ctx.cancelled, self.poll_interval, session=ctx.session)
+                    if status == _CANCELLED:
+                        ctx.emit("cancelled", {"tokens_in": tokens_in, "tokens_out": tokens_out})
+                        return
+                    output = result if isinstance(result, str) else str(result)
+                    truncated = output[:MAX_EVENT_OUT]
+                    ctx.emit("tool_result", {"tool": name, "output": truncated})
+                    self._messages.append({"role": "tool", "content": truncated})
+
+            ctx.emit("error", {"message": "hit iteration cap ({})".format(self.max_iters)})
+        finally:
+            # Enforce the cap at the end of the turn too (not only at the
+            # start of the next one): a turn can itself add many messages
+            # (assistant replies, tool_call/tool_result pairs), and this is
+            # what keeps _messages bounded right after THIS turn ends,
+            # regardless of which return/exception path got here.
+            self._trim_messages()
 
 
 def _self_test():
@@ -520,7 +567,16 @@ def _self_test():
     assert elapsed < 1.0, "cancellation must interrupt promptly, took {:.2f}s".format(elapsed)
     ev5 = _all_events(sess5)
     assert ev5[-1]["kind"] == "cancelled", ev5
+    # Finding 1, pinned against the REAL _run_cancellable (not a stand-in):
+    # status is idle, but slow_chat is still blocked on slow_release, so the
+    # abandoned worker is still live and is_workspace_busy() must say so.
+    assert sess5.is_workspace_busy() is True, \
+        "is_workspace_busy() must be true while the abandoned model call is still running"
     slow_release.set()  # let the abandoned worker thread finish and exit cleanly
+    deadline = time.monotonic() + 5
+    while sess5.is_workspace_busy() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert sess5.is_workspace_busy() is False, "is_workspace_busy() never cleared once the worker finished"
 
     # === F: cancellation actually interrupts a slow tool execution, the ===
     # === same way, not just a slow model call ==============================
@@ -554,7 +610,16 @@ def _self_test():
     assert elapsed2 < 1.0, "tool-call cancellation must interrupt promptly, took {:.2f}s".format(elapsed2)
     ev6 = _all_events(sess6)
     assert ev6[-1]["kind"] == "cancelled", ev6
+    # Finding 1 again, this time for an abandoned tool call (run_command,
+    # which is the actually dangerous case: it can write to the workspace
+    # for up to 1800s). status is idle; the workspace must still read busy.
+    assert sess6.is_workspace_busy() is True, \
+        "is_workspace_busy() must be true while the abandoned run_command is still executing"
     tool_release.set()
+    deadline = time.monotonic() + 5
+    while sess6.is_workspace_busy() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert sess6.is_workspace_busy() is False, "is_workspace_busy() never cleared once the tool call finished"
 
     # === G: a checkpoint failure is reported, never silently swallowed, ===
     # === and never blocks the turn from proceeding ==========================
@@ -711,6 +776,50 @@ def _self_test():
         server_release.set()
         http_server.shutdown()
         http_server.server_close()
+
+    # === J: RealEngine._messages is capped, trimming whole turns from the ===
+    # === oldest end, keeping the system prompt and the most recent turns ===
+    turns_seen = {"n": 0}
+
+    def counting_chat(messages):
+        turns_seen["n"] += 1
+        return ({"role": "assistant", "content": "reply #{}".format(turns_seen["n"]),
+                 "tool_calls": []}, 1, 1)
+
+    engine9 = RealEngine(chat_fn=counting_chat, execute_tool_fn=fake_execute_tool,
+                         checkpoint_fn=fake_checkpoint, max_messages=8)
+    sess9 = session_mod.Session(ws, "fake-model", "edit", engine=engine9)
+    n_turns = 10
+    for i in range(n_turns):
+        sess9.submit_prompt("turn number {}".format(i))
+        _wait_idle(sess9, timeout=5)
+
+    assert engine9._messages[0]["role"] == "system", \
+        "the system prompt must survive trimming, always at index 0"
+    assert len(engine9._messages) <= 8, \
+        "RealEngine._messages must stay capped at max_messages: {}".format(len(engine9._messages))
+    user_contents = [m["content"] for m in engine9._messages if m["role"] == "user"]
+    assert "turn number {}".format(n_turns - 1) in user_contents, \
+        "the most recent turn must survive trimming: {}".format(user_contents)
+    assert "turn number 0" not in user_contents, \
+        "the oldest turn must have been trimmed away: {}".format(user_contents)
+    # every remaining turn_starts index must still actually point at a "user"
+    # message -- proof trimming re-indexed cleanly rather than corrupting
+    # the turn/message alignment it depends on for the next trim.
+    for idx in engine9._turn_starts:
+        assert engine9._messages[idx]["role"] == "user", (idx, engine9._messages)
+
+    # === K: engine.py must not import the unused hw module -- the review ===
+    # === flagged the dead import. Checked as an actual top-level import ===
+    # === statement (anchored to the start of a line), not a plain =========
+    # === substring search, so this assertion cannot trivially match its ===
+    # === own source text (this comment, or the assert message below).
+    import re as _re
+    with open(os.path.abspath(__file__), "r", encoding="utf-8") as _fh:
+        _engine_src = _fh.read()
+    _dead_module_name = "hearth" + "_" + "hw"
+    assert _re.search(r"(?m)^import {}\b".format(_dead_module_name), _engine_src) is None, \
+        "engine.py must not import the unused " + _dead_module_name + " module"
 
     # === list_installed_models degrades to [] when Ollama is unreachable ===
     assert list_installed_models(ollama_url="http://127.0.0.1:1", timeout=1) == []
