@@ -107,6 +107,11 @@ def _html_to_text(html_text):
 
 
 COMMAND_TIMEOUT = 120
+# 120s was too short for a real build (a cold `npm install` or a full test
+# suite routinely runs past it). 1800s (30 minutes) is the ceiling a model can
+# ask for via the per-call `timeout` argument; COMMAND_TIMEOUT stays the
+# default for a call that does not specify one.
+MAX_COMMAND_TIMEOUT = 1800
 HTTP_TIMEOUT = 30
 MAX_OUT = 4000
 
@@ -222,19 +227,33 @@ def _explain_oserror(exc):
 
 
 def tool_run_command(args, workspace):
+    """Run a shell command via hearth_proc.run_contained, with workspace as cwd.
+
+    NOT contained: this runs through a real shell (cmd.exe or /bin/sh) with the
+    workspace only as a working directory, and a working directory is not a
+    security boundary. On NixOS this sits behind systemd isolation and an
+    nftables egress wall; on Windows there is no such backstop. hearth_proc
+    only fixes the timeout-kill, encoding, and command-length defects, not
+    containment.
+
+    On timeout the whole process tree is killed (not just the shell) and
+    whatever partial output was captured is returned, distinguished from a
+    non-zero exit rather than folded into it.
+    """
     cmd = args.get("command", "")
     if not cmd:
         return "error: no command"
     try:
-        r = subprocess.run(cmd, shell=True, cwd=workspace, capture_output=True,
-                           text=True, timeout=COMMAND_TIMEOUT)
-        out = (r.stdout or "")[-MAX_OUT:]
-        err = (r.stderr or "")[-2000:]
-        return "exit={}\nstdout:\n{}\nstderr:\n{}".format(r.returncode, out, err)
-    except subprocess.TimeoutExpired:
-        return "error: command timed out after {}s".format(COMMAND_TIMEOUT)
-    except OSError as exc:
-        return "error: {}".format(exc)
+        timeout = int(args.get("timeout") or COMMAND_TIMEOUT)
+    except (TypeError, ValueError):
+        timeout = COMMAND_TIMEOUT
+    timeout = max(1, min(timeout, MAX_COMMAND_TIMEOUT))
+    rc, out, err, timed_out = hearth_proc.run_contained(cmd, workspace, timeout=timeout)
+    if timed_out:
+        tail = (out or "")[-1000:]
+        return "error: command timed out after {}s (process tree killed)\npartial stdout:\n{}".format(
+            timeout, tail)
+    return "exit={}\nstdout:\n{}\nstderr:\n{}".format(rc, (out or "")[-MAX_OUT:], (err or "")[-2000:])
 
 
 def tool_write_file(args, workspace):
@@ -957,7 +976,8 @@ TOOLS = [
         "name": "run_command",
         "description": "Run a shell command in the workspace. Use for building, testing, and inspecting code.",
         "parameters": {"type": "object", "properties": {
-            "command": {"type": "string", "description": "the shell command"}},
+            "command": {"type": "string", "description": "the shell command"},
+            "timeout": {"type": "integer", "description": "seconds to allow, default 120, max 1800"}},
             "required": ["command"]},
         "fn": tool_run_command,
     },
@@ -1622,6 +1642,29 @@ def _self_test():
         assert "not a git repository" in r.lower() or "git is not installed" in r.lower(), r
     finally:
         _shutil.rmtree(_ws6, ignore_errors=True)
+
+    # run_command reports a timeout promptly rather than blocking on
+    # grandchildren, and never reports exit=0 with empty output for a command
+    # that wrote bytes outside the host codepage.
+    _ws5 = os.path.realpath(_tempfile.mkdtemp(prefix="hearth-cmd-"))
+    try:
+        r = tool_run_command({"command": "echo marker123"}, _ws5)
+        assert "exit=0" in r and "marker123" in r, r
+
+        import time as _time
+        _slow = "ping -n 20 127.0.0.1 >nul" if hearth_paths.is_windows() else "sleep 20"
+        _t0 = _time.time()
+        r = tool_run_command({"command": _slow, "timeout": 3}, _ws5)
+        assert "timed out" in r, r
+        assert _time.time() - _t0 < 12, "run_command blocked past its timeout"
+
+        # The hint layer must not tell a Windows user about a message cmd.exe
+        # never emits.
+        if hearth_paths.is_windows():
+            r = tool_run_command({"command": "definitelynotarealbinary"}, _ws5)
+            assert "not recognized" in r or "exit=" in r, r
+    finally:
+        _shutil.rmtree(_ws5, ignore_errors=True)
 
     print("hearth-tools self-test OK")
     return 0

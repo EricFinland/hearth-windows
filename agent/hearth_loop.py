@@ -85,11 +85,24 @@ MAX_STEP_OUT = 4000  # cap recorded output per step
 # audit-row error written when the daily token budget circuit breaker fires
 BUDGET_ERROR = "budget: daily token cap reached"
 
+# Which shell run_command actually talks to, so the model does not carry over
+# habits (';' as a separator, multi-line heredocs, assuming cat/ls/grep exist)
+# from the other platform. Computed once at import time; os.name does not
+# change within a process.
+_OS_LINE = (
+    "You are running on Windows. run_command uses cmd.exe: ';' is not a command "
+    "separator (use '&&'), a multi-line command is truncated at the first newline "
+    "(write a script file instead), and Unix tools such as cat, ls, and grep are "
+    "not available unless the user installed them."
+    if os.name == "nt" else
+    "You are running on Linux. run_command uses /bin/sh."
+)
+
 SYSTEM_PROMPT = (
     "You are a capable agent working in a sandboxed workspace. You have tools to "
     "run shell commands, read and write files, and make HTTP requests. Use them to "
     "accomplish the goal step by step. When the goal is complete, reply with a short "
-    "summary and do not call any more tools."
+    "summary and do not call any more tools. " + _OS_LINE
 )
 
 
@@ -455,7 +468,8 @@ def _result_hint(result):
         return ("\n\n[hint] That Python package is not installed. Use ONLY the "
                 "Python standard library (for images, write a PPM/PGM file by "
                 "hand), or call a tool that is installed.")
-    if "command not found" in low or "not found in path" in low:
+    if ("command not found" in low or "not found in path" in low
+            or "is not recognized as an internal or external command" in low):
         return ("\n\n[hint] That command is not on PATH. Use an installed tool "
                 "(ffmpeg, imagemagick's `convert`, yt-dlp, sox, git, python3) or a "
                 "different approach.")
@@ -1103,6 +1117,23 @@ def _self_test():
     assert "standard library" in _result_hint("Traceback ... No module named 'PIL'")
     assert "PATH" in _result_hint("convert: command not found")
     assert _result_hint("wrote 42 bytes") == ""
+    # cmd.exe never emits "command not found"; it emits this instead. The
+    # POSIX wording above must keep working too, since hearth still runs on
+    # Linux.
+    assert "PATH" in _result_hint(
+        "'nope' is not recognized as an internal or external command,\n"
+        "operable program or batch file.")
+
+    # SYSTEM_PROMPT tells the model which shell it is actually talking to, so
+    # it does not chain commands with ';' or emit multi-line heredocs on
+    # Windows, or reach for cmd.exe habits on Linux.
+    if os.name == "nt":
+        assert "cmd.exe" in SYSTEM_PROMPT, SYSTEM_PROMPT
+        assert "';'" in SYSTEM_PROMPT or "; " in SYSTEM_PROMPT, SYSTEM_PROMPT
+        assert "newline" in SYSTEM_PROMPT, SYSTEM_PROMPT
+        assert "cat" in SYSTEM_PROMPT and "grep" in SYSTEM_PROMPT, SYSTEM_PROMPT
+    else:
+        assert "/bin/sh" in SYSTEM_PROMPT, SYSTEM_PROMPT
 
     ws = tempfile.mkdtemp(prefix="hearth-loop-")
     db = os.path.join(ws, "audit.db")
