@@ -11,6 +11,16 @@ reserved device names (NUL, CON, COM1) which swallow writes silently, alternate
 data streams (a.txt:hidden) which are invisible to directory listings and to
 git, and reparse points (junctions) which os.path.islink does not detect.
 
+A leading path separator is treated as workspace-root-relative, not as a
+filesystem-absolute escape: "/etc/passwd" resolves to "<root>/etc/passwd",
+never to the real /etc/passwd. This is deliberate, not an oversight. It
+matches the original _safe_join, which every existing hearth agent already
+depends on, and containment is still enforced after the strip: a path that
+climbs back out with ".." from that root-relative position is still refused.
+On Windows a drive-qualified path such as "C:\\Windows\\win.ini" is not
+touched by this stripping (it has no leading separator) and is refused on its
+own terms.
+
 Standard library only.
 """
 
@@ -154,13 +164,36 @@ def _self_test():
             except ValueError:
                 pass
 
-        # Absolute paths outside the root are refused.
-        outside = "C:\\Windows\\win.ini" if hearth_paths.is_windows() else "/etc/passwd"
+        # A sibling whose name merely starts with the workspace name is outside it.
+        # A startswith(root + os.sep) test would wrongly accept this; commonpath does not.
+        sibling = root + "-evil"
+        os.makedirs(sibling, exist_ok=True)
         try:
-            safe_join(root, outside)
-            raise AssertionError("absolute escape not caught")
+            safe_join(root, os.path.join("..", os.path.basename(sibling), "x.txt"))
+            raise AssertionError("sibling-prefix escape not caught")
         except ValueError:
             pass
+        finally:
+            shutil.rmtree(sibling, ignore_errors=True)
+
+        # A leading slash is workspace-root-relative on every platform, not a
+        # filesystem-absolute escape. This is deliberate (see module docstring)
+        # and matches the original _safe_join that hearth's agents depend on.
+        if hearth_paths.is_windows():
+            # A drive-qualified path has no leading separator, so it is not
+            # touched by the leading-slash strip, and must still be refused
+            # on its own terms. C:\Windows\win.ini is caught by the
+            # alternate-data-stream check on "C:" before containment even
+            # runs, so exercise _within directly too, with no colon involved,
+            # to prove the containment check itself also fails closed here.
+            try:
+                safe_join(root, "C:\\Windows\\win.ini")
+                raise AssertionError("drive-qualified escape not caught")
+            except ValueError:
+                pass
+            assert not _within(os.path.join(os.path.dirname(root), "win.ini"), root)
+        else:
+            assert safe_join(root, "/etc/passwd") == os.path.realpath(os.path.join(root, "etc", "passwd"))
 
         # Reserved device names are refused, with or without an extension.
         for bad in ("NUL", "nul", "CON", "com1", "LPT9", "NUL.txt", "sub/NUL.tar.gz", "aux.log"):
