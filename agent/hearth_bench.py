@@ -77,16 +77,50 @@ stale reading from a different machine (or the same machine after a GPU
 swap) is simply never matched rather than needing an explicit eviction
 pass.
 
-## Energy, only if it can be read honestly
+## Energy, sampled over the window it is attributed to
 
-If `nvidia-smi --query-gpu=power.draw` is readable, measure() samples GPU
-power draw immediately before and immediately after the generation call
-and reports energy_wh_per_1k_tokens, the local analogue of a hosted tool
-reporting dollars. This is a real but rough approximation (an average of
-two instantaneous samples standing in for the true power curve over the
-generation), so it is documented as such. When nvidia-smi or a GPU is not
-available, the field is left out of the result entirely. It is never
-fabricated or replaced with a guess.
+If `nvidia-smi --query-gpu=power.draw` is readable, measure() runs a
+background thread (_PowerSampler) that samples GPU power repeatedly for
+the whole duration of the /api/generate call, instead of reading power
+once immediately before the call and once immediately after it returns.
+That before/after approach bracketed the entire round trip (model load,
+prompt evaluation, and generation) but was then multiplied by
+eval_seconds, the generation-only sub-interval: an average power measured
+over one window multiplied by the duration of a different, shorter
+window. On identical generation work, that produced energy figures
+roughly 14 percent apart purely because the surrounding load and prompt
+phases took different amounts of wall-clock time between two runs. See
+_attribute_energy() for the fix: only the power samples whose timestamps
+fall inside the generation sub-window (estimated from the server's own
+load_duration and prompt_eval_duration, i.e. when generation is expected
+to start) are averaged and multiplied by eval_seconds, so the power
+average and the duration it is multiplied by always refer to the same
+interval. If the call was faster than the sampling interval, or the
+server did not report enough timing detail to locate the window,
+energy_wh_per_1k_tokens is omitted and energy_note explains why: a
+missing number is preferable to one that moves 14 percent on identical
+work.
+
+nvidia-smi reports power for every GPU it can see, with no attribution to
+which one is actually running the model under test. On a single-GPU
+machine that is unambiguous. On a multi-GPU machine - which is exactly
+the shared, do-everything machine this module's target user is most
+likely to have - the figure sums power across every GPU nvidia-smi
+reports, so a browser, a game, or a second GPU drawing power during the
+measurement is silently folded in. This module does not attempt to
+identify which physical GPU is hosting the Ollama process: nvidia-smi's
+per-process GPU attribution is unreliable across driver and platform
+combinations, and is frequently unavailable outright on Windows consumer
+cards running in WDDM mode, which is what this module's own calibration
+hardware uses. Instead, when more than one GPU is visible,
+energy_gpu_count records how many, and energy_note states plainly that
+the figure is machine-wide, not per-model. Treat energy_wh_per_1k_tokens
+on a multi-GPU box as an upper bound on what this model actually cost,
+not an exact figure.
+
+When nvidia-smi or a GPU is not available at all, the energy fields are
+left out of the result entirely. They are never fabricated or replaced
+with a guess.
 
 ## What this module will never do
 
@@ -186,6 +220,13 @@ def _gpu_power_watts():
 
     None must never be treated as "zero watts"; it means "unknown", and
     callers must omit dependent fields rather than compute from it.
+
+    This deliberately does not attribute power to a specific GPU: on a
+    multi-GPU machine it folds in whatever every visible GPU is drawing,
+    not just the one running the model under test. See _detect_gpu_count()
+    and the module docstring's "Energy" section for how callers are
+    expected to disclose that rather than present the sum as exclusive to
+    the model being measured.
     """
     exe = shutil.which("nvidia-smi")
     if not exe:
@@ -213,6 +254,35 @@ def _gpu_power_watts():
         return None
 
 
+def _detect_gpu_count():
+    """How many GPUs nvidia-smi currently reports, or None if nvidia-smi is
+    not on PATH, times out, or its output cannot be parsed at all.
+
+    Used only to attach a multi-GPU caveat to an energy figure (see
+    measure() and the module docstring's "Energy" section); never used to
+    compute the figure itself.
+    """
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return None
+    try:
+        proc = subprocess.run(
+            [exe, "--query-gpu=index", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=POWER_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+    return len(lines) if lines else None
+
+
 def _now_iso():
     return datetime.now(timezone.utc).isoformat()
 
@@ -227,6 +297,14 @@ def hardware_signature():
     produce the same signature (GPU order does not matter: the list is
     sorted first); a real hardware change (different GPU, different VRAM
     reading, different CPU count) always produces a different one.
+
+    Deliberately hardware-only: it has no software-version component. An
+    Ollama upgrade, a GPU driver update, or swapping a model for a
+    requantized build published under the same name can all change real
+    throughput or energy behaviour without changing anything this function
+    reads, so a cached result can go stale on completely unchanged
+    hardware and still look current. cached_measure(..., force=True) is
+    the escape hatch: it ignores whatever is cached and measures again.
     """
     probe = hearth_hw.probe()
     gpu_sig = sorted(
@@ -338,6 +416,136 @@ def residency(base_url, model, timeout=PS_TIMEOUT):
 
 
 # --------------------------------------------------------------------------
+# Energy: background power sampling and window attribution
+# --------------------------------------------------------------------------
+
+POWER_SAMPLE_INTERVAL = 0.05  # seconds between GPU power samples while a
+# request is in flight. Small enough to catch several samples during even
+# a sub-second generation phase, large enough not to spawn a new
+# nvidia-smi subprocess needlessly fast.
+
+_SAMPLER_MAX_SECONDS = GENERATE_TIMEOUT + 30  # hard safety cap: the
+# sampler must never outlive the request it belongs to, even if a bug
+# elsewhere means stop() never gets called.
+
+
+class _PowerSampler:
+    """Samples GPU power on a background thread for the duration of one
+    /api/generate call, producing a (timestamp, watts) series instead of
+    the two endpoint reads (immediately before, immediately after) the
+    previous implementation used. See the module docstring's "Energy"
+    section and _attribute_energy() below for why that replacement
+    matters: the old before/after reading bracketed the whole round trip
+    but was multiplied by the generation-only sub-duration, which is the
+    Important review finding this class exists to fix.
+
+    Uses time.perf_counter() for its own timestamps, deliberately not
+    time.monotonic(): the self-test monkeypatches the real time.monotonic
+    with a small, finite, fake sequence while exercising the wall-clock
+    fallback path elsewhere in this module, and a background thread
+    reading that same patched, finite fake clock concurrently would race
+    the main thread for it and could raise StopIteration on a daemon
+    thread. perf_counter is a second, independent monotonic clock that
+    nothing else in this module touches, so the two never collide.
+
+    start() launches the thread. stop() signals it to exit and joins with
+    a bounded timeout, so calling code always gets control back even if
+    something goes wrong; it is safe to call stop() more than once. A hard
+    max_seconds cap means the thread exits on its own even if stop() is
+    never called at all.
+    """
+
+    def __init__(self, interval=POWER_SAMPLE_INTERVAL, power_fn=None,
+                 clock_fn=None, max_seconds=_SAMPLER_MAX_SECONDS):
+        self._interval = interval
+        self._power_fn = power_fn if power_fn is not None else (lambda: _gpu_power_watts())
+        self._clock_fn = clock_fn if clock_fn is not None else time.perf_counter
+        self._max_seconds = max_seconds
+        self._samples = []
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def _sample_once(self):
+        ts = self._clock_fn()
+        watts = self._power_fn()
+        if watts is not None:
+            self._samples.append((ts, watts))
+
+    def _run(self):
+        deadline = self._clock_fn() + self._max_seconds
+        while not self._stop_event.is_set():
+            self._sample_once()
+            if self._clock_fn() >= deadline:
+                break
+            self._stop_event.wait(self._interval)
+
+    def stop(self, join_timeout=5.0):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=join_timeout)
+            self._thread = None
+
+    def samples(self):
+        return list(self._samples)
+
+
+def _attribute_energy(samples, t0_perf, load_seconds, prompt_eval_seconds,
+                       eval_seconds, eval_count):
+    """Turn a (timestamp, watts) series collected over a whole
+    /api/generate call into a Wh-per-1k-tokens figure for the generation
+    phase specifically, or explain why that cannot be done honestly.
+
+    The samples bracket the entire request: model load, then prompt
+    evaluation, then token generation, in that order (the same order
+    Ollama's own load_duration / prompt_eval_duration / eval_duration add
+    up in). Only the samples whose timestamp falls inside the generation
+    sub-window - [t0_perf + load_seconds + prompt_eval_seconds, ... +
+    eval_seconds] - are averaged, so the average power this returns is
+    always paired with the same duration it gets multiplied by.
+
+    This is the fix for the reproduced review finding: an average power
+    sampled over the WHOLE call (load + prompt + generate) was previously
+    multiplied by eval_seconds alone, so identical generation work
+    produced energy figures that moved with however long the surrounding
+    load and prompt phases happened to take, purely an artifact of the
+    measurement window, not of anything the GPU actually did differently.
+
+    Returns (energy_wh_per_1k_tokens, note, sample_count). energy is None
+    when the window cannot be computed at all (missing load/prompt/eval
+    timing) or no sample happened to land inside it (the call was faster
+    than the sampling interval, or the background thread was not
+    scheduled in time); in both cases note explains why, and the caller
+    should omit the field rather than fabricate a number from samples
+    outside the window.
+    """
+    if load_seconds is None or prompt_eval_seconds is None or not eval_seconds:
+        return None, (
+            "server did not report enough timing detail (load/prompt/eval "
+            "duration) to isolate the generation window; omitting energy "
+            "rather than mixing load or prompt time into the figure"
+        ), 0
+
+    t_eval_start = t0_perf + load_seconds + prompt_eval_seconds
+    t_eval_end = t_eval_start + eval_seconds
+    eval_watts = [w for (ts, w) in samples if t_eval_start <= ts <= t_eval_end]
+    if not eval_watts:
+        return None, (
+            "GPU power was sampled during this call, but no sample landed "
+            "inside the estimated {:.3f}s generation window; omitting "
+            "rather than guessing".format(eval_seconds)
+        ), 0
+
+    avg_watts = sum(eval_watts) / len(eval_watts)
+    energy_wh = avg_watts * eval_seconds / 3600.0
+    return energy_wh * 1000.0 / eval_count, None, len(eval_watts)
+
+
+# --------------------------------------------------------------------------
 # Core measurement
 # --------------------------------------------------------------------------
 
@@ -372,6 +580,11 @@ def measure(base_url, model, prompt=None, num_predict=DEFAULT_NUM_PREDICT, timeo
         "time_to_first_token_seconds": None,
         "residency": None,
     }
+    # energy_wh_per_1k_tokens, energy_sample_count, energy_gpu_count, and
+    # energy_note are added conditionally below, not pre-populated with
+    # None: their absence is itself meaningful (see the module docstring's
+    # "Energy" section), and pre-populating with None would make "we
+    # could not measure this" indistinguishable from "we did not try".
 
     if not base_url:
         result["error"] = "empty base_url"
@@ -387,79 +600,111 @@ def measure(base_url, model, prompt=None, num_predict=DEFAULT_NUM_PREDICT, timeo
         "options": {"temperature": 0, "seed": 42, "num_predict": num_predict},
     }
 
-    power_before = _gpu_power_watts()
+    sampler = _PowerSampler()
+    sampler.start()
     t0 = time.monotonic()
+    t0_perf = time.perf_counter()
     try:
-        data = _http_post(base_url + "/api/generate", payload, timeout)
-    except urllib.error.HTTPError as exc:
         try:
-            body = exc.read().decode("utf-8", errors="replace")
-        except Exception:  # noqa: BLE001 - reading the error body is best-effort
-            body = ""
-        result["error"] = "HTTP {}: {}".format(exc.code, body[:300] or exc.reason)
+            data = _http_post(base_url + "/api/generate", payload, timeout)
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+            except Exception:  # noqa: BLE001 - reading the error body is best-effort
+                body = ""
+            result["error"] = "HTTP {}: {}".format(exc.code, body[:300] or exc.reason)
+            return result
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            result["error"] = "{}: {}".format(type(exc).__name__, exc)
+            return result
+        except (ValueError, json.JSONDecodeError) as exc:
+            result["error"] = "invalid JSON from Ollama: {}".format(exc)
+            return result
+        wall_seconds = time.monotonic() - t0
+        sampler.stop()
+        power_samples = sampler.samples()
+
+        if not isinstance(data, dict):
+            result["error"] = "unexpected response shape from Ollama"
+            return result
+
+        eval_count = int(data.get("eval_count") or 0)
+        prompt_eval_count = int(data.get("prompt_eval_count") or 0)
+        eval_duration_ns = data.get("eval_duration")
+        prompt_eval_duration_ns = data.get("prompt_eval_duration")
+        load_duration_ns = data.get("load_duration")
+        total_duration_ns = data.get("total_duration")
+
+        result["tokens_generated"] = eval_count
+        result["prompt_tokens"] = prompt_eval_count
+        result["wall_seconds"] = wall_seconds
+        result["load_seconds"] = load_duration_ns / 1e9 if isinstance(load_duration_ns, (int, float)) else None
+        result["total_seconds"] = total_duration_ns / 1e9 if isinstance(total_duration_ns, (int, float)) else None
+
+        if eval_count <= 0:
+            result["error"] = data.get("error") or "no tokens generated"
+            return result
+
+        eval_seconds = None
+        if isinstance(eval_duration_ns, (int, float)) and eval_duration_ns > 0:
+            eval_seconds = eval_duration_ns / 1e9
+        result["eval_seconds"] = eval_seconds
+
+        if eval_seconds:
+            result["tokens_per_second"] = eval_count / eval_seconds
+            result["tokens_per_second_source"] = "server_eval_duration"
+        elif wall_seconds > 0:
+            # Older Ollama build or a response missing timing fields: fall back
+            # to our own stopwatch. Strictly worse (it also counts JSON and
+            # network round-trip time), but a degraded number beats none.
+            result["tokens_per_second"] = eval_count / wall_seconds
+            result["tokens_per_second_source"] = "wall_clock"
+
+        if isinstance(load_duration_ns, (int, float)) and isinstance(prompt_eval_duration_ns, (int, float)):
+            result["time_to_first_token_seconds"] = (load_duration_ns + prompt_eval_duration_ns) / 1e9
+
+        # Residency at the moment right after generation: the model is certain
+        # to be loaded now if it is ever going to be.
+        result["residency"] = residency(base_url, model, timeout=PS_TIMEOUT)
+
+        # Energy: attribute only the power samples that fall inside the
+        # generation sub-window, never the whole call. See _attribute_energy()
+        # and the module docstring's "Energy" section for why.
+        if power_samples:
+            prompt_eval_seconds = (
+                prompt_eval_duration_ns / 1e9
+                if isinstance(prompt_eval_duration_ns, (int, float))
+                else None
+            )
+            energy_per_1k, energy_note, sample_count = _attribute_energy(
+                power_samples, t0_perf, result["load_seconds"], prompt_eval_seconds,
+                eval_seconds, eval_count,
+            )
+            if energy_per_1k is not None:
+                result["energy_wh_per_1k_tokens"] = energy_per_1k
+                result["energy_sample_count"] = sample_count
+                # Multi-GPU disclosure: nvidia-smi sums power across every
+                # GPU it can see, with no attribution to which one is
+                # actually running this model. Say so rather than stay silent.
+                gpu_count = _detect_gpu_count()
+                if gpu_count is not None:
+                    result["energy_gpu_count"] = gpu_count
+                    if gpu_count > 1:
+                        result["energy_note"] = (
+                            "{} GPUs are visible to nvidia-smi; this figure sums "
+                            "power draw across all of them, not just the one "
+                            "running this model, so any other GPU load on this "
+                            "machine inflates it. Treat it as a machine-wide "
+                            "figure, not a per-model one.".format(gpu_count)
+                        )
+            elif energy_note:
+                result["energy_note"] = energy_note
+        # else: nvidia-smi/GPU unavailable entirely -> omit silently, as documented.
+
+        result["ok"] = True
         return result
-    except (urllib.error.URLError, OSError, TimeoutError) as exc:
-        result["error"] = "{}: {}".format(type(exc).__name__, exc)
-        return result
-    except (ValueError, json.JSONDecodeError) as exc:
-        result["error"] = "invalid JSON from Ollama: {}".format(exc)
-        return result
-    wall_seconds = time.monotonic() - t0
-    power_after = _gpu_power_watts()
-
-    if not isinstance(data, dict):
-        result["error"] = "unexpected response shape from Ollama"
-        return result
-
-    eval_count = int(data.get("eval_count") or 0)
-    prompt_eval_count = int(data.get("prompt_eval_count") or 0)
-    eval_duration_ns = data.get("eval_duration")
-    prompt_eval_duration_ns = data.get("prompt_eval_duration")
-    load_duration_ns = data.get("load_duration")
-    total_duration_ns = data.get("total_duration")
-
-    result["tokens_generated"] = eval_count
-    result["prompt_tokens"] = prompt_eval_count
-    result["wall_seconds"] = wall_seconds
-    result["load_seconds"] = load_duration_ns / 1e9 if isinstance(load_duration_ns, (int, float)) else None
-    result["total_seconds"] = total_duration_ns / 1e9 if isinstance(total_duration_ns, (int, float)) else None
-
-    if eval_count <= 0:
-        result["error"] = data.get("error") or "no tokens generated"
-        return result
-
-    eval_seconds = None
-    if isinstance(eval_duration_ns, (int, float)) and eval_duration_ns > 0:
-        eval_seconds = eval_duration_ns / 1e9
-    result["eval_seconds"] = eval_seconds
-
-    if eval_seconds:
-        result["tokens_per_second"] = eval_count / eval_seconds
-        result["tokens_per_second_source"] = "server_eval_duration"
-    elif wall_seconds > 0:
-        # Older Ollama build or a response missing timing fields: fall back
-        # to our own stopwatch. Strictly worse (it also counts JSON and
-        # network round-trip time), but a degraded number beats none.
-        result["tokens_per_second"] = eval_count / wall_seconds
-        result["tokens_per_second_source"] = "wall_clock"
-
-    if isinstance(load_duration_ns, (int, float)) and isinstance(prompt_eval_duration_ns, (int, float)):
-        result["time_to_first_token_seconds"] = (load_duration_ns + prompt_eval_duration_ns) / 1e9
-
-    # Residency at the moment right after generation: the model is certain
-    # to be loaded now if it is ever going to be.
-    result["residency"] = residency(base_url, model, timeout=PS_TIMEOUT)
-
-    # Energy: only when both power samples were actually read. Never guess.
-    if power_before is not None and power_after is not None:
-        duration_for_energy = eval_seconds if eval_seconds else wall_seconds
-        if duration_for_energy and duration_for_energy > 0:
-            avg_watts = (power_before + power_after) / 2.0
-            energy_wh = avg_watts * duration_for_energy / 3600.0
-            result["energy_wh_per_1k_tokens"] = energy_wh * 1000.0 / eval_count
-
-    result["ok"] = True
-    return result
+    finally:
+        sampler.stop()
 
 
 # --------------------------------------------------------------------------
@@ -729,16 +974,149 @@ def _run_live_http_self_test():
 
 
 def _self_test():
-    global _http_post, _http_get, _gpu_power_watts
+    global _http_post, _http_get, _gpu_power_watts, _detect_gpu_count
 
     orig_http_post = _http_post
     orig_http_get = _http_get
     orig_power = _gpu_power_watts
+    orig_gpu_count = _detect_gpu_count
     orig_probe = hearth_hw.probe
     orig_monotonic = time.monotonic
 
     try:
-        # -- measure(): full server timing available -------------------------
+        # -- _attribute_energy(): THE regression pin. These are the exact ----
+        # -- numbers from the live-hardware review: identical generation work
+        # -- (0.475s eval) measured twice, with wildly different surrounding
+        # -- load/prompt time (making total duration 10.73s vs 0.85s), must
+        # -- produce the SAME energy figure. The old before/after
+        # -- implementation moved 14 percent between these two; this is the
+        # -- property that must never regress again.
+        #
+        # Each run's sample series includes BOTH load/prompt-phase samples
+        # (lower, constant wattage, outside the generation window) and
+        # eval-phase samples (higher, constant wattage, inside it) - and
+        # deliberately different COUNTS of load-phase samples between the
+        # two runs (5 vs 2), mirroring how a longer load/prompt phase in
+        # real life gets sampled more times. A correct implementation
+        # ignores the load-phase samples entirely and averages only the
+        # eval-phase ones, so both runs land on the same figure. An
+        # implementation that (incorrectly) averages every sample from the
+        # whole call would dilute run 1's average far more than run 2's
+        # (more low-wattage samples pulling the mean down), reproducing the
+        # exact 14-percent-style drift the review found.
+        eval_seconds = 0.475
+        eval_count = 40
+        load_watts = 50.0
+        eval_watts = 150.0
+
+        # run 1: long load+prompt phase (pre_eval = 10.73 - 0.475 = 10.255s),
+        # sampled 5 times during load/prompt, 3 times during generation.
+        pre_eval_1 = 10.73 - eval_seconds
+        samples_1 = [
+            (1.0, load_watts), (3.0, load_watts), (5.0, load_watts),
+            (7.0, load_watts), (9.0, load_watts),
+            (pre_eval_1 + 0.05, eval_watts),
+            (pre_eval_1 + 0.20, eval_watts),
+            (pre_eval_1 + 0.40, eval_watts),
+        ]
+        energy_1, note_1, count_1 = _attribute_energy(
+            samples_1, 0.0, pre_eval_1 - 0.1, 0.1, eval_seconds, eval_count,
+        )
+        assert note_1 is None, note_1
+        assert count_1 == 3, count_1
+
+        # run 2: short load+prompt phase (pre_eval = 0.85 - 0.475 = 0.375s),
+        # sampled only 2 times during load/prompt, same 3 times during
+        # generation - the SAME generation work as run 1.
+        pre_eval_2 = 0.85 - eval_seconds
+        samples_2 = [
+            (0.1, load_watts), (0.2, load_watts),
+            (pre_eval_2 + 0.05, eval_watts),
+            (pre_eval_2 + 0.20, eval_watts),
+            (pre_eval_2 + 0.40, eval_watts),
+        ]
+        energy_2, note_2, count_2 = _attribute_energy(
+            samples_2, 0.0, pre_eval_2 - 0.1, 0.1, eval_seconds, eval_count,
+        )
+        assert note_2 is None, note_2
+        assert count_2 == 3, count_2
+
+        assert energy_1 is not None and energy_2 is not None, (energy_1, energy_2)
+        assert abs(energy_1 - energy_2) < 1e-9, (
+            "same generation work must yield the same energy figure "
+            "regardless of surrounding load/prompt duration", energy_1, energy_2,
+        )
+        # sanity: 150W * 0.475s / 3600 = 0.019791..Wh total, per 1k tokens
+        expected = eval_watts * eval_seconds / 3600.0 * 1000.0 / eval_count
+        assert abs(energy_1 - expected) < 1e-9, (energy_1, expected)
+
+        # -- _attribute_energy(): missing load/prompt timing -> omit with note
+        no_timing_energy, no_timing_note, no_timing_count = _attribute_energy(
+            samples_1, 0.0, None, 0.1, eval_seconds, eval_count,
+        )
+        assert no_timing_energy is None, no_timing_energy
+        assert no_timing_note is not None, no_timing_note
+        assert no_timing_count == 0, no_timing_count
+
+        # -- _attribute_energy(): samples exist but none land inside the -----
+        # -- generation window -> omit with note, not a number computed from
+        # -- the wrong interval
+        samples_before_window = [(0.0, 999.0), (0.01, 999.0)]
+        outside_energy, outside_note, outside_count = _attribute_energy(
+            samples_before_window, 0.0, 5.0, 1.0, eval_seconds, eval_count,
+        )
+        assert outside_energy is None, outside_energy
+        assert outside_note is not None and "no sample landed" in outside_note, outside_note
+
+        # -- _attribute_energy(): only in-window samples are averaged, ------
+        # -- samples from the load/prompt phase must not pollute the figure
+        mixed_samples = [
+            (0.0, 50.0),    # load phase: well before the window, must be excluded
+            (4.9, 999.0),   # still before the window (window starts at 5.0)
+            (5.1, 100.0),   # inside window [5.0, 5.0+eval_seconds]
+            (5.3, 100.0),   # inside window
+            (5.0 + eval_seconds + 1.0, 999.0),  # after the window, must be excluded
+        ]
+        mixed_energy, mixed_note, mixed_count = _attribute_energy(
+            mixed_samples, 0.0, 4.0, 1.0, eval_seconds, eval_count,
+        )
+        assert mixed_note is None, mixed_note
+        assert mixed_count == 2, mixed_count  # only the two 100.0W samples
+        expected_mixed = 100.0 * eval_seconds / 3600.0 * 1000.0 / eval_count
+        assert abs(mixed_energy - expected_mixed) < 1e-9, (mixed_energy, expected_mixed)
+
+        # -- _PowerSampler: sampling/recording logic, driven directly (no ----
+        # -- real thread, fully deterministic). None readings must be
+        # -- dropped, not recorded as a bogus 0.0 watts.
+        fake_clock = iter([0.0, 0.1, 0.2, 0.3])
+        fake_power = iter([10.0, None, 20.0, None])
+        sampler_unit = _PowerSampler(
+            power_fn=lambda: next(fake_power),
+            clock_fn=lambda: next(fake_clock),
+        )
+        sampler_unit._sample_once()
+        sampler_unit._sample_once()
+        sampler_unit._sample_once()
+        sampler_unit._sample_once()
+        assert sampler_unit.samples() == [(0.0, 10.0), (0.2, 20.0)], sampler_unit.samples()
+
+        # -- _PowerSampler: a real background thread actually collects ------
+        # -- samples over real (short) elapsed time. Constant power value
+        # -- keeps this assertion exact regardless of exactly how many
+        # -- samples land, which is inherently timing-dependent.
+        real_sampler = _PowerSampler(interval=0.01, power_fn=lambda: 123.0)
+        real_sampler.start()
+        time.sleep(0.15)
+        real_sampler.stop()
+        real_samples = real_sampler.samples()
+        assert len(real_samples) >= 1, "background thread collected no samples at all"
+        assert all(w == 123.0 for _, w in real_samples), real_samples
+
+        # -- _PowerSampler: stop() is idempotent and never blocks forever ---
+        real_sampler.stop()
+        real_sampler.stop()
+
+        # -- measure(): full server timing available --------------------------
         resp_full = {
             "model": "m",
             "eval_count": 100,
@@ -762,8 +1140,14 @@ def _self_test():
 
         _http_post = post_full
         _http_get = get_full
-        _gpu_power_watts = lambda: 200.0  # noqa: E731 - constant stub, before and after
+        _gpu_power_watts = lambda: 200.0  # noqa: E731 - constant stub
 
+        # The fake HTTP call above is a plain in-process function call and
+        # returns effectively instantly; the response claims a 5.75s total
+        # duration, so the generation window (starting 0.75s after t0) is
+        # never actually reached in real elapsed time. Per the "omit rather
+        # than guess" rule, energy must be absent here: this is exactly the
+        # case a fudged before/after reading would have papered over.
         r = measure("http://x:11434", "m", num_predict=100)
         assert r["ok"] is True, r
         assert r["error"] is None, r
@@ -777,21 +1161,87 @@ def _self_test():
         assert r["total_seconds"] == 5.75, r
         assert r["residency"]["loaded"] is True, r
         assert r["residency"]["fully_resident"] is True, r
-        # energy: 200W avg * 5s / 3600 = 0.277..Wh total, per 1k tokens = 25/9
-        assert "energy_wh_per_1k_tokens" in r, r
-        assert abs(r["energy_wh_per_1k_tokens"] - (25.0 / 9.0)) < 1e-9, r
+        assert "energy_wh_per_1k_tokens" not in r, r
 
         # -- measure(): missing power reading omits energy, does not fabricate
         _gpu_power_watts = lambda: None  # noqa: E731
         r_no_power = measure("http://x:11434", "m", num_predict=100)
         assert r_no_power["ok"] is True, r_no_power
         assert "energy_wh_per_1k_tokens" not in r_no_power, r_no_power
+        assert "energy_note" not in r_no_power, r_no_power
 
-        # -- measure(): one of the two power samples missing also omits energy
-        power_seq = iter([200.0, None])
-        _gpu_power_watts = lambda: next(power_seq)  # noqa: E731
-        r_half_power = measure("http://x:11434", "m", num_predict=100)
-        assert "energy_wh_per_1k_tokens" not in r_half_power, r_half_power
+        # -- measure(): full pipeline through the real background sampler, --
+        # -- with a fake HTTP call that actually sleeps roughly as long as it
+        # -- claims to have taken, so the sampler has a genuine chance to
+        # -- land samples inside the generation window. Constant power keeps
+        # -- the expected value exact. This is the end-to-end proof that the
+        # -- wiring (not just _attribute_energy in isolation) works, AND that
+        # -- it stays stable when the surrounding load/prompt phase is much
+        # -- longer relative to the same generation work - the actual
+        # -- regression scenario from the review, exercised through measure()
+        # -- itself rather than only the pure helper above.
+        _gpu_power_watts = lambda: 77.0  # noqa: E731 - constant, so avg is exact regardless of sample count/positions
+        _http_get = lambda url, timeout: {"models": []}  # noqa: E731
+
+        def make_realtime_post(load_ns, prompt_ns, eval_ns, sleep_seconds):
+            resp = {
+                "model": "m",
+                "eval_count": 20,
+                "eval_duration": eval_ns,
+                "prompt_eval_count": 5,
+                "prompt_eval_duration": prompt_ns,
+                "load_duration": load_ns,
+                "total_duration": load_ns + prompt_ns + eval_ns,
+            }
+
+            def _post(url, payload, timeout):
+                time.sleep(sleep_seconds)
+                return resp
+            return _post
+
+        # short load/prompt: 20ms load + 20ms prompt + 200ms eval, sleep covers it
+        _http_post = make_realtime_post(20_000_000, 20_000_000, 200_000_000, 0.30)
+        r_short_load = measure("http://x:11434", "m", num_predict=20)
+        assert r_short_load["ok"] is True, r_short_load
+
+        # long load/prompt: 500ms load + 100ms prompt + the SAME 200ms eval
+        _http_post = make_realtime_post(500_000_000, 100_000_000, 200_000_000, 0.90)
+        r_long_load = measure("http://x:11434", "m", num_predict=20)
+        assert r_long_load["ok"] is True, r_long_load
+
+        # Both must have actually measured energy (proves the sampler landed
+        # real samples inside the window in both cases; a machine too slow or
+        # too busy to schedule the background thread in time is the only way
+        # this could legitimately fail, in which case energy would be absent
+        # rather than wrong - never both present and different).
+        assert "energy_wh_per_1k_tokens" in r_short_load, r_short_load
+        assert "energy_wh_per_1k_tokens" in r_long_load, r_long_load
+        # 77W constant -> exact regardless of exactly which samples landed
+        expected_realtime = 77.0 * 0.2 / 3600.0 * 1000.0 / 20
+        assert abs(r_short_load["energy_wh_per_1k_tokens"] - expected_realtime) < 1e-6, r_short_load
+        assert abs(r_long_load["energy_wh_per_1k_tokens"] - expected_realtime) < 1e-6, r_long_load
+        assert abs(r_short_load["energy_wh_per_1k_tokens"] - r_long_load["energy_wh_per_1k_tokens"]) < 1e-9, (
+            "identical generation work took a 4x longer load/prompt phase in "
+            "one run and the energy figure still moved", r_short_load, r_long_load,
+        )
+
+        # -- measure(): multi-GPU disclosure - the figure is still reported --
+        # -- but with a plain caveat and the GPU count, never silently summed
+        _detect_gpu_count = lambda: 3  # noqa: E731
+        r_multi_gpu = measure("http://x:11434", "m", num_predict=20)
+        assert r_multi_gpu["ok"] is True, r_multi_gpu
+        assert "energy_wh_per_1k_tokens" in r_multi_gpu, r_multi_gpu
+        assert r_multi_gpu.get("energy_gpu_count") == 3, r_multi_gpu
+        assert r_multi_gpu.get("energy_note") is not None, r_multi_gpu
+        assert "3 GPUs" in r_multi_gpu["energy_note"], r_multi_gpu
+
+        # -- measure(): single GPU carries the count but no caveat -----------
+        _detect_gpu_count = lambda: 1  # noqa: E731
+        r_single_gpu = measure("http://x:11434", "m", num_predict=20)
+        assert r_single_gpu.get("energy_gpu_count") == 1, r_single_gpu
+        assert "energy_note" not in r_single_gpu, r_single_gpu
+
+        _detect_gpu_count = orig_gpu_count
         _gpu_power_watts = lambda: None  # noqa: E731
 
         # -- measure(): server omits duration fields -> wall-clock fallback --
@@ -1033,6 +1483,7 @@ def _self_test():
         _http_post = orig_http_post
         _http_get = orig_http_get
         _gpu_power_watts = orig_power
+        _detect_gpu_count = orig_gpu_count
         hearth_hw.probe = orig_probe
         time.monotonic = orig_monotonic
 
@@ -1042,6 +1493,53 @@ def _self_test():
     assert isinstance(real_sig, str) and len(real_sig) == 16, real_sig
     real_power = _gpu_power_watts()
     assert real_power is None or (isinstance(real_power, float) and real_power >= 0.0), real_power
+    real_gpu_count = _detect_gpu_count()
+    assert real_gpu_count is None or (isinstance(real_gpu_count, int) and real_gpu_count >= 0), real_gpu_count
+
+    # -- _load_cache(): a corrupt or truncated cache.json is a clean miss, ---
+    # -- never a crash. Covers both "not JSON at all" and "valid JSON that
+    # -- isn't the dict shape this module writes".
+    corrupt_dir = tempfile.mkdtemp(prefix="hearth-bench-test-corrupt-")
+    old_data_dir_env3 = os.environ.get("HEARTH_DATA_DIR")
+    os.environ["HEARTH_DATA_DIR"] = corrupt_dir
+    try:
+        cache_file = os.path.join(corrupt_dir, CACHE_SUBDIR, CACHE_FILENAME)
+        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+
+        with open(cache_file, "w", encoding="utf-8") as f:
+            f.write("{not valid json at all")
+        assert _load_cache() == {}, "truncated/garbage JSON must be a clean cache miss"
+
+        with open(cache_file, "w", encoding="utf-8") as f:
+            f.write("")
+        assert _load_cache() == {}, "an empty cache file must be a clean cache miss"
+
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump([1, 2, 3], f)  # valid JSON, but not the dict shape this module writes
+        assert _load_cache() == {}, "a valid-JSON-but-wrong-shape cache file must be a clean cache miss"
+
+        # cached_measure() must recover cleanly from a corrupt cache file
+        # rather than raising: a miss, then a normal successful measurement.
+        with open(cache_file, "w", encoding="utf-8") as f:
+            f.write("{garbage")
+        _http_post = lambda url, payload, timeout: {  # noqa: E731
+            "eval_count": 10, "eval_duration": 1_000_000_000,
+        }
+        _http_get = lambda url, timeout: {"models": []}  # noqa: E731
+        _gpu_power_watts = lambda: None  # noqa: E731
+        hearth_hw.probe = lambda: rtx2060
+        recovered = cached_measure("http://x:11434", "recovery-model", num_predict=10)
+        assert recovered["ok"] is True, recovered
+        assert recovered["from_cache"] is False, recovered
+    finally:
+        _http_post = orig_http_post
+        _http_get = orig_http_get
+        _gpu_power_watts = orig_power
+        hearth_hw.probe = orig_probe
+        if old_data_dir_env3 is None:
+            os.environ.pop("HEARTH_DATA_DIR", None)
+        else:
+            os.environ["HEARTH_DATA_DIR"] = old_data_dir_env3
 
     _run_live_http_self_test()
 
