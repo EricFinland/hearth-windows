@@ -16,3 +16,6 @@ site/.astro/
 # python bytecode
 __pycache__/
 *.pyc
+
+# agent worktrees and session scratch
+.claude/
