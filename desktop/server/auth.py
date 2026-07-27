@@ -22,6 +22,20 @@ must pass three independent checks:
      cross-origin fetch; a same-origin request or a non-browser client may
      omit it, so an absent Origin is not itself a failure)
 
+These three only stay independent as long as a request that fails one of
+them can never let a second, attacker-shaped request piggyback on the same
+TCP connection and get parsed as if it were the next legitimate request --
+otherwise an attacker could smuggle arbitrary Host/Origin/Authorization
+values past whichever check runs first, on a rejected request's own
+connection. That is a transport-layer property, not something these
+functions themselves can provide: see app.py's SidecarHandler.
+_prepare_body, which reads every request's full declared body off the
+socket before any of do_GET/do_POST's checks run (including before the
+unauthenticated /healthz route), so no early rejection here can ever leave
+unread bytes behind for HTTP pipelining to misinterpret as a second
+request. With that in place, these three checks are genuinely independent;
+without it, they are not, no matter how they are written.
+
 These are pure, I/O-free functions on purpose: no socket, no server, so the
 security contract is unit-testable in isolation from the transport that
 calls it (see app.py).

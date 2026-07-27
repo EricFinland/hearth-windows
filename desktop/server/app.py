@@ -82,6 +82,38 @@ Every route except GET /healthz requires, in this order: a valid Host header
 valid bearer token. See auth.py for why and how; this module only wires
 those checks into the request lifecycle.
 
+SECURITY: HTTP request smuggling on rejected requests. With
+protocol_version = "HTTP/1.1" and Content-Length responses, a connection
+stays alive across requests by default. Every route handler used to read its
+JSON body (via _read_json) only after already deciding to proceed -- so a
+request rejected by _authorized() (401/403), or by a handler's own "no
+session yet" check, returned its error WITHOUT ever reading the declared
+Content-Length bytes off the socket. Those unread bytes stayed sitting in
+the connection's read buffer, and the next handle_one_request() call (the
+one BaseHTTPRequestHandler makes automatically to serve the next pipelined
+request on a kept-alive connection) parsed them as an entirely new HTTP
+request -- with whatever Host, Origin, and Authorization headers the
+attacker chose, none of which had to pass this server's own checks, because
+they were never received as a "request" by this server's routing logic at
+all; they arrived as the tail of a request this server had already
+rejected. A page that can issue one no-cors cross-origin POST (no
+preflight, response unreadable, but the request itself is sent and a bad
+token guarantees rejection) could smuggle a second, fully-formed request
+past the Host and Origin checks entirely.
+
+Fix: every request's full declared body is read off the socket in
+_prepare_body(), called at the very start of do_GET/do_POST, before
+_authorized() or any route logic runs -- not just before whichever
+early-return call sites the original review happened to name. This closes
+the hole for every current and future early-return path uniformly, rather
+than requiring each one to remember to drain. A declared Content-Length
+larger than MAX_BODY_BYTES is rejected with 413 and the connection is
+closed instead of drained: reading an attacker-declared, unbounded length
+off the wire would just move the resource-exhaustion problem from "a second
+smuggled request" to "this handler thread blocks reading gigabytes", so for
+that one case closing (which makes any further bytes on that socket
+irrelevant) is used instead of draining. See _prepare_body and MAX_BODY_BYTES.
+
 Standard library only: http.server + ThreadingHTTPServer, no framework.
 """
 
@@ -97,6 +129,14 @@ import session as session_mod
 
 
 MAX_SSE_CONNECTIONS = 16  # bound on concurrent GET /events streams; see acquire_sse_slot
+
+# Cap on a single request's declared Content-Length, enforced by
+# _prepare_body before any body is read. An authenticated client (post-auth,
+# so lower severity than the smuggling fix above) could otherwise make
+# _read_json allocate however many bytes it declares. 16 MiB is generous for
+# a write_file body (source files, generated docs, etc.) while still
+# bounding the allocation a single request can force.
+MAX_BODY_BYTES = 16 * 1024 * 1024
 
 
 class WorkspaceBusyError(RuntimeError):
@@ -166,23 +206,37 @@ class SidecarState:
         and moving on would leave the abandoned worker free to race the new
         session's own turns in that same directory. A different workspace
         is always safe to replace immediately -- the old session's abandoned
-        worker, if any, keeps running against its own, different, path."""
+        worker, if any, keeps running against its own, different, path.
+
+        The read of `old`, the busy check, old.cancel(), and the assignment
+        of the new session all happen under a single, uninterrupted hold of
+        self._lock -- this used to be check-then-act (old read under the
+        lock, the busy check and cancel() outside it, self.session assigned
+        under the lock again), which let two concurrent POST /session calls
+        both read the same `old`, both pass the busy check, and both
+        proceed: the loser's freshly-built Session would then overwrite the
+        winner's, and the winner's session -- along with whatever turn it
+        had just started -- would be orphaned exactly the way the busy
+        check exists to prevent. Holding self._lock across the whole
+        sequence makes concurrent callers fully serialize instead: the
+        second caller only ever sees the first caller's already-completed
+        outcome (either the first call's new session as its own `old`, or
+        the pre-existing session untouched if the first call raised)."""
         with self._lock:
             old = self.session
-        if old is not None:
-            try:
-                same_workspace = os.path.realpath(workspace) == os.path.realpath(old.workspace)
-            except (OSError, ValueError):
-                same_workspace = False
-            if same_workspace and old.is_workspace_busy():
-                raise WorkspaceBusyError(
-                    "cannot replace session: this workspace has running or abandoned "
-                    "work in progress; wait for it to finish and try again")
-            old.cancel()
-        s = session_mod.Session(workspace, model, mode, engine=self.engine_factory())
-        with self._lock:
+            if old is not None:
+                try:
+                    same_workspace = os.path.realpath(workspace) == os.path.realpath(old.workspace)
+                except (OSError, ValueError):
+                    same_workspace = False
+                if same_workspace and old.is_workspace_busy():
+                    raise WorkspaceBusyError(
+                        "cannot replace session: this workspace has running or abandoned "
+                        "work in progress; wait for it to finish and try again")
+                old.cancel()
+            s = session_mod.Session(workspace, model, mode, engine=self.engine_factory())
             self.session = s
-        return s
+            return s
 
 
 class SidecarHandler(BaseHTTPRequestHandler):
@@ -197,25 +251,55 @@ class SidecarHandler(BaseHTTPRequestHandler):
 
     # ---- request helpers ----
 
-    def _send_json(self, code, obj):
+    def _send_json(self, code, obj, close=False):
         body = json.dumps(obj).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if close:
+            # BaseHTTPRequestHandler.send_header special-cases the
+            # "Connection" header: sending "close" here sets
+            # self.close_connection = True, which is what actually makes the
+            # server tear the socket down after this response instead of
+            # waiting to serve another pipelined request on it. Used only by
+            # _prepare_body's 413 path -- see MAX_BODY_BYTES.
+            self.send_header("Connection", "close")
         self.end_headers()
         try:
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             pass
 
-    def _read_json(self):
+    def _prepare_body(self):
+        """Read this request's full declared Content-Length body off the
+        socket into self._body, unconditionally, as the very first thing
+        do_GET/do_POST do -- before _authorized() and before any route
+        decides whether it even wants a body. See the module docstring's
+        smuggling note: this is what guarantees no early-return path
+        (rejected auth, "no session yet", or any future one) can ever leave
+        unread bytes on the connection for the next pipelined request to
+        misparse.
+
+        Returns True with self._body set (b"" if there was no body) on
+        success. Returns False if the declared length exceeds
+        MAX_BODY_BYTES -- a 413 has already been sent and the connection
+        closed (not drained: reading an attacker-declared, unbounded length
+        would itself be a resource-exhaustion vector), and the caller must
+        stop processing the request immediately."""
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             length = 0
-        if length <= 0:
-            return {}
-        raw = self.rfile.read(length)
+        if length < 0:
+            length = 0
+        if length > MAX_BODY_BYTES:
+            self._send_json(413, {"error": "request_body_too_large"}, close=True)
+            return False
+        self._body = self.rfile.read(length) if length > 0 else b""
+        return True
+
+    def _read_json(self):
+        raw = getattr(self, "_body", b"") or b""
         if not raw:
             return {}
         try:
@@ -257,6 +341,13 @@ class SidecarHandler(BaseHTTPRequestHandler):
     # ---- routing ----
 
     def do_GET(self):
+        # Drain the declared body, if any, before anything else -- including
+        # before the unauthenticated /healthz route -- so a request that
+        # never otherwise reads its body can never leave bytes behind for
+        # the next pipelined request on this connection. See the module
+        # docstring and _prepare_body.
+        if not self._prepare_body():
+            return
         path = self._path()
         if path == "/healthz":
             self._send_json(200, {"ok": True})
@@ -275,6 +366,11 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not_found"})
 
     def do_POST(self):
+        # Same reasoning as do_GET: drain the body before _authorized() so a
+        # rejected (401/403) request can never smuggle a follow-up request
+        # past this connection's remaining pipelined bytes.
+        if not self._prepare_body():
+            return
         if not self._authorized():
             return
         path = self._path()
@@ -502,6 +598,7 @@ def make_handler(state):
 
 def _self_test():
     import http.client
+    import socket
     import time
     import urllib.request
 
@@ -544,6 +641,32 @@ def _self_test():
             return resp.status, data
         finally:
             conn.close()
+
+    def _one_connection_responses(port, raw_request_bytes, read_timeout=2.0):
+        """Send raw_request_bytes over a single fresh TCP connection, then
+        read from that SAME connection for up to read_timeout seconds,
+        returning every byte the server sent back on it. Used to prove the
+        smuggling property directly against real socket framing: a
+        higher-level HTTP client (http.client/urllib) would transparently
+        make a second connection or silently discard a pipelined response,
+        which would prove nothing about whether the server actually sent
+        one."""
+        s = socket.create_connection(("127.0.0.1", port), timeout=5)
+        try:
+            s.sendall(raw_request_bytes)
+            s.settimeout(read_timeout)
+            chunks = []
+            try:
+                while True:
+                    data = s.recv(65536)
+                    if not data:
+                        break
+                    chunks.append(data)
+            except socket.timeout:
+                pass
+            return b"".join(chunks)
+        finally:
+            s.close()
 
     server, state = _start(engine_factory=lambda: _FakeEngine())
     port = state.port
@@ -605,6 +728,99 @@ def _self_test():
         good_origin_headers = dict(auth_headers, Origin="http://127.0.0.1:{}".format(port))
         status, _ = _raw_request(port, "GET", "/session", headers=good_origin_headers)
         assert status == 404, status  # still no session; proves it passed the gate
+
+        # === Finding 1: HTTP request smuggling on rejected requests. =======
+        # === The actual pin: a real socket, a request rejected for a bad ===
+        # === bearer token, whose body IS ITSELF a second, fully-formed ====
+        # === HTTP request with an attacker-chosen Host -- and proof that ==
+        # === the connection never yields a second response for it. =======
+        smuggled_request = (
+            "GET /healthz HTTP/1.1\r\n"
+            "Host: evil.example.com:{}\r\n"
+            "\r\n"
+        ).format(port).encode("utf-8")
+        smuggling_attempt = (
+            "POST /prompt HTTP/1.1\r\n"
+            "Host: 127.0.0.1:{port}\r\n"
+            "Authorization: Bearer totally-wrong-token\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: {n}\r\n"
+            "\r\n"
+        ).format(port=port, n=len(smuggled_request)).encode("utf-8") + smuggled_request
+
+        raw = _one_connection_responses(port, smuggling_attempt)
+        status_lines = raw.split(b"HTTP/1.1 ")[1:]
+        assert len(status_lines) == 1, (
+            "request smuggling succeeded: {} HTTP responses arrived on one connection "
+            "for one request, expected exactly 1 (the 401 rejection): {!r}".format(
+                len(status_lines), raw))
+        assert status_lines[0].startswith(b"401"), raw
+        assert b"evil.example.com" not in raw, \
+            "the smuggled request's spoofed Host must never reach a route handler"
+
+        # The same channel is even more severe through the completely
+        # unauthenticated /healthz route -- no bad token needed at all, any
+        # local process or web page can reach it. _prepare_body runs before
+        # do_GET even looks at the path, so this must be closed too.
+        smuggled_via_healthz = (
+            "GET /session HTTP/1.1\r\n"
+            "Host: evil.example.com:{}\r\n"
+            "\r\n"
+        ).format(port).encode("utf-8")
+        healthz_smuggling_attempt = (
+            "GET /healthz HTTP/1.1\r\n"
+            "Host: 127.0.0.1:{port}\r\n"
+            "Content-Length: {n}\r\n"
+            "\r\n"
+        ).format(port=port, n=len(smuggled_via_healthz)).encode("utf-8") + smuggled_via_healthz
+        raw_healthz = _one_connection_responses(port, healthz_smuggling_attempt)
+        healthz_status_lines = raw_healthz.split(b"HTTP/1.1 ")[1:]
+        assert len(healthz_status_lines) == 1, (
+            "request smuggling succeeded via the unauthenticated /healthz route: "
+            "{} HTTP responses on one connection: {!r}".format(
+                len(healthz_status_lines), raw_healthz))
+        assert healthz_status_lines[0].startswith(b"200"), raw_healthz
+
+        # === Finding 1, also: a Content-Length that exceeds MAX_BODY_BYTES =
+        # === is rejected with 413 and the connection is closed, not =======
+        # === silently drained -- proven the same way, over a real socket. =
+        oversized_len = MAX_BODY_BYTES + 1
+        oversized_headers = (
+            "POST /session HTTP/1.1\r\n"
+            "Host: 127.0.0.1:{port}\r\n"
+            "Authorization: Bearer {token}\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: {n}\r\n"
+            "\r\n"
+        ).format(port=port, token=token, n=oversized_len).encode("utf-8")
+        # Only send the headers (declaring a huge body) plus a small amount
+        # of the "body" -- never the full oversized_len bytes. If the server
+        # tried to read() the full declared length before rejecting, this
+        # connection would hang waiting for bytes that never arrive; getting
+        # a prompt 413 instead proves the length is checked before any read.
+        s_over = socket.create_connection(("127.0.0.1", port), timeout=5)
+        try:
+            s_over.sendall(oversized_headers + b'{"padding": "' + b"x" * 1024)
+            s_over.settimeout(5)
+            resp_data = b""
+            while b"\r\n\r\n" not in resp_data:
+                chunk = s_over.recv(4096)
+                if not chunk:
+                    break
+                resp_data += chunk
+            assert resp_data.startswith(b"HTTP/1.1 413"), resp_data
+            assert b"Connection: close" in resp_data, \
+                "the oversized-body rejection must close the connection: {!r}".format(resp_data)
+        finally:
+            s_over.close()
+
+        # A body right at the cap is accepted (still 400: bad workspace
+        # value -- the point is the length check itself does not fire).
+        at_cap_body = json.dumps({"workspace": "", "model": "m",
+                                  "padding": "x" * 100}).encode("utf-8")
+        status, data = _raw_request(port, "POST", "/session", headers=auth_headers,
+                                    body=at_cap_body)
+        assert status == 400, (status, data)
 
         # === session lifecycle ===
 
@@ -1068,6 +1284,57 @@ def _self_test():
                     "POST /restore over HTTP did not actually restore the file"
         finally:
             _shutil.rmtree(ws_dir, ignore_errors=True)
+
+        # === Minor: SidecarState.create_session is atomic -- the read of ===
+        # === the old session, the busy check, cancel(), and the new =======
+        # === session's assignment all happen under one uninterrupted hold =
+        # === of state._lock. Proven with get_session() as the probe, not =
+        # === a second concurrent create_session call: a second =========
+        # === create_session call would ALSO block inside its own slow ====
+        # === engine_factory() regardless of locking (both calls share the =
+        # === same slow factory), which would make "B hasn't finished yet" =
+        # === true whether or not the sequence is actually atomic -- a ====
+        # === false pass. get_session() only ever needs state._lock for a =
+        # === plain read, so it can only be blocked here by create_session =
+        # === genuinely holding the lock across its own engine_factory() ==
+        # === call, which is exactly the property being fixed. =============
+        create_enter = threading.Event()
+        create_release = threading.Event()
+
+        def _slow_engine_factory():
+            create_enter.set()
+            create_release.wait(timeout=5)
+            return _FakeEngine()
+
+        state_atomic = SidecarState("atomic-token", engine_factory=_slow_engine_factory)
+        thread_a = threading.Thread(
+            target=lambda: state_atomic.create_session("/tmp/ws-atomic-a", "m", "edit"))
+        thread_a.start()
+        assert create_enter.wait(timeout=5), "thread A's critical section never started"
+
+        # Thread A is now inside engine_factory(), blocked on
+        # create_release. If create_session holds state._lock for its whole
+        # duration (the fix), a concurrent get_session() -- which only ever
+        # needs a brief hold of the same lock -- must be unable to complete
+        # until A releases it.
+        get_done = threading.Event()
+
+        def _call_get():
+            state_atomic.get_session()
+            get_done.set()
+
+        thread_get = threading.Thread(target=_call_get)
+        thread_get.start()
+        assert not get_done.wait(timeout=0.3), (
+            "get_session() completed while create_session's own critical section "
+            "(inside engine_factory()) was still in flight -- create_session does not "
+            "hold state._lock for its full duration, so the sequence is not atomic")
+        create_release.set()
+        assert get_done.wait(timeout=5), "get_session() never completed after A released the lock"
+        thread_a.join(timeout=5)
+        thread_get.join(timeout=5)
+        assert state_atomic.get_session().workspace == "/tmp/ws-atomic-a", \
+            "thread A's session must be the one left live"
 
         # === malformed JSON body is rejected, not a 500 ===
         status, data = _raw_request(port, "POST", "/session", headers=auth_headers, body="{not json")

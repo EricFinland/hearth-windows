@@ -47,6 +47,39 @@ Two properties added after the first security pass:
      truncated history, so it can tell "I'm caught up" apart from "I missed
      something and don't know what".
 
+Two more bounded structures, added after a review found them growing
+without limit:
+
+  3. `_approvals` is a bounded dict (approvals_cap, default APPROVALS_CAP).
+     Approval.args retains the tool call's full arguments for as long as the
+     Approval object lives, and for write_file in edit mode (the default
+     permission mode) that is the entire file body being written -- a
+     session that writes 200 files would otherwise retain all 200 bodies for
+     its whole lifetime. Eviction only ever removes an already-RESOLVED
+     approval (Approval.decision is not None), oldest insertion order first:
+     at most one approval is ever pending at a time, because RealEngine.run()
+     blocks on ctx.request_approval() before issuing the next tool call, so
+     an entry a turn is still blocked on (decision is None) can never be the
+     one an eviction pass removes. See _evict_approvals_locked.
+
+     cancel() now also resolves every pending approval it wakes (setting
+     decision to "deny", not just firing the event) instead of leaving
+     decision as None forever -- previously a cancelled-but-never-explicitly-
+     resolved approval could never become eligible for eviction at all, since
+     "resolved" was the only safe eviction signal.
+
+  4. `_cancel_flags` never held more than one live entry's worth of purpose
+     (only the *current* turn's flag is ever consulted -- see cancel() and
+     _is_cancelled()), so instead of a generic cap it is simply cleared each
+     time a new turn starts (submit_prompt). Nothing looks up a previous
+     turn's flag once that turn's submit_prompt._run() has returned:
+     _run_cancellable's polling loop (the only reader of _is_cancelled other
+     than the engine's own ctx.cancelled() calls, which stop once a turn
+     returns) lives on the turn's own calling thread and stops polling the
+     instant it observes cancellation, and an abandoned worker thread never
+     consults the flag itself. So clearing the dict at the top of each new
+     submit_prompt cannot drop a flag anything still needs.
+
 Standard library only.
 """
 
@@ -65,6 +98,7 @@ STATUS_IDLE = "idle"
 STATUS_RUNNING = "running"
 
 EVENTS_CAP = 500  # bounded ring for Session._events; see module docstring
+APPROVALS_CAP = 200  # bounded dict for Session._approvals; see module docstring
 
 
 class Approval:
@@ -118,7 +152,8 @@ class Session:
     does not try to migrate state from the session it replaces.
     """
 
-    def __init__(self, workspace, model, mode=DEFAULT_MODE, engine=None, events_cap=None):
+    def __init__(self, workspace, model, mode=DEFAULT_MODE, engine=None, events_cap=None,
+                 approvals_cap=None):
         if not workspace:
             raise ValueError("workspace is required")
         if not model:
@@ -138,8 +173,9 @@ class Session:
         self._events = collections.deque(maxlen=self._events_cap)  # dicts: id, turn_id, kind, data, ts
         self._dropped_count = 0  # events evicted from the ring so far
         self._event_id_seq = itertools.count(1)
-        self._approvals = {}  # approval_id -> Approval
-        self._cancel_flags = {}  # turn_id -> threading.Event
+        self._approvals_cap = approvals_cap or APPROVALS_CAP
+        self._approvals = {}  # approval_id -> Approval; bounded, see _evict_approvals_locked
+        self._cancel_flags = {}  # turn_id -> threading.Event; cleared per-turn, see submit_prompt
         self._thread = None
         self._live_workers = 0  # abandoned/in-flight _run_cancellable calls; see is_workspace_busy()
 
@@ -164,6 +200,11 @@ class Session:
             turn_id = uuid.uuid4().hex
             self.turn_id = turn_id
             self.status = STATUS_RUNNING
+            # Only the current turn's flag is ever consulted (see the module
+            # docstring, point 4): drop every previous turn's flag here
+            # rather than letting _cancel_flags grow by one entry per turn
+            # for the life of the session.
+            self._cancel_flags.clear()
             self._cancel_flags[turn_id] = threading.Event()
 
         ctx = TurnContext(self, turn_id, message)
@@ -187,7 +228,9 @@ class Session:
         """Signal the running turn to stop. Returns True if there was a turn
         to cancel. Also wakes any approval currently blocking that turn's
         worker thread, so a pending gate does not hang forever; an approval
-        woken this way resolves as "deny" (see _request_approval)."""
+        woken this way is explicitly marked resolved with decision "deny"
+        (not just its event fired) so it becomes eligible for eviction like
+        any other resolved approval -- see _evict_approvals_locked."""
         with self._lock:
             if self.status != STATUS_RUNNING:
                 return False  # nothing in flight, including a turn that already finished
@@ -198,7 +241,9 @@ class Session:
             flag.set()
             for appr in self._approvals.values():
                 if appr.decision is None:
+                    appr.decision = "deny"
                     appr.event.set()
+            self._evict_approvals_locked()
         return True
 
     def _is_cancelled(self, turn_id):
@@ -291,6 +336,31 @@ class Session:
 
     # ---- approvals (POST /approve) ----
 
+    def _evict_approvals_locked(self):
+        """Keep self._approvals bounded at self._approvals_cap entries.
+        Approval.args can hold an entire file's contents (write_file's
+        content argument), so an edit-mode session (the default permission
+        mode, where every write and every dangerous call is gated) that
+        performs many approvals over its lifetime would otherwise retain
+        every one of those payloads, plus a threading.Event each, forever.
+
+        Only RESOLVED approvals (decision is not None) are ever removed,
+        oldest insertion-order first, stopping as soon as the dict is back
+        at or under the cap. This can never drop an approval a turn is
+        still blocked on: RealEngine.run() blocks on ctx.request_approval()
+        (which blocks on appr.event.wait()) before issuing its next tool
+        call, so at most one approval is ever pending (decision is None) at
+        any moment for the whole session, and a pending entry is never a
+        candidate for eviction here. Must be called with self._lock held.
+        """
+        if len(self._approvals) <= self._approvals_cap:
+            return
+        for appr_id in list(self._approvals.keys()):
+            if len(self._approvals) <= self._approvals_cap:
+                break
+            if self._approvals[appr_id].decision is not None:
+                del self._approvals[appr_id]
+
     def _request_approval(self, turn_id, tool, args):
         # secrets.token_urlsafe rather than a sequential counter: an approval
         # id must not be guessable from a previous one (defense in depth --
@@ -300,6 +370,7 @@ class Session:
         appr = Approval(appr_id, tool, args)
         with self._lock:
             self._approvals[appr_id] = appr
+            self._evict_approvals_locked()
         self._emit(turn_id, "approval_request", {"id": appr_id, "tool": tool, "args": args})
         appr.event.wait()  # released by resolve_approval() or by cancel()
         with self._lock:
@@ -315,6 +386,7 @@ class Session:
             if appr is None or appr.decision is not None:
                 return False
             appr.decision = "allow" if allow else "deny"
+            self._evict_approvals_locked()
         appr.event.set()
         return True
 
@@ -406,6 +478,16 @@ def _self_test():
     tool_call3 = next(e for e in events3 if e["kind"] == "tool_call")
     assert tool_call3["data"]["decision"] == "deny", "a cancelled approval must deny, not hang or allow"
     assert s3.cancel() is False, "cancelling an idle session reports nothing to cancel"
+    # A cancelled approval must be explicitly resolved (decision set to
+    # "deny"), not merely have its event fired with decision left None --
+    # otherwise it can never become eligible for eviction (see Finding 2 /
+    # _evict_approvals_locked, which only ever removes a resolved entry).
+    with s3._lock:
+        cancelled_apprs = list(s3._approvals.values())
+    assert cancelled_apprs, "expected the cancelled approval to still be present"
+    assert all(a.decision == "deny" for a in cancelled_apprs), \
+        "cancel() must set decision, not just fire the event: {}".format(
+            [(a.id, a.decision) for a in cancelled_apprs])
 
     # --- only one turn at a time ---
     class SlowEngine:
@@ -525,6 +607,76 @@ def _self_test():
     # a bookmark that is already caught up sees no gap marker at all
     fresh = s5.events_after(s5._events[-1]["id"], timeout=1)
     assert fresh == [], fresh
+
+    # === Finding 2: _approvals is bounded, across many turns of one =======
+    # === session, without ever evicting a still-pending approval ==========
+    class OneApprovalEngine:
+        def run(self, ctx):
+            decision = ctx.request_approval("write_file", {"path": "p.txt", "content": "y" * 50})
+            ctx.emit("tool_call", {"tool": "write_file", "decision": decision})
+            ctx.emit("done", {})
+
+    approvals_cap = 3
+    s_cap = Session("/tmp/ws-approvals-cap", "m", "edit", engine=OneApprovalEngine(),
+                    approvals_cap=approvals_cap)
+    n_turns = 6  # more turns than the cap, to actually exercise eviction
+    for i in range(n_turns):
+        s_cap.submit_prompt("turn {}".format(i))
+        deadline = time.monotonic() + 5
+        approval_id = None
+        while approval_id is None and time.monotonic() < deadline:
+            pending = s_cap.pending_approvals()
+            if pending:
+                approval_id = pending[0]
+            time.sleep(0.005)
+        assert approval_id, "approval never arrived on turn {}".format(i)
+        assert s_cap.resolve_approval(approval_id, True) is True
+        deadline = time.monotonic() + 5
+        while s_cap.to_dict()["status"] != STATUS_IDLE and time.monotonic() < deadline:
+            time.sleep(0.01)
+    assert len(s_cap._approvals) <= approvals_cap, \
+        "approvals dict must stay bounded by approvals_cap across many turns: {} entries, cap {}".format(
+            len(s_cap._approvals), approvals_cap)
+
+    # THE PIN: eviction must never remove a still-pending approval, even
+    # when resolved entries around it push the dict well past the cap.
+    # Exercised directly against _evict_approvals_locked (the mechanism
+    # itself), with a manufactured mix of one pending and several resolved
+    # entries, rather than only indirectly through timing-sensitive turns.
+    s_evict = Session("/tmp/ws-evict-pin", "m", "edit", approvals_cap=3)
+    pending_appr = Approval("appr-pending", "run_command", {"command": "does not matter"})
+    with s_evict._lock:
+        s_evict._approvals["appr-pending"] = pending_appr
+        for i in range(6):
+            resolved = Approval("appr-resolved-{}".format(i), "write_file", {"path": "f"})
+            resolved.decision = "allow"
+            s_evict._approvals[resolved.id] = resolved
+        s_evict._evict_approvals_locked()
+        surviving = dict(s_evict._approvals)
+    assert "appr-pending" in surviving, \
+        "eviction must never drop a still-pending approval: {}".format(list(surviving))
+    assert len(surviving) == 3, \
+        "eviction must trim resolved entries down to the cap: {}".format(list(surviving))
+    # oldest-resolved-first: the two most recently inserted resolved entries
+    # survive alongside the pending one.
+    assert set(surviving) == {"appr-pending", "appr-resolved-4", "appr-resolved-5"}, surviving
+
+    # === Finding 2: _cancel_flags never accumulates past the current ======
+    # === turn's single flag, across many turns of one session =============
+    class QuickEngine:
+        def run(self, ctx):
+            ctx.emit("done", {})
+
+    s_flags = Session("/tmp/ws-flags", "m", "edit", engine=QuickEngine())
+    assert s_flags._cancel_flags == {}, "no cancel flag should exist before any turn has run"
+    for i in range(5):
+        s_flags.submit_prompt("turn {}".format(i))
+        deadline = time.monotonic() + 5
+        while s_flags.to_dict()["status"] != STATUS_IDLE and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(s_flags._cancel_flags) == 1, \
+            "cancel flags must never accumulate across turns of one session: {}".format(
+                s_flags._cancel_flags)
 
     print("hearth-desktop-session self-test OK")
     return 0

@@ -88,13 +88,46 @@ _PLAN_MODE_ADDENDUM = (
     "step-by-step plan and stop."
 )
 
+# OS-appropriate run_command guidance, sidecar-local rather than imported
+# from hearth_loop -- see SIDECAR_SYSTEM_PROMPT below for why this module
+# does not reuse hearth_loop.SYSTEM_PROMPT verbatim.
+_WINDOWS_OS_LINE = (
+    "You are running on Windows. run_command runs through cmd.exe: chain "
+    "commands with '&' or separate lines rather than POSIX '&&' chaining "
+    "assumptions, use a newline or '&' between statements (write a script "
+    "file instead for anything elaborate), and Unix tools such as cat, ls, "
+    "and grep are not available unless the user installed them."
+)
+_POSIX_OS_LINE = "You are running on Linux. run_command uses /bin/sh."
+
+# Deliberately its own text, not hearth_loop.SYSTEM_PROMPT verbatim. That
+# shared prompt tells the model it "can make HTTP requests" -- true for
+# hearth_loop's own callers, but not for this sidecar: RealEngine._chat
+# advertises only hearth_tools.WINDOWS_TOOLS (file read/write/edit/list/
+# search/replace, run_command, git status/diff -- no http_request, no
+# web_fetch, no web_search, no fetch_to_kb), and permissions.decide is
+# called here with allowed_tools=hearth_tools.WINDOWS_TOOLS, which denies
+# every network tool outright regardless of mode. A weak local model that
+# believes the old prompt's claim will burn a turn calling a network tool
+# and get an automatic "not in this run's capability manifest" denial every
+# time. This prompt states the manifest the sidecar actually enforces.
+SIDECAR_SYSTEM_PROMPT = (
+    "You are a capable coding agent working in a sandboxed workspace. Your "
+    "tools let you read, write, edit, list, and search files; replace text "
+    "across files; run shell commands; and inspect git status and diffs. "
+    "You do not have any network tools here -- no HTTP requests, no web "
+    "fetch, no web search -- so do not attempt them; use only the tools "
+    "you were given. Use them to accomplish the goal step by step. When "
+    "the goal is complete, reply with a short summary and do not call any "
+    "more tools. " + (_WINDOWS_OS_LINE if os.name == "nt" else _POSIX_OS_LINE)
+)
+
 
 def _system_prompt(mode):
-    """The system prompt for a turn, mode-aware. Built from hearth_loop's own
-    SYSTEM_PROMPT constant (which already carries the OS-appropriate
-    run_command guidance) plus a plan-mode addendum, so plan mode is
-    reinforced in the prompt itself, not only enforced by permissions.decide."""
-    base = hearth_loop.SYSTEM_PROMPT
+    """The system prompt for a turn, mode-aware: SIDECAR_SYSTEM_PROMPT plus
+    a plan-mode addendum, so plan mode is reinforced in the prompt itself,
+    not only enforced by permissions.decide."""
+    base = SIDECAR_SYSTEM_PROMPT
     if mode == "plan":
         base += _PLAN_MODE_ADDENDUM
     return base
@@ -228,6 +261,12 @@ class RealEngine:
         ctx.emit("checkpoint", {
             "id": cp.get("id"), "label": cp.get("label"),
             "file_count": cp.get("file_count"), "sub_repos": cp.get("sub_repos", []),
+            # Both the machine-readable flag and the human-readable prose
+            # must travel together: a UI that only ever sees "warning" can
+            # show the text but has no reliable way to detect a truncated
+            # sub-repo scan programmatically (e.g. to badge the checkpoint,
+            # or decide whether to re-run with a larger scan budget).
+            "sub_repos_truncated": cp.get("sub_repos_truncated"),
             "warning": cp.get("warning"),
         })
 
@@ -399,7 +438,12 @@ def _self_test():
 
     def fake_checkpoint(workspace, label=None, timestamp=None):
         checkpoint_calls.append((workspace, label))
-        return {"id": "deadbeef", "label": label, "file_count": 3, "sub_repos": [], "warning": None}
+        # sub_repos_truncated deliberately True here (paired with a non-None
+        # warning, exactly as hearth_checkpoint.checkpoint() itself always
+        # pairs them) so the "checkpoint" event's forwarding of BOTH fields
+        # can be pinned below, not just "warning" alone.
+        return {"id": "deadbeef", "label": label, "file_count": 3, "sub_repos": [],
+                "sub_repos_truncated": True, "warning": "sub-repo scan truncated at 500 dirs"}
 
     tool_calls_seen = []
 
@@ -433,6 +477,11 @@ def _self_test():
     cp_event, _ = _wait_for_kind(sess, "checkpoint")
     assert cp_event["data"]["id"] == "deadbeef", cp_event
     assert checkpoint_calls and checkpoint_calls[0][0] == os.path.realpath(ws), checkpoint_calls
+    # Minor: sub_repos_truncated must travel alongside warning, not be
+    # dropped while warning survives -- a UI needs the machine-readable flag
+    # as much as the prose.
+    assert cp_event["data"]["sub_repos_truncated"] is True, cp_event
+    assert cp_event["data"]["warning"] == "sub-repo scan truncated at 500 dirs", cp_event
 
     appr_event, _ = _wait_for_kind(sess, "approval_request")
     approval_id = appr_event["data"]["id"]
@@ -823,6 +872,43 @@ def _self_test():
 
     # === list_installed_models degrades to [] when Ollama is unreachable ===
     assert list_installed_models(ollama_url="http://127.0.0.1:1", timeout=1) == []
+
+    # === Minor: the sidecar's system prompt matches the manifest it =======
+    # === actually enforces -- it must never claim network capability, ====
+    # === since WINDOWS_TOOLS excludes every network tool and =============
+    # === permissions.decide(allowed_tools=WINDOWS_TOOLS) denies them all. =
+    edit_prompt = _system_prompt("edit")
+    lowered = edit_prompt.lower()
+    assert "make http" not in lowered and "make requests" not in lowered, \
+        "the sidecar system prompt must not claim it can make HTTP requests: " + edit_prompt
+    assert "no http requests" in lowered, \
+        "the sidecar system prompt should explicitly say it lacks network tools: " + edit_prompt
+    for network_word in ("web_fetch", "web_search", "http_request", "fetch_to_kb"):
+        assert network_word not in edit_prompt, \
+            "the sidecar system prompt must not name a tool outside WINDOWS_TOOLS: " + edit_prompt
+    # it must still describe the tools actually in the manifest, in some
+    # form, so the model knows what it CAN do
+    for capability_word in ("read", "write", "run", "git"):
+        assert capability_word in lowered, \
+            "the sidecar system prompt dropped a real capability: " + edit_prompt
+    # every actual entry in the manifest is denied, not silently missing --
+    # cross-check against hearth_tools.WINDOWS_TOOLS itself rather than a
+    # hand-maintained list, so this cannot drift out of sync with the
+    # manifest RealEngine._chat actually advertises.
+    assert "http_request" not in hearth_tools.WINDOWS_TOOLS  # sanity: still excluded upstream
+    # plan mode still layers its addendum on top of the sidecar prompt, not
+    # hearth_loop's
+    plan_prompt = _system_prompt("plan")
+    assert plan_prompt.startswith(SIDECAR_SYSTEM_PROMPT), plan_prompt
+    assert "PLAN MODE" in plan_prompt, plan_prompt
+    # OS-awareness survives: the sidecar only ever runs on Windows or Linux
+    # (see hearth_tools.WINDOWS_TOOLS's own module docstring), and
+    # run_command's shell semantics differ enough between them that the
+    # model needs to be told which one it has.
+    if os.name == "nt":
+        assert "cmd.exe" in edit_prompt, edit_prompt
+    else:
+        assert "/bin/sh" in edit_prompt, edit_prompt
 
     print("hearth-desktop-engine self-test OK")
     return 0
