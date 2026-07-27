@@ -138,6 +138,18 @@ def _write_text_atomic(full, content, newline=""):
     return len(data)
 
 
+def _dominant_newline(text):
+    """The line ending a file mostly uses, so an edit can preserve it.
+
+    Returns "\r\n", "\n", or "" for a file with no line break at all.
+    """
+    crlf = text.count("\r\n")
+    lf = text.count("\n") - crlf
+    if crlf == 0 and lf == 0:
+        return ""
+    return "\r\n" if crlf > lf else "\n"
+
+
 def _explain_oserror(exc):
     """Turn a Windows OSError into something a model can act on."""
     winerr = getattr(exc, "winerror", None)
@@ -172,6 +184,13 @@ def tool_write_file(args, workspace):
     except ValueError as exc:
         return "error: {}".format(exc)
     content = args.get("content", "")
+    if os.path.exists(hearth_paths.long_path(full)):
+        try:
+            existing_nl = _dominant_newline(_read_text(full))
+            if existing_nl == "\r\n":
+                content = content.replace("\r\n", "\n").replace("\n", "\r\n")
+        except (OSError, UnicodeDecodeError):
+            pass
     parent = os.path.dirname(full)
     if parent:
         try:
@@ -1364,6 +1383,32 @@ def _self_test():
         assert open(binf, "rb").read() == before, "replace_in_files corrupted a binary file"
     finally:
         _shutil.rmtree(_ws3, ignore_errors=True)
+
+    # An edit must not rewrite line endings across the whole file.
+    _ws4 = os.path.realpath(_tempfile.mkdtemp(prefix="hearth-eol-"))
+    try:
+        lf = os.path.join(_ws4, "lf.txt")
+        with open(lf, "wb") as fh:
+            fh.write(b"one\ntwo\nthree\n")
+        tool_edit_file({"path": "lf.txt", "find": "two", "replace": "TWO"}, _ws4)
+        assert open(lf, "rb").read() == b"one\nTWO\nthree\n", open(lf, "rb").read()
+
+        crlf = os.path.join(_ws4, "crlf.txt")
+        with open(crlf, "wb") as fh:
+            fh.write(b"one\r\ntwo\r\nthree\r\n")
+        tool_edit_file({"path": "crlf.txt", "find": "two", "replace": "TWO"}, _ws4)
+        assert open(crlf, "rb").read() == b"one\r\nTWO\r\nthree\r\n", open(crlf, "rb").read()
+
+        # A find string spanning a CRLF line break must match a CRLF file.
+        r = tool_edit_file({"path": "crlf.txt", "find": "one\r\nTWO", "replace": "X"}, _ws4)
+        assert "not found" not in r, r
+
+        assert _dominant_newline("a\r\nb\r\n") == "\r\n"
+        assert _dominant_newline("a\nb\n") == "\n"
+        assert _dominant_newline("a\r\nb\nc\n") == "\n"
+        assert _dominant_newline("no newlines") == ""
+    finally:
+        _shutil.rmtree(_ws4, ignore_errors=True)
 
     print("hearth-tools self-test OK")
     return 0
