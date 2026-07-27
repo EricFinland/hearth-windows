@@ -40,13 +40,23 @@ comfortably in 16GB; the exact same model at a long context can need
 roughly twice the memory of its weights alone once the KV cache is added
 in.
 
-So every catalog entry carries `kv_bytes_per_token`, derived from that
-model's actual architecture (layer count, KV-head count, head dimension),
-never guessed from parameter count. Where the exact attention
-configuration isn't confidently known for a given model, the entry says so
-(`kv_confidence: "conservative_overestimate"`) and uses a deliberately
-large estimate rather than inventing a number - safe to over-count KV cost,
-never safe to under-count it.
+So every catalog entry carries `kv_bytes_per_token`, computed from that
+model's attention architecture (layer count, KV-head count, head dimension)
+rather than from parameter count alone - the arithmetic itself is never a
+guess. What isn't always known with the same confidence is the architecture
+figures that arithmetic runs on, and each entry says so through its
+`kv_confidence` label: `published_config` when the layer and head counts
+come straight from the model family's published architecture, high
+confidence; `recalled_estimate` when they're recalled from the model's
+technical report rather than reverified against a live config file,
+good-faith but not gospel; and `conservative_overestimate` when the exact
+attention configuration isn't confidently known at all, in which case the
+entry deliberately assumes the least favorable case (no grouped-query
+attention) rather than inventing a number - safe to over-count KV cost,
+never safe to under-count it. The confidence label is the honest part of
+this system: it exists precisely because not every number behind the math
+is equally certain, and it says so wherever that's true instead of
+presenting every verdict with the same confidence.
 
 The concrete payoff: on a 6GB RTX 2060, Ollama's own default context for
 that card is 4096 tokens. Hearth's calculator instead selects 16384,

@@ -53,15 +53,23 @@ everything else on this page.
   listing, searching, and replacing in files; running shell commands; git
   status and diff). The NixOS-only tools still exist in the codebase but
   are never offered on Windows.
+- The sidecar HTTP layer (`desktop/server/`): a standard-library-only HTTP
+  server wiring the permission engine, the tool layer, and checkpoint/undo
+  to real routes (`/session`, `/prompt`, `/events`, `/approve`, `/cancel`,
+  `/restore`, `/models`, `/checkpoints`). Every route but `/healthz` requires
+  a bearer token plus `Host`/`Origin` validation, and the server binds
+  `127.0.0.1` on an ephemeral port only. Self-tested, and exercised end to
+  end against a real Ollama by `scripts/e2e_live.py`: 16 of 16 steps pass,
+  including a real tool call, the permission gate firing, an approval
+  resolved over HTTP, a byte-exact workspace change, an automatic pre-turn
+  checkpoint, and a byte-exact restore.
 
 **Not built yet.** There is no Tauri desktop shell, no UI, no installer, no
-code signing, and nothing published anywhere. The sidecar HTTP layer that
-will let a UI actually talk to this engine is in progress but not done.
-The model shop described below has no interface yet: it exists as data and
-logic today, callable, tested, and correct, but with nothing to click.
-There is no cloud API key support. **There is no download.** Everything on
-this page describes an engine that works when driven directly, not a
-finished application.
+code signing, and nothing published anywhere. The model shop described below
+has no interface yet: it exists as data and logic today, callable, tested,
+and correct, but with nothing to click. There is no cloud API key support.
+**There is no download.** Everything on this page describes an engine that
+works when driven directly, not a finished application.
 
 ## What you need
 
@@ -128,6 +136,22 @@ list of tools that run is allowed to touch at all, checked before the mode
 logic runs and enforced in every mode including `bypass`. A run scoped to
 fewer tools can't be talked into reaching for one outside that list no
 matter what it reads or what mode it's in.
+
+"`plan` refuses everything but reads" is a claim about the permission
+engine, and the permission engine is only half of what has to be true for
+it to hold. The other half is that every tool classified `safe` in
+`agent/permissions.py`'s `RISK` table actually is read-only in what it
+does - the engine trusts that classification, it doesn't independently
+verify it. That trust broke once already on this branch: `git_diff` was
+classified `safe`, but its `path` argument was interpolated into a shell
+command string, so a crafted path reached a real shell and `plan` mode
+allowed arbitrary command execution. The fix was to run git through argv
+with no shell involved at all (`agent/hearth_tools.py`'s `_run_git_argv`),
+and a property test now asserts that no tool classified `safe` can reach a
+shell (`agent/hearth_tools.py`). The permission table below is accurate
+today because of that test, not just because of the mode logic - if a
+future `safe`-classified tool shells out again, that's the invariant to
+check first.
 
 Read [docs/limitations.md](limitations.md) before treating `auto` or
 `bypass` as safe defaults for `run_command` specifically - the short version

@@ -62,19 +62,23 @@ of the ones that felt free on NixOS are gone.
   enough on Windows, and because the next Windows-specific hole in this
   boundary is more likely to look like this one than like a classic path
   traversal.
-- **The loopback HTTP server is NOT a trust boundary.** The sidecar binds
-  `127.0.0.1` and speaks HTTP. It is tempting to treat "only reachable from
-  this machine" as equivalent to "only reachable by things I trust." It is
-  not. Every process running as the same user, and every website open in the
-  user's browser, can reach a loopback port: browsers do not apply
-  same-origin restrictions to `127.0.0.1` the way they do to remote hosts,
-  and DNS rebinding (resolving an attacker-controlled domain to
-  `127.0.0.1` after the browser's initial same-origin check) defeats origin
-  checks that assume the resolved address stays stable. This is a known,
-  general class of attack against localhost-bound developer tools and local
-  MCP-style servers, not something specific to Hearth. Treat the sidecar's
-  HTTP surface as internet-facing for design purposes, because in practice it
-  is reachable by anything that can run JavaScript on the machine.
+- **The loopback HTTP server is NOT a trust boundary by itself.** The
+  sidecar binds `127.0.0.1` and speaks HTTP. It is tempting to treat "only
+  reachable from this machine" as equivalent to "only reachable by things I
+  trust." It is not: every process running as the same user, and every
+  website open in the user's browser, can reach a loopback port, and DNS
+  rebinding (resolving an attacker-controlled domain to `127.0.0.1` after
+  the browser's initial same-origin check) defeats origin checks that only
+  compare hostnames rather than pinning to loopback addresses. This is a
+  known, general class of attack against localhost-bound developer tools and
+  local MCP-style servers, not something specific to Hearth, which is why
+  the sidecar does not rely on the bind address alone: see section 4's
+  bearer token, `Host`, and `Origin` checks, which are what actually stands
+  between an arbitrary local process or web page and the sidecar's API.
+  Design and review decisions should still treat the HTTP surface as
+  internet-facing rather than assuming the loopback bind is doing any work
+  on its own; the token and header checks are the control, not the bind
+  address.
 - **The permission mode boundary.** `agent/permissions.py` draws a line
   between what the model can do unattended and what needs a human to click
   approve. This is a real boundary for tool *dispatch*, but it is enforced by
@@ -126,9 +130,13 @@ outside Hearth.
 
 Covered in section 2: loopback is not a trust boundary. A second application
 on the machine, or a page open in the user's browser, can attempt to talk to
-the sidecar's HTTP API. Absent authentication, either could drive the agent
-by proxy, reading the workspace or issuing commands as if it were the
-legitimate UI.
+the sidecar's HTTP API. The bearer token, `Host`, and `Origin` checks in
+section 4 close the naive version of this attack: a request with no token,
+the wrong token, or a spoofed `Host` is refused before it reaches a route
+handler. What those checks do not do is limit what a *correct* token can
+reach - a process on the machine that does obtain the token (by reading it
+out of another compromised process, for instance) can still drive the agent
+by proxy, exactly as if it were the legitimate UI.
 
 ### 3.4 Supply-chain compromise of the installer or update channel
 
@@ -176,10 +184,10 @@ means exactly that, and is listed so nobody assumes otherwise later.
 
 | Status | Mitigation |
 |---|---|
-| Planned | A bearer token on every sidecar route except a health check, `Host`/`Origin` validation on incoming requests, and binding to `127.0.0.1` on an ephemeral (not fixed) port. The port and token are handed to the Rust shell at handshake and are not hardcoded, so a script cannot assume a well-known port. |
-| Designed | The token is meant to never reach the WebView. The Rust shell holds it and proxies sidecar calls, specifically so that an XSS bug in the UI layer cannot read the token and use it to talk to the sidecar directly. |
-| Not mitigated | None of the above is implemented yet as of this writing; it is specified for the sidecar but this document should not be read as claiming the token or origin checks are live. Until they land, the sidecar's HTTP surface should be assumed reachable by anything on the machine that can make an HTTP request. |
-| Not mitigated | DNS rebinding specifically defeats naive `Origin` header checks if the check only compares against an expected hostname rather than pinning to loopback addresses. Whatever validation ships needs to account for that, not just check for a plausible-looking origin string. |
+| Designed | A bearer token is required on every sidecar route except `GET /healthz`, checked with `hmac.compare_digest` rather than `==` so a wrong guess cannot be narrowed byte-by-byte through timing. `Host` and `Origin` are validated against `127.0.0.1:<port>`/`localhost:<port>` before the token is even checked, and the server binds `127.0.0.1` on an ephemeral (not fixed) port. The token and port are never hardcoded: `main.py` generates the token with `secrets.token_urlsafe(32)` and prints it, with the ephemeral port and the process id, as one line of JSON on stdout for a caller (the eventual Rust shell, or today's test harness) to read at startup, and never again after that (`desktop/server/auth.py`, `desktop/server/app.py`, `desktop/server/main.py`). `GET /healthz` itself returns nothing beyond `{"ok": true}` - no token, no workspace path, no other state. |
+| Designed | `POST /session` rejects `mode: "bypass"` over this transport with 400. `permissions.decide` still implements `bypass` for the Linux CLI, but the sidecar's HTTP surface cannot be asked for it, so one leaked or guessed token cannot turn into unattended arbitrary command execution over the network. |
+| Designed | DNS rebinding is handled by checking the literal `Host` header text against the loopback allowlist, not by resolving a hostname and comparing addresses - a rebound name that resolves to `127.0.0.1` on the wire still fails the check because its `Host` header does not read `127.0.0.1:<port>` or `localhost:<port>`. |
+| Designed (intent, not yet built) | The token is meant to never reach the WebView. The Rust shell would hold it and proxy sidecar calls, specifically so that an XSS bug in the UI layer cannot read the token and use it to talk to the sidecar directly. There is still no Rust shell, so this remains a design intention rather than something built and tested. |
 
 ### Supply-chain compromise of installer or updates (3.4)
 

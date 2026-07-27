@@ -26,15 +26,18 @@ Hearth runs local models on your own machine and gives them tools: files, a
 shell, an agent loop that can be turned loose on a task. It comes in two
 forms today.
 
-**Hearth is a Windows desktop application.** Point it at a model through
-[Ollama](https://ollama.com) and it works the way a hosted AI assistant
-does, except every token comes from your own GPU at no cost, and it tells
-you honestly what your hardware can actually run instead of leaving you to
-guess. **Hearth Code** is the agentic coding surface inside Hearth: the part
-that reads your repo, proposes edits, runs commands, and can be handed a
-task to work on while you do something else. Two names, used consistently
-throughout this repo: Hearth is the application, Hearth Code is the coding
-agent inside it.
+**Hearth is a Windows desktop application in development. There is no
+download yet.** The engine underneath it (permissions, containment,
+checkpoint/undo, the sidecar HTTP layer) is built and self-tested; the
+desktop shell, the UI, and the installer are not built. Once it exists, the
+pitch is simple: point it at a model through [Ollama](https://ollama.com)
+and it works the way a hosted AI assistant does, except every token comes
+from your own GPU at no cost, and it tells you honestly what your hardware
+can actually run instead of leaving you to guess. **Hearth Code** is the
+agentic coding surface inside Hearth: the part that reads your repo,
+proposes edits, runs commands, and can be handed a task to work on while
+you do something else. Two names, used consistently throughout this repo:
+Hearth is the application, Hearth Code is the coding agent inside it.
 
 **Hearth is also a fully declarative NixOS system.** The same agent engine
 runs as sandboxed systemd units on a machine defined entirely by one
