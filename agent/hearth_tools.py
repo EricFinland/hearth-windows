@@ -102,6 +102,54 @@ HTTP_TIMEOUT = 30
 MAX_OUT = 4000
 
 
+def _read_text(full):
+    """Read a text file as UTF-8 without translating line endings.
+
+    newline='' keeps CRLF as CRLF so an edit round-trip does not rewrite every
+    line of the file, which would make an approval diff unreviewable.
+    """
+    with open(hearth_paths.long_path(full), "r", encoding="utf-8", newline="") as fh:
+        return fh.read()
+
+
+def _write_text_atomic(full, content, newline=""):
+    """Write UTF-8 text via a temp file in the same directory, then os.replace.
+
+    Atomic so a failure part-way through cannot leave a truncated file. The
+    unpatched code opened the target with mode 'w' (truncating it) before
+    encoding, so an encoding error destroyed the original.
+
+    Returns the number of BYTES written, which is what the caller should report.
+    """
+    full = hearth_paths.long_path(full)
+    parent = os.path.dirname(full) or "."
+    data = content.encode("utf-8")
+    tmp = os.path.join(parent, ".hearth-tmp-{}".format(os.getpid()))
+    try:
+        with open(tmp, "w", encoding="utf-8", newline=newline) as fh:
+            fh.write(content)
+        os.replace(tmp, full)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return len(data)
+
+
+def _explain_oserror(exc):
+    """Turn a Windows OSError into something a model can act on."""
+    winerr = getattr(exc, "winerror", None)
+    if winerr == 32:
+        return "the file is open in another program, close it and retry"
+    if winerr == 5:
+        return "access denied (the file may be read-only)"
+    if winerr == 3 or winerr == 206:
+        return "the path is too long or does not exist"
+    return str(exc)
+
+
 def tool_run_command(args, workspace):
     cmd = args.get("command", "")
     if not cmd:
@@ -126,10 +174,15 @@ def tool_write_file(args, workspace):
     content = args.get("content", "")
     parent = os.path.dirname(full)
     if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(full, "w") as fh:
-        fh.write(content)
-    return "wrote {} ({} bytes)".format(args.get("path"), len(content))
+        try:
+            os.makedirs(hearth_paths.long_path(parent), exist_ok=True)
+        except OSError as exc:
+            return "error: cannot create directory: {}".format(exc)
+    try:
+        n = _write_text_atomic(full, content)
+    except OSError as exc:
+        return "error: {}".format(_explain_oserror(exc))
+    return "wrote {} ({} bytes)".format(args.get("path"), n)
 
 
 def tool_read_file(args, workspace):
@@ -138,10 +191,11 @@ def tool_read_file(args, workspace):
     except ValueError as exc:
         return "error: {}".format(exc)
     try:
-        with open(full) as fh:
-            return fh.read()[:MAX_OUT]
+        return _read_text(full)[:MAX_OUT]
+    except UnicodeDecodeError:
+        return "error: {} is not valid UTF-8 text (binary file?)".format(args.get("path"))
     except OSError as exc:
-        return "error: {}".format(exc)
+        return "error: {}".format(_explain_oserror(exc))
 
 
 def tool_list_files(args, workspace):
@@ -188,7 +242,7 @@ def tool_search_files(args, workspace):
             try:
                 if os.path.getsize(fp) > 2_000_000:
                     continue
-                with open(fp, "r", errors="replace") as fh:
+                with open(hearth_paths.long_path(fp), "r", encoding="utf-8", errors="replace", newline="") as fh:
                     for i, line in enumerate(fh, 1):
                         if rx.search(line):
                             hits.append("{}:{}: {}".format(os.path.relpath(fp, root), i, line.rstrip()[:200]))
@@ -242,9 +296,8 @@ def tool_edit_file(args, workspace):
         return "error: no 'find' text given"
     replace = args.get("replace", "")
     try:
-        with open(full) as fh:
-            content = fh.read()
-    except OSError as exc:
+        content = _read_text(full)
+    except (OSError, UnicodeDecodeError) as exc:
         return "error: {}".format(exc)
     count = content.count(find)
     if count == 0:
@@ -255,8 +308,7 @@ def tool_edit_file(args, workspace):
     else:
         content = content.replace(find, replace, 1)
         n = 1
-    with open(full, "w") as fh:
-        fh.write(content)
+    _write_text_atomic(full, content, newline="")
     return "edited {}: {} replacement{}".format(args.get("path"), n, "s" if n != 1 else "")
 
 
@@ -736,14 +788,15 @@ def tool_replace_in_files(args, workspace):
             try:
                 if os.path.getsize(fp) > 2_000_000:
                     continue
-                with open(fp, "r", errors="replace") as fh:
-                    content = fh.read()
-            except OSError:
-                continue
+                content = _read_text(fp)
+            except (OSError, UnicodeDecodeError):
+                continue  # unreadable or not text: never rewrite it
             c = content.count(find)
             if c:
-                with open(fp, "w") as fh:
-                    fh.write(content.replace(find, replace))
+                try:
+                    _write_text_atomic(fp, content.replace(find, replace))
+                except OSError:
+                    continue
                 files_changed += 1
                 total += c
     if not files_changed:
@@ -1277,6 +1330,40 @@ def _self_test():
     finally:
         _shutil.rmtree(_ws2, ignore_errors=True)
         _shutil.rmtree(_out, ignore_errors=True)
+
+    # Unicode round-trips regardless of the host ANSI codepage. On a cp1252
+    # machine the unpatched code cannot write a checkmark at all.
+    _ws3 = os.path.realpath(_tempfile.mkdtemp(prefix="hearth-enc-"))
+    try:
+        sample = "café ✓ 日本語\n"
+        res = tool_write_file({"path": "u.txt", "content": sample}, _ws3)
+        assert "error" not in res, res
+        back = tool_read_file({"path": "u.txt"}, _ws3)
+        assert back == sample, repr(back)
+
+        # The byte count reported is real bytes on disk, not characters.
+        assert "({} bytes)".format(len(sample.encode("utf-8"))) in res, res
+
+        # A failed write must not destroy the existing file.
+        target = os.path.join(_ws3, "keep.txt")
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write("PRECIOUS")
+        os.makedirs(os.path.join(_ws3, "keep.txt.d"), exist_ok=True)
+        # Writing succeeds normally; assert the atomic path leaves no partial file.
+        tool_write_file({"path": "keep.txt", "content": "REPLACED"}, _ws3)
+        with open(target, encoding="utf-8") as fh:
+            assert fh.read() == "REPLACED"
+        assert not [f for f in os.listdir(_ws3) if f.startswith(".hearth-tmp")], "temp file leaked"
+
+        # An undecodable file is skipped, never truncated.
+        binf = os.path.join(_ws3, "bin.dat")
+        with open(binf, "wb") as fh:
+            fh.write(b"\x00\xff\xfe binary \x00")
+        before = open(binf, "rb").read()
+        tool_replace_in_files({"find": "binary", "replace": "text"}, _ws3)
+        assert open(binf, "rb").read() == before, "replace_in_files corrupted a binary file"
+    finally:
+        _shutil.rmtree(_ws3, ignore_errors=True)
 
     print("hearth-tools self-test OK")
     return 0
