@@ -39,9 +39,10 @@ KNOWN CORRECTNESS HOLES, HANDLED HERE, NOT LEFT FOR SOMEONE TO DISCOVER:
   present, silently leaving that sub-tree's real content neither checkpointed
   nor restored. sub_repos() finds these with a bounded, prune-aware scan, and
   _add_all() excludes each one from every add -A with an explicit
-  ":(exclude)path" pathspec, which is a hard "do not even look here" filter,
-  not a mere ignore pattern. Nested repos are reported, never silently
-  swallowed; see the "sub_repos" field on checkpoint()'s return value.
+  ":(exclude,literal)path" pathspec, which is a hard "do not even look here"
+  filter, not a mere ignore pattern. Nested repos are reported, never
+  silently swallowed; see the "sub_repos" field on checkpoint()'s return
+  value.
 
   Secrets. In a workspace with no .gitignore, a plain `git add -A` would pull
   .env straight into Hearth's own data directory. The shadow store ships a
@@ -69,6 +70,29 @@ KNOWN CORRECTNESS HOLES, HANDLED HERE, NOT LEFT FOR SOMEONE TO DISCOVER:
   what actually changed. checkpoint() gates its "warning" field primarily on
   file count (see LARGE_TREE_WARNING_FILES) so the caller can surface a
   warning instead of the operation appearing to hang.
+
+  A partial read-tree failure. `read-tree -u --reset` is the only call in
+  this module that writes to the worktree. If it fails partway through (a
+  file locked by an antivirus scanner or an open editor on Windows, a full
+  disk, or GIT_TIMEOUT_S killing the child mid-checkout), some paths may
+  already have been overwritten while others were not: the tree can end up
+  matching neither the checkpoint nor its pre-restore state, and git gives
+  this module no way to ask which paths it reached before it died. restore()
+  never reports this as "restored": [] the way a clean no-op restore would,
+  because that reads as "nothing was touched" and may be false. Instead it
+  returns "worktree_state": "unknown" plus "attempted", the list of paths the
+  diff said would change, so a caller can tell "nothing happened" apart from
+  "something happened and we cannot say exactly what."
+
+  Concurrency. Git's own index and ref lockfiles protect the shadow object
+  database, but nothing in git covers the worktree writes read-tree -u makes.
+  Two concurrent restores, or a checkpoint hashing files while a restore
+  rewrites them underneath it, is a real race. This module closes that gap
+  itself with a simple lockfile (see _StoreLock) in the store's own
+  directory, held for the whole staging+commit or staging+diff+read-tree
+  critical section of checkpoint() and restore() against the same workspace,
+  rather than leaning on git's unrelated locking or leaving the race
+  undocumented.
 
 GIT PLUMBING NOTES:
 
@@ -131,6 +155,16 @@ LARGE_TREE_WARNING_SECONDS = 5.0
 
 MAX_SCAN_DIRS = 20000  # bound on sub_repos()'s directory walk, so a
                         # pathological tree cannot hang detection.
+
+_LOCK_TIMEOUT_S = 60.0   # how long a caller will wait for another
+                          # checkpoint/restore on the same workspace before
+                          # giving up, rather than blocking forever.
+_LOCK_POLL_S = 0.05
+_LOCK_STALE_SECONDS = 600  # a lock file older than this is assumed to be
+                            # left behind by a crashed process (nothing
+                            # legitimate holds it this long, given
+                            # GIT_TIMEOUT_S=180 on any single git call) and is
+                            # removed rather than blocking forever.
 
 _HEARTH_COMMITTER_NAME = "Hearth Checkpoint"
 _HEARTH_COMMITTER_EMAIL = "checkpoint@hearth.local"
@@ -203,6 +237,23 @@ def _git(gitdir, worktree, args, timeout=GIT_TIMEOUT_S):
     return _run_git(argv, cwd=worktree, timeout=timeout)
 
 
+def _validate_workspace(workspace):
+    """Resolve and validate `workspace`, raising ValueError for anything that
+    is not a genuine, non-empty path.
+
+    os.path.realpath("") resolves to the process's own current working
+    directory, not an error. Left unguarded, a caller bug that passes ""
+    (a default that was never filled in, a mis-joined path) would silently
+    point the shadow store at Hearth's own working directory, and a later
+    restore()'s read-tree -u --reset would rewrite files there instead of
+    failing loudly right away. Every public entry point below calls this
+    before doing anything else.
+    """
+    if not isinstance(workspace, str) or not workspace.strip():
+        raise ValueError("workspace must be a non-empty path, got {!r}".format(workspace))
+    return os.path.realpath(workspace)
+
+
 def _store_key(ws_real):
     """A stable, filesystem-safe key for a workspace's shadow store.
 
@@ -222,6 +273,63 @@ def _gitdir_for(ws_real):
     return os.path.join(_store_root(ws_real), "gitdir")
 
 
+class _StoreLock:
+    """A mutex over one workspace's shadow store.
+
+    Git's own index and ref lockfiles protect the shadow object database,
+    but read-tree -u's worktree writes are not covered by anything git does.
+    Two concurrent restores, or a checkpoint hashing files while a restore
+    rewrites them, is a real race; this closes it with a plain lockfile
+    rather than leaving it undocumented (see the module docstring's
+    "Concurrency" note).
+
+    Implemented with os.open(..., O_CREAT | O_EXCL), which is atomic on both
+    Windows and POSIX, so this needs no non-stdlib dependency and no
+    platform-specific fcntl/msvcrt branch. A lock older than
+    _LOCK_STALE_SECONDS is treated as abandoned by a crashed process and is
+    removed rather than blocking a legitimate caller forever.
+    """
+
+    def __init__(self, store_root, timeout=_LOCK_TIMEOUT_S):
+        self.store_root = store_root
+        self.path = os.path.join(store_root, ".lock")
+        self.timeout = timeout
+        self._fd = None
+
+    def __enter__(self):
+        os.makedirs(self.store_root, exist_ok=True)
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                self._fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(self._fd, str(os.getpid()).encode("ascii"))
+                return self
+            except FileExistsError:
+                try:
+                    age = time.time() - os.path.getmtime(self.path)
+                    if age > _LOCK_STALE_SECONDS:
+                        os.remove(self.path)
+                        continue
+                except OSError:
+                    continue  # lock vanished between the check and now; retry
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "checkpoint store is locked by another operation "
+                        "(timed out after {}s waiting for {})".format(self.timeout, self.path)
+                    )
+                time.sleep(_LOCK_POLL_S)
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
+        return False
+
+
 def init_store(workspace):
     """Ensure a shadow git store exists for `workspace`, returning its GIT_DIR.
 
@@ -231,49 +339,51 @@ def init_store(workspace):
     keyed by a hash of the workspace's real path, and is never created inside
     the workspace itself.
     """
-    ws = os.path.realpath(workspace)
+    ws = _validate_workspace(workspace)
     store = _store_root(ws)
     gitdir = _gitdir_for(ws)
     os.makedirs(store, exist_ok=True)
     _find_git()  # raise early and clearly if git is missing
 
-    if os.path.isdir(os.path.join(gitdir, "objects")):
-        # Already initialised. Re-assert core.worktree in case the workspace
-        # moved on disk since the store was created; cheap, and self-healing.
-        _git(gitdir, ws, ["config", "core.worktree", ws])
-        return gitdir
+    with _StoreLock(store):
+        if os.path.isdir(os.path.join(gitdir, "objects")):
+            # Already initialised. Re-assert core.worktree in case the
+            # workspace moved on disk since the store was created; cheap,
+            # and self-healing.
+            _git(gitdir, ws, ["config", "core.worktree", ws])
+            return gitdir
 
-    exe = _find_git()
-    rc, out, err = _run_git([exe, "init", "--bare", "--quiet", gitdir], cwd=store)
-    if rc != 0:
-        raise RuntimeError(
-            "failed to initialise checkpoint store at {}: {}".format(gitdir, err.strip())
-        )
-
-    for key, value in (
-        ("core.worktree", ws),
-        ("core.longpaths", "true"),
-        ("core.autocrlf", "false"),
-        ("user.name", _HEARTH_COMMITTER_NAME),
-        ("user.email", _HEARTH_COMMITTER_EMAIL),
-        ("gc.auto", "0"),
-    ):
-        rc, out, err = _git(gitdir, ws, ["config", key, value])
+        exe = _find_git()
+        rc, out, err = _run_git([exe, "init", "--bare", "--quiet", gitdir], cwd=store)
         if rc != 0:
             raise RuntimeError(
-                "failed to configure checkpoint store ({}={}): {}".format(key, value, err.strip())
+                "failed to initialise checkpoint store at {}: {}".format(gitdir, err.strip())
             )
 
-    info_dir = os.path.join(gitdir, "info")
-    os.makedirs(info_dir, exist_ok=True)
-    with open(os.path.join(info_dir, "attributes"), "w", encoding="utf-8", newline="\n") as fh:
-        fh.write("* -text -filter -ident\n")
-    with open(os.path.join(info_dir, "exclude"), "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(_BUILTIN_EXCLUDES)
-    with open(os.path.join(store, "workspace.txt"), "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(ws + "\n")
+        for key, value in (
+            ("core.worktree", ws),
+            ("core.longpaths", "true"),
+            ("core.autocrlf", "false"),
+            ("user.name", _HEARTH_COMMITTER_NAME),
+            ("user.email", _HEARTH_COMMITTER_EMAIL),
+            ("gc.auto", "0"),
+        ):
+            rc, out, err = _git(gitdir, ws, ["config", key, value])
+            if rc != 0:
+                raise RuntimeError(
+                    "failed to configure checkpoint store ({}={}): {}".format(key, value, err.strip())
+                )
 
-    return gitdir
+        info_dir = os.path.join(gitdir, "info")
+        os.makedirs(info_dir, exist_ok=True)
+        with open(os.path.join(info_dir, "attributes"), "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("* -text -filter -ident\n")
+        with open(os.path.join(info_dir, "exclude"), "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(_BUILTIN_EXCLUDES)
+        with open(os.path.join(store, "workspace.txt"), "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(ws + "\n")
+
+        return gitdir
 
 
 def sub_repos(workspace):
@@ -291,14 +401,23 @@ def sub_repos(workspace):
     left alone, git captures it as a gitlink holding only a commit sha,
     checkpointing and restoring none of its actual content. See the module
     docstring's "known correctness holes" section.
+
+    Returns (found, truncated). truncated is True when MAX_SCAN_DIRS was hit
+    before the walk finished, meaning some part of the tree was never
+    examined and a nested repo past that point could exist unreported: a
+    caller must surface that, not let it pass as "nothing else was found."
+    checkpoint() does this via its "sub_repos_truncated" and "warning"
+    fields.
     """
-    ws = os.path.realpath(workspace)
+    ws = _validate_workspace(workspace)
     walk_root = hearth_paths.long_path(ws)
     found = []
     visited = 0
+    truncated = False
     for dirpath, dirs, files in os.walk(walk_root):
         visited += 1
         if visited > MAX_SCAN_DIRS:
+            truncated = True
             break
         if dirpath != walk_root and (".git" in dirs or ".git" in files):
             rel = os.path.relpath(dirpath, walk_root).replace(os.sep, "/")
@@ -306,7 +425,7 @@ def sub_repos(workspace):
             dirs[:] = []  # it is its own repository; do not look inside it
             continue
         hearth_contain.prune(dirpath, dirs, hearth_contain.SKIP_DIRS)
-    return found
+    return found, truncated
 
 
 def _add_all(gitdir, ws, timeout=GIT_TIMEOUT_S):
@@ -314,22 +433,33 @@ def _add_all(gitdir, ws, timeout=GIT_TIMEOUT_S):
     workspace's own top-level .git (if the workspace is itself a git repo)
     and every nested sub-repository found by sub_repos().
 
-    Returns (rc, stdout, stderr, sub_repo_list).
+    Returns (rc, stdout, stderr, sub_repo_list, sub_repos_truncated).
 
-    The exclusion uses pathspec ':(exclude)path' rather than relying on
-    info/exclude's '.git/' pattern alone: a directory that is itself a git
-    repository is captured as a gitlink even when an ignore pattern names it,
-    because git's repository-boundary detection runs ahead of the ordinary
-    ignore check. Pathspec exclusion is a hard filter applied to what add
-    even considers, and reliably avoids that path.
+    The exclusion uses pathspec ':(exclude,literal)path' rather than relying
+    on info/exclude's '.git/' pattern alone: a directory that is itself a
+    git repository is captured as a gitlink even when an ignore pattern
+    names it, because git's repository-boundary detection runs ahead of the
+    ordinary ignore check. Pathspec exclusion is a hard filter applied to
+    what add even considers, and reliably avoids that path. The 'literal'
+    magic is required, not cosmetic: without it, a plain ':(exclude)path'
+    lets git interpret *, ?, and [...] in the excluded path as pathspec
+    globs instead of literal characters, so a vendored directory whose name
+    happens to contain one of those would not actually be excluded.
+
+    The workspace's own top-level .git existence check goes through
+    hearth_paths.long_path(), same as sub_repos()'s walk: on a deep
+    workspace path with Windows long-path support disabled, an unwrapped
+    os.path.exists() can return False for a .git that really exists, which
+    would let the user's own repository be captured as an unreported
+    gitlink instead of excluded.
     """
-    subs = sub_repos(ws)
+    subs, subs_truncated = sub_repos(ws)
     exclude_paths = list(subs)
-    if os.path.exists(os.path.join(ws, ".git")):
+    if os.path.exists(hearth_paths.long_path(os.path.join(ws, ".git"))):
         exclude_paths.append(".git")
-    pathspecs = [":(exclude){}".format(p) for p in exclude_paths]
+    pathspecs = [":(exclude,literal){}".format(p) for p in exclude_paths]
     rc, out, err = _git(gitdir, ws, ["add", "-A", "--", "."] + pathspecs, timeout=timeout)
-    return rc, out, err, subs
+    return rc, out, err, subs, subs_truncated
 
 
 def checkpoint(workspace, label=None, timestamp=None):
@@ -347,32 +477,35 @@ def checkpoint(workspace, label=None, timestamp=None):
 
     Returns a dict with at least: id (the shadow commit sha), label,
     timestamp, file_count, elapsed_seconds, sub_repos (nested repos found and
-    excluded this run, see sub_repos()), and workspace. A "warning" key is
-    present when the tree is large or slow enough that the caller should
-    surface it to the user rather than let the call appear to hang.
+    excluded this run, see sub_repos()), sub_repos_truncated (True if
+    MAX_SCAN_DIRS was hit and sub_repos may be incomplete), and workspace. A
+    "warning" key is present when the tree is large or slow enough, or the
+    sub-repo scan was truncated, that the caller should surface it to the
+    user rather than let either condition pass unnoticed.
     """
-    ws = os.path.realpath(workspace)
+    ws = _validate_workspace(workspace)
     gitdir = init_store(ws)
     t0 = time.perf_counter()
 
-    rc, out, err, subs = _add_all(gitdir, ws)
-    if rc != 0:
-        raise RuntimeError("checkpoint failed while staging {}: {}".format(ws, err.strip()))
+    with _StoreLock(_store_root(ws)):
+        rc, out, err, subs, subs_truncated = _add_all(gitdir, ws)
+        if rc != 0:
+            raise RuntimeError("checkpoint failed while staging {}: {}".format(ws, err.strip()))
 
-    ts = timestamp if timestamp is not None else time.time()
-    clean_label = (label or "checkpoint").replace("\r", " ").replace("\n", " ").strip() or "checkpoint"
-    message = "{}\n\nHearth-Timestamp: {}\nHearth-Label: {}\n".format(clean_label, ts, clean_label)
-    rc, out, err = _git(gitdir, ws, ["commit", "--allow-empty", "--quiet", "-m", message])
-    if rc != 0:
-        raise RuntimeError("checkpoint failed while committing {}: {}".format(ws, err.strip()))
+        ts = timestamp if timestamp is not None else time.time()
+        clean_label = (label or "checkpoint").replace("\r", " ").replace("\n", " ").strip() or "checkpoint"
+        message = "{}\n\nHearth-Timestamp: {}\nHearth-Label: {}\n".format(clean_label, ts, clean_label)
+        rc, out, err = _git(gitdir, ws, ["commit", "--allow-empty", "--quiet", "-m", message])
+        if rc != 0:
+            raise RuntimeError("checkpoint failed while committing {}: {}".format(ws, err.strip()))
 
-    rc, out, err = _git(gitdir, ws, ["rev-parse", "HEAD"])
-    if rc != 0:
-        raise RuntimeError("checkpoint committed but HEAD could not be read: {}".format(err.strip()))
-    sha = out.strip()
+        rc, out, err = _git(gitdir, ws, ["rev-parse", "HEAD"])
+        if rc != 0:
+            raise RuntimeError("checkpoint committed but HEAD could not be read: {}".format(err.strip()))
+        sha = out.strip()
 
-    rc, out, err = _git(gitdir, ws, ["ls-files"])
-    file_count = len([line for line in out.splitlines() if line.strip()]) if rc == 0 else -1
+        rc, out, err = _git(gitdir, ws, ["ls-files"])
+        file_count = len([line for line in out.splitlines() if line.strip()]) if rc == 0 else -1
 
     elapsed = time.perf_counter() - t0
     result = {
@@ -382,13 +515,22 @@ def checkpoint(workspace, label=None, timestamp=None):
         "file_count": file_count,
         "elapsed_seconds": elapsed,
         "sub_repos": subs,
+        "sub_repos_truncated": subs_truncated,
         "workspace": ws,
     }
+    warnings = []
     if file_count > LARGE_TREE_WARNING_FILES or elapsed > LARGE_TREE_WARNING_SECONDS:
-        result["warning"] = (
+        warnings.append(
             "large or slow checkpoint: {} files in {:.2f}s; consider excluding more paths "
             "via the shadow store's info/exclude".format(file_count, elapsed)
         )
+    if subs_truncated:
+        warnings.append(
+            "sub-repo scan stopped after {} directories; some nested git repositories "
+            "past that point may not have been detected or excluded".format(MAX_SCAN_DIRS)
+        )
+    if warnings:
+        result["warning"] = " ".join(warnings)
     return result
 
 
@@ -404,7 +546,7 @@ def list_checkpoints(workspace):
     has never been called for it. Never raises for that reason: an empty
     history is a normal, expected state, not an error.
     """
-    ws = os.path.realpath(workspace)
+    ws = _validate_workspace(workspace)
     gitdir = _gitdir_for(ws)
     if not os.path.isdir(os.path.join(gitdir, "objects")):
         return []
@@ -483,52 +625,92 @@ def restore(workspace, checkpoint_id):
     or a git error, returns a dict with an "error" key instead of raising: a
     failed restore is an expected outcome the caller needs to show the user,
     not a programming error.
+
+    Two failure shapes need to be told apart, because both happen after the
+    worktree may already have started changing:
+
+      - The `git diff --raw` step (used only to compute the "restored" list
+        this function reports, not to decide what read-tree will do) fails.
+        This function refuses to proceed to the destructive read-tree step
+        in that case and returns an error instead: it will not silently
+        report an empty "restored" list and then go reset the tree anyway,
+        because a caller cannot tell "nothing changed" apart from "reporting
+        broke and the whole tree just got overwritten." Nothing is touched
+        on this path.
+
+      - The `read-tree -u --reset` step itself fails partway. This is the
+        only call that writes to the worktree, and a partial failure (a
+        locked file, a full disk, a timeout) can leave it matching neither
+        the checkpoint nor its pre-restore state, with no reliable way to
+        ask git which paths it reached. The return in that case omits
+        "restored" and instead carries "worktree_state": "unknown" plus
+        "attempted" (what the diff said would change), so a caller does not
+        mistake this for a clean no-op.
     """
-    ws = os.path.realpath(workspace)
+    ws = _validate_workspace(workspace)
     gitdir = _gitdir_for(ws)
     if not os.path.isdir(os.path.join(gitdir, "objects")):
         return {"error": "no checkpoint store for this workspace", "restored": [], "skipped_gitlinks": []}
 
-    rc, out, err = _git(gitdir, ws, ["rev-parse", "--verify", "{}^{{commit}}".format(checkpoint_id)])
-    if rc != 0:
-        return {"error": "unknown checkpoint: {}".format(checkpoint_id), "restored": [], "skipped_gitlinks": []}
-    target = out.strip()
+    with _StoreLock(_store_root(ws)):
+        rc, out, err = _git(gitdir, ws, ["rev-parse", "--verify", "{}^{{commit}}".format(checkpoint_id)])
+        if rc != 0:
+            return {"error": "unknown checkpoint: {}".format(checkpoint_id), "restored": [], "skipped_gitlinks": []}
+        target = out.strip()
 
-    rc, out, err, subs = _add_all(gitdir, ws)
-    if rc != 0:
-        return {
-            "error": "could not capture current state before restore: {}".format(err.strip()),
-            "restored": [], "skipped_gitlinks": [],
-        }
+        rc, out, err, subs, subs_truncated = _add_all(gitdir, ws)
+        if rc != 0:
+            return {
+                "error": "could not capture current state before restore: {}".format(err.strip()),
+                "restored": [], "skipped_gitlinks": [],
+            }
 
-    rc, before_tree, err = _git(gitdir, ws, ["write-tree"])
-    if rc != 0:
-        return {
-            "error": "could not snapshot current state: {}".format(err.strip()),
-            "restored": [], "skipped_gitlinks": [],
-        }
-    before_tree = before_tree.strip()
+        rc, before_tree, err = _git(gitdir, ws, ["write-tree"])
+        if rc != 0:
+            return {
+                "error": "could not snapshot current state: {}".format(err.strip()),
+                "restored": [], "skipped_gitlinks": [],
+            }
+        before_tree = before_tree.strip()
 
-    rc, raw, err = _git(gitdir, ws, ["diff", "--raw", "--no-renames", before_tree, target])
-    restored, skipped = _parse_raw_diff(raw) if rc == 0 else ([], [])
+        rc, raw, err = _git(gitdir, ws, ["diff", "--raw", "--no-renames", before_tree, target])
+        if rc != 0:
+            # Do not downgrade "we could not compute what would change" to
+            # "nothing changed" and reset anyway: refuse the destructive
+            # step instead. See the docstring above.
+            return {
+                "error": "could not compute what would change; refusing to reset the "
+                         "worktree without being able to report it: {}".format(err.strip()),
+                "checkpoint_id": target, "restored": [], "skipped_gitlinks": [],
+            }
+        restored, skipped = _parse_raw_diff(raw)
 
-    rc, out, err = _git(gitdir, ws, ["read-tree", "-u", "--reset", target])
-    if rc != 0:
-        return {
-            "error": "restore failed: {}".format(err.strip()),
-            "checkpoint_id": target, "restored": [], "skipped_gitlinks": skipped,
-        }
+        rc, out, err = _git(gitdir, ws, ["read-tree", "-u", "--reset", target])
+        if rc != 0:
+            # read-tree -u is the only worktree-mutating call. A partial
+            # failure here may have already written some of `restored`'s
+            # paths; "restored": [] would falsely claim nothing happened, so
+            # it is omitted in favour of an explicit unknown-state signal.
+            return {
+                "error": "restore failed partway through updating the worktree: {}".format(err.strip()),
+                "checkpoint_id": target,
+                "attempted": restored,
+                "worktree_state": "unknown",
+                "skipped_gitlinks": skipped,
+            }
 
-    # A file rewritten with byte-identical content still gets a fresh mtime,
-    # which git would otherwise report as "modified" on the next status or
-    # diff even though nothing actually differs. Refresh before anyone checks.
-    _git(gitdir, ws, ["update-index", "--refresh"])
+        # A file rewritten with byte-identical content still gets a fresh
+        # mtime, which git would otherwise report as "modified" on the next
+        # status or diff even though nothing actually differs. Refresh
+        # before anyone checks.
+        _git(gitdir, ws, ["update-index", "--refresh"])
 
     return {
         "checkpoint_id": target,
         "restored": restored,
         "skipped_gitlinks": sorted(set(skipped) | set(subs)),
         "sub_repos_excluded": subs,
+        "sub_repos_truncated": subs_truncated,
     }
 
 
@@ -555,12 +737,31 @@ def scope_limits():
         "Never reads from or writes to the workspace's own .git, if it has "
         "one: its HEAD, branches, staging area, stash, and reflog are always "
         "left exactly as the user left them.",
+        "read-tree -u --reset is the only call that writes to the workspace's "
+        "files, and it is the one part of a restore that cannot be made "
+        "atomic: if it fails partway (a file locked by another program, a "
+        "full disk, or a timeout), the workspace can end up matching neither "
+        "the checkpoint nor its pre-restore state. restore() reports this "
+        "case with worktree_state: 'unknown' rather than an empty restored "
+        "list, since there is no general way to know exactly which paths "
+        "were written before the failure.",
+        "Concurrent checkpoint/restore calls against the same workspace are "
+        "serialised by a lockfile in the shadow store; a call that cannot "
+        "acquire it within the timeout raises rather than racing another "
+        "one's worktree writes.",
     ]
 
 
 def _self_test():
     import tempfile
     import shutil as _shutil
+
+    # Declared here (module-function scope requires it before first use, not
+    # just before assignment) because two tests below temporarily monkeypatch
+    # _git and MAX_SCAN_DIRS to force error paths that are otherwise very
+    # hard to reach deterministically (a genuine git-diff or read-tree
+    # failure, or a directory-count limit without creating 20000 dirs).
+    global _git, MAX_SCAN_DIRS
 
     if not is_git_available():
         print("hearth-checkpoint self-test SKIPPED: git not found on PATH")
@@ -665,25 +866,55 @@ def _self_test():
         assert not os.path.isdir(os.path.join(ws3, ".git")), \
             "checkpointing a plain directory must not turn it into a git repo"
 
-        # -- 4. a nested sub-repo is detected and reported, not silently
-        #    swallowed as a gitlink ------------------------------------------
+        # -- 4. a nested sub-repo, WITH A REAL COMMIT IN IT (not just `git
+        #    init`), is detected and reported at checkpoint time, its
+        #    content is genuinely not restored, and restore() reports it in
+        #    skipped_gitlinks. A repo with zero commits fails loudly on its
+        #    own via git's "does not have a commit checked out" error even
+        #    without the exclude logic present, which would make the
+        #    assertions after it unreachable in a broken scenario and leave
+        #    a silent-capture regression undetected; committing here is what
+        #    makes this test exercise the real, load-bearing case. ----------
         ws4 = os.path.join(base, "ws4")
         os.makedirs(os.path.join(ws4, "vendor", "lib"))
         _write(os.path.join(ws4, "top.txt"), "top level file\n")
         _user_git(os.path.join(ws4, "vendor", "lib"), ["init", "--quiet"])
+        _user_git(os.path.join(ws4, "vendor", "lib"), ["config", "user.name", "Test User"])
+        _user_git(os.path.join(ws4, "vendor", "lib"), ["config", "user.email", "test@example.com"])
         _write(os.path.join(ws4, "vendor", "lib", "inner.txt"), "nested repo content\n")
+        _user_git(os.path.join(ws4, "vendor", "lib"), ["add", "inner.txt"])
+        rc, _o, nested_commit_err = _user_git(os.path.join(ws4, "vendor", "lib"), ["commit", "--quiet", "-m", "nested initial"])
+        assert rc == 0, "fixture setup: nested repo commit failed: {}".format(nested_commit_err)
 
-        subs4 = sub_repos(ws4)
+        subs4, subs4_truncated = sub_repos(ws4)
         assert subs4 == ["vendor/lib"], subs4
+        assert subs4_truncated is False, subs4_truncated
 
         cp4 = checkpoint(ws4, label="with nested repo")
         assert cp4["sub_repos"] == ["vendor/lib"], cp4
+        assert cp4["sub_repos_truncated"] is False, cp4
         ws4_real = os.path.realpath(ws4)
         rc, shadow_ls, _e = _git(_gitdir_for(ws4_real), ws4_real, ["ls-files"])
         assert "top.txt" in shadow_ls
         assert "vendor/lib/inner.txt" not in shadow_ls, "nested repo content leaked into the shadow store"
         rc, shadow_tree, _e = _git(_gitdir_for(ws4_real), ws4_real, ["ls-tree", "-r", "HEAD"])
         assert "160000" not in shadow_tree, "a gitlink entry leaked into the shadow tree: {}".format(shadow_tree)
+
+        # Now prove restore() itself does the right thing with the nested
+        # repo present: top-level content restores normally, the nested
+        # repo's real content is left completely alone (it was never
+        # captured, so restore has nothing to put back and must not touch
+        # it), and the sub-repo is reported in skipped_gitlinks so a caller
+        # knows restore did not cover it.
+        _write(os.path.join(ws4, "top.txt"), "top level file CHANGED\n")
+        _write(os.path.join(ws4, "vendor", "lib", "inner.txt"), "nested repo content CHANGED\n")
+        r4 = restore(ws4, cp4["id"])
+        assert "error" not in r4, r4
+        assert _read_bytes(os.path.join(ws4, "top.txt")) == b"top level file\n", \
+            "top-level restore should still work with a nested repo present"
+        assert _read_bytes(os.path.join(ws4, "vendor", "lib", "inner.txt")) == b"nested repo content CHANGED\n", \
+            "nested repo content must not be touched by restore: it is a gitlink boundary, not ours to manage"
+        assert "vendor/lib" in r4["skipped_gitlinks"], r4
 
         # -- 5. an excluded secret is genuinely not captured -----------------
         ws5 = os.path.join(base, "ws5")
@@ -708,6 +939,207 @@ def _self_test():
         assert "error" not in r6, r6
         assert _read_bytes(os.path.join(ws6, "crlf.txt")) == crlf_bytes, \
             "CRLF content was not restored byte for byte"
+
+        # -- 7. a glob character in an excluded nested-repo directory name is
+        #    still excluded, because the exclude pathspec uses ':(exclude,
+        #    literal)'. Without the 'literal' magic, git would interpret the
+        #    '[' and ']' in "vend[1]" as a pathspec character class matching
+        #    a single character, the pathspec would not match the actual
+        #    directory, and the nested repo would leak into the shadow store
+        #    as a gitlink instead of being excluded. ---------------------------
+        ws9 = os.path.join(base, "ws9")
+        nested9 = os.path.join(ws9, "vend[1]")
+        os.makedirs(nested9)
+        _write(os.path.join(ws9, "top.txt"), "top\n")
+        _user_git(nested9, ["init", "--quiet"])
+        _user_git(nested9, ["config", "user.name", "Test User"])
+        _user_git(nested9, ["config", "user.email", "test@example.com"])
+        _write(os.path.join(nested9, "inner.txt"), "nested\n")
+        _user_git(nested9, ["add", "inner.txt"])
+        _user_git(nested9, ["commit", "--quiet", "-m", "nested"])
+
+        subs9, _t9 = sub_repos(ws9)
+        assert subs9 == ["vend[1]"], subs9
+
+        cp9 = checkpoint(ws9, label="glob-char nested repo")
+        assert cp9["sub_repos"] == ["vend[1]"], cp9
+        ws9_real = os.path.realpath(ws9)
+        rc, shadow_tree9, _e = _git(_gitdir_for(ws9_real), ws9_real, ["ls-tree", "-r", "HEAD"])
+        assert "160000" not in shadow_tree9, (
+            "a gitlink entry leaked into the shadow tree because the exclude pathspec was "
+            "interpreted as a glob instead of a literal path: {}".format(shadow_tree9))
+        assert "inner.txt" not in shadow_tree9, shadow_tree9
+
+        # The above proves the behaviour is currently correct, but on the git
+        # version this test runs against, a bare (no trailing wildcard)
+        # directory-exclude pathspec turns out to use a literal shortcut for
+        # its "select everything under this directory" check regardless of
+        # glob magic, which makes the assertions above pass even if the
+        # 'literal' magic were removed: verified by hand, this scenario alone
+        # does not reliably move between git versions/builds. So also assert
+        # directly on the argv this module hands to git, which is the actual
+        # thing the fix changed and cannot silently stop mattering under a
+        # different git build: every exclude pathspec must carry ':(exclude,
+        # literal)', not the glob-interpretable ':(exclude)'.
+        captured_add_argv = []
+        _real_git3 = _git
+        def _capture_add_argv(gitdir, worktree, args, timeout=GIT_TIMEOUT_S):
+            if args and args[0] == "add":
+                captured_add_argv.append(list(args))
+            return _real_git3(gitdir, worktree, args, timeout=timeout)
+        _git = _capture_add_argv
+        try:
+            checkpoint(ws9, label="capture add argv")
+        finally:
+            _git = _real_git3
+        assert captured_add_argv, "expected at least one 'add' call to be captured"
+        exclude_specs = [a for a in captured_add_argv[-1] if a.startswith(":(exclude")]
+        assert exclude_specs, captured_add_argv[-1]
+        assert all(spec.startswith(":(exclude,literal)") for spec in exclude_specs), (
+            "every exclude pathspec must use ':(exclude,literal)' magic, not the glob-"
+            "interpretable ':(exclude)', or a vendored directory whose name contains "
+            "*, ?, or [...] could fail to be excluded on some git version: {}".format(exclude_specs)
+        )
+
+        # -- 8. the workspace's own .git existence check goes through
+        #    hearth_paths.long_path, the same wrapper sub_repos()'s walk
+        #    already uses, so it cannot silently miss a real .git on a long,
+        #    unwrapped path. Actual >260-character paths are not portable to
+        #    construct in a self-test on every platform/CI, so this proves
+        #    the wiring structurally: the check must consult long_path() for
+        #    exactly the workspace's own .git path. -----------------------------
+        long_path_calls = []
+        _real_long_path = hearth_paths.long_path
+        def _tracking_long_path(p):
+            long_path_calls.append(p)
+            return _real_long_path(p)
+        hearth_paths.long_path = _tracking_long_path
+        try:
+            checkpoint(ws2, label="long-path-check")
+        finally:
+            hearth_paths.long_path = _real_long_path
+        own_git = os.path.join(os.path.realpath(ws2), ".git")
+        assert any(os.path.normcase(c) == os.path.normcase(own_git) for c in long_path_calls), (
+            "_add_all's own-.git check must call hearth_paths.long_path on the workspace's "
+            ".git path, same as sub_repos()'s walk, or a real .git beyond MAX_PATH on Windows "
+            "with long paths disabled could be missed and captured as an unreported gitlink; "
+            "calls seen: {}".format(long_path_calls))
+
+        # -- 9. a git-diff failure during restore aborts BEFORE the
+        #    destructive read-tree step, instead of silently downgrading
+        #    "could not compute the report" to "nothing changed" and
+        #    resetting the tree anyway. The worktree must be left completely
+        #    untouched. --------------------------------------------------------
+        ws8 = os.path.join(base, "ws8")
+        os.makedirs(ws8)
+        _write(os.path.join(ws8, "f.txt"), "original\n")
+        cp8 = checkpoint(ws8, label="pre-diff-failure")
+        _write(os.path.join(ws8, "f.txt"), "changed after checkpoint\n")
+
+        _real_git = _git
+        def _fail_on_diff(gitdir, worktree, args, timeout=GIT_TIMEOUT_S):
+            if args and args[0] == "diff":
+                return 1, "", "simulated diff failure"
+            return _real_git(gitdir, worktree, args, timeout=timeout)
+        _git = _fail_on_diff
+        try:
+            r8 = restore(ws8, cp8["id"])
+        finally:
+            _git = _real_git
+        assert "error" in r8, r8
+        assert r8.get("restored") == [], r8
+        assert _read_bytes(os.path.join(ws8, "f.txt")) == b"changed after checkpoint\n", \
+            "a diff failure must abort before the destructive read-tree, leaving the worktree untouched"
+
+        # -- 10. a read-tree failure partway through a restore does not claim
+        #     "restored": [] (which would read as "nothing was touched" and
+        #     may be false): it reports worktree_state: "unknown" plus
+        #     "attempted", the paths the diff said would change. -------------
+        ws11 = os.path.join(base, "ws11")
+        os.makedirs(ws11)
+        _write(os.path.join(ws11, "f.txt"), "original\n")
+        cp11 = checkpoint(ws11, label="pre-read-tree-failure")
+        _write(os.path.join(ws11, "f.txt"), "changed after checkpoint\n")
+
+        _real_git2 = _git
+        def _fail_on_read_tree(gitdir, worktree, args, timeout=GIT_TIMEOUT_S):
+            if args and args[0] == "read-tree":
+                return 1, "", "simulated read-tree failure"
+            return _real_git2(gitdir, worktree, args, timeout=timeout)
+        _git = _fail_on_read_tree
+        try:
+            r11 = restore(ws11, cp11["id"])
+        finally:
+            _git = _real_git2
+        assert "error" in r11, r11
+        assert "restored" not in r11, r11
+        assert r11.get("worktree_state") == "unknown", r11
+        assert any(a["path"] == "f.txt" for a in r11.get("attempted", [])), r11
+
+        # -- 11. two operations against the same shadow store cannot
+        #     interleave: git's own lockfiles cover the object database and
+        #     refs, not read-tree -u's worktree writes, so this module adds
+        #     its own mutex. Directly exercises _StoreLock rather than going
+        #     through checkpoint()/restore(), so the assertion is about the
+        #     lock itself, not timing-dependent behaviour of the git calls
+        #     around it. ------------------------------------------------------
+        import threading
+        lock_store = os.path.join(base, "lock-test-store")
+        os.makedirs(lock_store, exist_ok=True)
+        active = [0]
+        overlap = []
+        overlap_lock = threading.Lock()
+        def _hold():
+            with _StoreLock(lock_store, timeout=10):
+                with overlap_lock:
+                    active[0] += 1
+                    overlap.append(active[0])
+                time.sleep(0.15)
+                with overlap_lock:
+                    active[0] -= 1
+        threads = [threading.Thread(target=_hold) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert max(overlap) == 1, "two threads held the store lock at the same time: {}".format(overlap)
+
+        # -- 12. sub_repos()'s scan reports when MAX_SCAN_DIRS truncated it,
+        #     instead of silently under-reporting a pathological tree; and
+        #     checkpoint() surfaces that as sub_repos_truncated plus a
+        #     warning. Uses a small MAX_SCAN_DIRS rather than actually
+        #     creating 20000 directories. ---------------------------------------
+        _real_max_scan_dirs = MAX_SCAN_DIRS
+        MAX_SCAN_DIRS = 2
+        try:
+            ws10 = os.path.join(base, "ws10")
+            os.makedirs(os.path.join(ws10, "d1", "d2", "d3"))
+            _write(os.path.join(ws10, "d1", "d2", "d3", "f.txt"), "x\n")
+            subs10, truncated10 = sub_repos(ws10)
+            assert truncated10 is True, "a scan that exceeds MAX_SCAN_DIRS must report truncated=True"
+
+            cp10 = checkpoint(ws10, label="truncated scan")
+            assert cp10["sub_repos_truncated"] is True, cp10
+            assert "warning" in cp10, cp10
+            assert "sub-repo scan" in cp10["warning"], cp10
+        finally:
+            MAX_SCAN_DIRS = _real_max_scan_dirs
+
+        # -- 13. every public entry point rejects an empty workspace path
+        #     instead of letting os.path.realpath("") silently resolve to
+        #     Hearth's own process cwd. ------------------------------------------
+        for bad_fn, bad_args in (
+            (checkpoint, ("",)),
+            (restore, ("", "deadbeef")),
+            (list_checkpoints, ("",)),
+            (sub_repos, ("",)),
+            (init_store, ("",)),
+        ):
+            try:
+                bad_fn(*bad_args)
+                assert False, "{} accepted an empty workspace path".format(bad_fn.__name__)
+            except ValueError:
+                pass
 
         # -- list_checkpoints and scope_limits sanity -------------------------
         listed = list_checkpoints(ws1)
