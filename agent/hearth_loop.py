@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hearth_budget  # noqa: E402
+import hearth_hw  # noqa: E402
 import hearth_notify  # noqa: E402
 import hearth_paths  # noqa: E402
 import hearth_router  # noqa: E402
@@ -114,10 +115,251 @@ def _usage_from_response(data):
     return int(d.get("prompt_eval_count") or 0), int(d.get("eval_count") or 0)
 
 
-def chat(base_url, model, messages, tools, timeout=300):
-    """One Ollama chat call with tools. Returns (message, tokens_in, tokens_out)."""
+# -- hardware-aware num_ctx ---------------------------------------------------
+#
+# Ollama picks its context length from detected VRAM when a request omits
+# options.num_ctx: 4096 under 23GiB, 32768 at 23GiB+, 262144 at 47GiB+. That
+# default is often far too tight for an agentic loop that pastes file
+# contents and tool output into the message array. The functions below pick
+# a num_ctx that actually fits this machine's GPU (via hearth_hw), rather
+# than silently inheriting Ollama's server-side guess.
+#
+# Ladder of sensible context sizes; the chosen value is always one of these,
+# never a hand-tuned in-between number.
+CONTEXT_LADDER = (4096, 8192, 16384, 32768, 65536)
+FALLBACK_NUM_CTX = CONTEXT_LADDER[0]  # matches Ollama's own <23GiB default
+
+# A rung only counts as "fits" when headroom clears whichever is larger: this
+# absolute floor, or this fraction of total VRAM. Small cards need the
+# absolute floor (a fraction alone would be tiny); large cards need the
+# fraction (a flat floor alone would barely register). Other processes use
+# the GPU too, and a model that fails to load is worse than one with less
+# context, so this margin is deliberately not zero.
+MIN_HEADROOM_BYTES = 512 * 1024 ** 2
+MIN_HEADROOM_FRACTION = 0.05
+
+# Used only when Ollama's /api/show cannot say (no Ollama running, model not
+# pulled, bad response, timeout): conservative placeholders that lean toward
+# assuming a BIGGER model and a HEAVIER kv cache than typical, since
+# over-estimating cost picks a smaller, safer context rather than one that
+# fails to load.
+FALLBACK_MODEL_BYTES = 8_000_000_000
+FALLBACK_KV_BYTES_PER_TOKEN = 262_144
+
+# bytes-per-parameter by Ollama/GGUF quantization_level, for turning a model's
+# reported parameter_count into an approximate weight size. Deliberately
+# coarse (exact per-model byte accounting is out of scope); unrecognized
+# quant levels fall back to _DEFAULT_BYTES_PER_PARAM, which leans toward the
+# larger (safer) end rather than assuming a tiny quant.
+_QUANT_BYTES_PER_PARAM = {
+    "F32": 4.0, "F16": 2.0, "BF16": 2.0,
+    "Q8_0": 1.0625, "Q8_1": 1.0625, "Q8_K": 1.0625,
+    "Q6_K": 0.8203,
+    "Q5_0": 0.6875, "Q5_1": 0.6875, "Q5_K": 0.7128, "Q5_K_M": 0.7128, "Q5_K_S": 0.6875,
+    # K-quants pack some tensors at higher precision than their nominal bit
+    # width, so effective bytes/param runs above a naive 4-bit guess (e.g.
+    # Q4_K_M on a ~7.6B model is close to 4.75GB on disk, not ~3.8GB).
+    "Q4_0": 0.5625, "Q4_1": 0.625, "Q4_K": 0.625, "Q4_K_M": 0.625, "Q4_K_S": 0.5625,
+    "Q3_K": 0.4844, "Q3_K_M": 0.4844, "Q3_K_S": 0.4375, "Q3_K_L": 0.5078,
+    "Q2_K": 0.3516,
+}
+_DEFAULT_BYTES_PER_PARAM = 1.0
+
+# Per-process caches: hardware and per-model /api/show probing are the
+# expensive/blocking parts, so each is done at most once per process, not
+# once per chat() call. _NUM_CTX_LOGGED tracks which (base_url, model,
+# num_ctx) decisions have already been logged, so a long session logs its
+# choice once rather than every turn.
+_GPU_PROBE_CACHE = None
+_NUM_CTX_CACHE = {}
+_NUM_CTX_LOGGED = set()
+
+
+def _choose_num_ctx(vram_bytes, model_bytes, kv_bytes_per_token):
+    """The largest CONTEXT_LADDER rung that fits vram_bytes (via hearth_hw.fits)
+    with a real safety margin -- see MIN_HEADROOM_BYTES/MIN_HEADROOM_FRACTION.
+    FALLBACK_NUM_CTX when vram_bytes is 0/unknown (no GPU detected: never
+    invent a large context) or when even the smallest rung fails to clear the
+    margin."""
+    if not vram_bytes or vram_bytes <= 0:
+        return FALLBACK_NUM_CTX
+    margin = max(MIN_HEADROOM_BYTES, int(vram_bytes * MIN_HEADROOM_FRACTION))
+    chosen = FALLBACK_NUM_CTX
+    for ctx in CONTEXT_LADDER:
+        r = hearth_hw.fits(model_bytes, ctx, kv_bytes_per_token, vram_bytes)
+        if r["fits"] and r["headroom_bytes"] >= margin:
+            chosen = ctx
+        else:
+            # the ladder is increasing and required_bytes grows monotonically
+            # with context, so once a rung misses the margin, larger rungs
+            # only miss it by more.
+            break
+    return chosen
+
+
+def _model_bytes_from_show(info):
+    """Best-effort weight-size estimate from an Ollama /api/show response:
+    reported parameter_count times a bytes-per-parameter figure derived from
+    the reported quantization_level. None when parameter_count is missing or
+    unusable, so the caller falls back to a conservative constant instead of
+    guessing at a made-up number."""
+    if not isinstance(info, dict):
+        return None
+    minfo = info.get("model_info")
+    if not isinstance(minfo, dict):
+        return None
+    param_count = minfo.get("general.parameter_count")
+    if not isinstance(param_count, (int, float)) or param_count <= 0:
+        return None
+    details = info.get("details")
+    quant = str((details or {}).get("quantization_level") or "").upper()
+    bpp = _QUANT_BYTES_PER_PARAM.get(quant, _DEFAULT_BYTES_PER_PARAM)
+    return int(param_count * bpp)
+
+
+def _kv_bytes_per_token_from_show(info):
+    """Best-effort per-token KV-cache size from an Ollama /api/show response's
+    model_info: 2 (K and V) * layer count * kv-head count * head_dim, at 2
+    bytes/element (Ollama's default fp16 KV cache). None when any needed
+    architecture field is missing or zero, so the caller falls back to a
+    conservative constant rather than reasoning about an unfamiliar
+    architecture."""
+    if not isinstance(info, dict):
+        return None
+    minfo = info.get("model_info")
+    if not isinstance(minfo, dict):
+        return None
+    arch = minfo.get("general.architecture")
+    if not arch:
+        return None
+
+    def _num(key):
+        v = minfo.get("{}.{}".format(arch, key))
+        return v if isinstance(v, (int, float)) and v > 0 else None
+
+    block_count = _num("block_count")
+    head_count = _num("attention.head_count")
+    head_count_kv = _num("attention.head_count_kv") or head_count
+    embedding_length = _num("embedding_length")
+    if not all((block_count, head_count, head_count_kv, embedding_length)):
+        return None
+    head_dim = embedding_length / head_count
+    return int(2 * block_count * head_count_kv * head_dim * 2)
+
+
+def _probe_show(base_url, model, timeout=5):
+    """Query Ollama's /api/show for a model's architecture details. Returns
+    the parsed JSON dict, or None on any failure whatsoever (Ollama not
+    running, model not pulled, malformed JSON, timeout) -- this must never
+    raise, since num_ctx selection must never block or break a chat call."""
+    try:
+        body = json.dumps({"model": model}).encode()
+        req = urllib.request.Request(
+            base_url.rstrip("/") + "/api/show", data=body,
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:  # noqa: BLE001 - probing must never break chat()
+        return None
+
+
+def _cached_gpu_vram_bytes():
+    """The largest single detected GPU's VRAM in bytes. hearth_hw.gpus() is
+    probed at most once per process; the result is cached (including the
+    empty-list case) for every call after the first. 0 when no GPU was
+    detected or probing raised -- this must never raise."""
+    global _GPU_PROBE_CACHE
+    if _GPU_PROBE_CACHE is None:
+        try:
+            _GPU_PROBE_CACHE = hearth_hw.gpus()
+        except Exception:  # noqa: BLE001 - hardware probing must never break chat()
+            _GPU_PROBE_CACHE = []
+    if not _GPU_PROBE_CACHE:
+        return 0
+    return max((g.get("vram_bytes") or 0) for g in _GPU_PROBE_CACHE)
+
+
+def _compute_num_ctx(base_url, model):
+    """Hardware-aware num_ctx for one (base_url, model) pair, plus a short
+    human-readable reason describing what was measured/assumed and why.
+    Never raises: an unqueryable model or an unrecognized architecture field
+    degrades to a conservative constant, and a GPU-less machine gets
+    FALLBACK_NUM_CTX outright (see _choose_num_ctx)."""
+    vram = _cached_gpu_vram_bytes()
+    if vram <= 0:
+        return FALLBACK_NUM_CTX, "no GPU detected; using the conservative default"
+    model_bytes = FALLBACK_MODEL_BYTES
+    kv_bytes_per_token = FALLBACK_KV_BYTES_PER_TOKEN
+    source = "conservative estimate (ollama /api/show unavailable)"
+    info = _probe_show(base_url, model)
+    if info:
+        got = []
+        mb = _model_bytes_from_show(info)
+        if mb:
+            model_bytes = mb
+            got.append("weights")
+        kv = _kv_bytes_per_token_from_show(info)
+        if kv:
+            kv_bytes_per_token = kv
+            got.append("kv/token")
+        if got:
+            source = "ollama /api/show ({})".format(", ".join(got))
+    ctx = _choose_num_ctx(vram, model_bytes, kv_bytes_per_token)
+    reason = ("{:.1f} GiB VRAM detected; model~{:,} bytes, kv~{:,} bytes/token "
+              "({}) -> num_ctx={}").format(vram / 1024 ** 3, model_bytes,
+                                           kv_bytes_per_token, source, ctx)
+    return ctx, reason
+
+
+def _log_num_ctx_decision(base_url, model, num_ctx, reason):
+    """Log a num_ctx decision to stderr exactly once per (base_url, model,
+    num_ctx), so an operator can see which context length was chosen and why
+    without a long session re-logging it every turn."""
+    key = (base_url, model, num_ctx)
+    if key in _NUM_CTX_LOGGED:
+        return
+    _NUM_CTX_LOGGED.add(key)
+    sys.stderr.write("[hearth-loop] num_ctx={} for model={} ({})\n".format(
+        num_ctx, model, reason))
+    sys.stderr.flush()
+
+
+def _resolve_num_ctx(base_url, model):
+    """The num_ctx to send for this (base_url, model). HEARTH_NUM_CTX
+    overrides everything when set to a positive integer (operator escape
+    hatch); otherwise a hardware-aware size is computed once per
+    (base_url, model) and cached for the rest of the process. Every decision
+    is logged (see _log_num_ctx_decision)."""
+    override = os.environ.get("HEARTH_NUM_CTX", "").strip()
+    if override:
+        try:
+            v = int(override)
+            if v > 0:
+                _log_num_ctx_decision(base_url, model, v, "HEARTH_NUM_CTX override")
+                return v
+        except ValueError:
+            pass
+    key = (base_url, model)
+    if key not in _NUM_CTX_CACHE:
+        _NUM_CTX_CACHE[key] = _compute_num_ctx(base_url, model)
+    ctx, reason = _NUM_CTX_CACHE[key]
+    _log_num_ctx_decision(base_url, model, ctx, reason)
+    return ctx
+
+
+def chat(base_url, model, messages, tools, timeout=300, options=None):
+    """One Ollama chat call with tools. options is Ollama's request-level
+    'options' dict (e.g. {"num_ctx": ...}); when omitted, a hardware-aware
+    num_ctx is chosen automatically (see _resolve_num_ctx), overridable
+    process-wide via HEARTH_NUM_CTX. Returns (message, tokens_in, tokens_out)."""
+    if options is None:
+        try:
+            num_ctx = _resolve_num_ctx(base_url, model)
+        except Exception:  # noqa: BLE001 - num_ctx selection must never break chat()
+            num_ctx = FALLBACK_NUM_CTX
+        options = {"num_ctx": num_ctx}
     body = json.dumps({"model": model, "messages": messages, "tools": tools,
-                       "stream": False}).encode()
+                       "options": options, "stream": False}).encode()
     req = urllib.request.Request(base_url.rstrip("/") + "/api/chat", data=body,
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -1371,6 +1613,215 @@ def _self_test():
         assert (_ctin, _ctout) == (21, 9), (_ctin, _ctout)
     finally:
         urllib.request.urlopen = _real_urlopen
+
+    # -- Hardware-aware num_ctx: pure ladder selection with synthetic --------
+    # -- hardware, exact expected values, independent of the test host -------
+    #
+    # 6GB card (an RTX 2060, the live host this defect was measured on) with
+    # real qwen2.5-coder-7b architecture numbers: 28 layers, 4 kv heads
+    # (GQA), 3584 hidden / 28 heads = 128 head_dim, fp16 kv cache:
+    # kv_bytes_per_token = 2*28*4*128*2 = 57344.
+    six_gb = 6 * 1024 ** 3
+    assert _choose_num_ctx(six_gb, 4_750_000_000, 57_344) == 16384, \
+        "6GB card + real qwen2.5-coder numbers should land on 16384"
+    # 32768 does not fit on this card at all (matches hearth_hw.fits() called
+    # directly against these numbers in the field measurement this task
+    # started from: 16384 fits with headroom, 32768 does not).
+    r32 = hearth_hw.fits(4_750_000_000, 32768, 57_344, six_gb)
+    assert r32["fits"] is False, r32
+
+    # 16GB and 24GB cards using the conservative fallback constants (as if
+    # /api/show were unreachable). 16GB must NOT reach 32768: only ~590MB of
+    # headroom would be left against an ~859MB required margin. 24GB reaches
+    # 32768 (ample headroom) but not 65536 -- which nicely lines up with
+    # Ollama's own real cutoffs (32768 at >=23GiB) despite this code never
+    # looking at Ollama's thresholds directly.
+    sixteen_gb = 16 * 1024 ** 3
+    assert _choose_num_ctx(sixteen_gb, FALLBACK_MODEL_BYTES,
+                           FALLBACK_KV_BYTES_PER_TOKEN) == 16384, \
+        "16GB card + fallback estimate should stop at 16384, not reach 32768"
+    twentyfour_gb = 24 * 1024 ** 3
+    assert _choose_num_ctx(twentyfour_gb, FALLBACK_MODEL_BYTES,
+                           FALLBACK_KV_BYTES_PER_TOKEN) == 32768, \
+        "24GB card + fallback estimate should reach 32768, not 65536"
+
+    # No GPU at all: never invent a large context.
+    assert _choose_num_ctx(0, FALLBACK_MODEL_BYTES, FALLBACK_KV_BYTES_PER_TOKEN) == FALLBACK_NUM_CTX
+    assert _choose_num_ctx(None, 1, 1) == FALLBACK_NUM_CTX
+
+    # A model whose weights alone exceed VRAM: even the floor rung fails, so
+    # the floor default is returned (nothing smaller exists on the ladder).
+    assert _choose_num_ctx(six_gb, 40_000_000_000, 0) == FALLBACK_NUM_CTX
+
+    # -- /api/show parsing: a real qwen2.5-coder-7b-shaped model_info --------
+    qwen_show = {
+        "details": {"quantization_level": "Q4_K_M"},
+        "model_info": {
+            "general.architecture": "qwen2",
+            "general.parameter_count": 7_600_000_000,
+            "qwen2.block_count": 28,
+            "qwen2.attention.head_count": 28,
+            "qwen2.attention.head_count_kv": 4,
+            "qwen2.embedding_length": 3584,
+        },
+    }
+    assert _model_bytes_from_show(qwen_show) == 4_750_000_000, _model_bytes_from_show(qwen_show)
+    assert _kv_bytes_per_token_from_show(qwen_show) == 57_344, _kv_bytes_per_token_from_show(qwen_show)
+
+    # Missing/garbage inputs degrade to None (caller falls back), never raise.
+    assert _model_bytes_from_show(None) is None
+    assert _model_bytes_from_show({}) is None
+    assert _model_bytes_from_show({"model_info": {}}) is None
+    assert _kv_bytes_per_token_from_show(None) is None
+    assert _kv_bytes_per_token_from_show({"model_info": {"general.architecture": "llama"}}) is None
+    # an unrecognized quant level falls back to the conservative bytes-per-param
+    unknown_quant = {"details": {"quantization_level": "MYSTERY_9"},
+                     "model_info": {"general.parameter_count": 1_000_000_000}}
+    assert _model_bytes_from_show(unknown_quant) == 1_000_000_000
+
+    # -- _probe_show: any failure (refused connection, bad JSON, timeout) is --
+    # -- swallowed to None, never raised. No real network call: stubbed. -----
+    def _refuse_urlopen(req, timeout=300):
+        raise OSError("connection refused (simulated, no live Ollama in tests)")
+    urllib.request.urlopen = _refuse_urlopen
+    try:
+        assert _probe_show("http://fake", "x") is None
+    finally:
+        urllib.request.urlopen = _real_urlopen
+
+    # -- Caching + end-to-end wiring, with hardware/global state saved and ---
+    # -- restored so this test cannot leak state into a later run -----------
+    _saved_gpu_cache = _GPU_PROBE_CACHE
+    _saved_ctx_cache = dict(_NUM_CTX_CACHE)
+    _saved_logged = set(_NUM_CTX_LOGGED)
+    globals()["_GPU_PROBE_CACHE"] = None
+    _NUM_CTX_CACHE.clear()
+    _NUM_CTX_LOGGED.clear()
+    try:
+        # hearth_hw.gpus() is probed at most once per process.
+        gpu_calls = []
+        real_gpus = hearth_hw.gpus
+
+        def _fake_gpus():
+            gpu_calls.append(1)
+            return [{"name": "A", "vram_bytes": 4 * 1024 ** 3, "vendor": "nvidia"},
+                   {"name": "B", "vram_bytes": 8 * 1024 ** 3, "vendor": "nvidia"}]
+        hearth_hw.gpus = _fake_gpus
+        try:
+            v1 = _cached_gpu_vram_bytes()
+            v2 = _cached_gpu_vram_bytes()
+            assert v1 == v2 == 8 * 1024 ** 3, (v1, v2)
+            assert len(gpu_calls) == 1, "gpus() must be probed at most once per process"
+        finally:
+            hearth_hw.gpus = real_gpus
+
+        # _compute_num_ctx end-to-end with a stubbed /api/show.
+        globals()["_GPU_PROBE_CACHE"] = [{"name": "fake", "vram_bytes": six_gb, "vendor": "nvidia"}]
+        real_probe_show = globals()["_probe_show"]
+        globals()["_probe_show"] = lambda base_url, model, timeout=5: qwen_show
+        try:
+            ctx, reason = _compute_num_ctx("http://fake", "qwen2.5-coder")
+            assert ctx == 16384, (ctx, reason)
+            assert "api/show" in reason and "16384" in reason, reason
+        finally:
+            globals()["_probe_show"] = real_probe_show
+
+        # _resolve_num_ctx: computed once per (base_url, model), then cached.
+        compute_calls = []
+        real_compute = globals()["_compute_num_ctx"]
+
+        def _fake_compute(b, m):
+            compute_calls.append((b, m))
+            return 12345, "test"
+        globals()["_compute_num_ctx"] = _fake_compute
+        try:
+            c1 = _resolve_num_ctx("http://a", "modelA")
+            c2 = _resolve_num_ctx("http://a", "modelA")
+            c3 = _resolve_num_ctx("http://a", "modelB")  # different model -> recomputed
+            assert (c1, c2, c3) == (12345, 12345, 12345), (c1, c2, c3)
+            assert compute_calls == [("http://a", "modelA"), ("http://a", "modelB")], compute_calls
+
+            # HEARTH_NUM_CTX overrides and skips hardware probing entirely.
+            del compute_calls[:]
+            os.environ["HEARTH_NUM_CTX"] = "9999"
+            try:
+                assert _resolve_num_ctx("http://a", "modelC") == 9999
+                assert compute_calls == [], "override must skip hardware probing entirely"
+            finally:
+                os.environ.pop("HEARTH_NUM_CTX", None)
+            # a non-numeric override is ignored; normal resolution still runs
+            os.environ["HEARTH_NUM_CTX"] = "not-a-number"
+            try:
+                assert _resolve_num_ctx("http://a", "modelD") == 12345
+            finally:
+                os.environ.pop("HEARTH_NUM_CTX", None)
+        finally:
+            globals()["_compute_num_ctx"] = real_compute
+
+        # Logging: one line per (base_url, model, num_ctx), not per call.
+        import io
+        real_stderr = sys.stderr
+        sys.stderr = io.StringIO()
+        try:
+            globals()["_NUM_CTX_LOGGED"] = set()
+            _log_num_ctx_decision("http://log", "m", 4096, "test reason")
+            _log_num_ctx_decision("http://log", "m", 4096, "test reason")  # duplicate: no 2nd line
+            logged = sys.stderr.getvalue()
+        finally:
+            sys.stderr = real_stderr
+        assert logged.count("num_ctx=4096") == 1, logged
+        assert "test reason" in logged, logged
+    finally:
+        globals()["_GPU_PROBE_CACHE"] = _saved_gpu_cache
+        _NUM_CTX_CACHE.clear()
+        _NUM_CTX_CACHE.update(_saved_ctx_cache)
+        _NUM_CTX_LOGGED.clear()
+        _NUM_CTX_LOGGED.update(_saved_logged)
+
+    # -- chat(): options flow through end-to-end, stubbed HTTP throughout ----
+    captured = {}
+
+    def _capture_urlopen(req, timeout=300):
+        captured["body"] = json.loads(req.data.decode())
+        return _FakeResp(json.dumps({"message": {"role": "assistant", "content": "ok"},
+                                     "prompt_eval_count": 1, "eval_count": 1}).encode())
+
+    real_resolve = globals()["_resolve_num_ctx"]
+    # An explicit options dict bypasses all hardware-aware selection entirely.
+    def _boom(base_url, model):
+        raise AssertionError("hardware-aware num_ctx must not run when options is given")
+    globals()["_resolve_num_ctx"] = _boom
+    urllib.request.urlopen = _capture_urlopen
+    try:
+        chat("http://fake", "mock", [], [], options={"num_ctx": 12321})
+        assert captured["body"]["options"] == {"num_ctx": 12321}, captured
+    finally:
+        urllib.request.urlopen = _real_urlopen
+        globals()["_resolve_num_ctx"] = real_resolve
+
+    # Omitted options: chat() calls the hardware-aware resolver and sends its
+    # result as options.num_ctx.
+    globals()["_resolve_num_ctx"] = lambda base_url, model: 7777
+    urllib.request.urlopen = _capture_urlopen
+    try:
+        chat("http://fake", "mock", [], [])
+        assert captured["body"]["options"] == {"num_ctx": 7777}, captured
+    finally:
+        urllib.request.urlopen = _real_urlopen
+        globals()["_resolve_num_ctx"] = real_resolve
+
+    # A raising resolver must never break chat(): it degrades to
+    # FALLBACK_NUM_CTX instead of propagating the exception.
+    def _raise_resolve(base_url, model):
+        raise RuntimeError("boom")
+    globals()["_resolve_num_ctx"] = _raise_resolve
+    urllib.request.urlopen = _capture_urlopen
+    try:
+        chat("http://fake", "mock", [], [])
+        assert captured["body"]["options"] == {"num_ctx": FALLBACK_NUM_CTX}, captured
+    finally:
+        urllib.request.urlopen = _real_urlopen
+        globals()["_resolve_num_ctx"] = real_resolve
 
     print("hearth-loop self-test OK:", final)
     return 0
