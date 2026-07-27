@@ -20,6 +20,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -112,22 +113,53 @@ def _read_text(full):
         return fh.read()
 
 
+def _copy_mode(target, tmp):
+    """Best-effort: carry the target's existing permissions onto the temp
+    file before the atomic replace. A brand-new temp file otherwise gets
+    default permissions (umask-derived on POSIX, inherited ACL on Windows),
+    so an edit of a deliberately-restricted file would silently widen or
+    narrow it on every write. A missing target (first write) has nothing to
+    copy, so the temp file just keeps the OS default. Never lets a
+    permissions problem break the write itself: a successful write with
+    default permissions beats a failed write. On Windows os.chmod only
+    really carries the read-only bit; that is all the platform exposes.
+    """
+    try:
+        mode = os.stat(target).st_mode
+    except OSError:
+        return
+    try:
+        os.chmod(tmp, mode)
+    except OSError:
+        pass
+
+
 def _write_text_atomic(full, content, newline=""):
-    """Write UTF-8 text via a temp file in the same directory, then os.replace.
+    """Write UTF-8 text via a uniquely-named temp file in the same directory,
+    then os.replace onto the target.
 
     Atomic so a failure part-way through cannot leave a truncated file. The
     unpatched code opened the target with mode 'w' (truncating it) before
     encoding, so an encoding error destroyed the original.
+
+    The temp name is derived from the target's own basename plus the unique
+    suffix tempfile.mkstemp guarantees, so two concurrent writes to
+    different files in the same directory from the same process never share
+    a temp path. A name keyed only on the pid does: one write's temp file
+    would clobber the other's before its os.replace runs, which surfaces as
+    a loud WinError 32 on Windows (mandatory locking) but succeeds silently
+    on POSIX, cross-contaminating both destinations with no error at all.
 
     Returns the number of BYTES written, which is what the caller should report.
     """
     full = hearth_paths.long_path(full)
     parent = os.path.dirname(full) or "."
     data = content.encode("utf-8")
-    tmp = os.path.join(parent, ".hearth-tmp-{}".format(os.getpid()))
+    fd, tmp = tempfile.mkstemp(prefix=".hearth-tmp-" + os.path.basename(full) + "-", dir=parent)
     try:
-        with open(tmp, "w", encoding="utf-8", newline=newline) as fh:
+        with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as fh:
             fh.write(content)
+        _copy_mode(full, tmp)
         os.replace(tmp, full)
     except BaseException:
         try:
@@ -259,7 +291,7 @@ def tool_search_files(args, workspace):
             except ValueError:
                 continue  # a link or an odd name that resolves outside the workspace
             try:
-                if os.path.getsize(fp) > 2_000_000:
+                if os.path.getsize(hearth_paths.long_path(fp)) > 2_000_000:
                     continue
                 with open(hearth_paths.long_path(fp), "r", encoding="utf-8", errors="replace", newline="") as fh:
                     for i, line in enumerate(fh, 1):
@@ -327,7 +359,10 @@ def tool_edit_file(args, workspace):
     else:
         content = content.replace(find, replace, 1)
         n = 1
-    _write_text_atomic(full, content, newline="")
+    try:
+        _write_text_atomic(full, content, newline="")
+    except OSError as exc:
+        return "error: {}".format(_explain_oserror(exc))
     return "edited {}: {} replacement{}".format(args.get("path"), n, "s" if n != 1 else "")
 
 
@@ -668,10 +703,11 @@ def tool_read_self_config(args, workspace):
     except ValueError as exc:
         return "error: {}".format(exc)
     try:
-        with open(full) as fh:
-            return fh.read()[:MAX_OUT]
+        return _read_text(full)[:MAX_OUT]
+    except UnicodeDecodeError:
+        return "error: {} is not valid UTF-8 text (binary file?)".format(args.get("path"))
     except OSError as exc:
-        return "error: {}".format(exc)
+        return "error: {}".format(_explain_oserror(exc))
 
 
 def tool_git_status(args, workspace):
@@ -709,13 +745,15 @@ def tool_write_self_config(args, workspace):
     content = args.get("content", "")
     parent = os.path.dirname(full)
     if parent:
-        os.makedirs(parent, exist_ok=True)
+        try:
+            os.makedirs(hearth_paths.long_path(parent), exist_ok=True)
+        except OSError as exc:
+            return "error: cannot create directory: {}".format(exc)
     try:
-        with open(full, "w") as fh:
-            fh.write(content)
+        n = _write_text_atomic(full, content)
     except OSError as exc:
-        return "error: {}".format(exc)
-    return "wrote {} ({} bytes) into the hearth repo".format(args.get("path"), len(content))
+        return "error: {}".format(_explain_oserror(exc))
+    return "wrote {} ({} bytes) into the hearth repo".format(args.get("path"), n)
 
 
 def tool_nix_check(args, workspace):
@@ -805,7 +843,7 @@ def tool_replace_in_files(args, workspace):
             except ValueError:
                 continue  # a link or an odd name that resolves outside the workspace
             try:
-                if os.path.getsize(fp) > 2_000_000:
+                if os.path.getsize(hearth_paths.long_path(fp)) > 2_000_000:
                     continue
                 content = _read_text(fp)
             except (OSError, UnicodeDecodeError):
@@ -1363,16 +1401,54 @@ def _self_test():
         # The byte count reported is real bytes on disk, not characters.
         assert "({} bytes)".format(len(sample.encode("utf-8"))) in res, res
 
-        # A failed write must not destroy the existing file.
+        # A successful write leaves no temp file behind.
         target = os.path.join(_ws3, "keep.txt")
         with open(target, "w", encoding="utf-8") as fh:
             fh.write("PRECIOUS")
-        os.makedirs(os.path.join(_ws3, "keep.txt.d"), exist_ok=True)
-        # Writing succeeds normally; assert the atomic path leaves no partial file.
         tool_write_file({"path": "keep.txt", "content": "REPLACED"}, _ws3)
         with open(target, encoding="utf-8") as fh:
             assert fh.read() == "REPLACED"
         assert not [f for f in os.listdir(_ws3) if f.startswith(".hearth-tmp")], "temp file leaked"
+
+        # A failed write must not destroy the existing file, must not leave a
+        # temp file behind, and must surface a useful error string rather
+        # than crash. Inject a real failure at the atomic-replace step (not
+        # just a bystander directory that has no bearing on the outcome).
+        target2 = os.path.join(_ws3, "keep2.txt")
+        with open(target2, "w", encoding="utf-8") as fh:
+            fh.write("PRECIOUS2")
+        _real_replace = os.replace
+
+        def _boom_replace(*_a, **_kw):
+            raise OSError(32, "simulated: file in use")
+
+        os.replace = _boom_replace
+        try:
+            out = tool_write_file({"path": "keep2.txt", "content": "REPLACED2"}, _ws3)
+        finally:
+            os.replace = _real_replace
+        assert out.startswith("error:"), ("a failed write must report an error, not crash", out)
+        with open(target2, encoding="utf-8") as fh:
+            assert fh.read() == "PRECIOUS2", "a failed write destroyed the original file"
+        assert not [f for f in os.listdir(_ws3) if f.startswith(".hearth-tmp")], \
+            "a failed write left a temp file behind"
+
+        # Permissions on the destination survive an atomic replace: the temp
+        # file is created fresh (default permissions), so without carrying
+        # the original mode across, an edit would silently widen or narrow
+        # access on every write. POSIX has meaningful permission bits to
+        # check here. Windows os.chmod only exposes the read-only attribute,
+        # and a genuinely read-only destination blocks os.replace itself
+        # (WinError 5, already surfaced through _explain_oserror), so there
+        # is nothing further to assert on that platform.
+        if not hearth_paths.is_windows():
+            permf = os.path.join(_ws3, "restricted.txt")
+            with open(permf, "w", encoding="utf-8") as fh:
+                fh.write("secret")
+            os.chmod(permf, 0o600)
+            tool_write_file({"path": "restricted.txt", "content": "secret2"}, _ws3)
+            assert (os.stat(permf).st_mode & 0o777) == 0o600, \
+                "permissions were not preserved across an atomic replace"
 
         # An undecodable file is skipped, never truncated.
         binf = os.path.join(_ws3, "bin.dat")
