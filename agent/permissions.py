@@ -33,6 +33,17 @@ RISK = {
     "list_generations": "safe",
     "system_health": "safe",
     "read_self_config": "safe",
+    # git_status/git_diff are genuinely read-only ONLY because hearth_tools
+    # runs them via an argv list straight to subprocess.run, with no shell
+    # in between. That was not always true: a prior version built a shell
+    # command STRING for these two tools with only space-aware quoting on
+    # git_diff's model-supplied 'path' argument, which let a value like
+    # 'x&whoami' run a second, unexamined command with no approval prompt in
+    # every mode (including 'plan', which every doc describes as read-only)
+    # because "safe" here is exactly what grants that free pass. Re-verify
+    # the argv-only property in hearth_tools.py before ever touching this
+    # value; see the property test there over every RISK=="safe" entry in
+    # WINDOWS_TOOLS, which exists specifically to catch this again.
     "git_status": "safe",
     "git_diff": "safe",
     "write_file": "edit",

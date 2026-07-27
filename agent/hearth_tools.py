@@ -42,12 +42,6 @@ def _bin(name, fallback):
     return shutil.which(name) or fallback
 
 
-def _q(path):
-    """Quote a path for a shell command line. Git on Windows commonly lives
-    under 'C:\\Program Files\\Git\\...', which contains a space."""
-    return '"{}"'.format(path) if " " in path else path
-
-
 HEARTH_REPO = os.environ.get("HEARTH_REPO", "/home/operator/hearth-desktop")
 _SYSTEM_PROFILES = "/nix/var/nix/profiles"
 
@@ -828,28 +822,76 @@ def tool_read_self_config(args, workspace):
         return "error: {}".format(_explain_oserror(exc))
 
 
+def _run_git_argv(argv, cwd, timeout=60):
+    """Run a git argv list directly with subprocess.run: no shell involved.
+
+    This is the fix for a confirmed RCE. tool_git_status and tool_git_diff
+    used to build a shell command STRING and hand it to
+    hearth_proc.run_contained, which runs it through cmd.exe /d /s /c or
+    /bin/sh -c. The model-supplied 'path' argument to git_diff was
+    interpolated into that string with only space-aware quoting (_q, now
+    deleted), so a path like 'x&whoami' was not quoted at all and '&' ran
+    'whoami' as a second command. Both tools were classified "safe" in
+    permissions.RISK, so this ran with no approval prompt, in 'plan' mode,
+    which every doc describes as read-only.
+
+    An argv list has no such hole: the OS hands each element to the child
+    process exactly as given, with no shell parsing step in between, so
+    there is nothing for '&', ';', '|', backticks, or '$()' to mean. A path
+    containing a space (e.g. 'C:\\Program Files\\Git\\...') also just works,
+    with no quoting needed at all, which is what made _q exist in the first
+    place and is exactly why it could never be fixed by quoting harder: see
+    the module-level notes in permissions.py's _command_head docstring for
+    why string-level defenses against a real shell cannot be made complete.
+
+    Output is decoded as UTF-8 with replacement, matching hearth_proc's own
+    behaviour, so a byte outside the host codepage does not crash this call
+    or silently read as empty output.
+    """
+    try:
+        proc = subprocess.run(argv, cwd=cwd, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 124, "", "git command timed out after {}s".format(timeout)
+    except OSError as exc:
+        return 127, "", str(exc)
+    out = proc.stdout.decode("utf-8", errors="replace")
+    err = proc.stderr.decode("utf-8", errors="replace")
+    return proc.returncode, out, err
+
+
 def tool_git_status(args, workspace):
-    """Show git status of the run workspace. Read-only."""
+    """Show git status of the run workspace. Read-only.
+
+    Runs via argv (see _run_git_argv), never a shell string, and scoped to
+    the run workspace (not HEARTH_REPO)."""
     git = shutil.which("git")
     if not git:
         return "git is not installed or not on PATH"
-    rc, out, err, _to = hearth_proc.run_contained(
-        "{} status --short --branch".format(_q(git)), workspace, timeout=60)
+    rc, out, err = _run_git_argv([git, "status", "--short", "--branch"], workspace, timeout=60)
     if rc != 0:
+        # Return code is checked, not masked: a git failure (not a repo, a
+        # corrupt index, etc.) is reported as an error rather than silently
+        # printing "(clean)" as if status had actually succeeded.
         return "error: {}".format((err or out or "git failed").strip()[:500])
     return out.strip() or "(clean)"
 
 
 def tool_git_diff(args, workspace):
-    """Show git diff of the run workspace (optionally for one path). Read-only."""
+    """Show git diff of the run workspace (optionally for one path). Read-only.
+
+    Runs via argv (see _run_git_argv): the model-supplied 'path' reaches git
+    as a single argv element, exactly as typed, with no shell in between to
+    interpret it. Scoped to the run workspace (not HEARTH_REPO)."""
     git = shutil.which("git")
     if not git:
         return "git is not installed or not on PATH"
-    cmd = "{} diff --stat".format(_q(git))
+    argv = [git, "diff", "--stat"]
     if args.get("path"):
-        cmd += " -- {}".format(_q(args["path"]))
-    rc, out, err, _to = hearth_proc.run_contained(cmd, workspace, timeout=60)
+        argv += ["--", args["path"]]
+    rc, out, err = _run_git_argv(argv, workspace, timeout=60)
     if rc != 0:
+        # Return code is checked, not masked: a git failure is reported as
+        # an error rather than silently printing "(no changes)".
         return "error: {}".format((err or out or "git failed").strip()[:500])
     return out.strip() or "(no changes)"
 
@@ -1718,6 +1760,155 @@ def _self_test():
         assert "not a git repository" in r.lower() or "git is not installed" in r.lower(), r
     finally:
         _shutil.rmtree(_ws6, ignore_errors=True)
+
+    # --- RCE regression: tool_git_diff/tool_git_status run git via argv,
+    # never a shell string. This is a direct regression test for a confirmed,
+    # reachable RCE: git_diff's 'path' argument used to be interpolated into
+    # a shell command string with only space-aware quoting, so
+    # permissions.decide('plan', 'git_diff', {'path': 'x&whoami'}) returned
+    # "allow" (git_diff is RISK-classified "safe") and the tool then ran
+    # 'whoami' as a second shell command with no approval prompt.
+    #
+    # Assert on an OBSERVABLE SIDE EFFECT (a marker file failing to appear),
+    # not just the returned string: a broken implementation could still
+    # return a plausible-looking "error: pathspec ... did not match" string
+    # while having executed the payload first (shell command chaining runs
+    # left to right regardless of whether the final git invocation
+    # succeeds), so checking only the return value would not have caught
+    # this bug.
+    if shutil.which("git"):
+        _ws_rce = os.path.realpath(_tempfile.mkdtemp(prefix="hearth-git-rce-"))
+        try:
+            subprocess.run(["git", "init", "--quiet"], cwd=_ws_rce, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=_ws_rce, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=_ws_rce, capture_output=True)
+            with open(os.path.join(_ws_rce, "f.txt"), "w") as fh:
+                fh.write("one\n")
+            subprocess.run(["git", "add", "f.txt"], cwd=_ws_rce, capture_output=True)
+            subprocess.run(["git", "commit", "--quiet", "-m", "init"], cwd=_ws_rce, capture_output=True)
+            with open(os.path.join(_ws_rce, "f.txt"), "w") as fh:
+                fh.write("two\n")
+
+            marker = os.path.join(_ws_rce, "PWNED.txt")
+            # Deliberately no spaces in any payload. The old vulnerable _q()
+            # only quoted a value that CONTAINED a space, so a payload with
+            # one (e.g. "touch PWNED.txt", "type nul") would get wrapped in
+            # quotes and accidentally neutralized -- a false negative that
+            # would prove nothing. "echo." (Windows) and a bare redirection
+            # (POSIX) create the marker with no space anywhere, matching the
+            # task's own reproduction ('x&echo.>PWNED.txt').
+            if hearth_paths.is_windows():
+                payloads = [
+                    "x&echo.>PWNED.txt",
+                    "x&&echo.>PWNED.txt",
+                    "x|echo.>PWNED.txt",
+                    "x\necho.>PWNED.txt",
+                ]
+            else:
+                payloads = [
+                    "x;>PWNED.txt",
+                    "x|>PWNED.txt",
+                    "x`>PWNED.txt`",
+                    "x$(>PWNED.txt)",
+                    "x\n>PWNED.txt",
+                ]
+            for payload in payloads:
+                tool_git_diff({"path": payload}, _ws_rce)
+                assert not os.path.exists(marker), (
+                    "tool_git_diff let a shell-metacharacter payload reach a shell "
+                    "(marker file created): path={!r}".format(payload))
+                assert not os.path.exists(marker)  # re-check: paranoia costs nothing here
+
+            # tool_git_status takes no model-controlled argument today, but
+            # prove the argv-only property directly on the plumbing it now
+            # shares with tool_git_diff (_run_git_argv), so a future change
+            # that starts threading arguments through tool_git_status trips
+            # this immediately rather than silently reopening the bug class.
+            rc_probe, out_probe, err_probe = _run_git_argv(
+                [shutil.which("git"), "status", "--short", "x&whoami"], _ws_rce, timeout=10)
+            assert not os.path.exists(marker)
+
+            # A path containing a space must still work: this is the entire
+            # reason the old (now-deleted) _q() quoting helper existed, and
+            # argv handles it with no quoting at all.
+            _spaced_dir = os.path.join(_ws_rce, "has space")
+            os.makedirs(_spaced_dir, exist_ok=True)
+            _spaced_file = os.path.join(_spaced_dir, "f.txt")
+            with open(_spaced_file, "w") as fh:
+                fh.write("one\n")
+            subprocess.run(["git", "add", "has space/f.txt"], cwd=_ws_rce, capture_output=True)
+            with open(_spaced_file, "w") as fh:
+                fh.write("two\n")
+            out_spaced = tool_git_diff({"path": "has space/f.txt"}, _ws_rce)
+            assert not out_spaced.startswith("error:"), out_spaced
+            assert "f.txt" in out_spaced, out_spaced
+
+            # Return code is checked, not masked: a genuine git failure (an
+            # invalid pathspec, here) must be reported as an error, never
+            # silently printed as "(no changes)" the way a swallowed
+            # non-zero exit would read. A merely nonexistent path is NOT
+            # this case: git diff on a pathspec that matches nothing exits 0
+            # with empty output, which is correctly "(no changes)".
+            bogus = tool_git_diff({"path": ":(icase,zzz)f.txt"}, _ws_rce)
+            assert bogus.startswith("error:"), bogus
+            assert bogus.strip() != "(no changes)", bogus
+        finally:
+            _shutil.rmtree(_ws_rce, ignore_errors=True)
+    else:
+        print("warning: git not on PATH, skipping git RCE regression tests")
+
+    # --- Property test: every WINDOWS_TOOLS tool classified "safe" in
+    # permissions.RISK must never let its arguments reach a shell.
+    #
+    # This is the regression guard that actually matters, because the class
+    # of bug found here is "a safe-classified tool gained a shell": a tool
+    # marked "safe" is auto-allowed in plan mode with no approval prompt, so
+    # if any future edit routes a safe tool's arguments through a shell
+    # string (the exact mistake tool_git_diff made), this trips immediately
+    # instead of waiting for someone to notice in production.
+    #
+    # Generic over WINDOWS_TOOLS's own parameter schema (TOOLS[i]["parameters"])
+    # rather than hardcoding which tools take which arguments, so a newly
+    # added safe tool is covered automatically without editing this test.
+    import permissions as _permissions
+    _marker_name = "HEARTH_SHELL_PROBE_MARKER.txt"
+    # No spaces in any payload -- see the comment on the RCE regression test
+    # above for why a spaced payload (e.g. "touch X") would be a false
+    # negative against the old _q()-style "quote only if it has a space"
+    # defense.
+    if hearth_paths.is_windows():
+        _shell_payloads = [
+            "x&echo.>{}".format(_marker_name),
+            "x&&echo.>{}".format(_marker_name),
+            "x|echo.>{}".format(_marker_name),
+            "x\necho.>{}".format(_marker_name),
+        ]
+    else:
+        _shell_payloads = [
+            "x;>{}".format(_marker_name),
+            "x|>{}".format(_marker_name),
+            "x`>{}`".format(_marker_name),
+            "x$(>{})".format(_marker_name),
+            "x\n>{}".format(_marker_name),
+        ]
+    _safe_windows_tools = [t for t in WINDOWS_TOOLS if _permissions.risk_of(t) == "safe"]
+    assert _safe_windows_tools, "expected at least one safe-classified Windows tool to check"
+    assert "git_diff" in _safe_windows_tools and "git_status" in _safe_windows_tools, _safe_windows_tools
+    for _tname in _safe_windows_tools:
+        _tspec = _BY_NAME[_tname]
+        _string_params = [p for p, s in _tspec["parameters"].get("properties", {}).items()
+                          if s.get("type") == "string"]
+        for _payload in _shell_payloads:
+            _ws_probe = os.path.realpath(_tempfile.mkdtemp(prefix="hearth-shellprobe-"))
+            try:
+                _call_args = {p: _payload for p in _string_params}
+                execute_tool(_tname, _call_args, _ws_probe)
+                _marker_path = os.path.join(_ws_probe, _marker_name)
+                assert not os.path.exists(_marker_path), (
+                    "safe-classified tool {!r} let a shell-metacharacter payload reach a "
+                    "shell (marker file created): args={}".format(_tname, _call_args))
+            finally:
+                _shutil.rmtree(_ws_probe, ignore_errors=True)
 
     # run_command reports a timeout promptly rather than blocking on
     # grandchildren, and never reports exit=0 with empty output for a command
