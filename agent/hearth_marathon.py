@@ -115,8 +115,14 @@ def run_marathon(goal, model, workspace, db=DEFAULT_DB, agent_id="marathon", mod
     tg_wait = tg_wait or hearth_telegram.wait_for_reply
     if emit_fn is None:
         emit_fn, _ = hearth_loop.make_db_transport(db, agent_id)
-    turn_chat_fn = turn_chat_fn or (lambda msgs: hearth_loop.chat(
-        ollama_url, model, msgs, hearth_tools.ollama_tool_specs()))
+    def _default_turn(msgs):
+        # hearth_loop.chat returns (message, tokens_in, tokens_out); turn_chat_fn's
+        # contract stays a 2-tuple (message, tokens_out), so adapt here.
+        msg, _tokens_in, tokens_out = hearth_loop.chat(
+            ollama_url, model, msgs, hearth_tools.ollama_tool_specs())
+        return msg, tokens_out
+
+    turn_chat_fn = turn_chat_fn or _default_turn
     os.makedirs(workspace, exist_ok=True)
 
     def state(s, d):
@@ -282,6 +288,31 @@ def _self_test():
     s3 = con.execute("SELECT state FROM agent_state WHERE agent_id='mv'").fetchone()
     con.close()
     assert s3 and s3[0] == "DONE", s3
+
+    # Regression: hearth_loop.chat returns a 3-tuple (message, tokens_in,
+    # tokens_out). run_marathon's default turn_chat_fn (used whenever no
+    # turn_chat_fn is injected, i.e. every real run) must adapt that 3-tuple
+    # down to the 2-tuple hearth_loop._run_turns unpacks at
+    # "msg, tout = chat_fn(messages)". If that adapter is ever removed or
+    # reverted to call hearth_loop.chat directly, this raises "too many
+    # values to unpack" instead of just failing an assert, exactly like the
+    # crash this test exists to catch. turn_chat_fn is intentionally left
+    # unset here so the module's real default adapter runs.
+    _real_chat = hearth_loop.chat
+    hearth_loop.chat = lambda *a, **k: (
+        {"role": "assistant", "content": "did the work"}, 11, 6)
+    try:
+        d4 = tempfile.mkdtemp(prefix="marathon-arity-")
+        db4 = os.path.join(d4, "a.db")
+        hearth_state.ensure_schema(db4)
+        sqlite3.connect(db4).executescript(hearth_loop.TRANSCRIPT_SCHEMA)
+        f4 = run_marathon("noop", "mock", d4, db=db4, agent_id="mar-arity",
+                          mode="bypass", max_rounds=1, checkin=False,
+                          tg_token="", tg_chat="", judge_fn=lambda msgs: "DONE",
+                          tg_send=lambda *a: True)
+        assert f4 == "did the work", f4
+    finally:
+        hearth_loop.chat = _real_chat
 
     print("hearth-marathon self-test OK")
     return 0

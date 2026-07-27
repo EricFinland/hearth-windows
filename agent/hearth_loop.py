@@ -667,14 +667,17 @@ def _resolve_auto_model(model, goal, allowed_tools, emit, db, agent_name):
     return chosen
 
 
-def run_loop(goal, model, workspace, db=_db_path(), agent_name="agent",
+def run_loop(goal, model, workspace, db=None, agent_name="agent",
              ollama_url=DEFAULT_OLLAMA, max_iters=MAX_ITERS, chat_fn=None,
              mode="auto", auto_allow=(), emit_fn=None, control_fn=None, recall=True,
              allowed_tools=None):
     """Drive a one-shot agent run. chat_fn/emit_fn/control_fn are injectable for
     testing; by default the loop talks Ollama and reads/writes the JSON protocol
     on stdin/stdout. allowed_tools is the run's capability manifest; when None it
-    falls back to HEARTH_ALLOWED_TOOLS from the environment (the spawn path)."""
+    falls back to HEARTH_ALLOWED_TOOLS from the environment (the spawn path).
+    db defaults to _db_path(), resolved at call time (not import time) so a
+    HEARTH_DB set after import still takes effect."""
+    db = db if db is not None else _db_path()
     if allowed_tools is None:
         allowed_tools = _env_manifest()
     emit = emit_fn or _stdout_emit
@@ -731,13 +734,16 @@ def run_loop(goal, model, workspace, db=_db_path(), agent_name="agent",
     return final, error
 
 
-def run_session(model, workspace, db=_db_path(), agent_name="session",
+def run_session(model, workspace, db=None, agent_name="session",
                 ollama_url=DEFAULT_OLLAMA, max_iters=MAX_ITERS, chat_fn=None,
                 mode="auto", auto_allow=(), emit_fn=None, control_fn=None,
                 allowed_tools=None):
     """Long-lived interactive session. Reads user_message / set_mode / stop from
     the control channel, runs agent turns per user_message, and streams events.
-    Ends on stop or EOF. Conversation context persists across messages."""
+    Ends on stop or EOF. Conversation context persists across messages.
+    db defaults to _db_path(), resolved at call time (not import time) so a
+    HEARTH_DB set after import still takes effect."""
+    db = db if db is not None else _db_path()
     if allowed_tools is None:
         allowed_tools = _env_manifest()
     emit = emit_fn or _stdout_emit
@@ -1329,6 +1335,42 @@ def _self_test():
     assert _usage == (17, 42), _usage
     _usage = _usage_from_response({})
     assert _usage == (0, 0), _usage
+
+    # Regression: chat() itself must return a 3-tuple (message, tokens_in,
+    # tokens_out), pinned here against a stubbed HTTP response so no live
+    # Ollama is needed. Every direct caller of hearth_loop.chat (hearth_evolve,
+    # hearth_grow, hearth_marathon) unpacks 3 values from it; if this drifts
+    # back to a 2-tuple, or a 4-tuple, this fails loudly here instead of as a
+    # ValueError on a real host.
+    class _FakeResp:
+        def __init__(self, body):
+            self._body = body
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    _real_urlopen = urllib.request.urlopen
+
+    def _fake_urlopen(req, timeout=300):
+        return _FakeResp(json.dumps({
+            "message": {"role": "assistant", "content": "hi"},
+            "prompt_eval_count": 21, "eval_count": 9}).encode())
+
+    urllib.request.urlopen = _fake_urlopen
+    try:
+        _chat_result = chat("http://fake", "mock", [], [])
+        assert len(_chat_result) == 3, ("chat() arity drifted", _chat_result)
+        _cmsg, _ctin, _ctout = _chat_result
+        assert _cmsg == {"role": "assistant", "content": "hi"}, _cmsg
+        assert (_ctin, _ctout) == (21, 9), (_ctin, _ctout)
+    finally:
+        urllib.request.urlopen = _real_urlopen
 
     print("hearth-loop self-test OK:", final)
     return 0

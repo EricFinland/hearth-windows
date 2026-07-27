@@ -55,8 +55,14 @@ def run_evolve(goal, model, db=DEFAULT_DB, agent_id="evolve", ollama_url=DEFAULT
     nix_check_fn = nix_check_fn or (lambda: hearth_tools.execute_tool("nix_check", {}, repo))
     if emit_fn is None:
         emit_fn, _ = hearth_loop.make_db_transport(db, agent_id)
-    turn_chat_fn = turn_chat_fn or (lambda msgs: hearth_loop.chat(
-        ollama_url, model, msgs, hearth_tools.ollama_tool_specs()))
+    def _default_turn(msgs):
+        # hearth_loop.chat returns (message, tokens_in, tokens_out); turn_chat_fn's
+        # contract stays a 2-tuple (message, tokens_out), so adapt here.
+        msg, _tokens_in, tokens_out = hearth_loop.chat(
+            ollama_url, model, msgs, hearth_tools.ollama_tool_specs())
+        return msg, tokens_out
+
+    turn_chat_fn = turn_chat_fn or _default_turn
     if tg_token is None:
         tg_token = hearth_tools._resolve_cred("telegram_token") or os.environ.get("TELEGRAM_BOT_TOKEN", "")
     if tg_chat is None:
@@ -208,6 +214,31 @@ def _self_test():
     s = con.execute("SELECT state FROM agent_state WHERE agent_id='ev2'").fetchone()
     con.close()
     assert s and s[0] == "ERRORED", s
+
+    # Regression: hearth_loop.chat returns a 3-tuple (message, tokens_in,
+    # tokens_out). run_evolve's default turn_chat_fn (used whenever no
+    # turn_chat_fn is injected, i.e. every real run) must adapt that 3-tuple
+    # down to the 2-tuple hearth_loop._run_turns unpacks at
+    # "msg, tout = chat_fn(messages)". If that adapter is ever removed or
+    # reverted to call hearth_loop.chat directly, this raises "too many
+    # values to unpack" instead of just failing an assert, exactly like the
+    # crash this test exists to catch. turn_chat_fn is intentionally left
+    # unset here so the module's real default adapter runs.
+    _real_chat = hearth_loop.chat
+    hearth_loop.chat = lambda *a, **k: (
+        {"role": "assistant", "content": "edited via default adapter"}, 9, 4)
+    try:
+        d3 = tempfile.mkdtemp(prefix="evolve-arity-")
+        db3 = os.path.join(d3, "a.db")
+        hearth_state.ensure_schema(db3)
+        sqlite3.connect(db3).executescript(hearth_loop.TRANSCRIPT_SCHEMA)
+        os.makedirs(os.path.join(d3, ".git"))
+        m3 = run_evolve("noop", "mock", db=db3, agent_id="ev3", repo=d3, max_rounds=1,
+                        nix_check_fn=lambda: "nix_check PASS\nok", git_fn=gitf,
+                        tg_send=tg, tg_token="T", tg_chat="1")
+        assert m3 and "SUCCESS" in m3, m3
+    finally:
+        hearth_loop.chat = _real_chat
 
     print("hearth-evolve self-test OK")
     return 0

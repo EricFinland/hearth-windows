@@ -67,8 +67,13 @@ def _clean_idea(text):
 def propose_idea(model, ollama_url, lessons_ctx, attempted, chat_fn=None):
     """Ask the model for the next improvement, informed by past lessons and the
     ideas already tried this run. Returns a one-line goal, or '' if none."""
-    chat_fn = chat_fn or (lambda msgs: hearth_loop.chat(
-        ollama_url, model, msgs, None))
+    def _default_chat(msgs):
+        # hearth_loop.chat returns (message, tokens_in, tokens_out); chat_fn's
+        # contract stays a 2-tuple (message, tokens_out), so adapt here.
+        msg, _tokens_in, tokens_out = hearth_loop.chat(ollama_url, model, msgs, None)
+        return msg, tokens_out
+
+    chat_fn = chat_fn or _default_chat
     tried = "\n".join("- " + a for a in attempted) or "(none yet)"
     user = ("{}\n\nAlready attempted this run (do NOT repeat any of these):\n{}\n\n"
             "Propose the next improvement now.").format(lessons_ctx or "(no lessons yet)", tried)
@@ -288,6 +293,22 @@ def _self_test():
     idea = propose_idea("m", "url", "Relevant lessons: be careful", ["old idea"], chat_fn=chat)
     assert idea == "Add a uptime field to system_health", idea
     assert "be careful" in seen["user"] and "old idea" in seen["user"], seen
+
+    # Regression: hearth_loop.chat returns a 3-tuple (message, tokens_in,
+    # tokens_out). propose_idea's default chat_fn (used whenever no chat_fn is
+    # injected, i.e. every real cycle) must adapt that 3-tuple down to the
+    # 2-tuple this module unpacks at "msg, _ = chat_fn(...)". If that adapter
+    # is ever removed or reverted to call hearth_loop.chat directly, this
+    # raises "too many values to unpack" instead of just failing an assert,
+    # exactly like the crash this test exists to catch.
+    _real_chat = hearth_loop.chat
+    hearth_loop.chat = lambda *a, **k: (
+        {"role": "assistant", "content": "Add retry backoff to the queue worker"}, 13, 6)
+    try:
+        idea_arity = propose_idea("m", "url", "", [])
+        assert idea_arity == "Add retry backoff to the queue worker", idea_arity
+    finally:
+        hearth_loop.chat = _real_chat
 
     # run_growth: drive the loop with injected seams. Cycle 2's evolve "fails"
     # (returns None) to exercise both branches.

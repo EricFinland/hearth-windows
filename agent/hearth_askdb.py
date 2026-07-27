@@ -29,7 +29,6 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hearth_paths  # noqa: E402
 
-DEFAULT_DB = hearth_paths.db_path()
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "llama3.2:3b"
 
@@ -223,7 +222,7 @@ def ask(question, db=None, chat_fn=None):
     ask the model to summarize, returning {"ok": True, "question", "sql",
     "columns", "rows", "summary"}. Any failure comes back as {"ok": False, ...}.
     """
-    db = db or os.environ.get("HEARTH_DB", DEFAULT_DB)
+    db = db or hearth_paths.db_path()
     if chat_fn is None:
         return {"ok": False, "error": "no chat function provided",
                 "sql": None}
@@ -423,7 +422,7 @@ def _self_test():
 def main(argv=None):
     p = argparse.ArgumentParser(prog="hearth-askdb")
     p.add_argument("question", nargs="?", help="a question in plain English")
-    p.add_argument("--db", default=os.environ.get("HEARTH_DB", DEFAULT_DB))
+    p.add_argument("--db", default=hearth_paths.db_path())
     p.add_argument("--ollama-url",
                    default=os.environ.get("HEARTH_OLLAMA_URL",
                                           DEFAULT_OLLAMA_URL))

@@ -21,8 +21,6 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hearth_paths  # noqa: E402
 
-DEFAULT_DB = hearth_paths.db_path()
-
 
 def cap():
     """The daily token cap from HEARTH_DAILY_TOKEN_CAP. Unset, zero, negative,
@@ -138,7 +136,7 @@ def _self_test():
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="hearth-budget")
-    p.add_argument("--db", default=os.environ.get("HEARTH_DB", DEFAULT_DB))
+    p.add_argument("--db", default=hearth_paths.db_path())
     p.add_argument("--self-test", action="store_true")
     a = p.parse_args(argv)
     if a.self_test:
