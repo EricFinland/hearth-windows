@@ -21,6 +21,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -192,7 +193,7 @@ def _write_text_atomic(full, content, newline=""):
         with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as fh:
             fh.write(content)
         _copy_mode(full, tmp)
-        os.replace(tmp, full)
+        _retry_io(lambda: os.replace(tmp, full))
     except BaseException:
         try:
             os.unlink(tmp)
@@ -200,6 +201,72 @@ def _write_text_atomic(full, content, newline=""):
             pass
         raise
     return len(data)
+
+
+def _retry_io(fn, attempts=3, delay=0.1):
+    """Call fn, retrying briefly on a sharing violation.
+
+    Windows refuses to replace or delete a file another process holds open
+    (WinError 32) or that is read-only (WinError 5). Antivirus scanners, the
+    Search Indexer, editors, and OneDrive sync all hold files open for short
+    windows, so a single attempt fails for reasons that resolve on their own.
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except PermissionError as exc:
+            last = exc
+            if i < attempts - 1:
+                time.sleep(delay * (i + 1))
+        except OSError as exc:
+            if getattr(exc, "winerror", None) not in (5, 32):
+                raise
+            last = exc
+            if i < attempts - 1:
+                time.sleep(delay * (i + 1))
+    raise last
+
+
+def _glob_match(name, pattern):
+    """Case-sensitive glob matching with identical semantics on every platform.
+
+    fnmatch.fnmatch normcases both arguments, so '*.py' matches 'App.PY' on
+    Windows but not on Linux. An agent's file filter should not change meaning
+    with the host operating system.
+    """
+    return fnmatch.fnmatchcase(name, pattern)
+
+
+def _case_conflict(requested_path, full):
+    """Return the existing on-disk name if it differs from the requested one
+    only by case.
+
+    NTFS is case-insensitive, so opening 'readme.md' when 'README.md' exists
+    writes the existing file while the tool reports a name that does not
+    exist on disk. Surface that instead of merging the two silently.
+
+    Takes the caller's original requested path as well as the resolved
+    `full`, not just `full` alone: hearth_contain.safe_join resolves through
+    os.path.realpath, which on Windows silently normalises an *existing*
+    target to its actual on-disk spelling regardless of what was asked for
+    (verified directly: os.path.realpath(".../readme.md") returns
+    ".../README.md" once README.md exists). By the time a tool holds `full`,
+    the mismatch is no longer visible by inspecting `full` in isolation; a
+    directory listing keyed on full's own basename would never find a
+    same-case-folded sibling either, since NTFS refuses to hold two entries
+    that differ only by case. The only place the original spelling still
+    exists is the caller's request, so that is what gets compared.
+    """
+    if not hearth_paths.is_windows():
+        return None
+    requested_base = os.path.basename((requested_path or "").replace("\\", "/"))
+    if not requested_base:
+        return None
+    actual_base = os.path.basename(full)
+    if requested_base != actual_base and requested_base.lower() == actual_base.lower():
+        return actual_base
+    return None
 
 
 def _dominant_newline(text):
@@ -261,6 +328,11 @@ def tool_write_file(args, workspace):
         full = hearth_contain.safe_join(workspace, args.get("path"))
     except ValueError as exc:
         return "error: {}".format(exc)
+    conflict = _case_conflict(args.get("path"), full)
+    if conflict:
+        return ("error: {} already exists as {} (this filesystem is "
+                "case-insensitive); use the existing name or rename it first").format(
+                    os.path.basename(args.get("path") or ""), conflict)
     content = args.get("content", "")
     if os.path.exists(hearth_paths.long_path(full)):
         try:
@@ -329,7 +401,7 @@ def tool_search_files(args, workspace):
     for dirpath, dirs, files in os.walk(base):
         hearth_contain.prune(dirpath, dirs, _TREE_SKIP)
         for fn in sorted(files):
-            if pattern and not fnmatch.fnmatch(fn, pattern):
+            if pattern and not _glob_match(fn, pattern):
                 continue
             fp = os.path.join(dirpath, fn)
             try:
@@ -494,7 +566,7 @@ def _host_allowed(host):
 def _log_egress(tool, host, url, allowed):
     """Record an outbound network attempt (allowed or blocked) to the audit db.
     Best-effort: an unwritable db must never break the tool."""
-    db = os.environ.get("HEARTH_DB", "/var/lib/hearth/runs/audit.db")
+    db = hearth_paths.db_path()
     agent_id = os.environ.get("HEARTH_AGENT_ID", "unknown")
     try:
         con = sqlite3.connect(db, timeout=10)
@@ -825,7 +897,7 @@ def tool_nix_check(args, workspace):
 def tool_remember(args, workspace):
     """Record a lesson into hearth's self-learning memory."""
     import hearth_memory
-    db = os.environ.get("HEARTH_DB", "/var/lib/hearth/runs/audit.db")
+    db = hearth_paths.db_path()
     rid = hearth_memory.remember(db, args.get("insight", ""), kind=args.get("kind", "lesson"),
                                  tags=args.get("tags", ""), source="tool")
     return "remembered (id {})".format(rid) if rid else "error: nothing to remember"
@@ -834,7 +906,7 @@ def tool_remember(args, workspace):
 def tool_recall(args, workspace):
     """Recall lessons from hearth's memory relevant to a query."""
     import hearth_memory
-    db = os.environ.get("HEARTH_DB", "/var/lib/hearth/runs/audit.db")
+    db = hearth_paths.db_path()
     hits = hearth_memory.recall(db, args.get("query", ""), limit=int(args.get("limit") or 8))
     if not hits:
         return "(no relevant lessons yet)"
@@ -842,7 +914,7 @@ def tool_recall(args, workspace):
 
 
 def _kb_db():
-    return os.environ.get("HEARTH_DB", "/var/lib/hearth/runs/audit.db")
+    return hearth_paths.db_path()
 
 
 def tool_kb_add(args, workspace):
@@ -883,7 +955,7 @@ def tool_replace_in_files(args, workspace):
     for dirpath, dirs, files in os.walk(base):
         hearth_contain.prune(dirpath, dirs, _TREE_SKIP)
         for fn in sorted(files):
-            if pattern and not fnmatch.fnmatch(fn, pattern):
+            if pattern and not _glob_match(fn, pattern):
                 continue
             fp = os.path.join(dirpath, fn)
             try:
@@ -1665,6 +1737,57 @@ def _self_test():
             assert "not recognized" in r or "exit=" in r, r
     finally:
         _shutil.rmtree(_ws5, ignore_errors=True)
+
+    # A transient lock is retried rather than surfaced immediately. Antivirus
+    # and sync clients hold files open for tens of milliseconds at a time.
+    _calls = {"n": 0}
+
+    def _flaky():
+        _calls["n"] += 1
+        if _calls["n"] < 3:
+            raise PermissionError(13, "in use")
+        return "ok"
+
+    assert _retry_io(_flaky, attempts=4, delay=0.01) == "ok"
+    assert _calls["n"] == 3
+
+    _always = {"n": 0}
+
+    def _stuck():
+        _always["n"] += 1
+        raise PermissionError(13, "in use")
+
+    try:
+        _retry_io(_stuck, attempts=3, delay=0.01)
+        raise AssertionError("a permanently locked file should still raise")
+    except PermissionError:
+        pass
+    assert _always["n"] == 3, _always
+
+    # Glob filters behave identically on both platforms.
+    assert _glob_match("App.PY", "*.py") is False
+    assert _glob_match("app.py", "*.py") is True
+    assert _glob_match("app.py", "*.PY") is False
+
+    # Writing a differently-cased name is reported, not silently merged.
+    _ws7 = os.path.realpath(_tempfile.mkdtemp(prefix="hearth-case-"))
+    try:
+        tool_write_file({"path": "README.md", "content": "A"}, _ws7)
+        if hearth_paths.is_windows():
+            r = tool_write_file({"path": "readme.md", "content": "B"}, _ws7)
+            assert "already exists as" in r, r
+            with open(os.path.join(_ws7, "README.md"), encoding="utf-8") as fh:
+                assert fh.read() == "A", "the original was overwritten"
+        else:
+            r = tool_write_file({"path": "readme.md", "content": "B"}, _ws7)
+            assert "wrote" in r, r
+            with open(os.path.join(_ws7, "README.md"), encoding="utf-8") as fh:
+                assert fh.read() == "A", "case-insensitivity check must not touch a case-sensitive filesystem"
+        # Rewriting the same name with the same case is fine.
+        r = tool_write_file({"path": "README.md", "content": "C"}, _ws7)
+        assert "wrote" in r, r
+    finally:
+        _shutil.rmtree(_ws7, ignore_errors=True)
 
     print("hearth-tools self-test OK")
     return 0
