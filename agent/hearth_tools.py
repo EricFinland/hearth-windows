@@ -24,6 +24,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 
@@ -123,13 +124,22 @@ def _read_text(full):
 def _copy_mode(target, tmp):
     """Best-effort: carry the target's existing permissions onto the temp
     file before the atomic replace. A brand-new temp file otherwise gets
-    default permissions (umask-derived on POSIX, inherited ACL on Windows),
-    so an edit of a deliberately-restricted file would silently widen or
-    narrow it on every write. A missing target (first write) has nothing to
-    copy, so the temp file just keeps the OS default. Never lets a
-    permissions problem break the write itself: a successful write with
-    default permissions beats a failed write. On Windows os.chmod only
-    really carries the read-only bit; that is all the platform exposes.
+    default permissions (umask-derived on POSIX), so an edit of a
+    deliberately-restricted file would silently widen or narrow it on every
+    write. A missing target (first write) has nothing to copy, so the temp
+    file just keeps the OS default. Never lets a permissions problem break
+    the write itself: a successful write with default permissions beats a
+    failed write.
+
+    On Windows, this call does set the read-only attribute on tmp to match
+    the target (verified directly, see _self_test), but that effect is then
+    unobservable through the normal write path: os.replace() itself refuses
+    to overwrite a read-only destination (WinError 5) regardless of the
+    source file's mode, so a read-only target's chmod'd-to-match tmp file
+    never actually gets used, and a writable target's tmp file was already
+    writable by construction. In other words the call does something, it
+    just never changes the outcome of tool_write_file/tool_edit_file on
+    Windows.
     """
     try:
         mode = os.stat(target).st_mode
@@ -149,20 +159,30 @@ def _write_text_atomic(full, content, newline=""):
     unpatched code opened the target with mode 'w' (truncating it) before
     encoding, so an encoding error destroyed the original.
 
-    The temp name is derived from the target's own basename plus the unique
-    suffix tempfile.mkstemp guarantees, so two concurrent writes to
-    different files in the same directory from the same process never share
-    a temp path. A name keyed only on the pid does: one write's temp file
-    would clobber the other's before its os.replace runs, which surfaces as
-    a loud WinError 32 on Windows (mandatory locking) but succeeds silently
+    The temp name is derived from the target's own basename plus a uuid4
+    hex suffix, created with O_EXCL, so two concurrent writes to different
+    files in the same directory from the same process never share a temp
+    path. A name keyed only on the pid does: one write's temp file would
+    clobber the other's before its os.replace runs, which surfaces as a
+    loud WinError 32 on Windows (mandatory locking) but succeeds silently
     on POSIX, cross-contaminating both destinations with no error at all.
+
+    The temp file is opened with mode 0o666, which the OS masks by the
+    process umask exactly like a normal open() call, so a brand-new target
+    ends up with the ordinary umask-derived default (0o644 under a typical
+    022 umask) rather than something else. tempfile.mkstemp was tried first
+    for the same collision-safety guarantee, but it hardcodes mode 0o600 on
+    the file it creates regardless of umask, which silently narrowed the
+    permissions of every newly-written file; os.open's mode argument does
+    not have that problem, so there is no umask-reading dance needed here.
 
     Returns the number of BYTES written, which is what the caller should report.
     """
     full = hearth_paths.long_path(full)
     parent = os.path.dirname(full) or "."
     data = content.encode("utf-8")
-    fd, tmp = tempfile.mkstemp(prefix=".hearth-tmp-" + os.path.basename(full) + "-", dir=parent)
+    tmp = os.path.join(parent, ".hearth-tmp-{}-{}".format(os.path.basename(full), uuid.uuid4().hex))
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as fh:
             fh.write(content)
@@ -1456,22 +1476,91 @@ def _self_test():
         assert not [f for f in os.listdir(_ws3) if f.startswith(".hearth-tmp")], \
             "a failed write left a temp file behind"
 
-        # Permissions on the destination survive an atomic replace: the temp
-        # file is created fresh (default permissions), so without carrying
-        # the original mode across, an edit would silently widen or narrow
-        # access on every write. POSIX has meaningful permission bits to
-        # check here. Windows os.chmod only exposes the read-only attribute,
-        # and a genuinely read-only destination blocks os.replace itself
-        # (WinError 5, already surfaced through _explain_oserror), so there
-        # is nothing further to assert on that platform.
+        # Permissions on the destination survive an atomic replace, and a
+        # brand-new file gets the ordinary umask default rather than some
+        # hardcoded value (the earlier mkstemp-based implementation got this
+        # wrong: it hardcoded 0o600 on every temp file regardless of umask,
+        # which happened to equal a naive "existing file" test's expected
+        # value too, so that test passed whether or not preservation code
+        # ran at all). Deliberately avoid 0o600 and any value that might
+        # coincide with the live umask default, so both assertions can only
+        # pass if the code is actually doing the right thing.
         if not hearth_paths.is_windows():
+            # Existing-file case: the mode must be preserved exactly.
             permf = os.path.join(_ws3, "restricted.txt")
             with open(permf, "w", encoding="utf-8") as fh:
                 fh.write("secret")
-            os.chmod(permf, 0o600)
+            os.chmod(permf, 0o640)
             tool_write_file({"path": "restricted.txt", "content": "secret2"}, _ws3)
-            assert (os.stat(permf).st_mode & 0o777) == 0o600, \
+            assert (os.stat(permf).st_mode & 0o777) == 0o640, \
                 "permissions were not preserved across an atomic replace"
+
+            # New-file case: must get the live umask default, not a
+            # hardcoded mode. Read the umask via the standard get-and-restore
+            # dance (os.umask has no read-only peek); fine in a
+            # single-threaded self-test, not safe to do under threads.
+            _um = os.umask(0)
+            os.umask(_um)
+            expected_new = 0o666 & ~_um
+            newf = os.path.join(_ws3, "brand_new.txt")
+            tool_write_file({"path": "brand_new.txt", "content": "fresh"}, _ws3)
+            assert (os.stat(newf).st_mode & 0o777) == expected_new, (
+                "a new file must get the umask-derived default, not a hardcoded mode",
+                oct(os.stat(newf).st_mode & 0o777), oct(expected_new))
+        else:
+            # NOTE: this branch does not exercise _copy_mode. Verified by
+            # direct experiment that it cannot: os.replace() on Windows
+            # refuses to overwrite a read-only destination (WinError 5)
+            # regardless of the source file's mode, and a writable
+            # destination's temp file is already writable by construction
+            # (os.open's mode 0o666 default). There is no Windows-reachable
+            # state where deleting the _copy_mode call changes any outcome
+            # a test could observe -- confirmed by removing the call and
+            # re-running self-test, which still passed (see the fix report).
+            # What IS worth asserting on Windows is the safety property the
+            # platform actually gives us: a read-only file is refused, not
+            # silently corrupted or widened.
+            import stat as _stat
+            permf = os.path.join(_ws3, "restricted_win.txt")
+            with open(permf, "w", encoding="utf-8") as fh:
+                fh.write("secret")
+            os.chmod(permf, _stat.S_IREAD)
+            out = tool_write_file({"path": "restricted_win.txt", "content": "secret2"}, _ws3)
+            assert out.startswith("error:"), ("a read-only file must refuse the write, not crash", out)
+            with open(permf, encoding="utf-8") as fh:
+                assert fh.read() == "secret", "a refused write must not touch the original file"
+            assert not (os.stat(permf).st_mode & _stat.S_IWRITE), \
+                "the read-only attribute must survive a refused write"
+
+        # _copy_mode itself, called directly rather than through
+        # tool_write_file. Going through os.replace (as above) cannot prove
+        # anything on Windows, since a read-only destination blocks replace
+        # regardless of the source's mode, and a writable destination's temp
+        # file was already writable by construction -- either way the outer
+        # test would pass whether or not _copy_mode ran. Calling it directly
+        # on a standalone pair of files sidesteps that and is mutation-
+        # sensitive on both platforms.
+        import stat as _stat3
+        _cw = os.path.realpath(_tempfile.mkdtemp(prefix="hearth-copymode-"))
+        try:
+            cm_target = os.path.join(_cw, "cm_target.txt")
+            cm_tmp = os.path.join(_cw, "cm_tmp.txt")
+            with open(cm_target, "w", encoding="utf-8") as fh:
+                fh.write("t")
+            with open(cm_tmp, "w", encoding="utf-8") as fh:
+                fh.write("u")
+            if hearth_paths.is_windows():
+                os.chmod(cm_target, _stat3.S_IREAD)
+                _copy_mode(cm_target, cm_tmp)
+                assert not (os.stat(cm_tmp).st_mode & _stat3.S_IWRITE), \
+                    "_copy_mode did not carry the read-only attribute onto the temp file"
+            else:
+                os.chmod(cm_target, 0o640)
+                _copy_mode(cm_target, cm_tmp)
+                assert (os.stat(cm_tmp).st_mode & 0o777) == 0o640, \
+                    "_copy_mode did not carry the target's mode onto the temp file"
+        finally:
+            _shutil.rmtree(_cw, ignore_errors=True)
 
         # An undecodable file is skipped, never truncated.
         binf = os.path.join(_ws3, "bin.dat")
