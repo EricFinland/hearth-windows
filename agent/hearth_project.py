@@ -15,6 +15,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hearth_contain  # noqa: E402
 import hearth_knowledge  # noqa: E402
+import hearth_paths  # noqa: E402
 
 DEFAULT_DB = hearth_knowledge.DEFAULT_DB
 SKIP_DIRS = {".git", "__pycache__", "node_modules", "result", ".direnv",
@@ -43,6 +44,10 @@ def index_dir(db, name, root, embed_fn=None, globs=None, max_files=MAX_FILES, ma
             if not any(fnmatch.fnmatch(fn, g) for g in globs):
                 continue
             fp = os.path.join(dirpath, fn)
+            try:
+                hearth_contain.safe_join(root, os.path.relpath(fp, root))
+            except ValueError:
+                continue  # a link or an odd name that resolves outside the workspace
             try:
                 if os.path.getsize(fp) > max_bytes:
                     skipped += 1
@@ -103,6 +108,66 @@ def _self_test():
             fh.write("file number {}".format(i))
     capped = index_dir(db, "big", big, max_files=3)
     assert capped["files"] == 3 and capped["truncated"], capped
+
+    # Reparse-point containment, vector A: a linked directory inside the
+    # indexed tree must not be walked. Creating a directory junction needs no
+    # admin rights on Windows, which is exactly why the walk cannot assume the
+    # tree it indexes is free of them.
+    import shutil
+    projA = os.path.join(d, "projA")
+    os.makedirs(projA)
+    outsideA = os.path.realpath(tempfile.mkdtemp(prefix="hearth-proj-outsideA-"))
+    try:
+        with open(os.path.join(outsideA, "dir_secret.md"), "w", encoding="utf-8") as fh:
+            fh.write("SENTINEL_DIR_LEAK content\n")
+        with open(os.path.join(projA, "ok.md"), "w", encoding="utf-8") as fh:
+            fh.write("ordinary\n")
+        linkA = os.path.join(projA, "escape")
+        if hearth_paths.is_windows():
+            dir_linked = os.system('mklink /J "{}" "{}" >nul 2>&1'.format(linkA, outsideA)) == 0
+        else:
+            os.symlink(outsideA, linkA)
+            dir_linked = True
+        if dir_linked:
+            dbA = os.path.join(d, "kbA.db")
+            resA = index_dir(dbA, "projA", projA)
+            srcsA = {s["source"] for s in project_sources(dbA, "projA")}
+            assert "projA/ok.md" in srcsA, srcsA
+            assert not any("dir_secret" in s for s in srcsA), ("linked directory walked", srcsA, resA)
+        else:
+            print("warning: link creation failed, skipping containment assertions (linked directory)")
+    finally:
+        shutil.rmtree(outsideA, ignore_errors=True)
+
+    # Reparse-point containment, vector B: a linked FILE sitting inside an
+    # otherwise-legitimate directory must not be opened either. Pruning alone
+    # only stops descent into a linked directory; this is the case that needs
+    # the per-file safe_join re-validation inside the walk.
+    projB = os.path.join(d, "projB")
+    os.makedirs(os.path.join(projB, "sub"))
+    outsideB = os.path.realpath(tempfile.mkdtemp(prefix="hearth-proj-outsideB-"))
+    try:
+        with open(os.path.join(outsideB, "file_secret.md"), "w", encoding="utf-8") as fh:
+            fh.write("SENTINEL_FILE_LEAK content\n")
+        with open(os.path.join(projB, "sub", "ok.md"), "w", encoding="utf-8") as fh:
+            fh.write("ordinary\n")
+        linkB = os.path.join(projB, "sub", "escape_file.md")
+        if hearth_paths.is_windows():
+            file_linked = os.system(
+                'mklink "{}" "{}" >nul 2>&1'.format(linkB, os.path.join(outsideB, "file_secret.md"))) == 0
+        else:
+            os.symlink(os.path.join(outsideB, "file_secret.md"), linkB)
+            file_linked = True
+        if file_linked:
+            dbB = os.path.join(d, "kbB.db")
+            resB = index_dir(dbB, "projB", projB)
+            srcsB = {s["source"] for s in project_sources(dbB, "projB")}
+            assert "projB/sub/ok.md" in srcsB, srcsB
+            assert "projB/sub/escape_file.md" not in srcsB, ("linked file opened and indexed", srcsB, resB)
+        else:
+            print("warning: link creation failed, skipping containment assertions (linked file)")
+    finally:
+        shutil.rmtree(outsideB, ignore_errors=True)
 
     print("hearth-project self-test OK")
     return 0

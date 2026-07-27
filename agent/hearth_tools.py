@@ -1272,6 +1272,8 @@ def _self_test():
             with open(os.path.join(_out, "secret.txt"), encoding="utf-8") as fh:
                 assert "SENTINEL_VALUE_DO_NOT_LEAK" in fh.read(), \
                     "replace_in_files rewrote a file outside the workspace: {}".format(res)
+        else:
+            print("warning: link creation failed, skipping containment assertions")
     finally:
         _shutil.rmtree(_ws2, ignore_errors=True)
         _shutil.rmtree(_out, ignore_errors=True)
