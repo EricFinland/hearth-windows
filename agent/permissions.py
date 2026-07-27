@@ -68,6 +68,11 @@ def _command_head(args):
     inspection of a shell command cannot be one: cmd.exe strips carets, so
     's^e^t' runs 'set', and %VAR:~n,m% substring expansion assembles an
     executable name that never appears in the approved string.
+
+    Quoting the path is not a mitigation against this limitation. Shell
+    metacharacters like &&, ;, |, &, backticks, and $() can chain an
+    unexamined payload after an approved executable name. Reliable containment
+    belongs at the execution layer, not string inspection.
     """
     cmd = ((args or {}).get("command") or "").strip()
     if not cmd:
@@ -77,7 +82,12 @@ def _command_head(args):
         end = cmd.find(quote, 1)
         head = cmd[1:end] if end > 0 else cmd[1:]
     else:
-        head = cmd.split()[0]
+        # Handle backslash-escaped spaces before splitting, as they appear in
+        # POSIX shell paths (e.g. /opt/my\ tool/bin/git).
+        placeholder = "__HEARTH_ESCAPED_SPACE__"
+        cmd_for_split = cmd.replace("\\ ", placeholder)
+        head = cmd_for_split.split()[0]
+        head = head.replace(placeholder, " ")
     head = head.replace("\\", "/").rsplit("/", 1)[-1]
     if head.lower().endswith((".exe", ".cmd", ".bat", ".com", ".ps1")):
         head = head.rsplit(".", 1)[0]
@@ -175,13 +185,15 @@ def _self_test():
     assert decide("bypass", "web_fetch", allowed_tools=set()) == "deny"  # empty manifest denies everything
     assert decide("bypass", "web_fetch", allowed_tools=None) == "allow"  # None = no manifest (back-compat)
     assert decide("auto", "run_command", {"command": "git status"}, auto_allow={"git"}, allowed_tools={"run_command"}) == "allow"
-    # A quoted executable path containing a space must still match the
-    # allowlist. cmd.split()[0] returned '"C:\\Program' and never matched.
-    assert _command_head({"command": '"C:\\Program Files\\Git\\bin\\git.exe" status'}) == "git"
-    assert _command_head({"command": "git status"}) == "git"
-    assert _command_head({"command": "  git   status  "}) == "git"
-    assert _command_head({"command": "C:\\tools\\ripgrep\\rg.exe -n foo"}) == "rg"
+    # _command_head: quoted paths, escaped spaces, and bare names all extract
+    # the executable name correctly for allowlist matching. Note that this does
+    # not mitigate shell-metacharacter chaining: an approved head can still
+    # carry an unexamined payload via &&, ;, |, &, backticks, or $().
+    assert _command_head({"command": "/opt/my\\ tool/bin/git status"}) == "git"
     assert _command_head({"command": "/usr/bin/git status"}) == "git"
+    assert _command_head({"command": r"C:\tools\rg.exe -n foo"}) == "rg"
+    assert _command_head({"command": '"C:\\Program Files\\Git\\bin\\git.exe" status'}) == "git"
+    assert _command_head({"command": "'/usr/bin/git' status"}) == "git"
     assert _command_head({"command": ""}) == ""
     assert decide("auto", "run_command",
                   {"command": '"C:\\Program Files\\Git\\bin\\git.exe" status'},
