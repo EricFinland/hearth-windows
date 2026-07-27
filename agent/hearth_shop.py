@@ -297,17 +297,35 @@ def free_disk_bytes(path=None):
 
 
 def _gpu_vram_bytes(hw):
-    """VRAM available to a single loaded model, from a hearth_hw-shaped dict.
+    """(vram_bytes, approximate) for the single GPU a model would be loaded
+    onto, from a hearth_hw-shaped dict.
 
     Deliberately the *largest single GPU*, not the sum across GPUs: Ollama
     does not reliably pool multiple cards' VRAM for one model, and the shop's
     job is honesty, not optimism. A machine with two 8GB cards is treated
     like an 8GB machine, not a 16GB one.
+
+    vram_bytes is the GPU's total nameplate capacity as reported by
+    hearth_hw, not "available" or "free" VRAM: it has no accounting for
+    memory already claimed by the OS, a browser, or another loaded model.
+    Callers that show this figure to a user should be clear it is a ceiling,
+    not a live free-memory reading.
+
+    approximate is True when that reading came from hearth_hw's WMI/CIM or
+    wmic fallback path rather than nvidia-smi (see hearth_hw's module
+    docstring: Win32_VideoController.AdapterRAM is a signed 32-bit field
+    that misreports anything above ~4GB, in either direction - it can read
+    low, high, or even negative-clamped-to-zero). Every caller that turns
+    vram_bytes into a verdict or a message MUST also look at approximate;
+    a confident "great" or "wont_fit" built on a guessed number is not
+    honest. (0, False) when no GPU was detected at all - that is an exact
+    reading of "nothing", not a guess.
     """
     gpus = hw.get("gpus") or []
     if not gpus:
-        return 0
-    return max((g.get("vram_bytes", 0) for g in gpus), default=0)
+        return 0, False
+    best = max(gpus, key=lambda g: g.get("vram_bytes", 0))
+    return best.get("vram_bytes", 0), bool(best.get("approximate", False))
 
 
 def _ram_budget_bytes(hw):
@@ -319,12 +337,24 @@ def _ram_budget_bytes(hw):
     return max(0, ram - reserve)
 
 
+# Appended to a verdict's message whenever the VRAM figure it was judged
+# against is a known-unreliable reading (see _gpu_vram_bytes), so no caller
+# can display a verdict without also surfacing the uncertainty behind it.
+_VRAM_APPROX_NOTE = (
+    " This machine's VRAM size could not be read precisely (no nvidia-smi "
+    "available), so the figure behind this verdict is an approximate "
+    "reading and could be significantly off, in either direction."
+)
+
+
 def verdict_for(model, hw, context_tokens=None):
     """The shop's core judgment call: will `model` actually run well on `hw`?
 
     Returns a dict with at least:
       verdict              - one of the VERDICT_* constants.
-      message               - a short human-readable explanation.
+      message               - a short human-readable explanation. Hedged
+                              with _VRAM_APPROX_NOTE whenever vram_approximate
+                              is True.
       requested_context_tokens - the context length this verdict was judged
                               against.
       max_context_tokens    - the largest context that fits in VRAM alone,
@@ -333,8 +363,21 @@ def verdict_for(model, hw, context_tokens=None):
                               any context.
       vram_bytes            - VRAM this verdict was judged against (the
                               largest single GPU; see _gpu_vram_bytes).
+      vram_approximate      - True when vram_bytes came from a known-unreliable
+                              fallback reading rather than nvidia-smi (see
+                              _gpu_vram_bytes and hearth_hw's module
+                              docstring). A caller MUST check this before
+                              presenting the verdict with any confidence; a
+                              "great" computed from an approximate reading is
+                              downgraded to "good" here for exactly that
+                              reason (see below).
       ram_bytes             - the RAM budget considered for spillover (total
-                              RAM minus reserve; see _ram_budget_bytes).
+                              RAM minus reserve; see _ram_budget_bytes). This
+                              is always the reserve-adjusted budget, in every
+                              verdict branch, never the raw system total - so
+                              ram_bytes - required_bytes reconciles with
+                              headroom_bytes whenever the verdict was decided
+                              against the RAM pool.
       required_bytes        - weights + KV cache at requested_context_tokens.
       headroom_bytes        - required_bytes subtracted from whichever pool
                               (VRAM or RAM) the verdict was decided against;
@@ -350,25 +393,44 @@ def verdict_for(model, hw, context_tokens=None):
     # makes, and this module does not have a better number to reach for.
     model_bytes = model["download_bytes"]
     kv_per_token = model["kv_bytes_per_token"]
-    vram_bytes = _gpu_vram_bytes(hw)
-    ram_bytes = hw.get("system_ram_bytes", 0) or 0
+    vram_bytes, vram_approximate = _gpu_vram_bytes(hw)
+    # ram_bytes means one thing everywhere in this function's output: the
+    # reserve-adjusted budget actually available for a spilled-over model,
+    # never the raw hw["system_ram_bytes"] total. Computed once, reused in
+    # every returned dict below, so the arithmetic always reconciles.
+    ram_bytes = _ram_budget_bytes(hw)
 
     vram_fit = hearth_hw.fits(model_bytes, context_tokens, kv_per_token, vram_bytes)
 
     if vram_fit["fits"]:
         ratio = (vram_fit["headroom_bytes"] / vram_bytes) if vram_bytes > 0 else 0.0
-        if ratio >= GREAT_HEADROOM_RATIO:
+        roomy = ratio >= GREAT_HEADROOM_RATIO
+        if roomy and not vram_approximate:
             verdict = VERDICT_GREAT
             message = "Runs fully on the GPU with plenty of headroom."
+        elif roomy and vram_approximate:
+            # Would have been "great" on a precise reading, but a "great"
+            # built on a guessed VRAM number is not really great - see the
+            # module docstring and hearth_hw on why WMI/wmic AdapterRAM can
+            # be badly wrong. Soften the verdict itself, not just the copy.
+            verdict = VERDICT_GOOD
+            message = (
+                "Runs fully on the GPU with headroom to spare, but is graded "
+                "good rather than great because the VRAM reading behind it "
+                "is approximate."
+            )
         else:
             verdict = VERDICT_GOOD
             message = "Runs fully on the GPU, but headroom is tight."
+        if vram_approximate:
+            message += _VRAM_APPROX_NOTE
         return {
             "verdict": verdict,
             "message": message,
             "requested_context_tokens": context_tokens,
             "max_context_tokens": context_tokens,
             "vram_bytes": vram_bytes,
+            "vram_approximate": vram_approximate,
             "ram_bytes": ram_bytes,
             "required_bytes": vram_fit["required_bytes"],
             "headroom_bytes": vram_fit["headroom_bytes"],
@@ -384,15 +446,19 @@ def verdict_for(model, hw, context_tokens=None):
 
     if max_context_tokens >= MIN_USEFUL_CONTEXT_TOKENS:
         reduced_fit = hearth_hw.fits(model_bytes, max_context_tokens, kv_per_token, vram_bytes)
+        message = (
+            f"Does not fit the GPU at {context_tokens} tokens of context, "
+            f"but fits up to about {max_context_tokens} tokens."
+        )
+        if vram_approximate:
+            message += _VRAM_APPROX_NOTE
         return {
             "verdict": VERDICT_REDUCED_CONTEXT,
-            "message": (
-                f"Does not fit the GPU at {context_tokens} tokens of context, "
-                f"but fits up to about {max_context_tokens} tokens."
-            ),
+            "message": message,
             "requested_context_tokens": context_tokens,
             "max_context_tokens": max_context_tokens,
             "vram_bytes": vram_bytes,
+            "vram_approximate": vram_approximate,
             "ram_bytes": ram_bytes,
             "required_bytes": reduced_fit["required_bytes"],
             "headroom_bytes": reduced_fit["headroom_bytes"],
@@ -400,27 +466,34 @@ def verdict_for(model, hw, context_tokens=None):
 
     # Not usefully fittable in VRAM at all. Would it run on CPU / spilled
     # across CPU and GPU, i.e. does it fit in the system RAM budget?
-    ram_budget = _ram_budget_bytes(hw)
-    ram_fit = hearth_hw.fits(model_bytes, context_tokens, kv_per_token, ram_budget)
+    ram_fit = hearth_hw.fits(model_bytes, context_tokens, kv_per_token, ram_bytes)
     if ram_fit["fits"]:
+        message = ("Does not fit the GPU; will run on CPU (or spill "
+                    "partly onto it) and be noticeably slower.")
+        if vram_approximate:
+            message += _VRAM_APPROX_NOTE
         return {
             "verdict": VERDICT_CPU_SPILLOVER,
-            "message": "Does not fit the GPU; will run on CPU (or spill "
-                       "partly onto it) and be noticeably slower.",
+            "message": message,
             "requested_context_tokens": context_tokens,
             "max_context_tokens": None,
             "vram_bytes": vram_bytes,
+            "vram_approximate": vram_approximate,
             "ram_bytes": ram_bytes,
             "required_bytes": ram_fit["required_bytes"],
             "headroom_bytes": ram_fit["headroom_bytes"],
         }
 
+    message = "Does not fit in VRAM or system RAM on this machine."
+    if vram_approximate:
+        message += _VRAM_APPROX_NOTE
     return {
         "verdict": VERDICT_WONT_FIT,
-        "message": "Does not fit in VRAM or system RAM on this machine.",
+        "message": message,
         "requested_context_tokens": context_tokens,
         "max_context_tokens": None,
         "vram_bytes": vram_bytes,
+        "vram_approximate": vram_approximate,
         "ram_bytes": ram_bytes,
         "required_bytes": ram_fit["required_bytes"],
         "headroom_bytes": ram_fit["headroom_bytes"],
@@ -471,8 +544,15 @@ def recommend(hw=None, context_tokens=None):
     great, and so on down the verdict tiers) - a genuinely lighter, faster
     option, not just "one size down".
 
+    wont_fit models are never the headline pick, full stop - that is the
+    catalog's own vocabulary ("Do not offer this model on this machine"),
+    and recommending one anyway would be exactly the dishonesty this module
+    exists to avoid. When nothing in the catalog earns a better verdict than
+    wont_fit, this returns an empty list rather than headline something that
+    cannot run: an honest "nothing fits" beats a confident wrong answer.
+
     Returns a list of 0-2 dicts (each a catalog_with_verdicts()-shaped
-    entry): [best] or [best, fallback], in that order. Empty only if the
+    entry): [best] or [best, fallback], in that order. Also empty if the
     catalog has no coding entries at all, which should never happen.
     """
     listed = catalog_with_verdicts(hw, context_tokens=context_tokens)
@@ -484,14 +564,22 @@ def recommend(hw=None, context_tokens=None):
     if runs_on_gpu:
         best = max(runs_on_gpu, key=lambda e: e["params_b"])
     else:
-        # Nothing fits the GPU cleanly. Prefer the least-bad CPU spillover
-        # (smaller model = less RAM pressure, still honestly labeled slow)
-        # over a model that plain does not fit at all.
+        # Nothing fits the GPU cleanly at the requested context. Prefer a
+        # reduced_context model (still fully resident in VRAM, just at a
+        # shorter context) over CPU spillover, and CPU spillover (smaller
+        # model = less RAM pressure, still honestly labeled slow) over
+        # nothing at all. This mirrors VERDICT_RANK's ordering.
+        reduced = [e for e in coding if e["verdict"]["verdict"] == VERDICT_REDUCED_CONTEXT]
         spill = [e for e in coding if e["verdict"]["verdict"] == VERDICT_CPU_SPILLOVER]
-        if spill:
+        if reduced:
+            best = min(reduced, key=lambda e: e["params_b"])
+        elif spill:
             best = min(spill, key=lambda e: e["params_b"])
         else:
-            best = min(coding, key=lambda e: e["params_b"])
+            # Every coding model in the catalog is wont_fit on this hardware.
+            # wont_fit is never a headline pick (see docstring above): return
+            # nothing rather than recommend a model that cannot run here.
+            return []
 
     fallback = None
     for tier in (VERDICT_GREAT, VERDICT_GOOD, VERDICT_REDUCED_CONTEXT, VERDICT_CPU_SPILLOVER):
@@ -540,9 +628,9 @@ def _self_test():
 
     # -- synthetic hardware, so the self-test passes on a machine with no ----
     # -- GPU and does not depend on whatever hardware happens to be present --
-    def _hw(vram_bytes, ram_bytes):
+    def _hw(vram_bytes, ram_bytes, approximate=False):
         gpus = [{"name": "synthetic", "vram_bytes": vram_bytes, "vendor": "nvidia",
-                 "approximate": False}] if vram_bytes else []
+                 "approximate": approximate}] if vram_bytes else []
         return {"platform": "synthetic", "gpus": gpus, "system_ram_bytes": ram_bytes,
                 "cpu_count": 8}
 
@@ -609,6 +697,75 @@ def _self_test():
     v = verdict_for(CATALOG[0], _hw(200 * 1024 ** 2, 8 * 1024 ** 3), context_tokens=4096)
     assert v["verdict"] in (VERDICT_CPU_SPILLOVER, VERDICT_WONT_FIT), v
 
+    # -- CRITICAL 1: the approximate VRAM flag must survive the seam --------
+    # between hearth_hw and hearth_shop, not get thrown away by
+    # _gpu_vram_bytes/verdict_for. Every verdict must say whether the VRAM
+    # figure behind it is a guess.
+    for hw_case, ctx in (
+        (hw_24gb, 8192), (hw_16gb, 8192), (hw_6gb_32ram, 8192), (hw_no_gpu_16ram, 8192),
+    ):
+        v = verdict_for(syn_14gb, hw_case, context_tokens=ctx)
+        assert "vram_approximate" in v, v
+        assert v["vram_approximate"] is False, v  # these fixtures are all precise readings
+
+    # Same 24GB card, same model, same context as the first "great" case
+    # above - the only difference is the GPU entry is marked approximate
+    # (as hearth_hw does for a WMI/CIM or wmic AdapterRAM reading). A
+    # confident "great" must not survive that: it is downgraded to "good",
+    # and the message must say why.
+    hw_24gb_approx = _hw(24 * 1024 ** 3, 64 * 1024 ** 3, approximate=True)
+    v_precise = verdict_for(syn_14gb, hw_24gb, context_tokens=8192)
+    v_approx = verdict_for(syn_14gb, hw_24gb_approx, context_tokens=8192)
+    assert v_precise["verdict"] == VERDICT_GREAT, v_precise
+    assert v_approx["vram_approximate"] is True, v_approx
+    assert v_approx["verdict"] == VERDICT_GOOD, (
+        "an approximate VRAM reading must never earn a 'great' verdict", v_approx,
+    )
+    assert v_approx["verdict"] != v_precise["verdict"], (
+        "approximate must actually change the outcome, not just be a silent field", v_approx,
+    )
+    assert "approximate" in v_approx["message"].lower(), v_approx
+    # The arithmetic (required/headroom) must be identical either way - only
+    # the confidence in the verdict changes, not the numbers themselves.
+    assert v_approx["required_bytes"] == v_precise["required_bytes"], (v_approx, v_precise)
+    assert v_approx["headroom_bytes"] == v_precise["headroom_bytes"], (v_approx, v_precise)
+
+    # An approximate reading must also be flagged (and hedged) on the
+    # non-GPU-fitting branches: reduced_context, cpu_spillover, wont_fit. The
+    # WMI/wmic bug this guards against can underreport too (a wrapped signed
+    # 32-bit AdapterRAM can even clamp to 0), so a "does not fit" verdict is
+    # just as capable of being wrong as a "great" one.
+    hw_6gb_32ram_approx = _hw(6_442_450_944, 32 * 1024 ** 3, approximate=True)
+    v = verdict_for(syn_14gb, hw_6gb_32ram_approx, context_tokens=8192)
+    assert v["verdict"] == VERDICT_CPU_SPILLOVER, v
+    assert v["vram_approximate"] is True, v
+    assert "approximate" in v["message"].lower(), v
+
+    hw_no_gpu_16ram_approx = _hw(0, 16 * 1024 ** 3, approximate=True)
+    # No GPU detected at all is an exact reading of "nothing" (approximate
+    # only applies to a GPU that WAS detected via a shaky path), so this
+    # must stay False even with approximate=True requested in the fixture -
+    # there is no GPU dict for the flag to live on.
+    v = verdict_for(syn_14gb, hw_no_gpu_16ram_approx, context_tokens=8192)
+    assert v["vram_approximate"] is False, v
+
+    # -- IMPORTANT 3: ram_bytes must mean the reserve-adjusted budget, in ---
+    # every branch, so the displayed numbers reconcile: ram_bytes minus
+    # required_bytes must equal headroom_bytes whenever the verdict was
+    # decided against the RAM pool (cpu_spillover, wont_fit).
+    v = verdict_for(syn_14gb, hw_6gb_32ram, context_tokens=8192)
+    assert v["verdict"] == VERDICT_CPU_SPILLOVER, v
+    assert v["ram_bytes"] == _ram_budget_bytes(hw_6gb_32ram), v
+    assert v["ram_bytes"] != hw_6gb_32ram["system_ram_bytes"], (
+        "ram_bytes must be the reserve-adjusted budget, not the raw total", v,
+    )
+    assert v["ram_bytes"] - v["required_bytes"] == v["headroom_bytes"], v
+
+    v = verdict_for(syn_14gb, hw_no_gpu_16ram, context_tokens=8192)
+    assert v["verdict"] == VERDICT_WONT_FIT, v
+    assert v["ram_bytes"] == _ram_budget_bytes(hw_no_gpu_16ram), v
+    assert v["ram_bytes"] - v["required_bytes"] == v["headroom_bytes"], v
+
     # -- catalog_with_verdicts: shape, sorting, disk check --------------------
     listed = catalog_with_verdicts(hw_24gb, context_tokens=8192)
     assert len(listed) == len(CATALOG)
@@ -659,6 +816,29 @@ def _self_test():
     rec_weak = recommend(_hw(0, 8 * 1024 ** 3), context_tokens=8192)
     assert len(rec_weak) >= 1, rec_weak
     assert rec_weak[0]["verdict"]["verdict"] != VERDICT_GREAT, rec_weak  # no GPU, can't be "great"
+
+    # -- CRITICAL 2: recommend() must never headline a wont_fit model -------
+    # Hardware weak enough that literally nothing in the catalog fits,
+    # unlike hw_weak above (which still has a cpu_spillover candidate - the
+    # exact fixture gap that let this bug hide from the shipped self-test
+    # originally). No GPU, and RAM below the fixed RAM_RESERVE_MIN_BYTES
+    # floor, so the spillover budget clamps to exactly 0.
+    hw_nothing_fits = _hw(0, 512 * 1024 ** 2)
+    assert _ram_budget_bytes(hw_nothing_fits) == 0, "fixture must zero out the RAM budget"
+
+    # Verify the premise, not just the conclusion: every coding entry in the
+    # catalog really is wont_fit on this hardware, so an empty recommendation
+    # is the honest answer here, not an artifact of a lucky assertion.
+    listed_nothing = catalog_with_verdicts(hw_nothing_fits, context_tokens=8192)
+    coding_nothing = [e for e in listed_nothing if e["focus"] == "coding"]
+    assert coding_nothing, "catalog must have coding entries"
+    assert all(e["verdict"]["verdict"] == VERDICT_WONT_FIT for e in coding_nothing), coding_nothing
+
+    rec_nothing = recommend(hw_nothing_fits, context_tokens=8192)
+    assert rec_nothing == [], (
+        "recommend() must never headline a wont_fit model; when nothing in "
+        "the catalog can run, an empty list is the honest answer", rec_nothing,
+    )
 
     print("hearth-shop self-test OK")
     return 0

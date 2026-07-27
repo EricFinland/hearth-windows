@@ -74,13 +74,22 @@ def _run(cmd, timeout=SUBPROCESS_TIMEOUT):
 
     This is the single chokepoint every external tool call goes through, so
     that a missing executable, a timeout, or a nonzero exit all degrade the
-    same way: no data, no exception.
+    same way: no data, no exception. encoding="utf-8", errors="replace" is
+    deliberate: without it, subprocess.run(text=True) decodes stdout with
+    the platform's default locale encoding, and malformed bytes or an
+    unusual locale raise UnicodeDecodeError - a ValueError subclass, not
+    caught by the (FileNotFoundError, OSError, subprocess.SubprocessError)
+    handler below, so it would otherwise escape this chokepoint entirely and
+    crash probe(). errors="replace" makes that failure mode impossible: a
+    malformed byte becomes U+FFFD instead of an exception.
     """
     try:
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             check=False,
         )
@@ -107,7 +116,11 @@ def _parse_nvidia_smi(output):
     """Parse `nvidia-smi --query-gpu=name,memory.total --format=csv,noheader`.
 
     A line looks like "NVIDIA GeForce RTX 4090, 24564 MiB". Multi-GPU
-    machines produce one line per GPU.
+    machines produce one line per GPU. Split from the right on the last
+    comma, not the first: the memory field is always the final column and
+    never itself contains a comma, but a GPU's name occasionally does (some
+    OEM/workstation card names embed one), and splitting from the left would
+    silently truncate or drop such a card.
     """
     gpus = []
     if not output:
@@ -116,7 +129,7 @@ def _parse_nvidia_smi(output):
         line = line.strip()
         if not line:
             continue
-        parts = [p.strip() for p in line.split(",")]
+        parts = [p.strip() for p in line.rsplit(",", 1)]
         if len(parts) < 2:
             continue
         name = parts[0]
@@ -237,13 +250,13 @@ def _gpus_linux_amd_sysfs():
         vram_path = os.path.join(base, entry, "device", "mem_info_vram_total")
         vendor_path = os.path.join(base, entry, "device", "vendor")
         try:
-            with open(vram_path) as f:
+            with open(vram_path, encoding="utf-8", errors="replace") as f:
                 vram_bytes = int(f.read().strip())
         except (OSError, ValueError):
             continue
         vendor = VENDOR_UNKNOWN
         try:
-            with open(vendor_path) as f:
+            with open(vendor_path, encoding="utf-8", errors="replace") as f:
                 vid = f.read().strip().lower()
             vendor = {"0x1002": VENDOR_AMD, "0x10de": VENDOR_NVIDIA, "0x8086": VENDOR_INTEL}.get(vid, VENDOR_UNKNOWN)
         except OSError:
@@ -308,7 +321,7 @@ def system_ram_bytes():
     system = platform.system()
     if system == "Linux":
         try:
-            with open("/proc/meminfo") as f:
+            with open("/proc/meminfo", encoding="utf-8", errors="replace") as f:
                 for line in f:
                     if line.startswith("MemTotal:"):
                         kb = int(line.split()[1])
@@ -452,9 +465,38 @@ def _self_test():
     gib_case = _parse_nvidia_smi("Some GPU, 24 GiB\n")
     assert gib_case[0]["vram_bytes"] == 24 * 1024 ** 3, gib_case
 
+    # A GPU name containing a comma must not be dropped or truncated: split
+    # from the right (the memory column is always last), not the left.
+    comma_name = _parse_nvidia_smi("NVIDIA RTX 6000, Ada Generation, 49140 MiB\n")
+    assert len(comma_name) == 1, comma_name
+    assert comma_name[0]["name"] == "NVIDIA RTX 6000, Ada Generation", comma_name
+    assert comma_name[0]["vram_bytes"] == 49140 * 1024 * 1024, comma_name
+
     # -- _run: missing executables never raise ------------------------------
     assert _run(["this-executable-does-not-exist-anywhere-12345"]) is None
     assert _run(["python", "-c", "import sys; sys.exit(1)"]) is None
+
+    # -- _run: malformed stdout bytes must never raise UnicodeDecodeError ---
+    # UnicodeDecodeError is a ValueError subclass, NOT caught by the
+    # (FileNotFoundError, OSError, subprocess.SubprocessError) handler in
+    # _run, so without an explicit encoding="utf-8", errors="replace" on the
+    # subprocess.run call, a child process that writes bytes that are not
+    # valid text under the platform's default locale encoding can crash
+    # probe() outright (or, observed on some Windows/thread configurations,
+    # silently corrupt the captured output instead of raising at all -
+    # either way, a real failure mode this call must not exhibit).
+    bad_bytes_cmd = [
+        sys.executable, "-c",
+        "import sys; sys.stdout.buffer.write(bytes([0x81, 0x8d, 0x90, 0xff])); "
+        "sys.stdout.buffer.flush()",
+    ]
+    bad_bytes_out = _run(bad_bytes_cmd)
+    assert bad_bytes_out is not None, "malformed stdout bytes must not become a None result"
+    assert isinstance(bad_bytes_out, str), bad_bytes_out
+    assert "�" in bad_bytes_out, (
+        "malformed bytes should decode to U+FFFD replacement characters, "
+        "not be silently dropped or raise", bad_bytes_out,
+    )
 
     # -- gpus(): shape holds regardless of what hardware is present ---------
     detected = gpus()
