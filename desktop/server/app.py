@@ -18,6 +18,15 @@ Endpoints:
   POST /approve   resolve a pending approval: {"id", "decision": "allow"|
                   "deny"}.
   POST /cancel    interrupt the running turn, if any.
+  GET  /models    what Ollama has pulled locally (best-effort; [] if Ollama
+                  is unreachable), plus the shop's catalog with fit verdicts
+                  for this machine, so a UI can show what will actually run.
+  GET  /checkpoints  the current session's checkpoint history, newest first.
+  POST /restore   revert the current session's workspace to a prior
+                  checkpoint: {"checkpoint_id"}. The response is whatever
+                  hearth_checkpoint.restore() reports, unmodified -- in
+                  particular "skipped_gitlinks" is always passed through, so
+                  a UI can never present a partial restore as a complete one.
 
 Every route except GET /healthz requires, in this order: a valid Host header
 (the DNS-rebinding defence), a valid Origin header when one is present, and a
@@ -28,11 +37,13 @@ Standard library only: http.server + ThreadingHTTPServer, no framework.
 """
 
 import json
+import os
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import auth
+import engine as engine_mod
 import session as session_mod
 
 
@@ -42,10 +53,13 @@ class SidecarState:
     `session` goes through a lock rather than relying on request isolation.
     """
 
-    def __init__(self, token, engine_factory=None, port=0):
+    def __init__(self, token, engine_factory=None, port=0, models_fetcher=None):
         self.token = token
         self.port = port  # main.py sets this to the real bound port after listen
         self.engine_factory = engine_factory or (lambda: session_mod.NullEngine())
+        # Best-effort GET /models data source. Injectable so tests never need
+        # a live Ollama; defaults to the real one for production use.
+        self.models_fetcher = models_fetcher or engine_mod.list_installed_models
         self._lock = threading.Lock()
         self.session = None
 
@@ -151,6 +165,10 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._get_session()
         elif path == "/events":
             self._get_events()
+        elif path == "/models":
+            self._get_models()
+        elif path == "/checkpoints":
+            self._get_checkpoints()
         else:
             self._send_json(404, {"error": "not_found"})
 
@@ -166,6 +184,8 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._post_approve()
         elif path == "/cancel":
             self._post_cancel()
+        elif path == "/restore":
+            self._post_restore()
         else:
             self._send_json(404, {"error": "not_found"})
 
@@ -284,6 +304,63 @@ class SidecarHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
             return
 
+    def _get_models(self):
+        """Best-effort: an unreachable Ollama must not take the whole route
+        down, since the shop's catalog verdicts (computed purely from local
+        hardware, no Ollama involved) are still useful on their own."""
+        try:
+            installed = self.state.models_fetcher()
+        except Exception:  # noqa: BLE001 - a fetcher bug must not break this route
+            installed = []
+        try:
+            catalog = engine_mod.hearth_shop.catalog_with_verdicts()
+        except Exception as exc:  # noqa: BLE001
+            self._send_json(500, {"error": "catalog_failed: {}".format(exc)})
+            return
+        self._send_json(200, {"installed": installed, "catalog": catalog})
+
+    def _get_checkpoints(self):
+        s = self.state.get_session()
+        if s is None:
+            self._send_json(404, {"error": "no_session"})
+            return
+        try:
+            checkpoints = engine_mod.hearth_checkpoint.list_checkpoints(s.workspace)
+        except Exception as exc:  # noqa: BLE001
+            self._send_json(500, {"error": "checkpoint_list_failed: {}".format(exc)})
+            return
+        self._send_json(200, {"checkpoints": checkpoints})
+
+    def _post_restore(self):
+        s = self.state.get_session()
+        if s is None:
+            self._send_json(400, {"error": "no_session"})
+            return
+        body = self._read_json()
+        if body is None:
+            self._send_json(400, {"error": "invalid_json"})
+            return
+        checkpoint_id = body.get("checkpoint_id")
+        if not isinstance(checkpoint_id, str) or not checkpoint_id:
+            self._send_json(400, {"error": "checkpoint_id is required"})
+            return
+        if s.to_dict()["status"] == session_mod.STATUS_RUNNING:
+            self._send_json(409, {"error": "cannot restore while a turn is running; cancel it first"})
+            return
+        try:
+            result = engine_mod.hearth_checkpoint.restore(s.workspace, checkpoint_id)
+        except Exception as exc:  # noqa: BLE001
+            self._send_json(500, {"error": "restore_failed: {}".format(exc)})
+            return
+        # Pass the module's own result straight through, unmodified: it
+        # already reports "skipped_gitlinks" and, on failure, an "error" key.
+        # This handler must never add a false note of completeness on top of
+        # what hearth_checkpoint itself is willing to claim.
+        if "error" in result:
+            self._send_json(409, result)
+            return
+        self._send_json(200, result)
+
     def _write_sse(self, ev):
         payload = json.dumps({"turn_id": ev["turn_id"], "kind": ev["kind"],
                               "data": ev["data"], "ts": ev["ts"]})
@@ -323,8 +400,8 @@ def _self_test():
                 time.sleep(0.02)
             ctx.emit("cancelled", {})
 
-    def _start(token="the-real-token-value", engine_factory=None):
-        state = SidecarState(token, engine_factory=engine_factory)
+    def _start(token="the-real-token-value", engine_factory=None, models_fetcher=None):
+        state = SidecarState(token, engine_factory=engine_factory, models_fetcher=models_fetcher)
         server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
         state.port = server.server_address[1]
         t = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
@@ -491,6 +568,14 @@ def _self_test():
                                         body=json.dumps({"message": "hang forever"}))
             assert status == 200, data
             time.sleep(0.1)  # let the stubborn engine actually start looping
+
+            # POST /restore must refuse while a turn is running rather than
+            # race a live turn's own file writes.
+            status, data = _raw_request(port2, "POST", "/restore", headers=headers2,
+                                        body=json.dumps({"checkpoint_id": "deadbeef"}))
+            assert status == 409, (status, data)
+            assert "running" in json.loads(data)["error"], data
+
             status, data = _raw_request(port2, "POST", "/cancel", headers=headers2)
             assert status == 200 and json.loads(data)["cancelled"] is True, (status, data)
             # cancelling again once idle reports nothing to cancel
@@ -522,6 +607,104 @@ def _self_test():
         finally:
             server2.shutdown()
             server2.server_close()
+
+        # === GET /models: works with an injected fetcher, no live Ollama ===
+        # === required, and the catalog survives a broken fetcher too ======
+
+        def _fake_models_fetcher():
+            return [{"name": "test-model:1b", "size_bytes": 42, "modified_at": "x", "digest": "y"}]
+
+        server3, state3 = _start(engine_factory=lambda: _FakeEngine(),
+                                 models_fetcher=_fake_models_fetcher)
+        try:
+            port3 = state3.port
+            headers3 = {"Host": "127.0.0.1:{}".format(port3),
+                       "Authorization": "Bearer " + state3.token}
+            status, data = _raw_request(port3, "GET", "/models", headers=headers3)
+            assert status == 200, (status, data)
+            body = json.loads(data)
+            assert body["installed"] == [_fake_models_fetcher()[0]], body
+            assert isinstance(body["catalog"], list) and len(body["catalog"]) >= 6, body
+            assert all("verdict" in e and "id" in e for e in body["catalog"]), body
+        finally:
+            server3.shutdown()
+            server3.server_close()
+
+        def _broken_fetcher():
+            raise RuntimeError("ollama unreachable")
+
+        server3b, state3b = _start(engine_factory=lambda: _FakeEngine(),
+                                   models_fetcher=_broken_fetcher)
+        try:
+            port3b = state3b.port
+            headers3b = {"Host": "127.0.0.1:{}".format(port3b),
+                        "Authorization": "Bearer " + state3b.token}
+            status, data = _raw_request(port3b, "GET", "/models", headers=headers3b)
+            assert status == 200, (status, data)  # a broken fetcher must not take the route down
+            body = json.loads(data)
+            assert body["installed"] == [], body
+            assert isinstance(body["catalog"], list) and body["catalog"], body
+        finally:
+            server3b.shutdown()
+            server3b.server_close()
+
+        # === GET /checkpoints and POST /restore, end to end over HTTP ======
+
+        import shutil as _shutil
+        import tempfile as _tempfile
+
+        ws_dir = _tempfile.mkdtemp(prefix="hearth-app-selftest-")
+        try:
+            status, data = _raw_request(port, "POST", "/session", headers=auth_headers,
+                                        body=json.dumps({"workspace": ws_dir, "model": "m"}))
+            assert status == 200, (status, data)
+
+            # No checkpoint store yet: an empty history, not an error.
+            status, data = _raw_request(port, "GET", "/checkpoints", headers=auth_headers)
+            assert status == 200, (status, data)
+            assert json.loads(data)["checkpoints"] == [], data
+
+            # missing checkpoint_id -> 400
+            status, data = _raw_request(port, "POST", "/restore", headers=auth_headers,
+                                        body=json.dumps({}))
+            assert status == 400, (status, data)
+
+            # an unknown checkpoint id -> 409, and the error response still
+            # carries "skipped_gitlinks" (empty here), never a bare "error"
+            # someone could mistake for a partial-success shape.
+            status, data = _raw_request(port, "POST", "/restore", headers=auth_headers,
+                                        body=json.dumps({"checkpoint_id": "d" * 40}))
+            assert status == 409, (status, data)
+            body = json.loads(data)
+            assert "error" in body and "skipped_gitlinks" in body, body
+
+            if engine_mod.hearth_checkpoint.is_git_available():
+                a_path = os.path.join(ws_dir, "a.txt")
+                with open(a_path, "w") as fh:
+                    fh.write("version one")
+                cp = engine_mod.hearth_checkpoint.checkpoint(ws_dir, label="selftest")
+
+                status, data = _raw_request(port, "GET", "/checkpoints", headers=auth_headers)
+                assert status == 200, (status, data)
+                listed = json.loads(data)["checkpoints"]
+                assert any(c["id"] == cp["id"] and c["label"] == "selftest" for c in listed), listed
+
+                with open(a_path, "w") as fh:
+                    fh.write("DESTROYED")
+                status, data = _raw_request(port, "POST", "/restore", headers=auth_headers,
+                                            body=json.dumps({"checkpoint_id": cp["id"]}))
+                assert status == 200, (status, data)
+                body = json.loads(data)
+                assert "error" not in body, body
+                assert "skipped_gitlinks" in body, \
+                    "skipped_gitlinks must always be present, even when empty"
+                assert body["skipped_gitlinks"] == [], body
+                with open(a_path) as fh:
+                    restored_text = fh.read()
+                assert restored_text == "version one", \
+                    "POST /restore over HTTP did not actually restore the file"
+        finally:
+            _shutil.rmtree(ws_dir, ignore_errors=True)
 
         # === malformed JSON body is rejected, not a 500 ===
         status, data = _raw_request(port, "POST", "/session", headers=auth_headers, body="{not json")

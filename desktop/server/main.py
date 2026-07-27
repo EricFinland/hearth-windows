@@ -26,14 +26,19 @@ import sys
 from http.server import ThreadingHTTPServer
 
 import app as app_mod
+import engine as engine_mod
 
 
-def make_server(engine_factory=None, host="127.0.0.1", port=0, token=None):
-    """Build and bind a (server, state) pair. Defaults to an ephemeral port
-    and a freshly generated token; both are overridable for tests. Does not
-    start serving -- call server.serve_forever() (or use run_until_stop)."""
+def make_server(engine_factory=None, host="127.0.0.1", port=0, token=None,
+                models_fetcher=None):
+    """Build and bind a (server, state) pair. Defaults to an ephemeral port,
+    a freshly generated token, and the real agent engine (engine.RealEngine);
+    all overridable for tests. Does not start serving -- call
+    server.serve_forever() (or use run_until_stop)."""
     token = token or secrets.token_urlsafe(32)
-    state = app_mod.SidecarState(token, engine_factory=engine_factory)
+    engine_factory = engine_factory or (lambda: engine_mod.RealEngine())
+    state = app_mod.SidecarState(token, engine_factory=engine_factory,
+                                 models_fetcher=models_fetcher)
     server = ThreadingHTTPServer((host, port), app_mod.make_handler(state))
     state.port = server.server_address[1]
     return server, state
