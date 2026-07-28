@@ -227,20 +227,31 @@ TIER_PARAM_RANGE = {
 # Difficulty language: each hit nudges classify() toward the large tier.
 # Deliberately short and specific rather than exhaustive - see the honesty
 # note above on why a list that sometimes misses is an accepted, stated
-# limitation rather than a hidden one.
+# limitation rather than a hidden one. "refactor across" is deliberately
+# NOT in this list as a fixed phrase: see _refactor_across_signal below,
+# which checks for both words anywhere in the prompt instead of requiring
+# them adjacent - "refactor the permission engine across three modules"
+# does not contain the literal substring "refactor across" but is exactly
+# the case this signal exists to catch.
 _HARD_KEYWORDS = (
-    "why", "debug", "root cause", "investigate", "refactor across",
+    "why", "debug", "root cause", "investigate",
     "redesign", "design", "architecture", "diagnose", "trace through",
     "figure out why", "across the codebase", "regression", "flaky",
     "race condition", "deep dive", "intermittent", "not sure why",
 )
 
 # Mechanical-edit language: each hit nudges classify() toward the small
-# tier, alongside a short prompt or a named file:line.
+# tier, alongside a short prompt or a named file:line. Bare "add"/"remove"/
+# "delete" are included deliberately broad (this module's stated bias is
+# cheap-by-default, and a single -1 here cannot reach the small tier alone -
+# it takes at least one more negative signal, e.g. a short prompt or a
+# named file). "fix" alone is deliberately NOT included: "fix the bug" is
+# genuinely ambiguous difficulty and must not be pre-judged mechanical.
 _EASY_KEYWORDS = (
     "rename", "typo", "fix the import", "fix import", "add a comment",
     "bump the version", "bump version", "delete the", "remove the",
     "one-line", "one line fix", "small fix", "trivial fix",
+    "add", "remove", "delete", "update the docstring", "format", "sort",
 )
 
 # A file name with an extension, optionally followed by a line number
@@ -249,6 +260,12 @@ _EASY_KEYWORDS = (
 _FILE_LOCATION_RE = re.compile(
     r"[\w./\\-]+\.[A-Za-z][A-Za-z0-9]{0,5}(:\d+|,?\s*line\s+\d+)", re.IGNORECASE
 )
+
+# A snake_case identifier (hearth_loop, hearth_tools) - the underscore is
+# what distinguishes "this names a real module/file" from ordinary English
+# prose, which is why this stays narrow rather than trying to parse noun
+# phrases in general.
+_SNAKE_CASE_RE = re.compile(r"\b[a-z][a-z0-9]*_[a-z0-9_]*\b")
 
 # Tool names (from hearth_tools.TOOL_SPECS) this module reads as "exploring"
 # versus "changing" the codebase. A search followed by edits across several
@@ -266,6 +283,29 @@ def _word_boundary_hits(haystack_lower, phrases):
         if re.search(r"\b" + re.escape(phrase) + r"\b", haystack_lower):
             hits.append(phrase)
     return hits
+
+
+def _named_components(text):
+    """Distinct snake_case identifiers mentioned in text (e.g. hearth_loop,
+    hearth_tools), order-preserving. A cheap, concrete proxy for "this
+    prompt names several real modules/files" - deliberately narrow
+    (snake_case only, via _SNAKE_CASE_RE) rather than an attempt at general
+    noun-phrase parsing, which this module has no reliable way to do."""
+    seen = []
+    for m in _SNAKE_CASE_RE.finditer(text.lower()):
+        tok = m.group(0)
+        if tok not in seen:
+            seen.append(tok)
+    return seen
+
+
+def _refactor_across_signal(low):
+    """True when the prompt says "refactor" (or refactoring/refactored/
+    refactors) AND "across" anywhere in it, not necessarily adjacent -
+    "refactor the permission engine across hearth_loop and hearth_tools"
+    is exactly the multi-module-refactor case this exists to catch, and it
+    does not contain the literal substring "refactor across"."""
+    return bool(re.search(r"\brefactor\w*\b", low)) and bool(re.search(r"\bacross\b", low))
 
 
 def classify(prompt, history=None, signals=None):
@@ -308,23 +348,42 @@ def classify(prompt, history=None, signals=None):
     score = 0
     reasons = []
 
+    # Difficulty signals are computed first and gate the length-based prior
+    # below, not the other way around. A short prompt can still name one of
+    # the hardest things you can ask for in ten words ("refactor the
+    # permission engine across hearth_loop, hearth_tools and the sidecar"),
+    # and brevity must not outvote that - see the module docstring's
+    # honesty note. An explicit difficulty term (a keyword hit, a
+    # refactor-across pattern, or naming several components) always beats
+    # the short-prompt prior; it does not just compete with it on points.
+    hard_hits = _word_boundary_hits(low, _HARD_KEYWORDS)
+    refactor_across = _refactor_across_signal(low)
+    named = _named_components(stripped)
+    multi_component = len(named) >= 2
+    has_hard_signal = bool(hard_hits) or refactor_across or multi_component
+
+    if hard_hits:
+        score += 4
+        reasons.append("difficulty language ({})".format(", ".join(hard_hits)))
+    if refactor_across:
+        score += 3
+        reasons.append('refactor spanning multiple components ("refactor" ... "across")')
+    if multi_component:
+        score += 2
+        reasons.append("names {} components ({})".format(len(named), ", ".join(named[:4])))
+
     if wc == 0:
         score -= 1
         reasons.append("empty prompt")
-    elif wc <= 10:
+    elif wc <= 10 and not has_hard_signal:
         score -= 1
         reasons.append("short prompt ({} words)".format(wc))
     if wc >= 45:
         score += 2
         reasons.append("long prompt ({} words)".format(wc))
 
-    hard_hits = _word_boundary_hits(low, _HARD_KEYWORDS)
-    if hard_hits:
-        score += 4
-        reasons.append("difficulty language ({})".format(", ".join(hard_hits)))
-
     easy_hits = _word_boundary_hits(low, _EASY_KEYWORDS)
-    if easy_hits and not hard_hits:
+    if easy_hits and not has_hard_signal:
         score -= 1
         reasons.append("mechanical-edit language ({})".format(", ".join(easy_hits)))
 
@@ -332,7 +391,7 @@ def classify(prompt, history=None, signals=None):
         score -= 1
         reasons.append("names a specific file and location")
 
-    if stripped.endswith("?") and not hard_hits:
+    if stripped.endswith("?") and not has_hard_signal:
         score += 1
         reasons.append("phrased as an open question")
 
@@ -728,6 +787,29 @@ def _self_test_task_aware():
         "dark theme across the application.")
     assert neutral["tier"] == TIER_MEDIUM, neutral
 
+    # -- regression fixtures: a difficulty term must beat the short-prompt --
+    # prior. This prompt used to score "medium" ("short prompt (10 words)")
+    # because "refactor" and "across" are not adjacent, so the old literal
+    # "refactor across" phrase match never fired and the difficulty term
+    # never showed up in the reason at all - length won by default.
+    cross_module_refactor = classify(
+        "refactor the permission engine across hearth_loop, hearth_tools and the sidecar")
+    assert cross_module_refactor["tier"] == TIER_LARGE, cross_module_refactor
+    assert "short prompt" not in cross_module_refactor["reason"], cross_module_refactor
+    assert "refactor" in cross_module_refactor["reason"].lower(), cross_module_refactor
+
+    # -- regression fixture: mechanical work beyond "rename" also lands -----
+    # small. This used to read as neither hard nor mechanical (the easy
+    # keyword list only caught "rename") and default to medium.
+    add_import = classify("add the missing import for json in scripts/foo.py")
+    assert add_import["tier"] == TIER_SMALL, add_import
+
+    # "fix the bug" must stay ambiguous, not get swept into "mechanical" by
+    # a too-broad easy-keyword list - ambiguous difficulty must not be
+    # pre-judged easy.
+    fix_bug = classify("fix the bug")
+    assert "mechanical-edit language" not in fix_bug["reason"], fix_bug
+
     # A failed-previous-turn signal must visibly raise the score versus the
     # same prompt with no such signal, and classify() must never crash on
     # signal-only, content-free input.
@@ -773,6 +855,20 @@ def _self_test_task_aware():
     assert r["tier"] == TIER_LARGE, r
     assert r["model"] in (large_id, "codellama:13b-instruct-q4_K_M"), r
     assert r["hardware_limited"] is False, r
+
+    # -- route(): regression fixtures for the two coordinator-reported ------
+    # misclassifications - a cross-module refactor must not get routed to
+    # the small model just because it is short, and mechanical import-add
+    # work must not default to medium.
+    r = route(
+        "refactor the permission engine across hearth_loop, hearth_tools and the sidecar",
+        all_ids, hw=hw_strong)
+    assert r["tier"] == TIER_LARGE, r
+    assert r["model"] in (large_id, "codellama:13b-instruct-q4_K_M"), r
+
+    r = route("add the missing import for json in scripts/foo.py", all_ids, hw=hw_strong)
+    assert r["tier"] == TIER_SMALL, r
+    assert r["model"] == small_id, r
 
     # -- route(): a 6GB card never has a fast-fitting large-tier candidate, -
     # so even a large-difficulty turn is honestly capped at medium. This
