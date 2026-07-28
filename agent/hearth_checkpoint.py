@@ -51,6 +51,37 @@ KNOWN CORRECTNESS HOLES, HANDLED HERE, NOT LEFT FOR SOMEONE TO DISCOVER:
   restorable: that tradeoff is deliberate and is spelled out in
   scope_limits().
 
+  Excluded-file change detection. The exclusion above has a sharp edge: an
+  agent turn can freely overwrite or delete a file like .env, and a plain
+  restore() silently cannot put it back, with nothing in the result to say
+  so. checkpoint() now also records a lightweight manifest -- relative path,
+  size, and mtime, nothing more -- of every file that currently exists and
+  matches the shadow store's SECRET file patterns specifically (.env*,
+  *.pem, *.key, id_rsa*, *.pfx, credentials*), written to a small sidecar
+  JSON file next to the shadow store, keyed by that checkpoint's commit sha.
+  This deliberately does NOT cover the heavy-directory excludes
+  (node_modules/, .venv/, __pycache__/, target/, dist/, build/, .git/):
+  those are large, ordinarily reproducible dependency/build trees rather
+  than irreplaceable user data, and stat-ing their contents on every
+  checkpoint (this runs before every agent turn) would trade a real,
+  recurring performance cost for very little safety benefit. restore()
+  reads the target checkpoint's manifest, if any, and compares it against
+  the same secret-pattern scan run again after the restore completes:
+  anything whose size/mtime changed, that vanished, or that is newly
+  present is reported in the "excluded_changed" field, as
+  {"path", "status"} entries with status one of "modified", "deleted",
+  "created" -- machine-readable, because a UI has to render it, not prose
+  buried in a warning string. A checkpoint taken before this feature
+  existed has no sidecar manifest; restore() reports an empty list for it
+  rather than guessing, because "we do not know what existed before" and
+  "nothing existed before" are not the same claim. Size+mtime is a
+  heuristic, not a content hash: it is the same class of lightweight signal
+  update-index --refresh already leans on elsewhere in this module, chosen
+  because a checkpoint runs before every agent turn and a hash of
+  potentially large secret files (a .pfx bundle, for instance) is not a
+  cost this module should pay on that hot path. See the module docstring's
+  "Performance" note above and scope_limits() for how this is disclosed.
+
   Not a git repo. The workspace very often will not be one. The shadow store
   does not care, because it owns its own GIT_DIR; init_store() works
   identically whether or not the workspace has ever seen "git init".
@@ -132,7 +163,9 @@ contain spaces, quotes, or Unicode that a shell-string command line would
 have to escape, and get wrong, in exactly this kind of code.
 """
 
+import fnmatch
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -155,6 +188,22 @@ LARGE_TREE_WARNING_SECONDS = 5.0
 
 MAX_SCAN_DIRS = 20000  # bound on sub_repos()'s directory walk, so a
                         # pathological tree cannot hang detection.
+
+MAX_EXCLUDED_MANIFEST_FILES = 100  # bound on how many secret-pattern files
+                                    # checkpoint() will record into the
+                                    # excluded-file manifest. Real secret
+                                    # counts (.env, a couple of key files,
+                                    # credentials.json) are almost always
+                                    # under 10; this exists so a pathological
+                                    # tree cannot slow checkpoint() or bloat
+                                    # the sidecar manifest file without
+                                    # bound. Excess is reported truncated,
+                                    # never silently dropped.
+MAX_EXCLUDED_MANIFEST_BYTES = 8192  # a second, independent cap on the
+                                     # manifest's serialised size, so a
+                                     # handful of unusually long paths
+                                     # cannot do what a large file count
+                                     # would.
 
 _LOCK_TIMEOUT_S = 60.0   # how long a caller will wait for another
                           # checkpoint/restore on the same workspace before
@@ -462,6 +511,131 @@ def _add_all(gitdir, ws, timeout=GIT_TIMEOUT_S):
     return rc, out, err, subs, subs_truncated
 
 
+def _excluded_manifest_dir(store_root):
+    return os.path.join(store_root, "excluded_manifest")
+
+
+def _excluded_manifest_path(store_root, sha):
+    return os.path.join(_excluded_manifest_dir(store_root), "{}.json".format(sha))
+
+
+def _secret_file_patterns():
+    """The subset of _BUILTIN_EXCLUDES that names individual files (no
+    trailing '/'), i.e. the secrets patterns, not the heavy directories.
+    Derived from _BUILTIN_EXCLUDES itself, not hand-copied, so the two
+    cannot silently drift apart if a pattern is ever added or removed."""
+    patterns = []
+    for line in _BUILTIN_EXCLUDES.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or line.endswith("/"):
+            continue
+        patterns.append(line)
+    return patterns
+
+
+def _scan_excluded_secrets(gitdir, ws):
+    """Every currently-existing file under `ws` that matches the shadow
+    store's secret file patterns, as a list of [relative-posix-path, size,
+    mtime_ns], capped at MAX_EXCLUDED_MANIFEST_FILES entries and
+    MAX_EXCLUDED_MANIFEST_BYTES serialised bytes. Returns (manifest,
+    truncated).
+
+    Uses `git ls-files --others --ignored --exclude-standard --directory`
+    rather than a Python os.walk: with --directory, a directory that is
+    wholly ignored (node_modules/, .venv/, target/, dist/, build/) is
+    reported as a single entry instead of being recursed into, so this call
+    does not pay to stat every file inside a dependency tree. What is left
+    is the same class of single, fast, git-side tree walk `_add_all`'s own
+    `git add -A` already performs every checkpoint, not a second slow
+    Python walk stacked on top of it. A failure here (git error, timeout)
+    is treated as truncated with an empty manifest rather than raised: a
+    checkpoint or restore must not fail outright because this best-effort
+    detection could not run.
+    """
+    rc, out, err = _git(gitdir, ws, [
+        "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z",
+    ])
+    if rc != 0:
+        return [], True
+    patterns = _secret_file_patterns()
+    manifest = []
+    truncated = False
+    for rel in out.split("\x00"):
+        if not rel or rel.endswith("/"):
+            continue  # blank split artefact, or a collapsed wholly-ignored directory
+        name = rel.rsplit("/", 1)[-1]
+        if not any(fnmatch.fnmatch(name, pat) for pat in patterns):
+            continue
+        if len(manifest) >= MAX_EXCLUDED_MANIFEST_FILES:
+            truncated = True
+            break
+        full = hearth_paths.long_path(os.path.join(ws, rel.replace("/", os.sep)))
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue  # vanished between listing and stat; nothing to record
+        manifest.append([rel, st.st_size, st.st_mtime_ns])
+    manifest.sort(key=lambda e: e[0])
+    encoded = json.dumps(manifest, separators=(",", ":"))
+    while len(encoded.encode("utf-8")) > MAX_EXCLUDED_MANIFEST_BYTES and manifest:
+        manifest.pop()
+        truncated = True
+        encoded = json.dumps(manifest, separators=(",", ":"))
+    return manifest, truncated
+
+
+def _write_excluded_manifest(store_root, sha, manifest, truncated):
+    manifest_dir = _excluded_manifest_dir(store_root)
+    os.makedirs(manifest_dir, exist_ok=True)
+    payload = {"files": manifest, "truncated": truncated}
+    path = _excluded_manifest_path(store_root, sha)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(payload, fh, separators=(",", ":"))
+    os.replace(tmp, path)
+
+
+def _read_excluded_manifest(store_root, sha):
+    """The manifest recorded for checkpoint `sha`, or None if it was never
+    written (either the checkpoint predates this feature, or the manifest
+    write itself failed). None is distinct from an empty list: an empty
+    list means "checkpointed, zero secret files existed then"; None means
+    "we genuinely do not know what existed then", and restore() must not
+    guess by treating it as zero."""
+    path = _excluded_manifest_path(store_root, sha)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    files = payload.get("files") if isinstance(payload, dict) else None
+    if not isinstance(files, list):
+        return None
+    return files
+
+
+def _diff_excluded_manifest(before, after):
+    """Compare two excluded-secret-file manifests (each a list of
+    [path, size, mtime_ns]), returning {"path", "status"} entries for every
+    path that differs: "deleted" (was recorded, no longer exists),
+    "modified" (size or mtime_ns differs), or "created" (exists now, was
+    not recorded before). Size+mtime is a heuristic, not a content hash;
+    see the module docstring's "Excluded-file change detection" note for
+    why that tradeoff was made."""
+    before_map = {e[0]: (e[1], e[2]) for e in before}
+    after_map = {e[0]: (e[1], e[2]) for e in after}
+    changed = []
+    for path, stat_before in before_map.items():
+        if path not in after_map:
+            changed.append({"path": path, "status": "deleted"})
+        elif after_map[path] != stat_before:
+            changed.append({"path": path, "status": "modified"})
+    for path in after_map:
+        if path not in before_map:
+            changed.append({"path": path, "status": "created"})
+    return sorted(changed, key=lambda e: e["path"])
+
+
 def checkpoint(workspace, label=None, timestamp=None):
     """Take a whole-tree snapshot of `workspace` into its shadow git store.
 
@@ -478,16 +652,23 @@ def checkpoint(workspace, label=None, timestamp=None):
     Returns a dict with at least: id (the shadow commit sha), label,
     timestamp, file_count, elapsed_seconds, sub_repos (nested repos found and
     excluded this run, see sub_repos()), sub_repos_truncated (True if
-    MAX_SCAN_DIRS was hit and sub_repos may be incomplete), and workspace. A
-    "warning" key is present when the tree is large or slow enough, or the
-    sub-repo scan was truncated, that the caller should surface it to the
-    user rather than let either condition pass unnoticed.
+    MAX_SCAN_DIRS was hit and sub_repos may be incomplete),
+    excluded_secrets_tracked (how many secret-pattern files this checkpoint
+    recorded a size/mtime manifest for, so a later restore() can detect
+    changes to them; see the module docstring's "Excluded-file change
+    detection" note), excluded_manifest_truncated (True if
+    MAX_EXCLUDED_MANIFEST_FILES or MAX_EXCLUDED_MANIFEST_BYTES was hit), and
+    workspace. A "warning" key is present when the tree is large or slow
+    enough, the sub-repo scan was truncated, or the excluded-secrets
+    manifest was truncated, that the caller should surface it to the user
+    rather than let any of those conditions pass unnoticed.
     """
     ws = _validate_workspace(workspace)
     gitdir = init_store(ws)
+    store_root = _store_root(ws)
     t0 = time.perf_counter()
 
-    with _StoreLock(_store_root(ws)):
+    with _StoreLock(store_root):
         rc, out, err, subs, subs_truncated = _add_all(gitdir, ws)
         if rc != 0:
             raise RuntimeError("checkpoint failed while staging {}: {}".format(ws, err.strip()))
@@ -507,6 +688,17 @@ def checkpoint(workspace, label=None, timestamp=None):
         rc, out, err = _git(gitdir, ws, ["ls-files"])
         file_count = len([line for line in out.splitlines() if line.strip()]) if rc == 0 else -1
 
+        excluded_manifest, excluded_manifest_truncated = _scan_excluded_secrets(gitdir, ws)
+        try:
+            _write_excluded_manifest(store_root, sha, excluded_manifest, excluded_manifest_truncated)
+        except OSError:
+            # Best-effort bookkeeping: a failure to write the sidecar manifest
+            # must not fail an otherwise-successful checkpoint. restore()
+            # already treats a missing manifest file as "unknown, not zero"
+            # (see _read_excluded_manifest), so this degrades to exactly the
+            # same behaviour as a pre-feature checkpoint, not a silent lie.
+            excluded_manifest_truncated = True
+
     elapsed = time.perf_counter() - t0
     result = {
         "id": sha,
@@ -516,6 +708,8 @@ def checkpoint(workspace, label=None, timestamp=None):
         "elapsed_seconds": elapsed,
         "sub_repos": subs,
         "sub_repos_truncated": subs_truncated,
+        "excluded_secrets_tracked": len(excluded_manifest),
+        "excluded_manifest_truncated": excluded_manifest_truncated,
         "workspace": ws,
     }
     warnings = []
@@ -528,6 +722,11 @@ def checkpoint(workspace, label=None, timestamp=None):
         warnings.append(
             "sub-repo scan stopped after {} directories; some nested git repositories "
             "past that point may not have been detected or excluded".format(MAX_SCAN_DIRS)
+        )
+    if excluded_manifest_truncated:
+        warnings.append(
+            "excluded-secrets manifest was truncated; a later restore may not detect "
+            "every excluded file that changed"
         )
     if warnings:
         result["warning"] = " ".join(warnings)
@@ -641,12 +840,27 @@ def restore(workspace, checkpoint_id):
     place without a spurious "local changes would be overwritten" refusal.
 
     Returns a dict with checkpoint_id, restored (list of {"path", "status"}),
-    and skipped_gitlinks (sub-repo paths this call could not touch either
-    way, plus any legacy gitlink entries found in the diff itself). On
-    failure, such as an unknown checkpoint id, no store for this workspace,
-    or a git error, returns a dict with an "error" key instead of raising: a
-    failed restore is an expected outcome the caller needs to show the user,
-    not a programming error.
+    skipped_gitlinks (sub-repo paths this call could not touch either way,
+    plus any legacy gitlink entries found in the diff itself), and
+    excluded_changed: {"path", "status"} entries (status "modified",
+    "deleted", or "created") for every secret-pattern excluded file that
+    changed since the checkpoint and that this restore therefore could NOT
+    put back, because it was never captured in the first place. This is the
+    signal that makes the gap between hearth_contain's containment (the
+    agent can write anywhere in the workspace) and this module's deliberate
+    secrets exclusion visible at the one moment it matters: restore()
+    reporting "restored": [...] on its own reads as a complete, trustworthy
+    undo even when a .env the agent corrupted was silently left corrupted.
+    excluded_changed is always a list, empty when there is nothing to
+    report; excluded_manifest_available is False when the checkpoint being
+    restored to predates this feature (no manifest was ever recorded for
+    it), in which case excluded_changed is necessarily [] because there is
+    no baseline to compare against, not because nothing changed -- see the
+    module docstring's "Excluded-file change detection" note. On failure,
+    such as an unknown checkpoint id, no store for this workspace, or a git
+    error, returns a dict with an "error" key instead of raising: a failed
+    restore is an expected outcome the caller needs to show the user, not a
+    programming error.
 
     Two failure shapes need to be told apart, because both happen after the
     worktree may already have started changing:
@@ -671,27 +885,34 @@ def restore(workspace, checkpoint_id):
     """
     ws = _validate_workspace(workspace)
     gitdir = _gitdir_for(ws)
+    store_root = _store_root(ws)
     if not os.path.isdir(os.path.join(gitdir, "objects")):
-        return {"error": "no checkpoint store for this workspace", "restored": [], "skipped_gitlinks": []}
+        return {
+            "error": "no checkpoint store for this workspace",
+            "restored": [], "skipped_gitlinks": [], "excluded_changed": [],
+        }
 
-    with _StoreLock(_store_root(ws)):
+    with _StoreLock(store_root):
         rc, out, err = _git(gitdir, ws, ["rev-parse", "--verify", "{}^{{commit}}".format(checkpoint_id)])
         if rc != 0:
-            return {"error": "unknown checkpoint: {}".format(checkpoint_id), "restored": [], "skipped_gitlinks": []}
+            return {
+                "error": "unknown checkpoint: {}".format(checkpoint_id),
+                "restored": [], "skipped_gitlinks": [], "excluded_changed": [],
+            }
         target = out.strip()
 
         rc, out, err, subs, subs_truncated = _add_all(gitdir, ws)
         if rc != 0:
             return {
                 "error": "could not capture current state before restore: {}".format(err.strip()),
-                "restored": [], "skipped_gitlinks": [],
+                "restored": [], "skipped_gitlinks": [], "excluded_changed": [],
             }
 
         rc, before_tree, err = _git(gitdir, ws, ["write-tree"])
         if rc != 0:
             return {
                 "error": "could not snapshot current state: {}".format(err.strip()),
-                "restored": [], "skipped_gitlinks": [],
+                "restored": [], "skipped_gitlinks": [], "excluded_changed": [],
             }
         before_tree = before_tree.strip()
 
@@ -704,6 +925,7 @@ def restore(workspace, checkpoint_id):
                 "error": "could not compute what would change; refusing to reset the "
                          "worktree without being able to report it: {}".format(err.strip()),
                 "checkpoint_id": target, "restored": [], "skipped_gitlinks": [],
+                "excluded_changed": [],
             }
         restored, skipped = _parse_raw_diff(raw)
 
@@ -719,6 +941,7 @@ def restore(workspace, checkpoint_id):
                 "attempted": restored,
                 "worktree_state": "unknown",
                 "skipped_gitlinks": skipped,
+                "excluded_changed": [],
             }
 
         # A file rewritten with byte-identical content still gets a fresh
@@ -727,12 +950,32 @@ def restore(workspace, checkpoint_id):
         # before anyone checks.
         _git(gitdir, ws, ["update-index", "--refresh"])
 
+        # The gap this closes: read-tree -u never touches a secret-pattern
+        # excluded file (it was never in the shadow index to begin with), so
+        # if the agent corrupted or deleted one, "restored" above reports a
+        # clean, complete-looking undo while that damage silently persists.
+        # Compare the manifest recorded at checkpoint time (if any) against
+        # the same secret-pattern scan run again now, after the reset.
+        before_manifest = _read_excluded_manifest(store_root, target)
+        excluded_manifest_available = before_manifest is not None
+        if excluded_manifest_available:
+            after_manifest, _after_truncated = _scan_excluded_secrets(gitdir, ws)
+            excluded_changed = _diff_excluded_manifest(before_manifest, after_manifest)
+        else:
+            # No manifest for this checkpoint: it predates this feature (or
+            # the write failed at checkpoint time). Reporting [] here means
+            # "we have no baseline", never "nothing changed" -- see
+            # excluded_manifest_available in the return value.
+            excluded_changed = []
+
     return {
         "checkpoint_id": target,
         "restored": restored,
         "skipped_gitlinks": sorted(set(skipped) | set(subs)),
         "sub_repos_excluded": subs,
         "sub_repos_truncated": subs_truncated,
+        "excluded_changed": excluded_changed,
+        "excluded_manifest_available": excluded_manifest_available,
     }
 
 
@@ -752,7 +995,16 @@ def scope_limits():
         "excludes (.env*, *.pem, *.key, id_rsa*, *.pfx, credentials*) or heavy "
         "directories (node_modules/, .venv/, __pycache__/, target/, dist/, "
         "build/, .git/): anything excluded there is never captured and "
-        "therefore never restorable.",
+        "therefore never restorable. That exclusion is not silent, though: "
+        "checkpoint() records a lightweight size/mtime manifest of the "
+        "secret-pattern files (not the heavy directories, for cost reasons) "
+        "that exist at checkpoint time, and restore() reports any of them "
+        "that were modified, deleted, or newly created since, in the "
+        "'excluded_changed' field, so a restore that could not undo real "
+        "damage says so instead of looking clean. A checkpoint taken before "
+        "this manifest existed has no baseline to compare against; restore() "
+        "signals that with 'excluded_manifest_available': False rather than "
+        "claiming nothing changed.",
         "Does not detect case-only renames on a case-insensitive filesystem "
         "(the Windows and macOS default): git's diff-index cannot see a rename "
         "that only changes case.",
@@ -783,7 +1035,7 @@ def _self_test():
     # _git and MAX_SCAN_DIRS to force error paths that are otherwise very
     # hard to reach deterministically (a genuine git-diff or read-tree
     # failure, or a directory-count limit without creating 20000 dirs).
-    global _git, MAX_SCAN_DIRS
+    global _git, MAX_SCAN_DIRS, MAX_EXCLUDED_MANIFEST_FILES
 
     if not is_git_available():
         print("hearth-checkpoint self-test SKIPPED: git not found on PATH")
@@ -833,6 +1085,11 @@ def _self_test():
             "restore left behind a file created after the checkpoint"
         paths_restored = {r["path"] for r in result["restored"]}
         assert "a.txt" in paths_restored and "junk.txt" in paths_restored, result
+        # A workspace with no excluded secret files at all still gets a
+        # (trivially empty) manifest recorded, so restore reports
+        # "we checked, nothing excluded changed", not "we don't know".
+        assert result["excluded_manifest_available"] is True, result
+        assert result["excluded_changed"] == [], result
 
         # -- 2. the user's own git repo is left exactly as it was -----------
         ws2 = os.path.join(base, "ws2")
@@ -943,12 +1200,87 @@ def _self_test():
         os.makedirs(ws5)
         _write(os.path.join(ws5, ".env"), "SECRET_KEY=do-not-checkpoint-me\n")
         _write(os.path.join(ws5, "app.py"), "print('hello')\n")
-        checkpoint(ws5, label="with secret")
+        cp5 = checkpoint(ws5, label="with secret")
         ws5_real = os.path.realpath(ws5)
         rc, shadow_ls5, _e = _git(_gitdir_for(ws5_real), ws5_real, ["ls-files"])
         names5 = shadow_ls5.splitlines()
         assert ".env" not in names5, names5
         assert "app.py" in names5, names5
+
+        # -- 5b. THE GAP THIS ITERATION CLOSES, end to end: restore() must
+        #     name the excluded file that changed while it could not restore
+        #     it, and must still restore the ordinary file byte-exact. This
+        #     is the scenario from the task: checkpoint a workspace with a
+        #     real excluded file, damage it, restore, and assert the new
+        #     field names it while ordinary files come back exact. ----------
+        _write(os.path.join(ws5, ".env"), "SECRET_KEY=DAMAGED-BY-AGENT\n")
+        _write(os.path.join(ws5, "app.py"), "print('DAMAGED')\n")
+        r5 = restore(ws5, cp5["id"])
+        assert "error" not in r5, r5
+        assert _read_bytes(os.path.join(ws5, "app.py")) == b"print('hello')\n", \
+            "an ordinary tracked file must still restore byte-exact even when an " \
+            "excluded file changed alongside it"
+        # The excluded file itself is untouched by restore (it was never
+        # captured, so there is nothing to put back) -- still showing the
+        # damage, proving restore genuinely left it alone rather than by
+        # coincidence matching the original.
+        assert _read_bytes(os.path.join(ws5, ".env")) == b"SECRET_KEY=DAMAGED-BY-AGENT\n"
+        assert r5["excluded_manifest_available"] is True, r5
+        excluded5 = {e["path"]: e["status"] for e in r5["excluded_changed"]}
+        assert excluded5.get(".env") == "modified", (
+            "restore() must name '.env' as changed but not restorable, not silently "
+            "report a clean 'restored' list: {}".format(r5)
+        )
+        # Ordinary restored files must not leak into excluded_changed, and
+        # vice versa: the two fields describe disjoint sets of paths.
+        assert "app.py" not in excluded5, r5
+        assert ".env" not in {r["path"] for r in r5["restored"]}, r5
+
+        # -- 5c. a secret file DELETED since the checkpoint is reported too,
+        #     not just a modified one: restore cannot know a file used to
+        #     exist unless the checkpoint-time manifest said so. ------------
+        ws5d = os.path.join(base, "ws5d")
+        os.makedirs(ws5d)
+        _write(os.path.join(ws5d, "id_rsa"), "-----BEGIN OPENSSH PRIVATE KEY-----\n")
+        _write(os.path.join(ws5d, "ok.txt"), "fine\n")
+        cp5d = checkpoint(ws5d, label="with key")
+        os.remove(os.path.join(ws5d, "id_rsa"))
+        r5d = restore(ws5d, cp5d["id"])
+        assert "error" not in r5d, r5d
+        excluded5d = {e["path"]: e["status"] for e in r5d["excluded_changed"]}
+        assert excluded5d.get("id_rsa") == "deleted", r5d
+
+        # -- 5e. a secret file CREATED since the checkpoint (did not exist
+        #     before) is reported too. -----------------------------------------
+        ws5e = os.path.join(base, "ws5e")
+        os.makedirs(ws5e)
+        _write(os.path.join(ws5e, "ok.txt"), "fine\n")
+        cp5e = checkpoint(ws5e, label="no secrets yet")
+        _write(os.path.join(ws5e, "credentials.json"), '{"token": "new"}\n')
+        r5e = restore(ws5e, cp5e["id"])
+        assert "error" not in r5e, r5e
+        excluded5e = {e["path"]: e["status"] for e in r5e["excluded_changed"]}
+        assert excluded5e.get("credentials.json") == "created", r5e
+        # A brand-new secret file created after the checkpoint is real user
+        # data now; restore must not delete it even though it is reported.
+        assert os.path.exists(os.path.join(ws5e, "credentials.json"))
+
+        # -- 5f. a checkpoint predating this feature (no manifest sidecar on
+        #     disk) reports excluded_manifest_available: False and an empty
+        #     excluded_changed, never a false "nothing changed". ------------
+        ws5f = os.path.join(base, "ws5f")
+        os.makedirs(ws5f)
+        _write(os.path.join(ws5f, ".env"), "SECRET\n")
+        cp5f = checkpoint(ws5f, label="pretend legacy")
+        manifest_path5f = _excluded_manifest_path(_store_root(os.path.realpath(ws5f)), cp5f["id"])
+        assert os.path.exists(manifest_path5f), manifest_path5f
+        os.remove(manifest_path5f)
+        _write(os.path.join(ws5f, ".env"), "SECRET-DAMAGED\n")
+        r5f = restore(ws5f, cp5f["id"])
+        assert "error" not in r5f, r5f
+        assert r5f["excluded_manifest_available"] is False, r5f
+        assert r5f["excluded_changed"] == [], \
+            "no manifest means no baseline, and must report [] rather than guess"
 
         # -- 6. CRLF content survives a round trip byte for byte -------------
         ws6 = os.path.join(base, "ws6")
@@ -1146,6 +1478,26 @@ def _self_test():
             assert "sub-repo scan" in cp10["warning"], cp10
         finally:
             MAX_SCAN_DIRS = _real_max_scan_dirs
+
+        # -- 12b. the excluded-secrets manifest reports truncation instead of
+        #     silently under-recording a pathological number of secret-
+        #     pattern files, the same discipline as the sub-repo scan above.
+        #     Uses a small MAX_EXCLUDED_MANIFEST_FILES rather than actually
+        #     creating 100+ files. --------------------------------------------
+        _real_max_manifest_files = MAX_EXCLUDED_MANIFEST_FILES
+        MAX_EXCLUDED_MANIFEST_FILES = 1
+        try:
+            ws10b = os.path.join(base, "ws10b")
+            os.makedirs(ws10b)
+            _write(os.path.join(ws10b, "a.pem"), "1\n")
+            _write(os.path.join(ws10b, "b.pem"), "2\n")
+            cp10b = checkpoint(ws10b, label="truncated manifest")
+            assert cp10b["excluded_manifest_truncated"] is True, cp10b
+            assert cp10b["excluded_secrets_tracked"] == 1, cp10b
+            assert "warning" in cp10b, cp10b
+            assert "manifest was truncated" in cp10b["warning"], cp10b
+        finally:
+            MAX_EXCLUDED_MANIFEST_FILES = _real_max_manifest_files
 
         # -- 13. every public entry point rejects an empty workspace path
         #     instead of letting os.path.realpath("") silently resolve to

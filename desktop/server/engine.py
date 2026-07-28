@@ -910,6 +910,84 @@ def _self_test():
     else:
         assert "/bin/sh" in edit_prompt, edit_prompt
 
+    # === restore()'s excluded_changed field survives this module's own ====
+    # === binding to hearth_checkpoint, and a future restore-forwarding ====
+    # === helper here cannot silently drop it the way sub_repos_truncated ==
+    # === was once dropped from the checkpoint event (see git history) and =
+    # === the way skipped_gitlinks was already lost from a forwarding path =
+    # === once on this branch. Restore itself is invoked over HTTP by ======
+    # === app.py as `engine_mod.hearth_checkpoint.restore` -- this file's ==
+    # === own `import hearth_checkpoint` (see top of module) IS that ======
+    # === binding, so exercising it here, through the identical object ====
+    # === app.py reaches through, is what actually proves the module ======
+    # === boundary does not eat the field, not just an assertion in prose. =
+    if hearth_checkpoint.is_git_available():
+        import shutil as _shutil
+        ws_restore = tempfile.mkdtemp(prefix="hearth-engine-restore-selftest-")
+        # Isolate the shadow store under this scratch dir instead of the
+        # real per-user Hearth data directory: this is the first place in
+        # this file's self-test that calls the real checkpoint()/restore(),
+        # not a fake_checkpoint stand-in, and it must not write into a real
+        # user's Hearth checkpoints directory just by running the self-test.
+        _old_data_dir = os.environ.get("HEARTH_DATA_DIR")
+        os.environ["HEARTH_DATA_DIR"] = os.path.join(ws_restore + "-data")
+        try:
+            # newline="" throughout: an ordinary text-mode write on Windows
+            # would translate "\n" to "\r\n" on the way in, which would make
+            # this test's own byte-exact comparison below meaningless (it
+            # would be comparing against bytes this test never actually
+            # asked git to store), not a real restore bug.
+            secret_path = os.path.join(ws_restore, ".env")
+            ordinary_path = os.path.join(ws_restore, "app.py")
+            with open(secret_path, "w", encoding="utf-8", newline="") as fh:
+                fh.write("SECRET=before\n")
+            with open(ordinary_path, "w", encoding="utf-8", newline="") as fh:
+                fh.write("print('before')\n")
+            cp = hearth_checkpoint.checkpoint(ws_restore, label="engine-selftest")
+            with open(secret_path, "w", encoding="utf-8", newline="") as fh:
+                fh.write("SECRET=DAMAGED\n")
+            with open(ordinary_path, "w", encoding="utf-8", newline="") as fh:
+                fh.write("print('DAMAGED')\n")
+            restore_result = hearth_checkpoint.restore(ws_restore, cp["id"])
+            assert "error" not in restore_result, restore_result
+            assert "excluded_changed" in restore_result, (
+                "hearth_checkpoint.restore()'s result lost 'excluded_changed' somewhere "
+                "between the module and this call site: {}".format(restore_result)
+            )
+            excluded_paths = {e["path"] for e in restore_result["excluded_changed"]}
+            assert ".env" in excluded_paths, (
+                "restore() must still name the excluded, unrestorable .env change when "
+                "called through engine.py's own hearth_checkpoint binding: {}".format(restore_result)
+            )
+            with open(ordinary_path, "rb") as fh:
+                assert fh.read() == b"print('before')\n", \
+                    "the ordinary file must come back byte-exact alongside the excluded_changed report"
+        finally:
+            if _old_data_dir is None:
+                os.environ.pop("HEARTH_DATA_DIR", None)
+            else:
+                os.environ["HEARTH_DATA_DIR"] = _old_data_dir
+            _shutil.rmtree(ws_restore, ignore_errors=True)
+            _shutil.rmtree(ws_restore + "-data", ignore_errors=True)
+    else:
+        print("hearth-desktop-engine self-test: restore()/excluded_changed check SKIPPED (no git)")
+
+    # Structural tripwire: if this file ever grows its own restore-result
+    # forwarding helper (mirroring how _checkpoint() above hand-picks fields
+    # out of checkpoint()'s return dict for the "checkpoint" SSE event), any
+    # dict literal here that names "skipped_gitlinks" must also name
+    # "excluded_changed" in the same literal, so the two can never again
+    # drift apart the way a forwarded field has already gone missing twice
+    # on this branch (sub_repos_truncated from the checkpoint event; see the
+    # iteration history in .superpowers/sdd/loop/).
+    with open(os.path.abspath(__file__), "r", encoding="utf-8") as fh:
+        _engine_src_for_restore_check = fh.read()
+    for _match in _re.finditer(r'\{[^{}]*"skipped_gitlinks"[^{}]*\}', _engine_src_for_restore_check, _re.DOTALL):
+        assert '"excluded_changed"' in _match.group(0), (
+            "a dict literal in engine.py forwards skipped_gitlinks without also "
+            "forwarding excluded_changed: {}".format(_match.group(0))
+        )
+
     print("hearth-desktop-engine self-test OK")
     return 0
 
