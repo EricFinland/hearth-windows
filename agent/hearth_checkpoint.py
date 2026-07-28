@@ -542,9 +542,20 @@ def _extract_trailer(body, key):
 def list_checkpoints(workspace):
     """Every checkpoint recorded for `workspace`, newest first.
 
-    Returns [] if the workspace has no shadow store yet, meaning checkpoint()
-    has never been called for it. Never raises for that reason: an empty
-    history is a normal, expected state, not an error.
+    Returns [] in exactly two "there is genuinely no history yet" cases:
+    the workspace has no shadow store at all (checkpoint() has never been
+    called for it), or the store exists but has no commit yet (init_store()
+    ran but no checkpoint() ever completed against it, for example a prior
+    checkpoint() call that failed partway through _add_all before it ever
+    reached the commit step). Both are a normal, expected state, never an
+    error.
+
+    Any OTHER `git log` failure -- a corrupt object database, GIT_TIMEOUT_S
+    expiring, git missing from PATH after the store was already created --
+    raises RuntimeError instead of returning []. Collapsing that into an
+    empty list would present a broken store to the user as "you have no
+    checkpoints", in a module whose own standard (see the module docstring)
+    is that nothing here is silently swallowed.
     """
     ws = _validate_workspace(workspace)
     gitdir = _gitdir_for(ws)
@@ -552,7 +563,18 @@ def list_checkpoints(workspace):
         return []
     rc, out, err = _git(gitdir, ws, ["log", "--format=%H%x1f%ct%x1f%B%x1e"])
     if rc != 0:
-        return []
+        # git's own wording for "the store exists but nothing has been
+        # committed to it yet" (a bare repo with no HEAD commit) -- the one
+        # non-zero exit that is still a legitimate empty history, not a
+        # failure. Every other non-zero exit is a real problem and must not
+        # be reported as if it were this one.
+        if "does not have any commits yet" in err or "bad default revision" in err:
+            return []
+        raise RuntimeError(
+            "could not read checkpoint history for {}: {}".format(
+                ws, (err or out or "git log failed").strip()
+            )
+        )
     checkpoints = []
     for rec in out.split("\x1e"):
         rec = rec.strip("\n").strip()
@@ -1163,6 +1185,47 @@ def _self_test():
         assert list_checkpoints(ws7) == []
         never = restore(ws7, "deadbeef")
         assert "error" in never, never
+
+        # -- 15. list_checkpoints distinguishes "no checkpoints yet" from a
+        #     real git failure. A store that was initialised but never
+        #     successfully committed to (mirroring a checkpoint() call that
+        #     failed partway through _add_all, before it ever reached the
+        #     commit step) is STILL a legitimate empty history, not an
+        #     error -- git's own "does not have any commits yet" is the one
+        #     non-zero exit from `git log` that means that. Any OTHER git
+        #     log failure (a corrupt store, a timeout) must raise instead of
+        #     silently reporting "you have no checkpoints", which would hide
+        #     real breakage from the user. --------------------------------------
+        ws12 = os.path.join(base, "ws12")
+        os.makedirs(ws12)
+        init_store(ws12)  # store created, but nothing has ever been committed
+        assert list_checkpoints(ws12) == [], \
+            "an initialised-but-never-committed store is a normal empty history, not an error"
+
+        _write(os.path.join(ws12, "f.txt"), "one\n")
+        checkpoint(ws12, label="only")
+        assert len(list_checkpoints(ws12)) == 1
+
+        _real_git4 = _git
+
+        def _fail_on_log(gitdir, worktree, args, timeout=GIT_TIMEOUT_S):
+            if args and args[0] == "log":
+                return 1, "", "fatal: object database corrupted (simulated)"
+            return _real_git4(gitdir, worktree, args, timeout=timeout)
+
+        _git = _fail_on_log
+        try:
+            try:
+                list_checkpoints(ws12)
+                assert False, \
+                    "a genuine git log failure must raise, not silently report an empty history"
+            except RuntimeError as exc:
+                assert "corrupted" in str(exc), exc
+        finally:
+            _git = _real_git4
+
+        # the un-mocked path still works after restoring the real _git.
+        assert len(list_checkpoints(ws12)) == 1
     finally:
         if old_data_dir is None:
             os.environ.pop("HEARTH_DATA_DIR", None)

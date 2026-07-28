@@ -372,7 +372,12 @@ def tool_list_files(args, workspace):
         return "error: {}".format(exc)
 
 
-_TREE_SKIP = {".git", "__pycache__", "node_modules", "result", ".direnv", ".mypy_cache"}
+# Sourced from hearth_contain.SKIP_DIRS, the one authoritative list, rather
+# than redefined here. The old local copy was missing ".venv", which let
+# replace_in_files walk into a virtualenv and rewrite site-packages -- files
+# the checkpoint store never captures, so that damage was not undoable. See
+# hearth_contain.SKIP_DIRS's docstring comment for the full story.
+_TREE_SKIP = hearth_contain.SKIP_DIRS
 
 
 def tool_search_files(args, workspace):
@@ -527,8 +532,11 @@ def plant_decoys(workspace):
         canary = _new_canary()
         body = template.format(canary=canary, tok8=canary[-8:])
         try:
-            with open(full, "w") as fh:
-                fh.write(body)
+            # Explicit UTF-8 via the same helper every manifest tool writes
+            # through, not a bare open() on the host's ANSI codepage: a
+            # decoy body containing a non-ASCII byte would otherwise fail
+            # (or mojibake) on a cp1252 machine instead of writing cleanly.
+            _write_text_atomic(full, body)
             planted.add(rel)
         except OSError:
             continue
@@ -969,8 +977,13 @@ def tool_kb_add(args, workspace):
     text = args.get("text")
     if not text and args.get("path"):
         try:
-            with open(hearth_contain.safe_join(workspace, args.get("path")), errors="replace") as fh:
-                text = fh.read()
+            # Same helper every manifest tool reads through (explicit UTF-8),
+            # not a bare open() on the host's ANSI codepage. safe_join can
+            # raise ValueError (containment) and _read_text can raise
+            # UnicodeDecodeError (not valid UTF-8, e.g. a binary file);
+            # UnicodeDecodeError is itself a ValueError subclass, so this one
+            # except clause already covered it before this change too.
+            text = _read_text(hearth_contain.safe_join(workspace, args.get("path")))
         except (OSError, ValueError) as exc:
             return "error: {}".format(exc)
     if not (text or "").strip():
@@ -1318,6 +1331,29 @@ def _self_test():
     ed = execute_tool("edit_file", {"path": "src/app.py", "find": "x = 1", "replace": "x = 42"}, ws)
     assert "1 replacement" in ed, ed
     assert "x = 42" in execute_tool("read_file", {"path": "src/app.py"}, ws)
+    # --- Finding 1, pinned with the actual consequence: a walk must never
+    # descend into .venv. The three skip-directory lists (hearth_contain,
+    # hearth_tools, hearth_project) used to diverge, and hearth_tools's own
+    # copy (_TREE_SKIP) was the one missing ".venv" -- so search_files,
+    # list_tree, and replace_in_files would all walk into a virtualenv and
+    # replace_in_files could rewrite site-packages there. That damage is not
+    # undoable: the checkpoint store's own built-in excludes (see
+    # hearth_checkpoint._BUILTIN_EXCLUDES) never capture .venv/ either, so a
+    # bad replace_in_files run had no undo path. _TREE_SKIP is now sourced
+    # from hearth_contain.SKIP_DIRS, which does include ".venv".
+    assert ".venv" in hearth_contain.SKIP_DIRS, "the authoritative list must cover .venv"
+    assert ".venv" in _TREE_SKIP, "_TREE_SKIP must be sourced from hearth_contain.SKIP_DIRS, not a stale local copy"
+    execute_tool("write_file", {"path": ".venv/lib/site-packages/evil.py", "content": "SENTINEL_VENV = 1\n"}, ws)
+    venv_tree = execute_tool("list_tree", {}, ws)
+    assert ".venv" not in venv_tree, ("list_tree walked into .venv", venv_tree)
+    venv_hits = execute_tool("search_files", {"query": "SENTINEL_VENV"}, ws)
+    assert venv_hits == "no matches", ("search_files walked into .venv", venv_hits)
+    venv_rep = execute_tool("replace_in_files", {"find": "SENTINEL_VENV", "replace": "PWNED"}, ws)
+    assert venv_rep == "no occurrences of that text found (no changes)", \
+        ("replace_in_files rewrote a file inside .venv", venv_rep)
+    assert execute_tool("read_file", {"path": ".venv/lib/site-packages/evil.py"}, ws) == "SENTINEL_VENV = 1\n", \
+        "a file inside .venv must survive a replace_in_files run untouched"
+
     miss = execute_tool("edit_file", {"path": "src/app.py", "find": "not there", "replace": "y"}, ws)
     assert "not found" in miss, ("edit_file errors cleanly when find absent", miss)
     # knowledge base: add docs (inline + from a workspace file), then search.
@@ -1331,6 +1367,18 @@ def _self_test():
         assert "added" in execute_tool("kb_add", {"source": "nix", "text": "NixOS rolls back atomically from a flake."}, ws)
         execute_tool("write_file", {"path": "notes.txt", "content": "Ollama serves local models on the GPU."}, ws)
         assert "added" in execute_tool("kb_add", {"source": "notes", "path": "notes.txt"}, ws)
+        # kb_add now reads via _read_text (explicit UTF-8, strict), the same
+        # helper every manifest tool reads through, instead of a bare
+        # open(..., errors="replace") on the host codepage that silently
+        # mangled bad bytes into replacement characters and ingested the
+        # corrupted result without complaint. A genuinely undecodable file
+        # must now surface as an error instead.
+        badenc = os.path.join(ws, "bad_enc.txt")
+        with open(badenc, "wb") as fh:
+            fh.write(b"before \xff\xfe after")
+        bad_res = execute_tool("kb_add", {"source": "badenc", "path": "bad_enc.txt"}, ws)
+        assert bad_res.startswith("error:"), \
+            ("kb_add must surface an undecodable file as an error, not silently ingest replacement characters", bad_res)
         found = execute_tool("kb_search", {"query": "rollback flake"}, ws)
         assert "nix" in found and "atomically" in found, found
         # index_dir: ingest a workspace subtree, then it is searchable
@@ -1456,6 +1504,26 @@ def _self_test():
         assert tok and tok.startswith("HEARTH-CANARY-"), (rel, body)
         tokens.add(tok)
     assert len(tokens) == len(planted), ("each decoy gets a unique token", tokens)
+
+    # plant_decoys now writes via _write_text_atomic (explicit UTF-8), not a
+    # bare open(full, "w") on the host's ANSI codepage, matching the ten
+    # manifest tools. Proven with a template containing non-ASCII text: on a
+    # cp1252-default host, a bare open()'s implicit encoding would raise
+    # UnicodeEncodeError (or mangle the bytes, depending on the character),
+    # rather than writing the real UTF-8 bytes this asserts on.
+    _old_templates = dict(_DECOY_TEMPLATES)
+    _DECOY_TEMPLATES["unicode.txt"] = "canary={canary} café ✓ 日本語\n"
+    try:
+        planted_u = plant_decoys(dws)
+        assert "unicode.txt" in planted_u, planted_u
+        with open(os.path.join(dws, "unicode.txt"), "rb") as fh:
+            raw = fh.read()
+        assert "café ✓ 日本語".encode("utf-8") in raw, \
+            ("plant_decoys must write explicit UTF-8, not the host codepage", raw)
+    finally:
+        _DECOY_TEMPLATES.clear()
+        _DECOY_TEMPLATES.update(_old_templates)
+
     assert find_canary("nothing to see here") is None
     assert find_canary("leak: HEARTH-CANARY-0123456789abcdef done") == "HEARTH-CANARY-0123456789abcdef"
     # a decoy is a real readable file that a shell "cat"-equivalent would

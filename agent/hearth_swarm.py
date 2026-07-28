@@ -30,9 +30,17 @@ import hearth_state  # noqa: E402
 import hearth_loop  # noqa: E402  (reused for make_db_transport + TRANSCRIPT_SCHEMA)
 import hearth_paths  # noqa: E402
 
-DEFAULT_QUEUE = "/var/lib/hearth/queue"
 DEFAULT_OLLAMA = "http://127.0.0.1:11434"
 DEFAULT_DB = hearth_paths.db_path()
+# Routed through hearth_paths the same way DEFAULT_DB is: hearth_paths.data_dir()
+# already probes for a genuinely writable root and falls back to a per-user
+# directory when /var/lib/hearth exists but this process cannot write into it
+# (see hearth_paths.py). A queue directory needs no dedicated helper of its
+# own -- it is just another subdirectory of the same writable root, exactly
+# like db_path()/logs_dir()/checkpoints_dir() -- so this shares data_dir()
+# rather than hardcoding the old root-owned Linux path, which a plain desktop
+# user could never write to.
+DEFAULT_QUEUE = os.path.join(hearth_paths.data_dir(), "queue")
 MAX_SUBTASKS = 5
 
 DECOMPOSE_SYS = (
@@ -234,6 +242,27 @@ def run_manager(goal, model, workspace, db=DEFAULT_DB, agent_id="manager", mode=
 
 def _self_test():
     import tempfile
+    # DEFAULT_QUEUE must be routed through hearth_paths.data_dir(), the same
+    # way DEFAULT_DB already is, not a leftover hardcoded "/var/lib/hearth"
+    # path from before the module was ported to hearth_paths. Proven against
+    # a redirected HEARTH_DATA_DIR so this does not depend on what the real
+    # host's /var/lib/hearth happens to be writable by.
+    _old_data_dir = os.environ.get("HEARTH_DATA_DIR")
+    _scratch_data_dir = tempfile.mkdtemp(prefix="hearth-swarm-datadir-")
+    os.environ["HEARTH_DATA_DIR"] = _scratch_data_dir
+    try:
+        assert hearth_paths.data_dir() == _scratch_data_dir, hearth_paths.data_dir()
+        assert os.path.join(hearth_paths.data_dir(), "queue") == \
+            os.path.join(_scratch_data_dir, "queue"), "sanity check on the join itself"
+    finally:
+        if _old_data_dir is None:
+            os.environ.pop("HEARTH_DATA_DIR", None)
+        else:
+            os.environ["HEARTH_DATA_DIR"] = _old_data_dir
+    assert DEFAULT_QUEUE == os.path.join(hearth_paths.data_dir(), "queue"), DEFAULT_QUEUE
+    assert DEFAULT_QUEUE != "/var/lib/hearth/queue" or hearth_paths.data_dir() == "/var/lib/hearth", (
+        "DEFAULT_QUEUE must track hearth_paths.data_dir(), not a hardcoded literal", DEFAULT_QUEUE)
+
     # parse_subtasks: well-formed + fallback
     ts = parse_subtasks('[{"name":"a","prompt":"do a"},{"name":"b","prompt":"do b"}]', "g")
     assert len(ts) == 2 and ts[0]["prompt"] == "do a", ts

@@ -85,13 +85,32 @@ Standard library only.
 
 import collections
 import itertools
+import os
 import secrets
 import sys
 import threading
 import time
 import uuid
 
-MODES = ("plan", "edit", "auto", "bypass")
+# permissions.py (agent/) is the authoritative source of the permission-mode
+# set. This module used to carry its own hardcoded duplicate of that tuple,
+# which meant a mode added to permissions.MODES (as "edit" once was) had to
+# be remembered here too, by hand, or session construction would reject a
+# mode permissions.decide already understands. sys.path is extended the same
+# way engine.py does (desktop/server -> desktop -> repo root -> agent/),
+# since this module is a sibling of engine.py and permissions.py is a small,
+# pure, I/O-free module -- importing just its MODES constant does not pull in
+# hearth_loop/hearth_tools or otherwise compromise the "no engine import"
+# seam described below.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))  # desktop/server -> desktop -> repo root
+_AGENT_DIR = os.path.join(_REPO_ROOT, "agent")
+if _AGENT_DIR not in sys.path:
+    sys.path.insert(0, _AGENT_DIR)
+
+import permissions  # noqa: E402
+
+MODES = permissions.MODES
 DEFAULT_MODE = "edit"
 
 STATUS_IDLE = "idle"
@@ -396,6 +415,13 @@ class Session:
 
 
 def _self_test():
+    # MODES must be sourced from permissions.MODES, not a local duplicate:
+    # a mode permissions.py knows about (all four, today) must be exactly
+    # the set Session accepts, so the two can never drift apart again.
+    assert MODES == permissions.MODES, (MODES, permissions.MODES)
+    assert MODES is permissions.MODES, "MODES must be the same object, not a copy that can drift"
+    assert "edit" in MODES, MODES
+
     # --- construction validates its inputs ---
     for bad in (dict(workspace="", model="m"), dict(workspace="w", model=""),
                 dict(workspace="w", model="m", mode="yolo")):

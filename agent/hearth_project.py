@@ -18,8 +18,11 @@ import hearth_knowledge  # noqa: E402
 import hearth_paths  # noqa: E402
 
 DEFAULT_DB = hearth_knowledge.DEFAULT_DB
-SKIP_DIRS = {".git", "__pycache__", "node_modules", "result", ".direnv",
-             ".mypy_cache", "dist", "build", ".venv", "venv", ".cache"}
+# hearth_contain.SKIP_DIRS is the one authoritative base list; this project
+# indexer genuinely needs a few extra build/venv directories on top of it,
+# so it unions them rather than redefining the base from scratch (which is
+# how it previously drifted).
+SKIP_DIRS = hearth_contain.SKIP_DIRS | {"dist", "build", "venv", ".cache"}
 # Text/code file types worth indexing by default.
 DEFAULT_GLOBS = ["*.py", "*.md", "*.txt", "*.rst", "*.nix", "*.js", "*.ts", "*.jsx",
                  "*.tsx", "*.json", "*.yaml", "*.yml", "*.toml", "*.ini", "*.cfg",
@@ -75,6 +78,12 @@ def project_sources(db, name):
 
 def _self_test():
     import tempfile
+    # SKIP_DIRS is hearth_contain.SKIP_DIRS (the one authoritative base list)
+    # plus this indexer's own genuine extras, not a redefinition from scratch.
+    assert SKIP_DIRS >= hearth_contain.SKIP_DIRS, SKIP_DIRS
+    assert {"dist", "build", "venv", ".cache"} <= SKIP_DIRS, SKIP_DIRS
+    assert ".venv" in SKIP_DIRS, "the base list's .venv entry must survive the union"
+
     d = tempfile.mkdtemp(prefix="hearth-proj-")
     root = os.path.join(d, "proj")
     os.makedirs(os.path.join(root, "src"))

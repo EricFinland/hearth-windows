@@ -30,6 +30,14 @@ import sys
 import hearth_paths
 
 
+# The one authoritative skip-directory list. hearth_tools and hearth_project
+# used to each carry their own divergent copy (one missing .venv entirely),
+# which meant replace_in_files could walk into .venv and rewrite
+# site-packages -- content the checkpoint store never captures (see
+# hearth_checkpoint's _BUILTIN_EXCLUDES), so that damage was not undoable.
+# Every walking tool now prunes with this set (hearth_checkpoint.sub_repos
+# already did); a caller that genuinely needs extra entries unions them on
+# top of this base rather than redefining it (see hearth_project.SKIP_DIRS).
 SKIP_DIRS = frozenset({".git", "__pycache__", "node_modules", "result", ".direnv", ".mypy_cache", ".venv"})
 
 _RESERVED = (
