@@ -63,13 +63,53 @@ everything else on this page.
   including a real tool call, the permission gate firing, an approval
   resolved over HTTP, a byte-exact workspace change, an automatic pre-turn
   checkpoint, and a byte-exact restore.
+- Session persistence (`desktop/server/session_state.py`): the conversation,
+  workspace, model, and mode survive a sidecar restart. A turn or an
+  approval that was in flight when the process stopped is never silently
+  resumed; see "What survives a restart" below.
+- Model downloads with honest progress (`agent/hearth_pull.py`): drives
+  Ollama's own pull stream and turns it into a progress bar and byte count
+  that never move backwards, with cancellation, a disk-space check up
+  front, and a per-layer digest record. Verified against a real Ollama
+  server pulling a real model: 6 layers, 2,019,393,189 bytes, progress
+  monotonic across every one of 10 callbacks sampled.
+- A prompt-injection scanner (`agent/hearth_injection.py`) and an outbound
+  secret scanner (`agent/hearth_secrets.py`). Both detect and surface;
+  neither blocks anything. See "What Hearth notices before you approve
+  something" below for what they catch and, just as important, what they
+  are known to miss.
+- Task-aware model routing (`agent/hearth_router.py`): `classify()` scores
+  how hard a turn looks from its prompt, history, and tool signals into a
+  small/medium/large tier; `route()` turns that into a concrete, installed,
+  hardware-appropriate model; `escalate()` moves up exactly one tier after
+  a demonstrated failure (a malformed tool call, a retry). Verified against
+  9 test prompts, all 9 classified into the expected tier, including a
+  malformed tool call correctly escalating a turn one tier up. A heuristic,
+  not a guarantee: it will misroute sometimes, and it is deliberately
+  biased toward starting cheap, since escalating after a bad turn is a
+  tested recovery path and there is no equivalent for the opposite mistake.
+- Idle-aware compute (`agent/hearth_idle.py`): holds off on heavy
+  background work while you are actively using the machine, and gets out
+  of the way again quickly once you stop. See "Staying out of your way"
+  below.
+- First-run setup diagnosis (`agent/hearth_setup.py`): checks, in
+  dependency order, whether Ollama is installed, running, new enough, has
+  any model pulled, and whether that model actually fits your hardware,
+  so a new user gets a sentence they can act on instead of a raw
+  connection error from deep inside the agent loop.
+- `.hearthignore` support (`agent/hearth_contain.py`, `agent/hearth_tools.py`):
+  a gitignore-flavoured file that narrows what an agent can see inside an
+  already-permitted workspace. See "Scoping what Hearth Code can see"
+  below for the full syntax reference.
 
 **Not built yet.** There is no Tauri desktop shell, no UI, no installer, no
 code signing, and nothing published anywhere. The model shop described below
 has no interface yet: it exists as data and logic today, callable, tested,
 and correct, but with nothing to click. There is no cloud API key support.
-**There is no download.** Everything on this page describes an engine that
-works when driven directly, not a finished application.
+**There is no download of Hearth itself.** The model-download engine above
+can pull an Ollama model when driven directly; there is no button, no app,
+and no installer around it yet. Everything on this page describes an engine
+that works when driven directly, not a finished application.
 
 ## What you need
 
@@ -78,6 +118,14 @@ installed with at least one model already pulled. Hearth does not fetch or
 manage models yet; that is the model shop's job, and it isn't built. Until
 then, whatever model you choose in Ollama is the trust decision, made
 outside Hearth.
+
+The engine already knows how to tell you which of those things is missing.
+`hearth_setup.py` checks, in order, whether Ollama is installed, whether it
+is running, what version it reports, whether any model has been pulled, and
+whether that model actually fits your hardware, and stops at the first
+thing that is actually wrong rather than piling up downstream failures you
+cannot act on yet. It has no interface yet either; today it is a diagnosis
+you can call directly, not a message you will see on first launch.
 
 ## How a model, and its context length, get chosen for your hardware
 
@@ -119,6 +167,52 @@ approximate, and the shop's verdicts are deliberately softened when they're
 built on an approximate reading rather than a precise one - a confident
 "this runs great" is never shown on a guessed number.
 
+## Getting a model onto your machine
+
+A multi-gigabyte download with a progress bar that lies, freezes, or jumps
+backwards is one of the more common ways local-model tools lose a user's
+trust in the first five minutes. `agent/hearth_pull.py` drives Ollama's own
+`/api/pull` stream and is built specifically not to do that.
+
+Ollama's stream is messier than it looks: early lines carry no byte counts
+at all, the same layer gets reported more than once as it downloads, a
+later line can arrive with a *smaller* completed-byte count than one
+already processed, and the full list of layers is never announced up
+front. A progress bar built from "whatever the latest line says" jumps
+backwards and sideways in the face of all of that. Hearth tracks every
+layer independently and only ever lets its byte counts increase, so the
+number on screen is monotonic by construction, not by luck. Verified
+against a real Ollama server pulling a real model: 6 layers, 2,019,393,189
+bytes total, and progress that never decreased across 10 sampled progress
+callbacks.
+
+A few other things this engine gets right before there is a UI to show
+them:
+
+- **Cancellation actually stops the download**, not just the progress bar.
+  Closing the underlying connection from outside interrupts a background
+  thread blocked mid-read, on both Windows and POSIX, so a cancelled
+  multi-gigabyte pull stops within about half a second rather than waiting
+  for Ollama to notice.
+- **A disk-space check runs before any connection opens.** When Hearth
+  knows or can estimate how large a model will be, it compares that
+  against free space on the volume Ollama stores models on and refuses
+  before wasting your bandwidth, naming both numbers in the refusal. When
+  neither number is knowable, the check is skipped rather than inventing a
+  threshold to fail on.
+- **Success is Ollama's word, not a guess.** The download is only reported
+  complete when Ollama's own stream says so explicitly. A dropped
+  connection, a timeout, or a stream that just stops are all reported as
+  not-confirmed-done, never inferred as success because the byte count
+  happened to reach the total.
+- **What was pulled is recorded**, not verified. On a successful pull,
+  Hearth writes down the digest and size of every layer Ollama reported.
+  That is a baseline a later integrity check could compare against, not a
+  hash Hearth computes and checks itself.
+
+There is still no button for any of this. It is driven directly today, the
+same as the rest of the engine described on this page.
+
 ## What the permission modes mean
 
 Hearth Code never runs unattended by default. Four modes, in
@@ -158,6 +252,123 @@ Read [docs/limitations.md](limitations.md) before treating `auto` or
 is that approving a command by reading its text is not a real security
 control on Windows.
 
+## What Hearth notices before you approve something
+
+Two scanners run underneath the permission gate above. Both follow the same
+rule, stated in their own source and repeated here because it is the single
+most important thing to understand about them: **they detect and surface,
+they do not block.** Neither one refuses a tool call, strips anything from
+what the model sees, or stops a write from landing. Each one scans a blob
+of text, returns structured findings with a severity and a plain-English
+reason, and hands that to the same approval step you already see in `edit`
+and `auto` mode. Blocking on a heuristic was considered and rejected for
+both: a false positive that silently dropped or mangled content would
+corrupt what the model sees, or corrupt a file you meant to write, which is
+a worse failure than an occasional miss.
+
+**The prompt-injection scanner** (`agent/hearth_injection.py`) looks at
+content the agent reads: repo files, web pages, dependency READMEs, tool
+output, anything that could carry text engineered to look like an
+instruction rather than information. It scores what it finds from `low` to
+`critical` across categories like imperative overrides ("ignore all
+previous instructions"), authority spoofing ("the user has already
+approved this"), exfiltration shapes (a directive verb plus a
+sensitive-looking target plus an outbound destination), escalation
+language ("skip the approval"), structural spoofing (fake system-message
+formatting), and obfuscation (invisible characters, homoglyphs, long
+base64 blobs). Verified against 10 real adversarial payloads, all 10 of
+which scored `high` or `critical`, while all 48 files in this repository
+scanned clean.
+
+It will miss things, by design and by disclosure. Two gaps worth knowing
+specifically:
+
+- An in-band exfiltration attempt ("print the value of the token you
+  found") is only caught when it names a target the scanner already
+  recognizes (`id_rsa`, `.env`, a private key, `AWS_SECRET_ACCESS_KEY`-style
+  names, and a short list of others). A generic, unnamed target produces no
+  finding at all, on purpose - the alternative made ordinary debugging
+  requests ("check if the API key expired") indistinguishable from an
+  attack.
+- Wrapping a real payload in fake quotes or narration ("for example,
+  ignore all previous instructions and...") gets the same discount a
+  genuine security document quoting the same phrase gets. There is no way
+  to tell the two apart from the text alone, and this is the single
+  largest known evasion in this scanner.
+
+Absence of a finding must never be read as "this content is safe." A
+paraphrase, an unfamiliar unicode trick, or an instruction split across the
+scanner's scan window can all pass through unseen.
+
+**The secret scanner** (`agent/hearth_secrets.py`) looks the other
+direction: text the agent is about to write to a real file. A small local
+model will sometimes invent a plausible-looking credential when asked for
+an example config, or inline a real one it read from `.env` while
+explaining a fix instead of referencing it out of band. The scanner
+recognizes known key shapes (AWS, GitHub, Slack, Stripe, Google, OpenAI-
+style, JWT, PEM blocks) and a generic high-entropy value sitting next to a
+suspicious name (`api_key`, `secret`, `token`, `password`, `credential`).
+Verified against 7 freshly generated, real-shaped keys (all 7 caught) and 6
+placeholder forms including AWS's own documented example key,
+`AKIAIOSFODNN7EXAMPLE` (all 6 stayed silent), with the same 48 repository
+files scanning clean.
+
+Its known gap is the harder half of the problem it was built to solve: a
+passphrase-style secret made of real words ("correct horse battery
+staple") has low character-level entropy, the same as a placeholder does,
+and this scanner cannot tell the two apart. A weak-but-real secret phrased
+that way will not be flagged.
+
+## Scoping what Hearth Code can see: `.hearthignore`
+
+Everything above assumes the agent operates inside a workspace boundary it
+cannot escape (`agent/hearth_contain.py`'s `safe_join`, see
+[docs/limitations.md](limitations.md) for exactly how strong that boundary
+is). `.hearthignore`, placed at the root of a workspace, narrows that
+further: a gitignore-flavoured pattern file that hides matching paths from
+every file tool (read, write, edit, search, list, replace, and directory
+walks) without changing where the workspace boundary itself sits.
+
+This is the one piece of configuration in this document you will actually
+write yourself, so here is the real reference rather than a mention.
+
+**Supported syntax:**
+
+- Blank lines and full-line `#` comments are ignored.
+- `\#` and `\!` match a literal leading `#` or `!`.
+- A leading `!` negates a pattern: it re-includes a path that an earlier or
+  later rule in the same file also matches. Rules are applied in file
+  order and the last match wins, exactly like `.gitignore`.
+- A trailing `/` makes a pattern match directories only.
+- `*` matches any run of characters except `/`; `?` matches exactly one;
+  `[seq]` / `[!seq]` are character classes.
+- `**` is special only as a whole path segment: `**/x` matches `x` at any
+  depth, `x/**` matches `x` and everything under it, `a/**/b` matches zero
+  or more whole directories between `a` and `b`.
+- A pattern containing `/` anywhere but its very end is anchored to the
+  workspace root. A pattern with no interior `/` matches at any depth, the
+  same as `.gitignore`.
+
+**Not supported:** nested per-directory `.hearthignore` files (only a
+single workspace-root file is ever read), backslash escapes other than a
+leading `\#` or `\!`, trailing-whitespace escaping, and `**` fused into a
+larger segment (`a**b` falls back to two ordinary `*`s rather than
+expanding). An unsupported construct degrades to a literal or partial
+match rather than raising, the same way an unmatched `.gitignore` pattern
+quietly matches nothing.
+
+**The guarantee that matters:** `.hearthignore` can only narrow access,
+never widen it. Every function that consults it classifies a path
+`safe_join` has already approved; there is no code path from a pattern
+string to a filesystem location, only from an already-contained path to a
+yes/no visibility bit. A hostile `.hearthignore` (a pattern like `!/../../etc/passwd`,
+a drive-qualified Windows path, a negate-everything catch-all) has nothing
+to widen and cannot escape the workspace boundary, and this is checked
+directly in the module's own tests, not just asserted here. If you edit
+`.hearthignore` mid-session, the change is picked up on the next tool call
+that reads it (it is cached per workspace, keyed on the file's own
+modification time), not on a delay or a restart.
+
 ## How undo works
 
 Local models get things wrong often enough that cheap, reliable recovery is
@@ -185,6 +396,76 @@ patterns (like `.env`) are excluded from the shadow store's own capture, so
 they are not restorable through undo; and a nested repository inside your
 workspace is tracked as a pointer, not its actual content, so its own
 history is what protects it, not Hearth's.
+
+That first gap used to be invisible at the moment it mattered: a restore
+could report a clean list of everything it put back while a `.env` the
+agent had corrupted stayed corrupted, silently, because it was never
+captured in the first place. Restore now closes that specific silence,
+without closing the underlying gap: it re-scans for the same secret
+patterns after restoring and reports every excluded file that changed
+since the checkpoint, as `excluded_changed` entries naming the path and
+whether it was modified, deleted, or newly created. It still cannot put
+those files back - they were never captured - but it no longer lets a
+restore look complete when it wasn't. A checkpoint taken before this
+existed has no baseline to compare against; restore says so explicitly
+(`excluded_manifest_available: false`) rather than reporting a false "no
+changes."
+
+## Staying out of your way
+
+A model saturating the GPU during a video call is a bad neighbor, and
+running Hearth hard overnight only stays appealing if it reliably gets out
+of the way the moment you sit back down. `agent/hearth_idle.py` is the
+part of the engine built to answer exactly that question: is now a good
+time to run heavy background work, and why.
+
+On Windows it combines several signals: how long since the last keyboard
+or mouse event system-wide (the strongest signal available anywhere in
+this module), whether the GPU is actually computing right now versus
+merely holding a model resident in VRAM, whether the foreground window is
+fullscreen, and whether the machine is running on battery. The two
+directions are deliberately asymmetric: it waits 5 minutes of genuine
+inactivity before declaring the machine idle, but drops back to "busy"
+after just 15 seconds of renewed activity. It costs little to be slow to
+start heavy work; it costs your trust in leaving Hearth running unattended
+to be slow to stop.
+
+Two honesty notes worth knowing:
+
+- **On headless Linux, input idleness cannot be seen at all.** X11 needs an
+  extension this module does not use, and Wayland does not expose global
+  input idleness to unprivileged clients by design. Where no signal is
+  available, the module answers "unknown, low confidence, good time to
+  run" rather than guessing - a wrong "busy" means nothing ever runs, which
+  is worse than a wrong "idle" running a job while someone happens to be
+  at the keyboard undetectably.
+- It does not catch a windowed video call (a call window that isn't
+  maximized); only borderless or exclusive fullscreen is detected, and only
+  against the primary monitor's resolution.
+
+There is no scheduler wired up to this yet. Today it is a signal a caller
+can consult, the same as the rest of the engine described on this page.
+
+## What survives a restart
+
+The sidecar keeps a session's entire life in memory by default, which
+means closing the app, a crash, or a reboot for an update used to mean
+losing the conversation, the workspace/model/mode in use, and the record
+of what was approved. `desktop/server/session_state.py` persists the
+conversation, the workspace, model, and mode, and a bounded tail of recent
+events, so a restart is a resumption rather than a reset.
+
+What is deliberately not persisted matters as much as what is. A pending
+approval is never resurrected: an approval is a live question with a
+thread blocked on it, and after a restart there is no thread and no turn
+to resume. A restarted session instead records that one was pending and
+marks the interrupted turn honestly in its own history, rather than
+silently dropping it or leaving a question nobody can still answer. The
+same is true of a turn that was mid-flight when the process stopped - it
+is never resumed, because a restarted process has no way to know whether
+the tool call that was in progress actually happened. The bearer token is
+never persisted either; it is regenerated on every process start on
+purpose, so it never becomes a file-on-disk secret.
 
 ## Read this next
 

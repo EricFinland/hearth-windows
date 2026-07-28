@@ -127,6 +127,67 @@ hard-capped capability manifest that applies in every mode including
 `bypass`. What it cannot do is contain what happens once a `run_command`
 call is allowed to proceed - see above.
 
+## Two scanners that detect and surface, and nothing more
+
+`agent/hearth_injection.py` (prompt injection in content the agent reads)
+and `agent/hearth_secrets.py` (credentials about to be written to a file)
+both say the same thing about themselves, in their own docstrings, and it
+is repeated here because it is the point most likely to be misread as
+stronger than it is: **they are a signal, not a boundary.** Neither one
+blocks a tool call, refuses a write, or strips anything from what actually
+reaches the model or the disk. A finding is something the permission gate
+and the human clicking approve get to see; absence of a finding is never
+proof that content is safe.
+
+Each has a specific, disclosed gap worth naming rather than leaving
+implicit:
+
+- The **injection scanner** can be evaded. Wrapping a real payload in fake
+  quotes or narrative framing ("for example, ignore all previous
+  instructions and...") gets the same discount a genuine security document
+  quoting the same phrase gets - there is no way to tell the two apart from
+  the text alone, and it is the single largest known evasion in this
+  scanner.
+- The **secret scanner** misses passphrase-style secrets. A real credential
+  made of ordinary words ("correct horse battery staple") has the same low
+  character-level entropy a placeholder does, and entropy is the signal
+  this scanner leans on hardest. A weak-but-real secret phrased that way
+  passes through unflagged.
+
+Both scanners are also bounded to a head-and-tail scan window on anything
+larger than about 60-80K characters; a payload or a secret placed only in
+the untouched middle of a very large document is not seen. Both stayed
+quiet on this repository's own files during testing (48 files each) and
+both caught real adversarial fixtures at high confidence, but "caught
+these" is not the same claim as "catches everything," and this page will
+not pretend otherwise.
+
+## Idle detection has a blind spot on headless Linux
+
+`agent/hearth_idle.py` decides whether it's a good time to run heavy
+background work. Its strongest signal, how long since the last keyboard or
+mouse event, is Windows-only: it reads through `GetLastInputInfo`, which
+has no headless-Linux equivalent. X11 needs an extension this module
+doesn't use, and Wayland does not expose global input idleness to
+unprivileged clients at all, by design. Where no signal is available at
+all, the module defaults to "good time to run" rather than guessing busy -
+the same asymmetry as everywhere else in this document: a wrong "always
+busy" silently disables a feature, a wrong "idle" merely means a
+background job ran while a human happened to be present undetectably.
+
+## Undo still cannot restore what it never captured
+
+Files matching common secret patterns (`.env`, `*.pem`, `id_rsa*`, and
+similar) are excluded from the checkpoint store's own capture, on purpose,
+so undo has never been able to restore damage inside one of them. That gap
+is unchanged. What changed is that it no longer hides: restore now
+re-scans for the same excluded files after putting everything else back,
+and reports every one that was modified, deleted, or created since the
+checkpoint, under `excluded_changed`, instead of letting a restore report
+a clean list while a corrupted `.env` stays corrupted. Naming a gap is not
+the same as closing it - if `excluded_changed` names a file, that file is
+not back to what it was, and nothing currently in Hearth can put it there.
+
 ## Read this before you flip to `bypass`
 
 `bypass` mode exists to let you skip every prompt. If you choose a model

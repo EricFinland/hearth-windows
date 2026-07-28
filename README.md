@@ -28,16 +28,20 @@ forms today.
 
 **Hearth is a Windows desktop application in development. There is no
 download yet.** The engine underneath it (permissions, containment,
-checkpoint/undo, the sidecar HTTP layer) is built and self-tested; the
-desktop shell, the UI, and the installer are not built. Once it exists, the
-pitch is simple: point it at a model through [Ollama](https://ollama.com)
-and it works the way a hosted AI assistant does, except every token comes
-from your own GPU at no cost, and it tells you honestly what your hardware
-can actually run instead of leaving you to guess. **Hearth Code** is the
-agentic coding surface inside Hearth: the part that reads your repo,
-proposes edits, runs commands, and can be handed a task to work on while
-you do something else. Two names, used consistently throughout this repo:
-Hearth is the application, Hearth Code is the coding agent inside it.
+checkpoint/undo, model downloads, the sidecar HTTP layer) is built and
+self-tested; the desktop shell, the UI, and the installer are not built.
+Once it exists, the pitch is simple: point it at a model through
+[Ollama](https://ollama.com) and it works the way a hosted AI assistant
+does, except every token comes from your own GPU at no cost, it tells you
+honestly what your hardware can actually run instead of leaving you to
+guess, it downloads that model with a progress bar that does not lie, it
+flags content that looks like it is trying to steer the model before you
+approve acting on it, and it stays out of your way while you are using the
+machine for something else. **Hearth Code** is the agentic coding surface
+inside Hearth: the part that reads your repo, proposes edits, runs
+commands, and can be handed a task to work on while you do something else.
+Two names, used consistently throughout this repo: Hearth is the
+application, Hearth Code is the coding agent inside it.
 
 **Hearth is also a fully declarative NixOS system.** The same agent engine
 runs as sandboxed systemd units on a machine defined entirely by one
@@ -57,20 +61,26 @@ first. NixOS users, skip ahead to [the NixOS system](#the-nixos-system).
 
 > **Windows desktop app: in development, nothing published yet.** The agent
 > engine underneath Hearth Code, hardware detection, the model shop's fit
-> calculator, workspace containment, and git-backed checkpoint/undo, is
-> built and self-tested on Windows. The desktop shell, the UI, the
-> installer, and the model shop's actual interface are not built yet. There
-> is no download. [Hearth for Windows](docs/windows.md) says exactly what
-> exists today; [the Windows threat model](docs/security/windows-threat-model.md)
-> says exactly what does not.
+> calculator, workspace containment, git-backed checkpoint/undo, model
+> downloads with honest progress, a prompt-injection scanner, an outbound
+> secret scanner, task-aware model routing, idle-aware compute, and
+> first-run setup diagnosis are all built and self-tested on Windows. The
+> desktop shell, the UI, the installer, and the model shop's actual
+> interface are not built yet. There is no download. [Hearth for
+> Windows](docs/windows.md) says exactly what exists today; [the Windows
+> threat model](docs/security/windows-threat-model.md) says exactly what
+> does not.
 
 ## Hearth for Windows
 
 Read the full page: **[docs/windows.md](docs/windows.md)**. It covers what
 Hearth and Hearth Code are, what you need today (Ollama, installed and with
 a model already pulled), how a model and a context length get chosen for
-your specific GPU, what the permission modes (`plan`, `edit`, `auto`,
-`bypass`) mean, and how undo works.
+your specific GPU, how a model download reports honest progress, what the
+permission modes (`plan`, `edit`, `auto`, `bypass`) mean, how Hearth flags
+content that looks like it is trying to steer the model or a write that
+looks like it is leaking a credential, how `.hearthignore` scopes what an
+agent can see, and how undo works.
 
 Also worth reading before you trust it with anything real:
 
