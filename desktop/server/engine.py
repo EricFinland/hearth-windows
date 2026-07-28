@@ -66,6 +66,36 @@ calling the right functions in the right order:
      for a real injection payload proven to actually reach the approval
      payload, not just asserted to in prose.
 
+  4. The write, not the read, is the untrusted-content entry point scanned
+     for live credentials (agent/hearth_secrets.py) -- the mirror image of
+     point 3. Only a GATED call is scanned (the same cost discipline
+     hearth_secrets.py itself asks for: "runs on every gated write", not
+     every write), and only for the three WINDOWS_TOOLS entries that ever
+     place new text into a file: write_file's `content`, and edit_file's
+     and replace_in_files' `replace` (their `find` field is text the tool
+     goes looking for, already present somewhere the agent read, not new
+     content the call introduces -- see _SECRET_SCAN_ARG_KEY). When that
+     scan's overall severity meets SECRETS_SURFACE_THRESHOLD, a redacted
+     summary -- kind, masked preview, a short hearth_secrets.redact()ed
+     context window, never the raw span -- rides along on the SAME
+     approval_request event the injection finding above already uses,
+     nested under a "secrets" key so neither scanner's finding can mask
+     the other (see _secrets_finding_for_approval). request_approval()'s
+     one keyword argument is still named injection_finding (session.py is
+     off limits this iteration, see the top-level task boundary this
+     module was built under); this module packs a second scanner's result
+     into that same slot rather than leaving it unsurfaced, and says so
+     here rather than pretending the name still describes only one thing.
+     Whenever a finding is produced this way, the SAME call's `args` that
+     reach every emitted event (approval_request, and the tool_call that
+     follows once/if approved) are also replaced with a redacted copy --
+     see display_args below -- so the raw secret a user is being asked
+     to approve is never itself the thing sitting in the SSE stream or the
+     event log; the actual write, if approved, still uses the real,
+     unredacted argument. See engine.py's self-test (section N) for a real
+     key proven to reach the approval payload redacted and never appear in
+     the serialised event.
+
 Standard library only.
 """
 
@@ -86,6 +116,7 @@ if _AGENT_DIR not in sys.path:
 import hearth_checkpoint  # noqa: E402
 import hearth_injection  # noqa: E402
 import hearth_loop  # noqa: E402
+import hearth_secrets  # noqa: E402
 import hearth_shop  # noqa: E402
 import hearth_tools  # noqa: E402
 import permissions  # noqa: E402
@@ -115,6 +146,52 @@ _CANCELLED = "cancelled"
 # layer from quietly re-tuning a scorer it was explicitly told not to
 # re-tune.
 INJECTION_SURFACE_THRESHOLD = "high"
+
+# Severity band, from hearth_secrets.SEVERITY, at or above which a gated
+# write's secret scan is worth (a) surfacing as its own finding on the
+# approval and (b) redacting out of every event this call's arguments reach
+# (see display_args in run()). "high" mirrors INJECTION_SURFACE_THRESHOLD's
+# own reasoning: it is where hearth_secrets.py's own self-test draws the
+# line between a real, structurally-unambiguous credential (every known key
+# format, a live Stripe key, a connection string, a suspicious-named
+# high-entropy assignment -- all "high" or "critical") and its two
+# deliberately weaker signals (a bare JWT, a Stripe TEST-mode key -- both
+# "medium", common enough and non-live enough that gating every approval on
+# them would train users to stop reading the prompt). Every known-negative
+# placeholder in that module's own self-test scores "none". One threshold
+# controls both effects (surface the finding, redact the args) rather than
+# two separate cutoffs, so there is no way for this wiring to redact
+# content out of an event while leaving the approval with no annotation
+# explaining why it changed, or vice versa.
+SECRETS_SURFACE_THRESHOLD = "high"
+
+# Which gated tool's which argument ever places NEW text into a file --
+# the exact set the task brief asks this module to work out for itself.
+# hearth_tools.WINDOWS_TOOLS has ten entries; only these three write
+# anything at all, and each has exactly one argument whose value actually
+# lands on disk:
+#   write_file        content  -- the entire new file body.
+#   edit_file         replace  -- the text inserted; its `find` argument is
+#                                  text the tool goes looking for, already
+#                                  present somewhere upstream (the agent
+#                                  read it to know what to search for), not
+#                                  new content this call introduces, so
+#                                  scanning it would not catch the failure
+#                                  mode hearth_secrets.py exists for and
+#                                  would double the scan work for no gain.
+#   replace_in_files   replace  -- same reasoning as edit_file, across many
+#                                  files instead of one.
+# The other seven (read_file, list_files, list_tree, search_files,
+# run_command, git_status, git_diff) either write nothing at all, or, for
+# run_command, do not carry "file content" in the shape hearth_secrets.py
+# scans for -- a shell command string is not itself the write; the file
+# handle, redirect, or echo target inside it is opaque to this dict-shaped
+# scan. Deliberately out of scope for this wiring, not silently missed.
+_SECRET_SCAN_ARG_KEY = {
+    "write_file": "content",
+    "edit_file": "replace",
+    "replace_in_files": "replace",
+}
 
 _PLAN_MODE_ADDENDUM = (
     " You are in PLAN MODE: do not modify anything and do not run commands. "
@@ -271,6 +348,74 @@ def _injection_finding_for_approval(scan_result):
         "category": top.get("category"),
         "matched": top.get("matched"),
         "explanation": top.get("explanation"),
+    }
+
+
+def _write_content_for_secrets_scan(name, args):
+    """The text a gated call `name` is about to write, or None if this call
+    does not write file content at all (not in _SECRET_SCAN_ARG_KEY), or
+    writes an empty/non-string value (nothing to scan, nothing to redact --
+    a deletion via edit_file's `replace=""` is not a credential leaving the
+    box). Returning None here is exactly the signal that skips both the
+    scan AND the redaction pass in run(), so a tool call outside this small
+    set never pays for either."""
+    key = _SECRET_SCAN_ARG_KEY.get(name)
+    if key is None:
+        return None
+    value = args.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def _secrets_context_snippet(content, finding, margin=30):
+    """A short, bounded window of `content` around one hearth_secrets
+    finding, with that finding's own span replaced via hearth_secrets.
+    redact() before the window is cut out -- never a raw slice containing
+    the secret itself. The finding's start/end are re-based onto the
+    window's own coordinates first (redact() expects offsets local to the
+    text it is given), so this stays a cheap, constant-size slice-then-
+    redact rather than redacting the entire write just to build one small
+    preview."""
+    start, end = finding.get("start", 0), finding.get("end", 0)
+    lo = max(0, start - margin)
+    hi = min(len(content), end + margin)
+    window = content[lo:hi]
+    local = dict(finding)
+    local["start"] = start - lo
+    local["end"] = end - lo
+    return hearth_secrets.redact(window, [local])
+
+
+def _secrets_finding_for_approval(scan_result, content):
+    """Reduce a hearth_secrets.scan() result to the small, display-ready
+    shape the approval_request event carries, in the same spirit as
+    _injection_finding_for_approval above: the overall severity and finding
+    count, plus the single strongest individual finding, chosen the same
+    way (highest severity, ties broken by confidence -- the two fields
+    hearth_secrets.py itself uses to rank a match). Unlike the injection
+    finding, this never carries a raw matched span: "masked" is already
+    redaction-safe (hearth_secrets._mask never reproduces the value), and
+    "context" is a hearth_secrets.redact()ed window, not raw text -- see
+    the module docstring's point 4 and hearth_secrets.py's own docstring
+    for why a scanner whose output reproduces the secret it found would be
+    self-defeating.
+
+    Returns None if the result has no findings -- defensive, since every
+    caller here already checked meets_threshold(scan_result, ...) first.
+    """
+    findings = scan_result.get("findings") or []
+    if not findings:
+        return None
+    rank = {s: i for i, s in enumerate(hearth_secrets.SEVERITY)}
+    top = max(findings, key=lambda f: (rank.get(f.get("severity"), 0), f.get("confidence", 0)))
+    return {
+        "severity": scan_result.get("severity"),
+        "count": scan_result.get("count"),
+        "kind": top.get("kind"),
+        "confidence": top.get("confidence"),
+        "line": top.get("line"),
+        "masked": top.get("masked"),
+        "context": _secrets_context_snippet(content, top),
+        "reason": top.get("reason"),
     }
 
 
@@ -462,6 +607,15 @@ class RealEngine:
                     else:
                         cargs = {}
 
+                    # The args every event this call reaches will show. Equal
+                    # to cargs unless the gate branch below finds this call's
+                    # write carries a secret-shaped value, in which case it
+                    # becomes a redacted copy -- see the module docstring's
+                    # point 4. The tool itself always executes against the
+                    # real `cargs`, never this: see the _run_cancellable call
+                    # below, which closes over `cargs`, not `display_args`.
+                    display_args = cargs
+
                     verdict = permissions.decide(ctx.mode, name, cargs, self.auto_allow,
                                                   allowed_tools=hearth_tools.WINDOWS_TOOLS)
 
@@ -482,12 +636,59 @@ class RealEngine:
                         if self._last_scan is not None and hearth_injection.meets_threshold(
                                 self._last_scan, INJECTION_SURFACE_THRESHOLD):
                             injection_finding = _injection_finding_for_approval(self._last_scan)
+
+                        # Scan THIS call's own write -- not a prior tool's
+                        # result -- for a live credential. Only for the three
+                        # tools that write file content at all (see
+                        # _SECRET_SCAN_ARG_KEY); every other gated call skips
+                        # both the scan and the redaction pass below entirely.
+                        secrets_finding = None
+                        write_content = _write_content_for_secrets_scan(name, cargs)
+                        if write_content is not None:
+                            secrets_scan = hearth_secrets.scan(write_content, path=cargs.get("path"))
+                            if hearth_secrets.meets_threshold(secrets_scan, SECRETS_SURFACE_THRESHOLD):
+                                secrets_finding = _secrets_finding_for_approval(secrets_scan, write_content)
+                                # The same threshold that earns this call a
+                                # finding also earns it a redacted copy of
+                                # display_args: a user must be able to see
+                                # WHY an approval carries a secrets finding
+                                # (the content shown still shows everything
+                                # except the secret itself, in place), but
+                                # the raw key must not additionally sit in
+                                # the approval_request/tool_call events' own
+                                # `args` field just because this module
+                                # scanned it. The real write below still uses
+                                # `cargs`, unredacted -- approving a write
+                                # that contains a real token must still write
+                                # that real token; see the module docstring.
+                                display_args = dict(cargs)
+                                display_args[_SECRET_SCAN_ARG_KEY[name]] = hearth_secrets.redact(
+                                    write_content, secrets_scan["findings"])
+
+                        # request_approval's one keyword argument is named
+                        # injection_finding (session.py is off limits this
+                        # iteration -- see the module docstring's point 4).
+                        # When only the injection scanner fired, this is
+                        # exactly the flat dict _injection_finding_for_approval
+                        # already built, byte-for-byte identical to before
+                        # this iteration existed -- zero shape change for
+                        # that case. The secrets finding, when present, rides
+                        # as an additional "secrets" key on the SAME dict
+                        # rather than replacing or discounting the injection
+                        # finding, so neither scanner's result can mask the
+                        # other on one approval.
+                        approval_finding = dict(injection_finding) if injection_finding is not None else None
+                        if secrets_finding is not None:
+                            if approval_finding is None:
+                                approval_finding = {}
+                            approval_finding["secrets"] = secrets_finding
+
                         # emits approval_request itself
-                        decision = ctx.request_approval(name, cargs, injection_finding=injection_finding)
+                        decision = ctx.request_approval(name, display_args, injection_finding=approval_finding)
                         if decision != "allow":
                             cancelled_now = ctx.cancelled()
                             result_text = "denied: turn cancelled" if cancelled_now else "denied by user"
-                            ctx.emit("tool_call", {"tool": name, "args": cargs, "decision": "deny"})
+                            ctx.emit("tool_call", {"tool": name, "args": display_args, "decision": "deny"})
                             ctx.emit("tool_result", {"tool": name, "denied": True, "output": result_text})
                             self._messages.append({"role": "tool", "content": result_text})
                             if cancelled_now:
@@ -495,7 +696,7 @@ class RealEngine:
                                 return
                             continue
 
-                    ctx.emit("tool_call", {"tool": name, "args": cargs, "decision": "allow"})
+                    ctx.emit("tool_call", {"tool": name, "args": display_args, "decision": "allow"})
                     status, result = _run_cancellable(
                         lambda nm=name, ar=cargs: self._execute_tool_fn(nm, ar, ctx.workspace),
                         ctx.cancelled, self.poll_interval, session=ctx.session)
@@ -1281,6 +1482,147 @@ def _self_test():
     engineM_c.load_state("not a dict")  # must not clobber a previously-good load
     assert engineM_c._messages == state_m["messages"], \
         "a subsequent malformed load_state call must not wipe out a good prior load"
+
+    # === N: hearth_secrets wiring -- a real-shaped credential sitting in ====
+    # === a gated write_file call's own `content` argument must reach the ===
+    # === very next approval's payload, REDACTED, and the raw secret must ===
+    # === never appear anywhere in that event once serialised -- see the ===
+    # === module docstring's point 4. Built the same way hearth_secrets.py's
+    # === own self-test builds its positive fixtures (via its
+    # === _build_real_secret_fixtures, at runtime, from secrets.choice), so
+    # === this file's own source never contains the matching string as a
+    # === contiguous literal either. ==========================================
+    real_key = hearth_secrets._build_real_secret_fixtures()["aws"]
+    secret_content = "aws_access_key_id = " + real_key + "\n"
+
+    secret_script = [
+        ({"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": "write_file",
+                          "arguments": {"path": "config.ini", "content": secret_content}}}]}, 1, 1),
+        ({"role": "assistant", "content": "wrote it", "tool_calls": []}, 1, 1),
+    ]
+
+    engineN = RealEngine(chat_fn=_scripted_chat(secret_script), execute_tool_fn=fake_execute_tool,
+                         checkpoint_fn=fake_checkpoint)
+    sessN = session_mod.Session(ws, "fake-model", "edit", engine=engineN)
+    sessN.submit_prompt("write config.ini with the aws key in it")
+    apprN, _ = _wait_for_kind(sessN, "approval_request")
+
+    finding = apprN["data"].get("injection_finding")
+    assert finding is not None and "secrets" in finding, (
+        "a gated write_file whose content scores high/critical on hearth_secrets "
+        "must carry a 'secrets' finding on the approval: {}".format(apprN)
+    )
+    secrets_part = finding["secrets"]
+    assert secrets_part["kind"] == hearth_secrets.KIND_AWS_ACCESS_KEY, secrets_part
+    assert secrets_part["severity"] in ("high", "critical"), secrets_part
+    assert real_key not in str(secrets_part), \
+        "the finding must never reproduce the raw secret: {}".format(secrets_part)
+
+    # The args THIS SAME event carries must be redacted too, not just the
+    # finding annotation -- the raw key must not sit anywhere in an event a
+    # user is being asked to approve.
+    assert real_key not in apprN["data"]["args"].get("content", ""), (
+        "the approval_request event's own args still carried the raw secret: {}".format(apprN)
+    )
+    assert "[REDACTED:" in apprN["data"]["args"]["content"], apprN
+
+    sessN.resolve_approval(apprN["data"]["id"], True)
+    _wait_for_kind(sessN, "done")
+    _wait_idle(sessN)
+
+    # The actual write, once approved, still used the REAL unredacted
+    # content -- approving a write that contains a real token must still
+    # write that real token; only the events describing the approval are
+    # redacted, never what reaches disk. fake_execute_tool records every
+    # call it actually received (tool_calls_seen, from section A); the real
+    # key must be present in the one this test drove.
+    real_write_calls = [c for c in tool_calls_seen
+                        if c[0] == "write_file" and c[1].get("path") == "config.ini"]
+    assert real_write_calls and real_key in real_write_calls[-1][1]["content"], (
+        "the tool actually executed must still receive the real, unredacted content"
+    )
+
+    # SSE round-trip: serialise the exact approval_request event a real
+    # client would receive and grep the raw bytes for the secret -- the same
+    # discipline section L already applies to the injection finding, applied
+    # here to the secrets finding AND to this event's own args.
+    fhN = _FakeHandler()
+    app_mod.SidecarHandler._write_sse(fhN, apprN)
+    rawN = b"".join(fhN.wfile.chunks).decode("utf-8")
+    assert real_key not in rawN, "the raw secret leaked into the approval_request SSE frame"
+
+    # --- prove the wiring is not vacuous: disable the reducer that turns a --
+    # --- hearth_secrets scan into an approval-ready finding, rerun the -----
+    # --- identical scenario, and confirm the approval's "secrets" key is ---
+    # --- gone. If it were still present, the assertions above would have ---
+    # --- passed for the wrong reason, the same proof section L already ----
+    # --- applies to the injection reducer. ---------------------------------
+    global _secrets_finding_for_approval
+    original_secrets_reducer = _secrets_finding_for_approval
+    tripped_without_secrets_reducer = False
+    try:
+        _secrets_finding_for_approval = lambda scan_result, content: None
+        engineN2 = RealEngine(chat_fn=_scripted_chat(secret_script), execute_tool_fn=fake_execute_tool,
+                              checkpoint_fn=fake_checkpoint)
+        sessN2 = session_mod.Session(ws, "fake-model", "edit", engine=engineN2)
+        sessN2.submit_prompt("write config.ini with the aws key in it")
+        apprN2, _ = _wait_for_kind(sessN2, "approval_request")
+        finding2 = apprN2["data"].get("injection_finding")
+        if not finding2 or "secrets" not in finding2:
+            tripped_without_secrets_reducer = True
+        sessN2.resolve_approval(apprN2["data"]["id"], True)
+        _wait_for_kind(sessN2, "done")
+        _wait_idle(sessN2)
+    finally:
+        _secrets_finding_for_approval = original_secrets_reducer
+
+    assert tripped_without_secrets_reducer, (
+        "wiring toggle had no effect: disabling _secrets_finding_for_approval did not "
+        "remove the 'secrets' key from the approval payload, so this test's earlier "
+        "pass is not proven to depend on the actual wiring"
+    )
+
+    # With the reducer restored, the identical scenario must carry the
+    # finding again -- proves the toggle above did not permanently break
+    # anything and the restore path itself works.
+    engineN3 = RealEngine(chat_fn=_scripted_chat(secret_script), execute_tool_fn=fake_execute_tool,
+                          checkpoint_fn=fake_checkpoint)
+    sessN3 = session_mod.Session(ws, "fake-model", "edit", engine=engineN3)
+    sessN3.submit_prompt("write config.ini with the aws key in it")
+    apprN3, _ = _wait_for_kind(sessN3, "approval_request")
+    finding3 = apprN3["data"].get("injection_finding")
+    assert finding3 is not None and "secrets" in finding3, \
+        "restoring _secrets_finding_for_approval must restore the finding too"
+    sessN3.resolve_approval(apprN3["data"]["id"], True)
+    _wait_for_kind(sessN3, "done")
+    _wait_idle(sessN3)
+
+    # --- an ordinary write with no secret-shaped content carries no --------
+    # --- "secrets" key at all, and its content reaches the approval --------
+    # --- unredacted -- an ordinary approval's event shape is unchanged -----
+    # --- from before this iteration existed, the same discipline section ---
+    # --- A already proves for "no injection_finding at all". ---------------
+    plain_script = [
+        ({"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": "write_file",
+                          "arguments": {"path": "notes.txt", "content": "just some notes"}}}]}, 1, 1),
+        ({"role": "assistant", "content": "done", "tool_calls": []}, 1, 1),
+    ]
+    engineN4 = RealEngine(chat_fn=_scripted_chat(plain_script), execute_tool_fn=fake_execute_tool,
+                          checkpoint_fn=fake_checkpoint)
+    sessN4 = session_mod.Session(ws, "fake-model", "edit", engine=engineN4)
+    sessN4.submit_prompt("write some plain notes")
+    apprN4, _ = _wait_for_kind(sessN4, "approval_request")
+    assert "injection_finding" not in apprN4["data"], (
+        "an ordinary write with no secret-shaped or injection-shaped content "
+        "must carry no finding at all: {}".format(apprN4)
+    )
+    assert apprN4["data"]["args"]["content"] == "just some notes", \
+        "ordinary content must reach the approval unredacted, untouched"
+    sessN4.resolve_approval(apprN4["data"]["id"], True)
+    _wait_for_kind(sessN4, "done")
+    _wait_idle(sessN4)
 
     print("hearth-desktop-engine self-test OK")
     return 0
