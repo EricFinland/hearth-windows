@@ -36,6 +36,24 @@ Verdict vocabulary (best to worst), see verdict_for():
   wont_fit       - does not fit in VRAM or in system RAM. Do not offer this
                    model on this machine.
 
+Two more facts ride alongside every verdict, deliberately not folded into
+the tier itself since they are about how much to trust the reading the
+tier was computed from, not about the tier's own meaning:
+  gpu_detected      - False when hearth_hw found no GPU at all. "No GPU was
+                   detected" and "your GPU is too small for this model" are
+                   different statements, and a wont_fit or cpu_spillover
+                   verdict must say which one is true rather than let the
+                   user infer "nothing runs here" from an absent GPU that
+                   was never even looked for successfully.
+  shared_memory_likely - True when the GPU behind this verdict reports as
+                   Intel or vendor-unknown (see SHARED_MEMORY_LIKELY_VENDORS):
+                   hearth_hw could not confirm this is a discrete card with
+                   real dedicated VRAM, as opposed to a shared-memory figure
+                   carved out of system RAM. Shared memory does not perform
+                   like VRAM, so a verdict resting on one is graded
+                   conservatively - a would-be great is downgraded to good -
+                   exactly like an approximate VRAM reading already is.
+
 Disk space is a separate, independent check (free_disk_bytes / disk_ok):
 a user with 8GB free cannot install a 17GB model, and finding that out at 90%
 through a download is a terrible experience.
@@ -105,6 +123,19 @@ RAM_RESERVE_MIN_BYTES = 2 * 1024 ** 3
 # little slack; without this, a user could clear a download at 99% free disk
 # and then fail on the last few bytes.
 DISK_BUFFER_BYTES = 512 * 1024 ** 2
+
+# GPU vendors whose reported vram_bytes this module trusts as real, dedicated
+# VRAM. Intel's shipping lineup is overwhelmingly integrated graphics that
+# shares system RAM (Intel does sell discrete Arc cards, but hearth_hw has no
+# signal beyond vendor name to tell the two apart), and vendor "unknown"
+# means hearth_hw could not even confirm the card is one of these two. Both
+# get graded conservatively rather than trusted at face value: shared system
+# memory does not perform like dedicated VRAM, so a "great" built on a
+# shared-memory figure would be exactly the kind of dishonest verdict this
+# module exists to avoid. AMD and NVIDIA discrete desktop/laptop cards are
+# the trusted common case; AMD APUs exist too and are a known gap here, the
+# same kind of judgment call this module already documents for kv_confidence.
+SHARED_MEMORY_LIKELY_VENDORS = (hearth_hw.VENDOR_INTEL, hearth_hw.VENDOR_UNKNOWN)
 
 
 # -- curated catalog -----------------------------------------------------------
@@ -289,16 +320,22 @@ def free_disk_bytes(path=None):
     """Free bytes on the volume containing path (default: the current
     working directory). 0 if it cannot be determined; never raises.
     """
-    target = path or os.getcwd()
     try:
+        target = path or os.getcwd()
         return shutil.disk_usage(target).free
     except OSError:
+        # os.getcwd() itself raises OSError (FileNotFoundError on POSIX,
+        # a WinError on Windows) if the process's working directory has
+        # been deleted out from under it - that used to happen outside
+        # this try block, so it escaped this function's own "never
+        # raises" promise. Both failure points now share one net.
         return 0
 
 
 def _gpu_vram_bytes(hw):
-    """(vram_bytes, approximate) for the single GPU a model would be loaded
-    onto, from a hearth_hw-shaped dict.
+    """Everything verdict_for needs to know about the single GPU a model
+    would be loaded onto, from a hearth_hw-shaped dict, as a dict with keys
+    vram_bytes, approximate, vendor, shared_memory_likely, gpu_detected.
 
     Deliberately the *largest single GPU*, not the sum across GPUs: Ollama
     does not reliably pool multiple cards' VRAM for one model, and the shop's
@@ -318,14 +355,40 @@ def _gpu_vram_bytes(hw):
     low, high, or even negative-clamped-to-zero). Every caller that turns
     vram_bytes into a verdict or a message MUST also look at approximate;
     a confident "great" or "wont_fit" built on a guessed number is not
-    honest. (0, False) when no GPU was detected at all - that is an exact
-    reading of "nothing", not a guess.
+    honest.
+
+    vendor is the detected GPU's vendor string (see hearth_hw's VENDOR_*
+    constants), or None when no GPU was detected. shared_memory_likely is
+    True when that vendor is in SHARED_MEMORY_LIKELY_VENDORS: an Intel or
+    unknown-vendor card's reported "VRAM" may actually be shared system
+    memory, which does not perform like dedicated VRAM.
+
+    gpu_detected is False only when hearth_hw's gpu list was empty, i.e. no
+    GPU was found at all - a fact distinct from "a GPU was found and it is
+    too small", which is what vram_bytes == 0 alone cannot tell a caller.
+    When gpu_detected is False, vram_bytes is 0, approximate is False (an
+    empty list is an exact reading of "nothing", not a guess), vendor is
+    None, and shared_memory_likely is False (there is no GPU for the flag
+    to describe).
     """
     gpus = hw.get("gpus") or []
     if not gpus:
-        return 0, False
+        return {
+            "vram_bytes": 0,
+            "approximate": False,
+            "vendor": None,
+            "shared_memory_likely": False,
+            "gpu_detected": False,
+        }
     best = max(gpus, key=lambda g: g.get("vram_bytes", 0))
-    return best.get("vram_bytes", 0), bool(best.get("approximate", False))
+    vendor = best.get("vendor")
+    return {
+        "vram_bytes": best.get("vram_bytes", 0),
+        "approximate": bool(best.get("approximate", False)),
+        "vendor": vendor,
+        "shared_memory_likely": vendor in SHARED_MEMORY_LIKELY_VENDORS,
+        "gpu_detected": True,
+    }
 
 
 def _ram_budget_bytes(hw):
@@ -345,6 +408,30 @@ _VRAM_APPROX_NOTE = (
     "available), so the figure behind this verdict is an approximate "
     "reading and could be significantly off, in either direction."
 )
+
+# Appended to a verdict's message whenever the GPU behind it is Intel or
+# vendor-unknown (see SHARED_MEMORY_LIKELY_VENDORS / _gpu_vram_bytes), so a
+# reading that may actually be shared system memory is never presented with
+# the same confidence as a confirmed discrete card.
+_SHARED_MEMORY_NOTE = (
+    " This GPU's memory could not be confirmed as dedicated VRAM (it may be "
+    "shared system memory reported by an integrated or unrecognized GPU), "
+    "which does not perform like real VRAM, so this verdict is graded "
+    "conservatively."
+)
+
+
+def _gpu_clause(gpu_detected, platform_name):
+    """The opening clause for a does-not-fit-VRAM message: distinguishes
+    "no GPU was ever found" from "a GPU was found and it does not fit",
+    which are different facts and must read as different sentences (see
+    the gpu_detected note in the module docstring).
+    """
+    if gpu_detected:
+        return "Does not fit the GPU"
+    if platform_name:
+        return "No GPU was detected on this {} machine".format(platform_name)
+    return "No GPU was detected on this machine"
 
 
 def verdict_for(model, hw, context_tokens=None):
@@ -371,6 +458,24 @@ def verdict_for(model, hw, context_tokens=None):
                               "great" computed from an approximate reading is
                               downgraded to "good" here for exactly that
                               reason (see below).
+      gpu_detected          - False when hearth_hw found no GPU at all, as
+                              opposed to finding one that is simply too
+                              small. See the module docstring's verdict
+                              vocabulary section for why this must not be
+                              collapsed into wont_fit/cpu_spillover's normal
+                              "does not fit" phrasing.
+      gpu_vendor            - the detected GPU's vendor string, or None when
+                              gpu_detected is False.
+      shared_memory_likely  - True when gpu_vendor is Intel or unknown (see
+                              SHARED_MEMORY_LIKELY_VENDORS): the vram_bytes
+                              reading may be shared system memory rather
+                              than dedicated VRAM. Like vram_approximate,
+                              this downgrades a would-be "great" to "good"
+                              and hedges the message.
+      platform              - hw["platform"] (e.g. "Windows", "Linux"),
+                              passed through so a caller can render an
+                              accurate "no GPU was detected on this X
+                              machine" message without re-deriving it.
       ram_bytes             - the RAM budget considered for spillover (total
                               RAM minus reserve; see _ram_budget_bytes). This
                               is always the reserve-adjusted budget, in every
@@ -393,45 +498,74 @@ def verdict_for(model, hw, context_tokens=None):
     # makes, and this module does not have a better number to reach for.
     model_bytes = model["download_bytes"]
     kv_per_token = model["kv_bytes_per_token"]
-    vram_bytes, vram_approximate = _gpu_vram_bytes(hw)
+    gpu_info = _gpu_vram_bytes(hw)
+    vram_bytes = gpu_info["vram_bytes"]
+    vram_approximate = gpu_info["approximate"]
+    gpu_vendor = gpu_info["vendor"]
+    shared_memory_likely = gpu_info["shared_memory_likely"]
+    gpu_detected = gpu_info["gpu_detected"]
+    platform_name = hw.get("platform")
+    # A "great" or "wont_fit" is only as honest as the VRAM figure it rests
+    # on. Both an approximate reading (WMI/wmic AdapterRAM) and a
+    # shared-memory-likely reading (Intel/unknown vendor) are reasons not to
+    # trust that figure fully, so both gate the same downgrade below.
+    vram_trustworthy = not vram_approximate and not shared_memory_likely
     # ram_bytes means one thing everywhere in this function's output: the
     # reserve-adjusted budget actually available for a spilled-over model,
     # never the raw hw["system_ram_bytes"] total. Computed once, reused in
     # every returned dict below, so the arithmetic always reconciles.
     ram_bytes = _ram_budget_bytes(hw)
 
+    common_fields = {
+        "vram_bytes": vram_bytes,
+        "vram_approximate": vram_approximate,
+        "gpu_detected": gpu_detected,
+        "gpu_vendor": gpu_vendor,
+        "shared_memory_likely": shared_memory_likely,
+        "platform": platform_name,
+        "ram_bytes": ram_bytes,
+    }
+
     vram_fit = hearth_hw.fits(model_bytes, context_tokens, kv_per_token, vram_bytes)
 
     if vram_fit["fits"]:
         ratio = (vram_fit["headroom_bytes"] / vram_bytes) if vram_bytes > 0 else 0.0
         roomy = ratio >= GREAT_HEADROOM_RATIO
-        if roomy and not vram_approximate:
+        if roomy and vram_trustworthy:
             verdict = VERDICT_GREAT
             message = "Runs fully on the GPU with plenty of headroom."
-        elif roomy and vram_approximate:
-            # Would have been "great" on a precise reading, but a "great"
-            # built on a guessed VRAM number is not really great - see the
-            # module docstring and hearth_hw on why WMI/wmic AdapterRAM can
-            # be badly wrong. Soften the verdict itself, not just the copy.
+        elif roomy:
+            # Would have been "great" on a fully trustworthy reading, but a
+            # "great" built on a guessed or possibly-shared-memory number is
+            # not really great - see the module docstring and hearth_hw on
+            # why WMI/wmic AdapterRAM can be badly wrong, and why an Intel or
+            # unknown-vendor card's VRAM figure may just be system RAM.
+            # Soften the verdict itself, not just the copy.
+            reasons = []
+            if vram_approximate:
+                reasons.append("the VRAM reading behind it is approximate")
+            if shared_memory_likely:
+                reasons.append(
+                    "this GPU's memory could not be confirmed as dedicated VRAM"
+                )
             verdict = VERDICT_GOOD
             message = (
                 "Runs fully on the GPU with headroom to spare, but is graded "
-                "good rather than great because the VRAM reading behind it "
-                "is approximate."
+                "good rather than great because " + " and ".join(reasons) + "."
             )
         else:
             verdict = VERDICT_GOOD
             message = "Runs fully on the GPU, but headroom is tight."
         if vram_approximate:
             message += _VRAM_APPROX_NOTE
+        if shared_memory_likely:
+            message += _SHARED_MEMORY_NOTE
         return {
+            **common_fields,
             "verdict": verdict,
             "message": message,
             "requested_context_tokens": context_tokens,
             "max_context_tokens": context_tokens,
-            "vram_bytes": vram_bytes,
-            "vram_approximate": vram_approximate,
-            "ram_bytes": ram_bytes,
             "required_bytes": vram_fit["required_bytes"],
             "headroom_bytes": vram_fit["headroom_bytes"],
         }
@@ -452,14 +586,14 @@ def verdict_for(model, hw, context_tokens=None):
         )
         if vram_approximate:
             message += _VRAM_APPROX_NOTE
+        if shared_memory_likely:
+            message += _SHARED_MEMORY_NOTE
         return {
+            **common_fields,
             "verdict": VERDICT_REDUCED_CONTEXT,
             "message": message,
             "requested_context_tokens": context_tokens,
             "max_context_tokens": max_context_tokens,
-            "vram_bytes": vram_bytes,
-            "vram_approximate": vram_approximate,
-            "ram_bytes": ram_bytes,
             "required_bytes": reduced_fit["required_bytes"],
             "headroom_bytes": reduced_fit["headroom_bytes"],
         }
@@ -468,33 +602,38 @@ def verdict_for(model, hw, context_tokens=None):
     # across CPU and GPU, i.e. does it fit in the system RAM budget?
     ram_fit = hearth_hw.fits(model_bytes, context_tokens, kv_per_token, ram_bytes)
     if ram_fit["fits"]:
-        message = ("Does not fit the GPU; will run on CPU (or spill "
-                    "partly onto it) and be noticeably slower.")
+        message = ("{}; will run on CPU (or spill partly onto it) and be "
+                    "noticeably slower.").format(_gpu_clause(gpu_detected, platform_name))
         if vram_approximate:
             message += _VRAM_APPROX_NOTE
+        if shared_memory_likely:
+            message += _SHARED_MEMORY_NOTE
         return {
+            **common_fields,
             "verdict": VERDICT_CPU_SPILLOVER,
             "message": message,
             "requested_context_tokens": context_tokens,
             "max_context_tokens": None,
-            "vram_bytes": vram_bytes,
-            "vram_approximate": vram_approximate,
-            "ram_bytes": ram_bytes,
             "required_bytes": ram_fit["required_bytes"],
             "headroom_bytes": ram_fit["headroom_bytes"],
         }
 
-    message = "Does not fit in VRAM or system RAM on this machine."
+    if gpu_detected:
+        message = "Does not fit in VRAM or system RAM on this machine."
+    else:
+        message = "{}, and the model does not fit in system RAM either.".format(
+            _gpu_clause(gpu_detected, platform_name)
+        )
     if vram_approximate:
         message += _VRAM_APPROX_NOTE
+    if shared_memory_likely:
+        message += _SHARED_MEMORY_NOTE
     return {
+        **common_fields,
         "verdict": VERDICT_WONT_FIT,
         "message": message,
         "requested_context_tokens": context_tokens,
         "max_context_tokens": None,
-        "vram_bytes": vram_bytes,
-        "vram_approximate": vram_approximate,
-        "ram_bytes": ram_bytes,
         "required_bytes": ram_fit["required_bytes"],
         "headroom_bytes": ram_fit["headroom_bytes"],
     }
@@ -601,6 +740,25 @@ def _self_test():
     assert here_free > 0, "the worktree's own volume must report positive free space"
     assert free_disk_bytes(None) >= 0
 
+    # A nonexistent path must degrade to 0, not raise - this exercises the
+    # shutil.disk_usage OSError branch.
+    assert free_disk_bytes(r"Z:\this\path\does\not\exist\anywhere") == 0
+
+    # os.getcwd() itself can raise OSError (a deleted working directory);
+    # that call used to sit outside this function's try block, so it
+    # could escape the "never raises" promise entirely. Prove it can't:
+    # simulate the failure and confirm free_disk_bytes(None) still
+    # degrades to 0 instead of propagating.
+    old_getcwd = os.getcwd
+    try:
+        os.getcwd = lambda: (_ for _ in ()).throw(OSError("cwd is gone"))
+        assert free_disk_bytes(None) == 0, (
+            "free_disk_bytes(None) must degrade to 0 when os.getcwd() "
+            "itself raises, not propagate the exception"
+        )
+    finally:
+        os.getcwd = old_getcwd
+
     # -- CATALOG shape: modest, defensible, weighted toward coding -----------
     assert isinstance(CATALOG, list)
     assert 6 <= len(CATALOG) <= 12, len(CATALOG)
@@ -628,10 +786,10 @@ def _self_test():
 
     # -- synthetic hardware, so the self-test passes on a machine with no ----
     # -- GPU and does not depend on whatever hardware happens to be present --
-    def _hw(vram_bytes, ram_bytes, approximate=False):
-        gpus = [{"name": "synthetic", "vram_bytes": vram_bytes, "vendor": "nvidia",
+    def _hw(vram_bytes, ram_bytes, approximate=False, vendor="nvidia", platform="synthetic"):
+        gpus = [{"name": "synthetic", "vram_bytes": vram_bytes, "vendor": vendor,
                  "approximate": approximate}] if vram_bytes else []
-        return {"platform": "synthetic", "gpus": gpus, "system_ram_bytes": ram_bytes,
+        return {"platform": platform, "gpus": gpus, "system_ram_bytes": ram_bytes,
                 "cpu_count": 8}
 
     hw_24gb = _hw(24 * 1024 ** 3, 64 * 1024 ** 3)
@@ -675,6 +833,13 @@ def _self_test():
     v = verdict_for(syn_14gb, hw_no_gpu_16ram, context_tokens=8192)
     assert v["verdict"] == VERDICT_WONT_FIT, v
     assert v["vram_bytes"] == 0, v
+    assert v["gpu_detected"] is False, v
+    assert v["gpu_vendor"] is None, v
+    assert v["shared_memory_likely"] is False, v
+    assert "no gpu was detected" in v["message"].lower(), (
+        "a wont_fit verdict with no GPU at all must say so explicitly, "
+        "not read identically to a wont_fit caused by a too-small GPU", v,
+    )
 
     # A second synthetic model with a deliberately huge KV cost, to exercise
     # reduced_context on the 16GB card: weights fit VRAM alone, but the full
@@ -765,6 +930,96 @@ def _self_test():
     assert v["verdict"] == VERDICT_WONT_FIT, v
     assert v["ram_bytes"] == _ram_budget_bytes(hw_no_gpu_16ram), v
     assert v["ram_bytes"] - v["required_bytes"] == v["headroom_bytes"], v
+
+    # -- CRITICAL 3: vendor/platform must not be thrown away by the seam ----
+    # between hearth_hw and hearth_shop, the same class of bug as the
+    # approximate flag above, one field over. An Intel or unknown-vendor
+    # "GPU" may just be reporting shared system memory, not real VRAM, so it
+    # must not be trusted the same as a confirmed discrete NVIDIA/AMD card.
+    hw_24gb_intel = _hw(24 * 1024 ** 3, 64 * 1024 ** 3, vendor=hearth_hw.VENDOR_INTEL)
+    hw_24gb_unknown = _hw(24 * 1024 ** 3, 64 * 1024 ** 3, vendor=hearth_hw.VENDOR_UNKNOWN)
+    hw_24gb_amd = _hw(24 * 1024 ** 3, 64 * 1024 ** 3, vendor=hearth_hw.VENDOR_AMD)
+
+    v_nvidia = verdict_for(syn_14gb, hw_24gb, context_tokens=8192)
+    v_intel = verdict_for(syn_14gb, hw_24gb_intel, context_tokens=8192)
+    v_unknown = verdict_for(syn_14gb, hw_24gb_unknown, context_tokens=8192)
+    v_amd = verdict_for(syn_14gb, hw_24gb_amd, context_tokens=8192)
+
+    assert v_nvidia["verdict"] == VERDICT_GREAT, v_nvidia
+    assert v_amd["verdict"] == VERDICT_GREAT, (
+        "AMD is a trusted discrete-vendor reading, same as NVIDIA", v_amd,
+    )
+    # Same VRAM, same model, same context as the NVIDIA "great" case above -
+    # the only difference is the vendor string. An Intel or unknown vendor
+    # must never earn "great": the reading might be shared system memory,
+    # which does not perform like dedicated VRAM.
+    for v_conservative, vendor_label in ((v_intel, "intel"), (v_unknown, "unknown")):
+        assert v_conservative["verdict"] == VERDICT_GOOD, (
+            "an Intel/unknown-vendor GPU must never earn a 'great' verdict "
+            "on VRAM that might actually be shared system memory",
+            vendor_label, v_conservative,
+        )
+        assert v_conservative["shared_memory_likely"] is True, (vendor_label, v_conservative)
+        assert v_conservative["verdict"] != v_nvidia["verdict"], (
+            "vendor must actually change the outcome, not just be a silent field",
+            vendor_label, v_conservative,
+        )
+        assert "dedicated vram" in v_conservative["message"].lower(), v_conservative
+        # The arithmetic must be identical to the trusted reading - only the
+        # confidence in the verdict changes, never the numbers.
+        assert v_conservative["required_bytes"] == v_nvidia["required_bytes"], v_conservative
+        assert v_conservative["headroom_bytes"] == v_nvidia["headroom_bytes"], v_conservative
+
+    assert v_nvidia["shared_memory_likely"] is False, v_nvidia
+    assert v_amd["shared_memory_likely"] is False, v_amd
+    assert v_intel["gpu_vendor"] == hearth_hw.VENDOR_INTEL, v_intel
+    assert v_unknown["gpu_vendor"] == hearth_hw.VENDOR_UNKNOWN, v_unknown
+
+    # -- CRITICAL 4: "no GPU was detected" must read as a different sentence
+    # from "a GPU was detected and it does not fit" - conflating the two is
+    # exactly the dishonesty bug 1 exists to close. Compare a wont_fit caused
+    # by a genuinely tiny (but present) GPU against a wont_fit caused by no
+    # GPU at all: same verdict tier, different underlying fact, so the
+    # message and the gpu_detected field must both say so.
+    hw_tiny_gpu_starved_ram = _hw(1 * 1024 * 1024, 512 * 1024 ** 2)  # 1MiB "GPU", ~0 RAM budget
+    hw_no_gpu_starved_ram = _hw(0, 512 * 1024 ** 2)
+    assert _ram_budget_bytes(hw_tiny_gpu_starved_ram) == 0
+    assert _ram_budget_bytes(hw_no_gpu_starved_ram) == 0
+
+    v_tiny_gpu = verdict_for(syn_14gb, hw_tiny_gpu_starved_ram, context_tokens=8192)
+    v_no_gpu = verdict_for(syn_14gb, hw_no_gpu_starved_ram, context_tokens=8192)
+    assert v_tiny_gpu["verdict"] == VERDICT_WONT_FIT, v_tiny_gpu
+    assert v_no_gpu["verdict"] == VERDICT_WONT_FIT, v_no_gpu
+    assert v_tiny_gpu["gpu_detected"] is True, v_tiny_gpu
+    assert v_no_gpu["gpu_detected"] is False, v_no_gpu
+    assert v_tiny_gpu["gpu_detected"] != v_no_gpu["gpu_detected"], (
+        "gpu_detected must actually distinguish the two cases, not be a "
+        "silent field", v_tiny_gpu, v_no_gpu,
+    )
+    assert v_tiny_gpu["message"] != v_no_gpu["message"], (
+        "wont_fit for a too-small GPU and wont_fit for no GPU at all must "
+        "not read as the same sentence", v_tiny_gpu["message"], v_no_gpu["message"],
+    )
+    assert "no gpu was detected" not in v_tiny_gpu["message"].lower(), v_tiny_gpu
+    assert "no gpu was detected" in v_no_gpu["message"].lower(), v_no_gpu
+    assert "synthetic" in v_no_gpu["message"].lower(), (
+        "the no-GPU message should surface the platform it ran the check "
+        "on (hw['platform']), not a generic sentence", v_no_gpu,
+    )
+    assert v_no_gpu["platform"] == "synthetic", v_no_gpu
+
+    # Same distinction must hold on the cpu_spillover branch, not just
+    # wont_fit: a small-but-present GPU with generous RAM spills over with
+    # "Does not fit the GPU" phrasing; no GPU at all with the same generous
+    # RAM spills over with "No GPU was detected" phrasing instead.
+    hw_tiny_gpu_big_ram = _hw(1 * 1024 * 1024, 64 * 1024 ** 3, vendor=hearth_hw.VENDOR_NVIDIA)
+    hw_no_gpu_big_ram = _hw(0, 64 * 1024 ** 3)
+    v_tiny_spill = verdict_for(syn_14gb, hw_tiny_gpu_big_ram, context_tokens=8192)
+    v_no_gpu_spill = verdict_for(syn_14gb, hw_no_gpu_big_ram, context_tokens=8192)
+    assert v_tiny_spill["verdict"] == VERDICT_CPU_SPILLOVER, v_tiny_spill
+    assert v_no_gpu_spill["verdict"] == VERDICT_CPU_SPILLOVER, v_no_gpu_spill
+    assert "does not fit the gpu" in v_tiny_spill["message"].lower(), v_tiny_spill
+    assert "no gpu was detected" in v_no_gpu_spill["message"].lower(), v_no_gpu_spill
 
     # -- catalog_with_verdicts: shape, sorting, disk check --------------------
     listed = catalog_with_verdicts(hw_24gb, context_tokens=8192)

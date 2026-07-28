@@ -136,7 +136,18 @@ def _parse_nvidia_smi(output):
         m = re.match(r"([\d.]+)\s*(\w+)?", parts[1])
         if not m:
             continue
-        value = float(m.group(1))
+        try:
+            value = float(m.group(1))
+        except ValueError:
+            # The regex admits digit-and-dot strings that are not valid
+            # floats, e.g. "1.2.3" (a malformed or unexpected driver
+            # string). float() raises ValueError on those, and this
+            # function's caller chain (_gpus_nvidia_smi -> gpus() ->
+            # probe()) promises never to raise, so skip the line instead
+            # of letting a bad reading from one GPU take down the whole
+            # probe - the same "degrade, don't crash" contract every other
+            # parse failure in this function already follows.
+            continue
         unit = (m.group(2) or "MiB").lower()
         vram_bytes = int(value * _UNIT_MULTIPLIERS.get(unit, _UNIT_MULTIPLIERS["mib"]))
         gpus.append({
@@ -464,6 +475,20 @@ def _self_test():
 
     gib_case = _parse_nvidia_smi("Some GPU, 24 GiB\n")
     assert gib_case[0]["vram_bytes"] == 24 * 1024 ** 3, gib_case
+
+    # A malformed numeric field ("1.2.3" style) matches the regex
+    # ([\d.]+) but is not a valid float; this must be skipped, not raise
+    # ValueError out of _parse_nvidia_smi (and thus out of gpus()/probe(),
+    # which both promise never to raise). Mixed with a good line to prove
+    # the bad line is skipped rather than the whole parse aborting.
+    malformed = _parse_nvidia_smi("Bad Driver GPU, 1.2.3 MiB\nGood GPU, 8192 MiB\n")
+    assert malformed == [{
+        "name": "Good GPU",
+        "vram_bytes": 8192 * 1024 * 1024,
+        "vendor": VENDOR_NVIDIA,
+        "approximate": False,
+    }], malformed
+    assert _parse_nvidia_smi("Only Bad GPU, 1.2.3 MiB\n") == []
 
     # A GPU name containing a comma must not be dropped or truncated: split
     # from the right (the memory column is always last), not the left.
