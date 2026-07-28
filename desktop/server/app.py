@@ -65,6 +65,27 @@ Endpoints:
                   hearth_checkpoint.restore() reports, unmodified -- in
                   particular "skipped_gitlinks" is always passed through, so
                   a UI can never present a partial restore as a complete one.
+  GET  /setup     hearth_setup.diagnose(): can this machine even run a local
+                  model right now, and if not, the one concrete next step.
+                  Never requires a session to exist -- a UI needs this
+                  before it can show a chat box at all. Runs the full
+                  diagnosis fresh on every call, never cached: unlike
+                  GET /idle below, a UI calls this rarely (at startup, or
+                  when a user explicitly asks "why can't I start"), and a
+                  stale "not ready" right after the user actually started
+                  Ollama would be actively unhelpful. RealEngine.run()
+                  separately runs hearth_setup.quick_check() -- the cheap
+                  path, not this full diagnosis -- before every turn; see
+                  engine.py's module docstring, point 6.
+  GET  /idle      hearth_idle.is_good_time(): is now a reasonable time for
+                  heavy work, and why. Cached for SidecarState.
+                  idle_cache_seconds (default 2s) -- see
+                  SidecarState.get_idle_status -- since hearth_idle.probe()
+                  can shell out to nvidia-smi and its own module docstring
+                  is explicit that it must not run on every request. Purely
+                  advisory: nothing in this sidecar ever gates a turn on
+                  it, and this route does not either -- a user who
+                  explicitly submits a prompt has said what they want.
 
                   Refused with 409 whenever Session.is_workspace_busy() is
                   true: not only while a turn is actively running, but also
@@ -121,6 +142,7 @@ import json
 import os
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import auth
@@ -129,6 +151,15 @@ import session as session_mod
 
 
 MAX_SSE_CONNECTIONS = 16  # bound on concurrent GET /events streams; see acquire_sse_slot
+
+# Default cache lifetime for GET /idle -- see SidecarState.get_idle_status.
+# hearth_idle.probe() can shell out to nvidia-smi (bounded, but still a real
+# subprocess call), and its own module docstring is explicit this must not
+# run "on a hot path or on every event". 2s is short enough that a status
+# indicator never looks stale to a human, but long enough that a client
+# polling once a second or faster only actually triggers a fresh probe
+# about half the time.
+IDLE_CACHE_SECONDS = 2.0
 
 # Cap on a single request's declared Content-Length, enforced by
 # _prepare_body before any body is read. An authenticated client (post-auth,
@@ -157,13 +188,27 @@ class SidecarState:
     """
 
     def __init__(self, token, engine_factory=None, port=0, models_fetcher=None,
-                 max_sse_connections=None, persist_hook=None):
+                 max_sse_connections=None, persist_hook=None,
+                 setup_diagnoser=None, idle_prober=None, idle_cache_seconds=None):
         self.token = token
         self.port = port  # main.py sets this to the real bound port after listen
         self.engine_factory = engine_factory or (lambda: session_mod.NullEngine())
         # Best-effort GET /models data source. Injectable so tests never need
         # a live Ollama; defaults to the real one for production use.
         self.models_fetcher = models_fetcher or engine_mod.list_installed_models
+        # GET /setup data source (hearth_setup.diagnose). Injectable the same
+        # way models_fetcher is, so tests never need a real Ollama, a real
+        # install, or real hardware.
+        self.setup_diagnoser = setup_diagnoser or engine_mod.hearth_setup.diagnose
+        # GET /idle data source (hearth_idle.is_good_time), cached -- see
+        # get_idle_status(). Injectable for the same reason as
+        # models_fetcher and setup_diagnoser.
+        self.idle_prober = idle_prober or engine_mod.hearth_idle.is_good_time
+        self.idle_cache_seconds = (
+            IDLE_CACHE_SECONDS if idle_cache_seconds is None else idle_cache_seconds)
+        self._idle_lock = threading.Lock()  # separate from self._lock below: probing
+        self._idle_cache = None             # (nvidia-smi) must never block session ops
+        self._idle_cache_at = None
         self._lock = threading.Lock()
         self.session = None
         # ThreadingHTTPServer spawns one thread per connection, and GET
@@ -218,6 +263,31 @@ class SidecarState:
         with self._lock:
             self.session = session
         session.set_persist_hook(self._persist_if_current if self._raw_persist_hook else None)
+
+    def get_idle_status(self):
+        """hearth_idle.is_good_time(), cached for self.idle_cache_seconds
+        (default IDLE_CACHE_SECONDS). See the module docstring's GET /idle
+        entry and hearth_idle.py's own "must not run on every event"
+        contract for why this caches at all.
+
+        Probing happens OUTSIDE self._idle_lock -- only the read/write of
+        the cached value itself is locked -- so a slow probe (nvidia-smi is
+        bounded, but still a real subprocess call) can never block a
+        concurrent request that only needed the still-fresh cached value.
+        A cache miss racing another cache miss just probes twice; that is
+        cheap and harmless for read-only advisory data, so no effort is
+        spent de-duplicating it.
+        """
+        now = time.monotonic()
+        with self._idle_lock:
+            cached, cached_at = self._idle_cache, self._idle_cache_at
+        if cached is not None and cached_at is not None and (now - cached_at) < self.idle_cache_seconds:
+            return cached
+        result = self.idle_prober()
+        with self._idle_lock:
+            self._idle_cache = result
+            self._idle_cache_at = time.monotonic()
+            return self._idle_cache
 
     def acquire_sse_slot(self):
         """True and reserves a slot if under max_sse_connections, else False
@@ -405,6 +475,10 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._get_models()
         elif path == "/checkpoints":
             self._get_checkpoints()
+        elif path == "/setup":
+            self._get_setup()
+        elif path == "/idle":
+            self._get_idle()
         else:
             self._send_json(404, {"error": "not_found"})
 
@@ -623,6 +697,30 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._send_json(409, result)
             return
         self._send_json(200, result)
+
+    def _get_setup(self):
+        """GET /setup: hearth_setup.diagnose(), fresh every call. Does not
+        require a session to exist -- a UI needs this before it can show a
+        chat box at all. See SidecarState.setup_diagnoser."""
+        try:
+            diagnosis = self.state.setup_diagnoser()
+        except Exception as exc:  # noqa: BLE001 - a diagnoser bug must not break this route
+            self._send_json(500, {"error": "setup_diagnosis_failed: {}".format(exc)})
+            return
+        self._send_json(200, diagnosis)
+
+    def _get_idle(self):
+        """GET /idle: hearth_idle.is_good_time(), cached -- see
+        SidecarState.get_idle_status. Advisory only: nothing in this
+        sidecar ever gates a turn on it -- see engine.py's module
+        docstring, point 6, and hearth_idle.py's own degrade-to-permissive
+        contract."""
+        try:
+            status = self.state.get_idle_status()
+        except Exception as exc:  # noqa: BLE001 - a prober bug must not break this route
+            self._send_json(500, {"error": "idle_probe_failed: {}".format(exc)})
+            return
+        self._send_json(200, status)
 
     def _write_sse(self, ev):
         payload = json.dumps({"turn_id": ev["turn_id"], "kind": ev["kind"],
@@ -1485,6 +1583,115 @@ def _self_test():
         # once for a freshly adopted session.
         replaced_sess = state_restore_guard.create_session("/tmp/ws-restored-2", "m", "edit")
         assert state_restore_guard.get_session() is replaced_sess
+
+        # === GET /setup and GET /idle: hearth_setup/hearth_idle wiring =====
+        # === (Part 1 / Part 2 of this iteration's brief). Both require the =
+        # === same auth as every other route -- proven directly against a ===
+        # === real socket, not merely inferred from do_GET's shared ========
+        # === structure, so a future route accidentally added above ========
+        # === _authorized() (the exact mistake /healthz's own placement =====
+        # === invites) would be caught here too. ==============================
+        setup_calls = {"n": 0}
+        stub_diagnosis = {
+            "status": "not_installed", "healthy": False, "platform": "Windows",
+            "base_url": "http://127.0.0.1:11434", "timestamp": "2026-01-01T00:00:00Z",
+            "findings": [{"check": "installed", "status": "problem",
+                          "message": "Ollama does not appear to be installed on this machine.",
+                          "remedy": "Download it from ollama.com/download.", "detail": None}],
+            "next_action": {"message": "Ollama does not appear to be installed on this machine.",
+                            "remedy": "Download it from ollama.com/download."},
+        }
+
+        def _stub_diagnoser():
+            setup_calls["n"] += 1
+            return stub_diagnosis
+
+        idle_calls = {"n": 0}
+        stub_idle = {"good_time": True, "state": "idle", "confidence": "high",
+                     "reason": "no keyboard/mouse input for 600s", "signals": {"platform": "Windows"}}
+
+        def _stub_idle_prober():
+            idle_calls["n"] += 1
+            return dict(stub_idle)  # a fresh dict each call -- proves get_idle_status
+                                     # returns the SAME cached object, not a lucky-equal one
+
+        server_setup, state_setup = _start(engine_factory=lambda: _FakeEngine())
+        state_setup.setup_diagnoser = _stub_diagnoser
+        state_setup.idle_prober = _stub_idle_prober
+        state_setup.idle_cache_seconds = 0.2  # short, so the test does not have to sleep long
+        try:
+            port_setup = state_setup.port
+            token_setup = state_setup.token
+
+            # -- auth: both new routes require it, exactly like every other -
+            # -- route except /healthz. --------------------------------------
+            status, _ = _raw_request(port_setup, "GET", "/setup",
+                                     headers={"Host": "127.0.0.1:{}".format(port_setup)})
+            assert status == 401, status
+            status, _ = _raw_request(port_setup, "GET", "/idle",
+                                     headers={"Host": "127.0.0.1:{}".format(port_setup)})
+            assert status == 401, status
+
+            auth_headers_setup = {"Host": "127.0.0.1:{}".format(port_setup),
+                                  "Authorization": "Bearer " + token_setup}
+
+            # -- GET /setup: the diagnoser's result passed straight through, -
+            # -- with no live session at all. ---------------------------------
+            status, data = _raw_request(port_setup, "GET", "/setup", headers=auth_headers_setup)
+            assert status == 200, (status, data)
+            assert json.loads(data) == stub_diagnosis, data
+            assert setup_calls["n"] == 1, setup_calls
+
+            status, data = _raw_request(port_setup, "GET", "/setup", headers=auth_headers_setup)
+            assert status == 200, (status, data)
+            assert setup_calls["n"] == 2, (
+                "GET /setup must diagnose fresh every call, never cache -- a stale "
+                "'not ready' right after the user actually started Ollama would be "
+                "actively unhelpful: {}".format(setup_calls))
+
+            # -- GET /idle: cached briefly, so a UI polling for a status ------
+            # -- indicator does not shell out to nvidia-smi on every request. -
+            status, data = _raw_request(port_setup, "GET", "/idle", headers=auth_headers_setup)
+            assert status == 200, (status, data)
+            assert json.loads(data) == stub_idle, data
+            assert idle_calls["n"] == 1, idle_calls
+
+            status, data = _raw_request(port_setup, "GET", "/idle", headers=auth_headers_setup)
+            assert status == 200, (status, data)
+            assert idle_calls["n"] == 1, (
+                "a second GET /idle within idle_cache_seconds must reuse the cached "
+                "reading, not re-probe: {}".format(idle_calls))
+
+            time.sleep(0.25)  # past state_setup.idle_cache_seconds (0.2s)
+            status, data = _raw_request(port_setup, "GET", "/idle", headers=auth_headers_setup)
+            assert status == 200, (status, data)
+            assert idle_calls["n"] == 2, (
+                "once the cache has aged past idle_cache_seconds, the next GET /idle "
+                "must re-probe rather than serve a stale reading forever: {}".format(idle_calls))
+        finally:
+            server_setup.shutdown()
+            server_setup.server_close()
+
+        # === GET /setup and GET /idle also work against the REAL, unstubbed =
+        # === hearth_setup/hearth_idle modules -- no Ollama, no GPU, no ======
+        # === network required for this to at least run without raising. ====
+        server_real, state_real = _start(engine_factory=lambda: _FakeEngine())
+        try:
+            port_real = state_real.port
+            headers_real = {"Host": "127.0.0.1:{}".format(port_real),
+                            "Authorization": "Bearer " + state_real.token}
+            status, data = _raw_request(port_real, "GET", "/setup", headers=headers_real)
+            assert status == 200, (status, data)
+            real_setup_body = json.loads(data)
+            assert "status" in real_setup_body and "findings" in real_setup_body, real_setup_body
+
+            status, data = _raw_request(port_real, "GET", "/idle", headers=headers_real)
+            assert status == 200, (status, data)
+            real_idle_body = json.loads(data)
+            assert "good_time" in real_idle_body and "state" in real_idle_body, real_idle_body
+        finally:
+            server_real.shutdown()
+            server_real.server_close()
 
         # === malformed JSON body is rejected, not a 500 ===
         status, data = _raw_request(port, "POST", "/session", headers=auth_headers, body="{not json")

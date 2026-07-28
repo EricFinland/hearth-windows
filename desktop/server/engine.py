@@ -141,6 +141,32 @@ calling the right functions in the right order:
      escalation path proven end to end, including a version of the test
      that disables the link and confirms it actually fails without it.
 
+  6. A turn that cannot even attempt a chat call fails with a clear reason,
+     not hearth_loop.chat's own connection-refused exception three network
+     hops later (agent/hearth_setup.py exists for exactly this: "can I even
+     start"). Before checkpointing or making any chat attempt, run() asks
+     self._setup_ready_fn() -- hearth_setup.quick_check(), one bounded HTTP
+     call, never the full diagnose() -- so an ordinary healthy turn pays
+     one cheap check, not a multi-step diagnosis, every single time. Only
+     once that cheap check already says "not ready" does this module pay
+     for hearth_setup.diagnose() (self._setup_diagnose_fn()), to build a
+     single "error" event carrying the diagnosis's own next_action message
+     and remedy verbatim -- never a message invented here -- so a user
+     whose Ollama is stopped gets that sentence instead of a stack trace.
+     Wired to the real hearth_setup module only when this engine is
+     actually going to call real hearth_loop.chat (chat_fn is None); an
+     engine built with an injected chat_fn (every self-test scenario in
+     this file) defaults to always-ready, the same "only reach for the
+     real implementation when no test double was given" convention every
+     other seam here (checkpoint_fn, execute_tool_fn, route_fn, ...)
+     already follows -- no self-test scenario needs a real, possibly-absent
+     Ollama just to prove it may proceed. This deliberately never consults
+     hearth_idle.py's idle/busy signal -- see app.py's GET /idle for why
+     that stays advisory-only, exposed for a UI or a future scheduler to
+     read, and is never used to gate a turn here: a user who explicitly
+     submitted a prompt has said what they want, and refusing because the
+     mouse moved would be exactly backwards.
+
 Standard library only.
 """
 
@@ -160,10 +186,12 @@ if _AGENT_DIR not in sys.path:
 
 import hearth_checkpoint  # noqa: E402
 import hearth_hw  # noqa: E402
+import hearth_idle  # noqa: E402
 import hearth_injection  # noqa: E402
 import hearth_loop  # noqa: E402
 import hearth_router  # noqa: E402
 import hearth_secrets  # noqa: E402
+import hearth_setup  # noqa: E402
 import hearth_shop  # noqa: E402
 import hearth_tools  # noqa: E402
 import permissions  # noqa: E402
@@ -487,11 +515,23 @@ class RealEngine:
     def __init__(self, ollama_url=None, chat_fn=None, execute_tool_fn=None,
                  checkpoint_fn=None, auto_allow=(), max_iters=None,
                  poll_interval=POLL_INTERVAL, max_messages=None,
-                 route_fn=None, available_models_fn=None, hw_fn=None):
+                 route_fn=None, available_models_fn=None, hw_fn=None,
+                 setup_ready_fn=None, setup_diagnose_fn=None):
         self.ollama_url = ollama_url or hearth_loop.DEFAULT_OLLAMA
         self._chat_fn = chat_fn
         self._execute_tool_fn = execute_tool_fn or hearth_tools.execute_tool
         self._checkpoint_fn = checkpoint_fn or hearth_checkpoint.checkpoint
+        # Setup-readiness gate (module docstring's point 6). Real
+        # hearth_setup wiring only kicks in when this engine is actually
+        # going to call real hearth_loop.chat (chat_fn is None) -- see the
+        # module docstring for why that is the right default rather than a
+        # magic "test mode" flag.
+        self._setup_ready_fn = setup_ready_fn or (
+            (lambda: hearth_setup.quick_check(self.ollama_url)) if chat_fn is None
+            else (lambda: True))
+        self._setup_diagnose_fn = setup_diagnose_fn or (
+            (lambda: hearth_setup.diagnose(self.ollama_url)) if chat_fn is None
+            else (lambda: {"status": hearth_setup.STATUS_READY, "next_action": None}))
         self.auto_allow = tuple(auto_allow)
         self.max_iters = max_iters or MAX_ITERS
         self.poll_interval = poll_interval
@@ -683,6 +723,31 @@ class RealEngine:
             "warning": cp.get("warning"),
         })
 
+    def _setup_not_ready_event_data(self):
+        """The 'error' event payload for a turn that cannot even attempt a
+        chat call because self._setup_ready_fn() reports Ollama is not
+        ready -- see the module docstring's point 6. Runs the full
+        diagnosis only now, once the cheap check has already found a
+        problem, and degrades to a generic message if even THAT fails: a
+        broken diagnosis must not cost the turn its one honest error
+        event."""
+        try:
+            diagnosis = self._setup_diagnose_fn()
+        except Exception:  # noqa: BLE001 - a broken diagnosis must not crash the turn
+            diagnosis = None
+        next_action = diagnosis.get("next_action") if isinstance(diagnosis, dict) else None
+        if next_action:
+            message = "Ollama is not ready: {}".format(next_action.get("message") or "").strip()
+            remedy = next_action.get("remedy")
+        else:
+            message = "Ollama is not ready, and a full diagnosis could not be completed."
+            remedy = None
+        return {
+            "message": message,
+            "remedy": remedy,
+            "setup_status": diagnosis.get("status") if isinstance(diagnosis, dict) else None,
+        }
+
     def _trim_messages(self):
         """Keep self._messages bounded at self.max_messages without ever
         splitting a turn's messages apart (a tool-call message separated
@@ -706,6 +771,18 @@ class RealEngine:
             self._turn_starts = []
 
         self._turn_count += 1  # classify()'s turn_index signal -- see _resolve_model
+
+        # Setup-readiness gate (module docstring's point 6): fail fast and
+        # clearly, before checkpointing or attempting a chat call that is
+        # certain to fail with an obscure connection error otherwise.
+        try:
+            ready = self._setup_ready_fn()
+        except Exception:  # noqa: BLE001 - a broken readiness check must not block a turn;
+            ready = True   # fail OPEN -- the real chat call below will surface a genuine
+                            # failure on its own if Ollama truly is unreachable.
+        if not ready:
+            ctx.emit("error", self._setup_not_ready_event_data())
+            return
 
         self._checkpoint(ctx)
         if ctx.cancelled():
@@ -1955,6 +2032,102 @@ def _self_test():
     assert len(restored_events) >= 2 and restored_events[-1]["data"]["model"] == large_id, (
         "restoring _mark_malformed_tool_call must restore escalation too: {}".format(restored_events)
     )
+
+    # === P: setup-readiness gate (module docstring's point 6) -- a turn ====
+    # === that cannot even attempt a chat call because hearth_setup says ====
+    # === Ollama is not ready must fail with a clear reason, never ==========
+    # === actually attempt the doomed chat call or checkpoint the ===========
+    # === workspace for a turn that cannot run at all. =======================
+    setup_ready_calls = {"n": 0}
+
+    def _setup_not_ready():
+        setup_ready_calls["n"] += 1
+        return False
+
+    setup_diagnose_calls = {"n": 0}
+
+    def _setup_diagnosis_stub():
+        setup_diagnose_calls["n"] += 1
+        return {
+            "status": "not_running",
+            "next_action": {
+                "message": "Ollama is installed but not reachable at http://127.0.0.1:11434.",
+                "remedy": "Start it: ollama serve",
+            },
+        }
+
+    def _chat_should_never_run(messages):
+        raise AssertionError("chat_fn must never be called when setup is not ready")
+
+    checkpoint_calls_p = []
+
+    def _checkpoint_should_never_run(workspace, label=None, timestamp=None):
+        checkpoint_calls_p.append((workspace, label))
+        raise AssertionError("checkpoint_fn must never be called when setup is not ready")
+
+    engine_p = RealEngine(chat_fn=_chat_should_never_run, execute_tool_fn=fake_execute_tool,
+                          checkpoint_fn=_checkpoint_should_never_run,
+                          setup_ready_fn=_setup_not_ready, setup_diagnose_fn=_setup_diagnosis_stub)
+    sess_p = session_mod.Session(ws, "fake-model", "edit", engine=engine_p)
+    sess_p.submit_prompt("do something")
+    err_event, _ = _wait_for_kind(sess_p, "error")
+    _wait_idle(sess_p)
+    assert setup_ready_calls["n"] == 1, setup_ready_calls
+    assert setup_diagnose_calls["n"] == 1, \
+        "diagnose() must run exactly once, only after quick_check() already failed"
+    assert checkpoint_calls_p == [], "no point checkpointing a turn that cannot run at all"
+    assert "not reachable" in err_event["data"]["message"], err_event
+    assert err_event["data"]["remedy"] == "Start it: ollama serve", err_event
+    assert err_event["data"]["setup_status"] == "not_running", err_event
+    all_kinds_p = [e["kind"] for e in _all_events(sess_p)]
+    assert all_kinds_p == ["error"], (
+        "a setup-not-ready turn must end immediately with just the one error "
+        "event: {}".format(all_kinds_p)
+    )
+
+    # --- non-vacuous: the SAME construction, only setup_ready_fn flipped ---
+    # --- to True, must proceed normally and actually reach the chat call ---
+    # --- -- proving the block above genuinely depended on setup_ready_fn ---
+    # --- returning False, not on some other accident. ------------------------
+    chat_calls_p2 = {"n": 0}
+
+    def _chat_ok(messages):
+        chat_calls_p2["n"] += 1
+        return ({"role": "assistant", "content": "all good", "tool_calls": []}, 1, 1)
+
+    engine_p2 = RealEngine(chat_fn=_chat_ok, execute_tool_fn=fake_execute_tool,
+                           checkpoint_fn=fake_checkpoint, setup_ready_fn=lambda: True,
+                           setup_diagnose_fn=_setup_diagnosis_stub)
+    sess_p2 = session_mod.Session(ws, "fake-model", "edit", engine=engine_p2)
+    sess_p2.submit_prompt("do something else")
+    _wait_for_kind(sess_p2, "done")
+    _wait_idle(sess_p2)
+    assert chat_calls_p2["n"] == 1, "setup_ready_fn=True must let the turn actually reach the chat call"
+
+    # --- default wiring: an injected chat_fn (as every OTHER scenario in ---
+    # --- this self-test uses) bypasses the real, possibly-absent Ollama ----
+    # --- check entirely by default -- the same "only reach for the real ---
+    # --- implementation when no test double was given" convention every ---
+    # --- other seam here (checkpoint_fn, execute_tool_fn, route_fn, ...) ---
+    # --- already follows. -----------------------------------------------------
+    engine_default_test_mode = RealEngine(chat_fn=fake_chat, execute_tool_fn=fake_execute_tool,
+                                          checkpoint_fn=fake_checkpoint)
+    assert engine_default_test_mode._setup_ready_fn() is True, (
+        "an engine built with an injected chat_fn must not gate on a real, "
+        "unreachable Ollama by default"
+    )
+
+    # --- production default: no chat_fn injected -> the gate is genuinely --
+    # --- wired to the real hearth_setup module, not a permissive stub. -----
+    # --- No assertion on the actual boolean (this machine may or may not ---
+    # --- have Ollama running) -- only that it runs without raising and -----
+    # --- returns well-shaped data, the same "shape only" discipline --------
+    # --- hearth_setup.py's own self-test uses for its unstubbed smoke test.
+    engine_prod_default = RealEngine()
+    real_ready = engine_prod_default._setup_ready_fn()
+    assert isinstance(real_ready, bool), real_ready
+    real_diag = engine_prod_default._setup_diagnose_fn()
+    assert isinstance(real_diag, dict) and "status" in real_diag, real_diag
 
     print("hearth-desktop-engine self-test OK")
     return 0
