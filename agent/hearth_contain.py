@@ -115,6 +115,36 @@ def _segment_to_regex(seg):
     return "".join(out)
 
 
+# Every interior '**' (strictly between the first and last segment)
+# compiles to its own "/(?:.*/)?" alternation -- an unbounded, unanchored
+# quantifier that overlaps itself on non-matching input ('.' matches '/'
+# too). A single one of these is cheap; several chained back to back is
+# classic catastrophic backtracking, since the regex engine tries every way
+# of splitting the input among them before concluding there is no match.
+# Measured on one is_ignored() call against a non-matching path, pattern
+# '(**/a)' repeated n times plus '/zzz': n=13 took 0.83s, n=14 took 3.34s,
+# n=15 took 13.8s, n=16 took 55.4s -- roughly 4x per added interior '**',
+# and unbounded as n grows, on a pattern any attacker-controlled
+# .hearthignore content can write (search_files and replace_in_files call
+# is_ignored per file and per directory, on a cancellable worker thread
+# that a hang leaves spinning forever even after the caller gives up -- see
+# is_workspace_busy in session.py). No real workspace-scoping pattern needs
+# more than a couple of these; MAX_INTERIOR_DOUBLE_STAR caps it at a number
+# comfortably above any legitimate use and comfortably below where
+# backtracking becomes measurable at all -- see the self-test for the
+# actual worst-case timing at the cap.
+MAX_INTERIOR_DOUBLE_STAR = 2
+
+
+class PatternTooComplex(ValueError):
+    """Raised by _pattern_to_regex when a pattern's interior '**' count
+    exceeds MAX_INTERIOR_DOUBLE_STAR. A distinct exception from ordinary
+    re.error so _parse_hearthignore can report this case with its own,
+    clearer message -- a user who wrote an over-complex pattern deserves to
+    know it was rejected, not have it silently fold into "matches nothing",
+    the fate of an ordinary malformed pattern."""
+
+
 def _pattern_to_regex(body, anchored, flags):
     """Translate a gitignore-style pattern body (negation and the
     directory-only trailing slash already stripped by the caller) into a
@@ -127,6 +157,10 @@ def _pattern_to_regex(body, anchored, flags):
     segment (e.g. 'a**b') is not expanded; it falls back to two ordinary
     '*'s, the same degrade-quietly behaviour a real gitignore gives that
     construct.
+
+    Raises PatternTooComplex if the pattern has more than
+    MAX_INTERIOR_DOUBLE_STAR interior '**' segments -- see that constant's
+    own comment for why this bound exists at all.
     """
     raw_segs = body.split("/")
     segs = []
@@ -134,8 +168,14 @@ def _pattern_to_regex(body, anchored, flags):
         if s == "**" and segs and segs[-1] == "**":
             continue  # collapse a run of consecutive '**' into one
         segs.append(s)
-    parts = []
     n = len(segs)
+    interior_double_star = sum(
+        1 for i, seg in enumerate(segs) if seg == "**" and 0 < i < n - 1)
+    if interior_double_star > MAX_INTERIOR_DOUBLE_STAR:
+        raise PatternTooComplex(
+            "pattern has {} interior '**' segments (max {}): {!r}".format(
+                interior_double_star, MAX_INTERIOR_DOUBLE_STAR, body))
+    parts = []
     for i, seg in enumerate(segs):
         if seg == "**":
             if n == 1:
@@ -203,6 +243,11 @@ def _parse_hearthignore(lines):
             continue
         try:
             regex = _pattern_to_regex(line, anchored, flags)
+        except PatternTooComplex as exc:
+            print("[hearth-contain] .hearthignore pattern rejected (too complex, "
+                  "would risk catastrophic regex backtracking): {}".format(exc),
+                  file=sys.stderr)
+            continue  # reported clearly, not silently dropped -- see PatternTooComplex
         except re.error:
             continue  # a malformed pattern matches nothing, rather than crashing
         rules.append(_Rule(regex, negate, dir_only))
@@ -430,8 +475,11 @@ def prune(dirpath, dirs, skip_names=(), root=None, ignore_spec=None):
 
 
 def _self_test():
+    import contextlib
+    import io
     import shutil
     import tempfile
+    import time
 
     root = os.path.realpath(tempfile.mkdtemp(prefix="hearth-contain-"))
     try:
@@ -650,6 +698,100 @@ def _self_test():
         assert _sig("data/anything/deep")
     finally:
         shutil.rmtree(ig_star, ignore_errors=True)
+
+    # === Finding 2: catastrophic regex backtracking from unbounded ========
+    # === interior '**' segments is capped, not merely observed ============
+    def _hostile_double_star_pattern(n):
+        """The exact shape the security review measured: '(**/a)' repeated
+        n times plus a trailing '/zzz' that never matches. Produces
+        n - 1 interior '**' segments (the first '**' is the pattern's
+        leading segment, not interior)."""
+        return "/".join(["**", "a"] * n) + "/zzz"
+
+    # THE PIN, part 1 (non-vacuousness): prove the repro really is
+    # catastrophic when nothing bounds it, by temporarily lifting the cap
+    # and timing a real match -- if this stops being slow, the fix below
+    # is not actually preventing anything, it would just be asserting its
+    # own existence.
+    global MAX_INTERIOR_DOUBLE_STAR
+    old_cap = MAX_INTERIOR_DOUBLE_STAR
+    MAX_INTERIOR_DOUBLE_STAR = 10_000
+    try:
+        hostile_n = 11  # 10 interior '**' segments, far past the real cap of 2
+        hostile_body = _hostile_double_star_pattern(hostile_n)
+        hostile_rx = _pattern_to_regex(hostile_body, True, 0)
+        hostile_path = "a/" * (3 * hostile_n) + "notzzz"  # close enough to match to force exhaustive backtracking
+        t0 = time.monotonic()
+        hostile_rx.match(hostile_path)
+        uncapped_seconds = time.monotonic() - t0
+    finally:
+        MAX_INTERIOR_DOUBLE_STAR = old_cap
+    assert uncapped_seconds > 1.0, (
+        "non-vacuousness check itself is broken: an uncapped pattern with 10 interior "
+        "'**' segments was expected to take multiple seconds to fail against a mere "
+        "33-segment non-matching path, but took only {:.3f}s -- either this no longer "
+        "reproduces catastrophic backtracking, or the harness changed under it, and the "
+        "PASS below would not be proving what it claims to prove".format(uncapped_seconds)
+    )
+
+    # THE PIN, part 2: with the real cap in place, _pattern_to_regex refuses
+    # the same pattern outright -- PatternTooComplex, not a hang.
+    assert MAX_INTERIOR_DOUBLE_STAR == 2, "cap must already be restored here"
+    try:
+        _pattern_to_regex(hostile_body, True, 0)
+        raise AssertionError("an over-complex pattern must raise PatternTooComplex, not compile")
+    except PatternTooComplex:
+        pass
+
+    # THE PIN, part 3: the real, end-to-end path (a hostile .hearthignore on
+    # disk, loaded via load_ignore, queried via is_ignored -- the exact
+    # call chain search_files/replace_in_files drive per file and per
+    # directory) rejects the pattern at PARSE time and returns fast, rather
+    # than compiling it and hanging on the first non-matching query. Also
+    # proves the rejection is reported, not silently dropped: the pattern
+    # never becomes a rule (it does not shadow the other, well-formed rule
+    # in the same file), and a clear message reaches stderr.
+    redos_root = os.path.realpath(tempfile.mkdtemp(prefix="hearth-ignore-redos-"))
+    try:
+        with open(os.path.join(redos_root, ".hearthignore"), "w", encoding="utf-8") as fh:
+            fh.write(hostile_body + "\n" + "plainly-ignored.txt\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            redos_spec = load_ignore(redos_root)
+        stderr_text = buf.getvalue()
+        assert "too complex" in stderr_text, \
+            "a rejected pattern must be reported clearly, not silently dropped: {!r}".format(stderr_text)
+        assert hostile_body in stderr_text, \
+            "the rejection message should name the actual rejected pattern: {!r}".format(stderr_text)
+        # The other, well-formed rule in the same file is unaffected.
+        assert len(redos_spec.rules) == 1, [r.regex.pattern for r in redos_spec.rules]
+
+        deep_path = os.path.join(redos_root, *(["a"] * (3 * hostile_n) + ["notzzz"]))
+        t0 = time.monotonic()
+        result = is_ignored(redos_root, deep_path)
+        capped_seconds = time.monotonic() - t0
+        assert result is False, "the rejected hostile pattern must never take effect as a rule"
+        assert capped_seconds < 1.0, \
+            "is_ignored() against the exact previously-catastrophic input must stay fast " \
+            "once the hostile pattern is rejected at parse time: took {:.3f}s".format(capped_seconds)
+    finally:
+        shutil.rmtree(redos_root, ignore_errors=True)
+
+    # A legitimate pattern AT the cap (2 interior '**') still compiles and
+    # matches correctly, and stays fast even against a long non-matching
+    # path -- the cap must not make ordinary .hearthignore patterns
+    # unusable, only reject the pathological ones past it.
+    at_cap_body = _hostile_double_star_pattern(3)  # 2 interior '**' segments, exactly at the cap
+    at_cap_rx = _pattern_to_regex(at_cap_body, True, 0)  # must not raise
+    at_cap_matching_path = "/".join(["x", "a"] * 3 + ["zzz"])
+    assert at_cap_rx.match(at_cap_matching_path), "a pattern at the cap must still match correctly"
+    long_non_matching = "a/" * 200 + "notzzz"
+    t0 = time.monotonic()
+    at_cap_rx.match(long_non_matching)
+    at_cap_seconds = time.monotonic() - t0
+    assert at_cap_seconds < 2.0, \
+        "a pattern at the cap must stay fast even against a long non-matching path: " \
+        "took {:.3f}s".format(at_cap_seconds)
 
     # --- The hard rule: a hostile .hearthignore cannot widen safe_join. ---
     # These patterns are exactly the shapes that would matter if the ignore

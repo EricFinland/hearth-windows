@@ -606,6 +606,23 @@ class RealEngine:
             self._messages = messages
             self._turn_starts = turn_starts
 
+    def expected_system_prompt(self, mode):
+        """The exact system-prompt text a freshly constructed engine would
+        use to open a conversation in `mode` -- see the module-level
+        _system_prompt() this simply wraps. Exposed as a method (not just
+        the module function) so session_state.py's restore path can
+        validate a persisted conversation's first message through the same
+        duck-typed, no-import seam get_state/load_state already use (see
+        this class's restart-survival comment above and
+        session_state.py's own module docstring for why it deliberately
+        never imports RealEngine): an attacker-authored 'system' message
+        sitting first in a persisted engine_state is a straightforward
+        instruction-injection vector, since run_command is uncontained and
+        could have written that state file directly. A conversation whose
+        first message does not match this, byte for byte, is not trusted
+        by the restore path and is dropped rather than loaded."""
+        return _system_prompt(mode)
+
     def _chat(self, ctx, messages, model):
         if self._chat_fn is not None:
             return self._chat_fn(messages)
@@ -948,6 +965,36 @@ class RealEngine:
                                 ctx.emit("cancelled", {"tokens_in": tokens_in, "tokens_out": tokens_out})
                                 return
                             continue
+
+                    else:
+                        # verdict == "allow" (deny already `continue`d
+                        # above): the exact gap the security review found
+                        # -- permissions.decide returns "allow" for
+                        # write_file/edit_file/replace_in_files in 'auto'
+                        # mode (and always in 'bypass'), so the scan in the
+                        # "gate" branch above, wired only into that branch,
+                        # never ran for precisely the three tools it exists
+                        # to cover. A user in 'auto' mode is exactly the
+                        # one who will never otherwise see this write, so
+                        # the scan must not depend on gating to fire. This
+                        # never turns "allow" into "gate" -- doing that
+                        # would be a permission-mode behaviour change
+                        # nobody asked for -- it only emits a standalone
+                        # "secrets_finding" event alongside the ordinary
+                        # tool_call, so the signal reaches the event log
+                        # (and whatever the UI does with it) without ever
+                        # blocking the call. See the module docstring's
+                        # point 4 for the gated twin of this scan.
+                        write_content_for_allow = _write_content_for_secrets_scan(name, cargs)
+                        if write_content_for_allow is not None:
+                            allow_secrets_scan = hearth_secrets.scan(
+                                write_content_for_allow, path=cargs.get("path"))
+                            if hearth_secrets.meets_threshold(allow_secrets_scan, SECRETS_SURFACE_THRESHOLD):
+                                ctx.emit("secrets_finding", {
+                                    "tool": name,
+                                    "finding": _secrets_finding_for_approval(
+                                        allow_secrets_scan, write_content_for_allow),
+                                })
 
                     ctx.emit("tool_call", {"tool": name, "args": display_args, "decision": "allow"})
                     status, result = _run_cancellable(
@@ -2128,6 +2175,81 @@ def _self_test():
     assert isinstance(real_ready, bool), real_ready
     real_diag = engine_prod_default._setup_diagnose_fn()
     assert isinstance(real_diag, dict) and "status" in real_diag, real_diag
+
+    # === Q: Finding 3 -- the secrets scanner must not be dead code in ======
+    # === 'auto' mode. permissions.decide returns "allow" (never "gate") ===
+    # === for write_file/edit_file/replace_in_files in 'auto' mode, so the =
+    # === scan wired only into the "gate" branch (section N, above) never ==
+    # === ran for exactly the three tools it exists to cover. A user in ====
+    # === 'auto' mode is precisely the one who would otherwise never see ===
+    # === the write at all -- this must surface the finding without ========
+    # === turning "allow" into "gate" (an unrequested permission-mode ======
+    # === behaviour change). ==================================================
+    real_key_q = hearth_secrets._build_real_secret_fixtures()["aws"]
+    secret_content_q = "aws_access_key_id = " + real_key_q + "\n"
+    secret_script_q = [
+        ({"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": "write_file",
+                          "arguments": {"path": "config.ini", "content": secret_content_q}}}]}, 1, 1),
+        ({"role": "assistant", "content": "wrote it", "tool_calls": []}, 1, 1),
+    ]
+    engineQ = RealEngine(chat_fn=_scripted_chat(secret_script_q), execute_tool_fn=fake_execute_tool,
+                         checkpoint_fn=fake_checkpoint)
+    sessQ = session_mod.Session(ws, "fake-model", "auto", engine=engineQ)
+    sessQ.submit_prompt("write config.ini with the aws key in it, auto mode")
+    finding_eventQ, _ = _wait_for_kind(sessQ, "secrets_finding")
+    _wait_for_kind(sessQ, "done")
+    _wait_idle(sessQ)
+
+    # THE PIN: the call was never gated at all -- no approval_request event
+    # anywhere in this turn's history -- yet the finding still reached the
+    # event log, unprompted.
+    kindsQ = [e["kind"] for e in _all_events(sessQ)]
+    assert "approval_request" not in kindsQ, (
+        "auto mode must never gate this write just because it scanned high on "
+        "secrets -- that would be a permission-mode behaviour change nobody "
+        "asked for: {}".format(kindsQ)
+    )
+    assert finding_eventQ["data"]["tool"] == "write_file", finding_eventQ
+    findingQ = finding_eventQ["data"]["finding"]
+    assert findingQ["kind"] == hearth_secrets.KIND_AWS_ACCESS_KEY, findingQ
+    assert findingQ["severity"] in ("high", "critical"), findingQ
+    assert real_key_q not in str(finding_eventQ), \
+        "the secrets_finding event must never reproduce the raw secret: {}".format(finding_eventQ)
+
+    # The write still actually happened, with the real content -- this scan
+    # only ever surfaces a signal; it never blocks or redacts the auto-mode
+    # write itself, unlike the gated path in section N.
+    real_write_calls_q = [c for c in tool_calls_seen
+                          if c[0] == "write_file" and c[1].get("path") == "config.ini"]
+    assert real_write_calls_q and real_key_q in real_write_calls_q[-1][1]["content"]
+
+    # SSE round-trip: the raw secret must never leak into the serialised
+    # event either, the same discipline section N already applies to the
+    # gated approval.
+    fhQ = _FakeHandler()
+    app_mod.SidecarHandler._write_sse(fhQ, finding_eventQ)
+    rawQ = b"".join(fhQ.wfile.chunks).decode("utf-8")
+    assert real_key_q not in rawQ, "the raw secret leaked into the secrets_finding SSE frame"
+
+    # --- non-vacuous: an ordinary auto-mode write with no secret-shaped ----
+    # --- content emits no secrets_finding event at all, and is still ------
+    # --- never gated -- proves the block above is not just always firing. -
+    plain_script_q = [
+        ({"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": "write_file",
+                          "arguments": {"path": "notes.txt", "content": "just some notes"}}}]}, 1, 1),
+        ({"role": "assistant", "content": "done", "tool_calls": []}, 1, 1),
+    ]
+    engineQ2 = RealEngine(chat_fn=_scripted_chat(plain_script_q), execute_tool_fn=fake_execute_tool,
+                          checkpoint_fn=fake_checkpoint)
+    sessQ2 = session_mod.Session(ws, "fake-model", "auto", engine=engineQ2)
+    sessQ2.submit_prompt("write some plain notes, auto mode")
+    _wait_for_kind(sessQ2, "done")
+    _wait_idle(sessQ2)
+    kindsQ2 = [e["kind"] for e in _all_events(sessQ2)]
+    assert "secrets_finding" not in kindsQ2, kindsQ2
+    assert "approval_request" not in kindsQ2, kindsQ2
 
     print("hearth-desktop-engine self-test OK")
     return 0

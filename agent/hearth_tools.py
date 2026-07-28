@@ -338,11 +338,50 @@ def _ignored_error(workspace, full, requested_path):
     return None
 
 
+_HEARTHIGNORE_FILENAME = ".hearthignore"
+
+
+def _hearthignore_protected(workspace, full):
+    """True if `full` (an already safe_join-resolved absolute path) IS the
+    workspace's own .hearthignore file -- not merely a path it excludes,
+    the scoping file itself.
+
+    .hearthignore does not ignore itself: nothing in hearth_contain's
+    matching logic ever adds the file's own name to its own exclusion set,
+    so without this check `write_file(".hearthignore", "")` succeeds like
+    any other write, silently erasing every rule that scoped the run --
+    and in 'auto' mode that write is auto-allowed, so it happens with no
+    approval prompt at all. This check is independent of the file's own
+    contents (a hostile .hearthignore cannot exempt itself by, say,
+    negating its own path) and independent of is_ignored() entirely: it
+    fires whether or not the file currently ignores anything, including
+    when it does not exist yet (so the agent cannot create one via
+    edit_file/replace_in_files' rename-through-content tricks either --
+    those tools only ever touch a path that already resolved to this
+    exact file). A user editing .hearthignore themselves, outside the
+    agent, is unaffected -- this only ever gates the three tool functions
+    that call it, not the filesystem itself."""
+    root = os.path.realpath(workspace)
+    hi = os.path.realpath(os.path.join(root, _HEARTHIGNORE_FILENAME))
+    return os.path.normcase(os.path.realpath(full)) == os.path.normcase(hi)
+
+
+def _hearthignore_protected_error(workspace, full):
+    if _hearthignore_protected(workspace, full):
+        return ("error: .hearthignore is always protected from write_file, edit_file, "
+                "and replace_in_files, regardless of its own contents; edit it directly "
+                "outside the agent if the workspace's scoping needs to change")
+    return None
+
+
 def tool_write_file(args, workspace):
     try:
         full = hearth_contain.safe_join(workspace, args.get("path"))
     except ValueError as exc:
         return "error: {}".format(exc)
+    protected = _hearthignore_protected_error(workspace, full)
+    if protected:
+        return protected
     blocked = _ignored_error(workspace, full, args.get("path"))
     if blocked:
         return blocked
@@ -515,6 +554,9 @@ def tool_edit_file(args, workspace):
         full = hearth_contain.safe_join(workspace, args.get("path"))
     except ValueError as exc:
         return "error: {}".format(exc)
+    protected = _hearthignore_protected_error(workspace, full)
+    if protected:
+        return protected
     blocked = _ignored_error(workspace, full, args.get("path"))
     if blocked:
         return blocked
@@ -1082,6 +1124,8 @@ def tool_replace_in_files(args, workspace):
                 continue  # a link or an odd name that resolves outside the workspace
             if spec.is_ignored(os.path.relpath(fp, root), is_dir=False):
                 continue
+            if _hearthignore_protected(root, fp):
+                continue  # .hearthignore is always protected, regardless of its own contents
             try:
                 if os.path.getsize(hearth_paths.long_path(fp)) > 2_000_000:
                     continue
@@ -2198,6 +2242,77 @@ def _self_test():
         assert r3.rstrip("\r\n") == "SENTINEL_LOOSE_SECRET", r3
     finally:
         _shutil.rmtree(_wsi, ignore_errors=True)
+
+    # === Finding 4: the agent cannot erase its own .hearthignore scope. ===
+    # === Reproduces the review's exact sequence: a read is refused, an ====
+    # === attempted write_file(".hearthignore", "") is refused too (not ====
+    # === silently accepted), and the SAME read is refused again ==========
+    # === afterward -- proving scope was never actually erased, not just ==
+    # === asserting the fix exists in isolation. ============================
+    _wsp = os.path.realpath(_tempfile.mkdtemp(prefix="hearth-ignore-selfprotect-"))
+    try:
+        _hi_path = os.path.join(_wsp, ".hearthignore")
+        with open(_hi_path, "w", encoding="utf-8") as fh:
+            fh.write("secrets/\n")
+        os.makedirs(os.path.join(_wsp, "secrets"))
+        with open(os.path.join(_wsp, "secrets", "creds.txt"), "w", encoding="utf-8") as fh:
+            fh.write("SENTINEL_STILL_SCOPED\n")
+        _hi_before = open(_hi_path, encoding="utf-8").read()
+
+        # THE PIN: a read the ignore file currently scopes out is refused
+        # before the attack.
+        r_before = execute_tool("read_file", {"path": "secrets/creds.txt"}, _wsp)
+        assert "excluded by .hearthignore" in r_before, r_before
+
+        # The attack: try to erase .hearthignore via each of the three
+        # tools that can place new text into a file. Every one must be
+        # refused, and the file on disk must be untouched byte-for-byte --
+        # this is checked directly against the filesystem, not just the
+        # tool's return string, the same discipline the walk assertions
+        # above use.
+        w = execute_tool("write_file", {"path": ".hearthignore", "content": ""}, _wsp)
+        assert "protected" in w, w
+        assert open(_hi_path, encoding="utf-8").read() == _hi_before, \
+            "write_file(\".hearthignore\", \"\") must not have touched the file on disk"
+
+        e = execute_tool("edit_file", {"path": ".hearthignore", "find": "secrets/", "replace": ""}, _wsp)
+        assert "protected" in e, e
+        assert open(_hi_path, encoding="utf-8").read() == _hi_before, \
+            "edit_file must not have touched .hearthignore on disk"
+
+        rp = execute_tool("replace_in_files", {"find": "secrets/", "replace": ""}, _wsp)
+        assert open(_hi_path, encoding="utf-8").read() == _hi_before, \
+            "replace_in_files must not have rewritten .hearthignore on disk: {}".format(rp)
+
+        # THE PIN, the actual non-vacuous proof: the SAME read that was
+        # refused before the attack is refused again afterward -- the
+        # attack did not silently succeed even though every individual
+        # tool call above reported failure.
+        r_after = execute_tool("read_file", {"path": "secrets/creds.txt"}, _wsp)
+        assert "excluded by .hearthignore" in r_after, \
+            ("scope was erased despite every write attempt reporting failure", r_after)
+
+        # A brand-new .hearthignore is protected too, even though it does
+        # not exist yet -- the agent must not be able to create one via
+        # write_file where none was there before.
+        _wsp2 = os.path.realpath(_tempfile.mkdtemp(prefix="hearth-ignore-selfprotect-new-"))
+        try:
+            assert not os.path.exists(os.path.join(_wsp2, ".hearthignore"))
+            w2 = execute_tool("write_file", {"path": ".hearthignore", "content": "*\n"}, _wsp2)
+            assert "protected" in w2, w2
+            assert not os.path.exists(os.path.join(_wsp2, ".hearthignore")), \
+                "a refused write must not create .hearthignore anyway"
+        finally:
+            _shutil.rmtree(_wsp2, ignore_errors=True)
+
+        # A user editing .hearthignore themselves, outside the agent
+        # entirely, is unaffected: this protection only ever gates the
+        # three tool functions above, never the filesystem itself.
+        with open(_hi_path, "a", encoding="utf-8") as fh:
+            fh.write("more/\n")
+        assert open(_hi_path, encoding="utf-8").read() == _hi_before + "more/\n"
+    finally:
+        _shutil.rmtree(_wsp, ignore_errors=True)
 
     print("hearth-tools self-test OK")
     return 0

@@ -240,7 +240,20 @@ def _self_test_body():
         """A minimal engine matching RealEngine's get_state()/load_state()
         shape closely enough to exercise the real restart path end to end,
         without needing a live Ollama: one user turn, one tool call gated
-        on an approval that this test deliberately never resolves."""
+        on an approval that this test deliberately never resolves.
+
+        server_b below (the "after the restart" server) uses make_server()'s
+        own default engine_factory -- the real engine_mod.RealEngine, not
+        this fake -- to prove the persisted state is genuinely
+        engine-agnostic JSON, not tied to whatever engine object happened to
+        produce it. That only still works now that session_state.py
+        validates a persisted conversation's first message against
+        whichever engine restores it (see its own Finding 1 fix): this
+        engine's own opening system message must therefore actually match
+        what RealEngine generates for the session's mode ("edit", the
+        default -- see the POST /session body below), not an arbitrary
+        placeholder string, or the real restart path would (correctly)
+        discard the conversation as unverifiable."""
 
         def __init__(self):
             self._messages = None
@@ -253,8 +266,12 @@ def _self_test_body():
         def load_state(self, state):
             self._messages = state.get("messages")
 
+        def expected_system_prompt(self, mode):
+            return engine_mod._system_prompt(mode)
+
         def run(self, ctx):
-            self._messages = self._messages or [{"role": "system", "content": "sys"}]
+            self._messages = self._messages or [
+                {"role": "system", "content": engine_mod._system_prompt(ctx.mode)}]
             self._messages.append({"role": "user", "content": ctx.message})
             ctx.request_approval("write_file", {"path": "f.txt", "content": "body"})
             # deliberately never reached in this test: the approval above
