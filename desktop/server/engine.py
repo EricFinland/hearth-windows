@@ -78,14 +78,18 @@ calling the right functions in the right order:
      scan's overall severity meets SECRETS_SURFACE_THRESHOLD, a redacted
      summary -- kind, masked preview, a short hearth_secrets.redact()ed
      context window, never the raw span -- rides along on the SAME
-     approval_request event the injection finding above already uses,
-     nested under a "secrets" key so neither scanner's finding can mask
-     the other (see _secrets_finding_for_approval). request_approval()'s
-     one keyword argument is still named injection_finding (session.py is
-     off limits this iteration, see the top-level task boundary this
-     module was built under); this module packs a second scanner's result
-     into that same slot rather than leaving it unsurfaced, and says so
-     here rather than pretending the name still describes only one thing.
+     approval_request event the injection finding above already uses, as
+     its own honestly-named `secrets_finding` argument to
+     request_approval() (see _secrets_finding_for_approval), landing on
+     the wire event as its own "secrets_finding" key, independent of
+     "injection_finding" -- a prior iteration of this wiring, written
+     while session.py was off limits, packed this into the
+     injection_finding slot instead (nested under a "secrets" key), which
+     left an approval that carried only a credential finding wearing a
+     field name that said "injection". session.py is this module's own
+     to edit now, so that wart is gone: each scanner gets its own field,
+     present only when that scanner actually found something, so a UI can
+     tell what it is looking at without inferring it from a nested key.
      Whenever a finding is produced this way, the SAME call's `args` that
      reach every emitted event (approval_request, and the tool_call that
      follows once/if approved) are also replaced with a redacted copy --
@@ -95,6 +99,47 @@ calling the right functions in the right order:
      unredacted argument. See engine.py's self-test (section N) for a real
      key proven to reach the approval payload redacted and never appear in
      the serialised event.
+
+  5. Task-aware model routing (agent/hearth_router.py) decides which model
+     runs a turn when the session was never told which model to use: a
+     session's `model` is the router's own "auto" sentinel (None, "", or
+     the literal string "auto" -- see hearth_router.route()'s own
+     contract) rather than a real model name. _resolve_model() below is
+     called once per chat attempt (not once per turn: a single turn can
+     make many chat calls across its tool-use loop, and an escalation
+     signal recorded mid-turn -- see point 5's continuation below -- must
+     be able to change the model on the very next attempt, not wait for
+     the user's next message). An explicit model name always wins outright
+     and the router is never consulted for it. Otherwise, this queries
+     Ollama for what is actually installed (list_installed_models,
+     already degrading to [] on any failure -- Ollama being unreachable
+     must never crash a turn, only fall back to whatever this session was
+     already using, or its own configured "auto" if it was never able to
+     resolve anything) and probes real local hardware once per engine
+     instance (hearth_hw.probe(), cached -- hardware does not change
+     mid-session, and re-probing every chat call would be wasted work).
+
+     Escalation is the other half, and the one this wiring exists to make
+     real: hearth_router.escalate() only fires when the caller hands
+     route() a signal saying the current tier was not enough. This module
+     is exactly the thing that can see that happen -- a tool call whose
+     `arguments` will not parse as JSON is a malformed tool call by
+     construction, and this file already has to catch that failure to
+     keep the turn going at all (see the `elif raw_args:` branch in run()
+     below) -- so _mark_malformed_tool_call() records it, and hitting the
+     iteration cap or the chat/tool call raising outright is recorded by
+     _mark_turn_failed() as a failed turn. Both are consumed exactly once,
+     by whichever _resolve_model() call comes next, so a single bad
+     attempt nudges the tier up by exactly one step (never repeats, never
+     overcorrects to the top) and then stops nudging -- see
+     hearth_router.escalate()'s own docstring for why one step at a time
+     is the whole point. Every time the resolved model actually changes,
+     a "model_selected" event carries the model and hearth_router's own
+     reason string verbatim (never a reason invented here) so a user
+     asking "why is this slow" has an answer instead of silent routing --
+     see engine.py's self-test (section O) for the malformed-tool-call ->
+     escalation path proven end to end, including a version of the test
+     that disables the link and confirms it actually fails without it.
 
 Standard library only.
 """
@@ -114,8 +159,10 @@ if _AGENT_DIR not in sys.path:
     sys.path.insert(0, _AGENT_DIR)
 
 import hearth_checkpoint  # noqa: E402
+import hearth_hw  # noqa: E402
 import hearth_injection  # noqa: E402
 import hearth_loop  # noqa: E402
+import hearth_router  # noqa: E402
 import hearth_secrets  # noqa: E402
 import hearth_shop  # noqa: E402
 import hearth_tools  # noqa: E402
@@ -439,7 +486,8 @@ class RealEngine:
 
     def __init__(self, ollama_url=None, chat_fn=None, execute_tool_fn=None,
                  checkpoint_fn=None, auto_allow=(), max_iters=None,
-                 poll_interval=POLL_INTERVAL, max_messages=None):
+                 poll_interval=POLL_INTERVAL, max_messages=None,
+                 route_fn=None, available_models_fn=None, hw_fn=None):
         self.ollama_url = ollama_url or hearth_loop.DEFAULT_OLLAMA
         self._chat_fn = chat_fn
         self._execute_tool_fn = execute_tool_fn or hearth_tools.execute_tool
@@ -459,6 +507,28 @@ class RealEngine:
         # in a way that matters: by the time a new tool result exists, it IS
         # the most recent untrusted content the agent has read.
         self._last_scan = None
+
+        # Task-aware model routing (module docstring's point 5). Injectable
+        # the same way chat_fn/execute_tool_fn/checkpoint_fn already are, so
+        # the self-test can drive real hearth_router.route() logic against a
+        # synthetic installed-models list and hardware reading -- no Ollama,
+        # no GPU, no network required to prove the wiring, per this
+        # iteration's own constraint.
+        self._route_fn = route_fn or hearth_router.route
+        self._available_models_fn = available_models_fn or (
+            lambda: list_installed_models(self.ollama_url))
+        self._hw_fn = hw_fn or hearth_hw.probe
+        self._hw_probed = False  # hardware is probed at most once per engine instance, then cached
+        self._hw_cache = None
+        self._current_model = None  # the concrete model actually in use right now, for stickiness
+        self._last_emitted_model = None  # dedupes "model_selected" so it fires only on an actual change
+        self._turn_count = 0  # classify()'s turn_index signal; incremented once per run() call
+        # Escalation signals recorded since the last _resolve_model() call,
+        # consumed exactly once by the very next one -- see
+        # _mark_malformed_tool_call/_mark_turn_failed and the module
+        # docstring's point 5. A plain dict, not a queue: at most one of
+        # each kind of signal matters between two routing decisions.
+        self._pending_signals = {}
 
     # ---- restart survival (session_state.py) ----
     #
@@ -496,11 +566,100 @@ class RealEngine:
             self._messages = messages
             self._turn_starts = turn_starts
 
-    def _chat(self, ctx, messages):
+    def _chat(self, ctx, messages, model):
         if self._chat_fn is not None:
             return self._chat_fn(messages)
         tools = hearth_tools.ollama_tool_specs(hearth_tools.WINDOWS_TOOLS)
-        return hearth_loop.chat(self.ollama_url, ctx.model, messages, tools)
+        return hearth_loop.chat(self.ollama_url, model, messages, tools)
+
+    def _hw(self):
+        """Real local hardware, probed at most once per engine instance and
+        cached -- see the module docstring's point 5. Any failure (no probe
+        tools on PATH, an unexpected error) degrades to None, which
+        hearth_router.route() itself already treats as "unknown hardware,
+        skip the fit check" rather than a reason to fail the turn."""
+        if not self._hw_probed:
+            try:
+                self._hw_cache = self._hw_fn()
+            except Exception:  # noqa: BLE001 - a hardware probe failure must not block routing
+                self._hw_cache = None
+            self._hw_probed = True
+        return self._hw_cache
+
+    def _mark_malformed_tool_call(self):
+        """Record that the model's last tool call carried `arguments` that
+        would not parse as JSON -- see the `elif raw_args:` branch in run()
+        below, the exact failure mode hearth_router.py's own docstring
+        calls "the defining weakness of small local models". Consumed
+        exactly once by the very next _resolve_model() call: often later
+        THIS turn (a long tool-using turn makes many chat calls), otherwise
+        the first call of the next one. Its own method, not an inline dict
+        write at the call site, so the self-test can monkeypatch just this
+        one link and prove the escalation wiring is not vacuous -- see
+        section O."""
+        self._pending_signals["malformed_tool_call"] = True
+
+    def _mark_turn_failed(self):
+        """Record that this turn ended by hitting the iteration cap, or by
+        an exception escaping the chat/tool-execution loop outright --
+        hearth_router.route()'s other escalation trigger. Consumed the same
+        one-shot way as _mark_malformed_tool_call(); see there and the
+        module docstring's point 5."""
+        self._pending_signals["previous_failed"] = True
+
+    def _resolve_model(self, ctx):
+        """Which concrete model THIS chat attempt should use (not
+        necessarily this whole turn -- see the module docstring's point 5).
+        An explicit, non-"auto" ctx.model always wins outright and the
+        router is never consulted for it: hearth_router.route()'s own
+        override contract, mirrored here rather than reimplemented.
+        Otherwise, classify and route this attempt against whatever Ollama
+        actually has installed right now and this machine's real hardware,
+        folding in any one-shot escalation signal recorded since the last
+        call (see _mark_malformed_tool_call/_mark_turn_failed).
+
+        Returns (model_name, decision_or_None). decision is the raw dict
+        hearth_router.route() returned, present whenever the router was
+        actually consulted -- whether or not it found a model to use --
+        so run() can decide what is worth surfacing on a model_selected
+        event. None only when ctx.model was an explicit override (nothing
+        to report) or the router itself raised.
+
+        Never raises, and never returns a model this session cannot at
+        least attempt to use: a failure reaching Ollama
+        (list_installed_models already degrades to [] on its own) or any
+        other routing failure falls back to self._current_model -- this
+        session's own last actually-working choice, if it has one -- or,
+        failing that, ctx.model itself. That is "the session's configured
+        model" read as "whatever this session has actually been using"
+        rather than the un-callable literal "auto"; a turn must never
+        crash just because routing could not be computed.
+        """
+        requested = ctx.model
+        if requested and str(requested).strip().lower() not in ("", "auto"):
+            return requested, None
+
+        fallback = self._current_model or requested
+        signals = self._pending_signals
+        self._pending_signals = {}  # consumed exactly once, see _mark_* above
+        signals["turn_index"] = self._turn_count
+
+        try:
+            available = self._available_models_fn()
+        except Exception:  # noqa: BLE001 - an unreachable Ollama must never crash a turn
+            available = []
+
+        try:
+            decision = self._route_fn(ctx.message, available, hw=self._hw(),
+                                      signals=signals, current_model=self._current_model)
+        except Exception:  # noqa: BLE001 - a router bug must never crash a turn either
+            return fallback, None
+
+        model = decision.get("model") if isinstance(decision, dict) else None
+        if model:
+            self._current_model = model
+            return model, decision
+        return fallback, decision
 
     def _checkpoint(self, ctx):
         """Checkpoint the workspace before the turn runs. A failure here (no
@@ -546,6 +705,8 @@ class RealEngine:
             self._messages = [{"role": "system", "content": _system_prompt(ctx.mode)}]
             self._turn_starts = []
 
+        self._turn_count += 1  # classify()'s turn_index signal -- see _resolve_model
+
         self._checkpoint(ctx)
         if ctx.cancelled():
             ctx.emit("cancelled", {})
@@ -564,8 +725,26 @@ class RealEngine:
                     ctx.emit("cancelled", {"tokens_in": tokens_in, "tokens_out": tokens_out})
                     return
 
+                turn_model, routing_decision = self._resolve_model(ctx)
+                # Only when the router was actually consulted AND the model
+                # this attempt will use has actually changed since the last
+                # time this was reported -- see the module docstring's point
+                # 5. This is what keeps a long, uneventful tool-using turn
+                # from emitting the same "kept X loaded" decision on every
+                # single iteration: silent routing is a bug, but so is
+                # repeating an unchanged decision on every tool call.
+                if routing_decision is not None and turn_model != self._last_emitted_model:
+                    self._last_emitted_model = turn_model
+                    ctx.emit("model_selected", {
+                        "model": turn_model,
+                        "tier": routing_decision.get("tier"),
+                        "reason": routing_decision.get("reason"),
+                        "escalated": routing_decision.get("escalated"),
+                        "hardware_limited": routing_decision.get("hardware_limited"),
+                    })
+
                 status, result = _run_cancellable(
-                    lambda msgs=list(self._messages): self._chat(ctx, msgs),
+                    lambda msgs=list(self._messages), m=turn_model: self._chat(ctx, msgs, m),
                     ctx.cancelled, self.poll_interval, session=ctx.session)
                 if status == _CANCELLED:
                     ctx.emit("cancelled", {"tokens_in": tokens_in, "tokens_out": tokens_out})
@@ -604,6 +783,13 @@ class RealEngine:
                             cargs = json.loads(raw_args)
                         except (ValueError, TypeError):
                             cargs = {}
+                            # The exact weakness task-aware routing's
+                            # escalation half exists to correct -- see the
+                            # module docstring's point 5. Recorded, not
+                            # raised: the turn still proceeds (with empty
+                            # args, as before this iteration), but the next
+                            # chat attempt is now nudged to a bigger model.
+                            self._mark_malformed_tool_call()
                     else:
                         cargs = {}
 
@@ -665,26 +851,16 @@ class RealEngine:
                                 display_args[_SECRET_SCAN_ARG_KEY[name]] = hearth_secrets.redact(
                                     write_content, secrets_scan["findings"])
 
-                        # request_approval's one keyword argument is named
-                        # injection_finding (session.py is off limits this
-                        # iteration -- see the module docstring's point 4).
-                        # When only the injection scanner fired, this is
-                        # exactly the flat dict _injection_finding_for_approval
-                        # already built, byte-for-byte identical to before
-                        # this iteration existed -- zero shape change for
-                        # that case. The secrets finding, when present, rides
-                        # as an additional "secrets" key on the SAME dict
-                        # rather than replacing or discounting the injection
-                        # finding, so neither scanner's result can mask the
-                        # other on one approval.
-                        approval_finding = dict(injection_finding) if injection_finding is not None else None
-                        if secrets_finding is not None:
-                            if approval_finding is None:
-                                approval_finding = {}
-                            approval_finding["secrets"] = secrets_finding
-
+                        # Each scanner's finding rides as its own honestly-
+                        # named argument -- session.py's own to edit this
+                        # iteration, see the module docstring's point 4 --
+                        # so neither can mask the other, and neither has to
+                        # borrow the other's name to be seen at all.
                         # emits approval_request itself
-                        decision = ctx.request_approval(name, display_args, injection_finding=approval_finding)
+                        decision = ctx.request_approval(
+                            name, display_args,
+                            injection_finding=injection_finding,
+                            secrets_finding=secrets_finding)
                         if decision != "allow":
                             cancelled_now = ctx.cancelled()
                             result_text = "denied: turn cancelled" if cancelled_now else "denied by user"
@@ -715,6 +891,17 @@ class RealEngine:
                     self._messages.append({"role": "tool", "content": truncated})
 
             ctx.emit("error", {"message": "hit iteration cap ({})".format(self.max_iters)})
+            self._mark_turn_failed()
+        except Exception:
+            # A failed turn is hearth_router's other escalation trigger,
+            # alongside a malformed tool call -- see the module docstring's
+            # point 5. Recorded, then re-raised completely unchanged: this
+            # must not alter what session.py already does with the
+            # exception (its own except Exception emits the "error" event
+            # and returns the turn to idle), only add a side-channel note
+            # for the next _resolve_model() call.
+            self._mark_turn_failed()
+            raise
         finally:
             # Enforce the cap at the end of the turn too (not only at the
             # start of the next one): a turn can itself add many messages
@@ -1184,17 +1371,28 @@ def _self_test():
     for idx in engine9._turn_starts:
         assert engine9._messages[idx]["role"] == "user", (idx, engine9._messages)
 
-    # === K: engine.py must not import the unused hw module -- the review ===
-    # === flagged the dead import. Checked as an actual top-level import ===
-    # === statement (anchored to the start of a line), not a plain =========
-    # === substring search, so this assertion cannot trivially match its ===
-    # === own source text (this comment, or the assert message below).
+    # === K: engine.py's imports must not be vestigial. An earlier iteration
+    # === flagged (and this self-test used to forbid outright) a dead
+    # === top-level `import hearth_hw` this file never referenced. This
+    # === iteration wires real hardware-aware model routing (module
+    # === docstring's point 5, RealEngine._hw), which needs hearth_hw
+    # === again -- legitimately this time. So the check below no longer
+    # === bans the import; it demands the import be genuinely used (an
+    # === attribute access on the module appears somewhere past the import
+    # === statement itself), which still catches a *future* accidental
+    # === dead import of this same module without permanently forbidding a
+    # === real one. Checked as an actual top-level import statement
+    # === (anchored to the start of a line), not a plain substring search,
+    # === so this assertion cannot trivially match its own source text.
     import re as _re
     with open(os.path.abspath(__file__), "r", encoding="utf-8") as _fh:
         _engine_src = _fh.read()
     _dead_module_name = "hearth" + "_" + "hw"
-    assert _re.search(r"(?m)^import {}\b".format(_dead_module_name), _engine_src) is None, \
-        "engine.py must not import the unused " + _dead_module_name + " module"
+    _import_match = _re.search(r"(?m)^import {}\b".format(_dead_module_name), _engine_src)
+    assert _import_match is not None, \
+        "engine.py must import " + _dead_module_name + " for hardware-aware routing"
+    assert (_dead_module_name + ".") in _engine_src[_import_match.end():], \
+        "engine.py imports " + _dead_module_name + " but never actually uses it (dead import)"
 
     # === list_installed_models degrades to [] when Ollama is unreachable ===
     assert list_installed_models(ollama_url="http://127.0.0.1:1", timeout=1) == []
@@ -1508,12 +1706,18 @@ def _self_test():
     sessN.submit_prompt("write config.ini with the aws key in it")
     apprN, _ = _wait_for_kind(sessN, "approval_request")
 
-    finding = apprN["data"].get("injection_finding")
-    assert finding is not None and "secrets" in finding, (
+    # The finding rides on its own honestly-named "secrets_finding" key --
+    # not nested inside "injection_finding" (see the module docstring's
+    # point 4 and session.py's own self-test for the other half of this
+    # proof). No injection scanner ever fired in this scenario (there is no
+    # preceding tool result to have scanned), so "injection_finding" must
+    # be entirely absent, not present-and-empty.
+    assert "injection_finding" not in apprN["data"], apprN
+    secrets_part = apprN["data"].get("secrets_finding")
+    assert secrets_part is not None, (
         "a gated write_file whose content scores high/critical on hearth_secrets "
-        "must carry a 'secrets' finding on the approval: {}".format(apprN)
+        "must carry a secrets_finding on the approval: {}".format(apprN)
     )
-    secrets_part = finding["secrets"]
     assert secrets_part["kind"] == hearth_secrets.KIND_AWS_ACCESS_KEY, secrets_part
     assert secrets_part["severity"] in ("high", "critical"), secrets_part
     assert real_key not in str(secrets_part), \
@@ -1554,10 +1758,10 @@ def _self_test():
 
     # --- prove the wiring is not vacuous: disable the reducer that turns a --
     # --- hearth_secrets scan into an approval-ready finding, rerun the -----
-    # --- identical scenario, and confirm the approval's "secrets" key is ---
-    # --- gone. If it were still present, the assertions above would have ---
-    # --- passed for the wrong reason, the same proof section L already ----
-    # --- applies to the injection reducer. ---------------------------------
+    # --- identical scenario, and confirm "secrets_finding" is gone. If it --
+    # --- were still present, the assertions above would have passed for ----
+    # --- the wrong reason, the same proof section L already applies to -----
+    # --- the injection reducer. ---------------------------------------------
     global _secrets_finding_for_approval
     original_secrets_reducer = _secrets_finding_for_approval
     tripped_without_secrets_reducer = False
@@ -1568,8 +1772,7 @@ def _self_test():
         sessN2 = session_mod.Session(ws, "fake-model", "edit", engine=engineN2)
         sessN2.submit_prompt("write config.ini with the aws key in it")
         apprN2, _ = _wait_for_kind(sessN2, "approval_request")
-        finding2 = apprN2["data"].get("injection_finding")
-        if not finding2 or "secrets" not in finding2:
+        if apprN2["data"].get("secrets_finding") is None:
             tripped_without_secrets_reducer = True
         sessN2.resolve_approval(apprN2["data"]["id"], True)
         _wait_for_kind(sessN2, "done")
@@ -1579,7 +1782,7 @@ def _self_test():
 
     assert tripped_without_secrets_reducer, (
         "wiring toggle had no effect: disabling _secrets_finding_for_approval did not "
-        "remove the 'secrets' key from the approval payload, so this test's earlier "
+        "remove secrets_finding from the approval payload, so this test's earlier "
         "pass is not proven to depend on the actual wiring"
     )
 
@@ -1591,15 +1794,47 @@ def _self_test():
     sessN3 = session_mod.Session(ws, "fake-model", "edit", engine=engineN3)
     sessN3.submit_prompt("write config.ini with the aws key in it")
     apprN3, _ = _wait_for_kind(sessN3, "approval_request")
-    finding3 = apprN3["data"].get("injection_finding")
-    assert finding3 is not None and "secrets" in finding3, \
+    assert apprN3["data"].get("secrets_finding") is not None, \
         "restoring _secrets_finding_for_approval must restore the finding too"
     sessN3.resolve_approval(apprN3["data"]["id"], True)
     _wait_for_kind(sessN3, "done")
     _wait_idle(sessN3)
 
+    # --- both scanners firing on the SAME gated call must both reach the ---
+    # --- approval, each under its own key, neither masking the other: -----
+    # --- a read that scores high on hearth_injection followed by a write ---
+    # --- whose content scores high on hearth_secrets. ----------------------
+    combined_script = [
+        ({"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": "read_file", "arguments": {"path": "notes.txt"}}}]}, 1, 1),
+        ({"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": "write_file",
+                          "arguments": {"path": "config.ini", "content": secret_content}}}]}, 1, 1),
+        ({"role": "assistant", "content": "done", "tool_calls": []}, 1, 1),
+    ]
+
+    def combined_tool(name, args, workspace):
+        if name == "read_file":
+            return real_payload
+        return "wrote {}".format(args.get("path"))
+
+    engineC = RealEngine(chat_fn=_scripted_chat(combined_script), execute_tool_fn=combined_tool,
+                         checkpoint_fn=fake_checkpoint)
+    sessC = session_mod.Session(ws, "fake-model", "edit", engine=engineC)
+    sessC.submit_prompt("read notes.txt then write the aws key to config.ini")
+    apprC, _ = _wait_for_kind(sessC, "approval_request")
+    assert apprC["data"].get("injection_finding") is not None, \
+        "the preceding high-scoring read must still surface an injection_finding: {}".format(apprC)
+    assert apprC["data"].get("secrets_finding") is not None, \
+        "this call's own secret-shaped write must still surface a secrets_finding: {}".format(apprC)
+    assert real_key not in str(apprC["data"]), \
+        "the combined-finding approval must never reproduce the raw secret: {}".format(apprC)
+    sessC.resolve_approval(apprC["data"]["id"], True)
+    _wait_for_kind(sessC, "done")
+    _wait_idle(sessC)
+
     # --- an ordinary write with no secret-shaped content carries no --------
-    # --- "secrets" key at all, and its content reaches the approval --------
+    # --- secrets_finding at all, and its content reaches the approval ------
     # --- unredacted -- an ordinary approval's event shape is unchanged -----
     # --- from before this iteration existed, the same discipline section ---
     # --- A already proves for "no injection_finding at all". ---------------
@@ -1618,11 +1853,108 @@ def _self_test():
         "an ordinary write with no secret-shaped or injection-shaped content "
         "must carry no finding at all: {}".format(apprN4)
     )
+    assert "secrets_finding" not in apprN4["data"], (
+        "an ordinary write with no secret-shaped or injection-shaped content "
+        "must carry no finding at all: {}".format(apprN4)
+    )
     assert apprN4["data"]["args"]["content"] == "just some notes", \
         "ordinary content must reach the approval unredacted, untouched"
     sessN4.resolve_approval(apprN4["data"]["id"], True)
     _wait_for_kind(sessN4, "done")
     _wait_idle(sessN4)
+
+    # === O: task-aware model routing (module docstring's point 5) is =======
+    # === actually wired into the turn loop, not just present and unused ===
+    # === in hearth_router.py -- and its escalation half actually fires ====
+    # === when THIS module's own malformed-tool-call detection (the ========
+    # === `elif raw_args:` json.loads failure above) reports one, moving ===
+    # === the NEXT chat attempt up exactly one tier. Proven against the ====
+    # === REAL hearth_router.route()/classify()/escalate(), with only the =
+    # === installed-models list and the hardware probe stubbed out, per ====
+    # === this iteration's own "no Ollama, no GPU, no network" constraint. =
+    small_id = "qwen2.5-coder:1.5b-instruct-q4_K_M"
+    medium_id = "qwen2.5-coder:7b-instruct-q4_K_M"
+    large_id = "qwen2.5-coder:14b-instruct-q4_K_M"
+    # A prompt hearth_router's own self-test already pins as "neutral" --
+    # classify()'s middle tier with no escalation signal in play -- so this
+    # test does not have to re-derive or re-justify that score itself.
+    routing_prompt = ("Add a new settings page that lets users toggle between "
+                      "light and dark theme across the application.")
+
+    def _stub_available_models():
+        return [small_id, medium_id, large_id]
+
+    def _stub_hw():
+        return None  # skip the VRAM fit check entirely; only "installed?" matters here
+
+    def _run_routing_scenario():
+        malformed_script = [
+            ({"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "list_tree", "arguments": "{not valid json"}}]}, 1, 1),
+            ({"role": "assistant", "content": "done", "tool_calls": []}, 1, 1),
+        ]
+        eng = RealEngine(chat_fn=_scripted_chat(malformed_script), execute_tool_fn=fake_execute_tool,
+                         checkpoint_fn=fake_checkpoint, available_models_fn=_stub_available_models,
+                         hw_fn=_stub_hw, route_fn=hearth_router.route)
+        # model="auto" -- the router sentinel, session.py's own "no explicit
+        # choice" convention (see the module docstring's point 5) -- is what
+        # actually turns routing on for this session; every OTHER engine in
+        # this file uses "fake-model" specifically so it never touches the
+        # router, Ollama, or hardware probing at all.
+        s = session_mod.Session(ws, "auto", "edit", engine=eng)
+        s.submit_prompt(routing_prompt)
+        _wait_for_kind(s, "done")
+        _wait_idle(s)
+        return [e for e in _all_events(s) if e["kind"] == "model_selected"]
+
+    routing_events = _run_routing_scenario()
+    assert len(routing_events) >= 2, (
+        "expected at least two model_selected events -- the initial pick, then the "
+        "escalation -- but got {}".format(routing_events)
+    )
+    first, last = routing_events[0], routing_events[-1]
+    assert first["data"]["model"] == medium_id, first
+    assert first["data"]["tier"] == "medium", first
+    assert first["data"]["escalated"] is False, first
+    # THE PIN: the malformed tool call on iteration 1 must move iteration 2's
+    # attempt -- still the SAME turn -- to a higher tier, not repeat the same
+    # failure with the same model.
+    assert last["data"]["model"] == large_id, (
+        "a malformed tool call must escalate the NEXT attempt to a higher tier: {}".format(last)
+    )
+    assert last["data"]["tier"] == "large", last
+    assert last["data"]["escalated"] is True, last
+    assert "malformed tool call" in last["data"]["reason"], (
+        "the router's own reason string must be surfaced verbatim, not invented here: {}".format(last)
+    )
+
+    # --- prove the escalation link is not vacuous: break the one thing -----
+    # --- that connects "the model just emitted a malformed tool call" to ---
+    # --- the router (_mark_malformed_tool_call), rerun the identical -------
+    # --- scenario, and confirm escalation no longer happens. If it still ---
+    # --- did, the assertions above would have passed for the wrong reason,
+    # --- the same proof sections L and N already apply to their own -------
+    # --- reducers. -----------------------------------------------------------
+    original_mark_malformed = RealEngine._mark_malformed_tool_call
+    RealEngine._mark_malformed_tool_call = lambda self: None
+    try:
+        broken_events = _run_routing_scenario()
+    finally:
+        RealEngine._mark_malformed_tool_call = original_mark_malformed
+
+    broken_models = [e["data"]["model"] for e in broken_events]
+    assert broken_models and all(m == medium_id for m in broken_models), (
+        "wiring toggle had no effect: disabling _mark_malformed_tool_call did not "
+        "prevent escalation, so the earlier pass is not proven to depend on the "
+        "actual malformed-tool-call -> escalation link: {}".format(broken_events)
+    )
+
+    # With the link restored, the identical scenario must escalate again --
+    # proves the toggle above did not permanently break anything.
+    restored_events = _run_routing_scenario()
+    assert len(restored_events) >= 2 and restored_events[-1]["data"]["model"] == large_id, (
+        "restoring _mark_malformed_tool_call must restore escalation too: {}".format(restored_events)
+    )
 
     print("hearth-desktop-engine self-test OK")
     return 0
