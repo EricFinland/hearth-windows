@@ -12,11 +12,30 @@ is a TurnContext offering:
 
   ctx.workspace, ctx.model, ctx.mode, ctx.message   -- the turn's inputs
   ctx.emit(kind, data)                              -- push an SSE event
-  ctx.request_approval(tool, args) -> "allow"|"deny" -- gate a tool call,
-                                                         blocking until
-                                                         POST /approve
-                                                         resolves it (or the
-                                                         turn is cancelled)
+  ctx.request_approval(tool, args, injection_finding=None) -> "allow"|"deny"
+                                                     -- gate a tool call,
+                                                        blocking until
+                                                        POST /approve
+                                                        resolves it (or the
+                                                        turn is cancelled).
+                                                        injection_finding, if
+                                                        given, is a small
+                                                        JSON-safe dict (see
+                                                        engine.py's
+                                                        _injection_finding_for_approval)
+                                                        carried on the
+                                                        approval_request
+                                                        event's data, unread
+                                                        and unvalidated by
+                                                        this module -- it is
+                                                        just another value in
+                                                        the event dict, so
+                                                        the same "json.dumps
+                                                        into one string"
+                                                        framing guarantee
+                                                        app.py already gives
+                                                        every event applies
+                                                        to it too.
   ctx.cancelled() -> bool                           -- poll for POST /cancel
 
 The eventual real engine wraps hearth_loop.chat(...) and permissions.decide
@@ -145,8 +164,8 @@ class TurnContext:
     def emit(self, kind, data=None):
         self.session._emit(self.turn_id, kind, data or {})
 
-    def request_approval(self, tool, args=None):
-        return self.session._request_approval(self.turn_id, tool, args or {})
+    def request_approval(self, tool, args=None, injection_finding=None):
+        return self.session._request_approval(self.turn_id, tool, args or {}, injection_finding)
 
     def cancelled(self):
         return self.session._is_cancelled(self.turn_id)
@@ -380,7 +399,7 @@ class Session:
             if self._approvals[appr_id].decision is not None:
                 del self._approvals[appr_id]
 
-    def _request_approval(self, turn_id, tool, args):
+    def _request_approval(self, turn_id, tool, args, injection_finding=None):
         # secrets.token_urlsafe rather than a sequential counter: an approval
         # id must not be guessable from a previous one (defense in depth --
         # nothing today lets an unauthenticated party race an approval, but
@@ -390,7 +409,16 @@ class Session:
         with self._lock:
             self._approvals[appr_id] = appr
             self._evict_approvals_locked()
-        self._emit(turn_id, "approval_request", {"id": appr_id, "tool": tool, "args": args})
+        event_data = {"id": appr_id, "tool": tool, "args": args}
+        # injection_finding is opaque to this module: whatever the engine
+        # passed (a small dict from a hearth_injection.scan() result, or
+        # None) rides straight into the event dict. It is only ever added
+        # when the caller has something to say, never an explicit None/False
+        # placeholder, so an ordinary approval's event shape is unchanged
+        # from before this field existed.
+        if injection_finding is not None:
+            event_data["injection_finding"] = injection_finding
+        self._emit(turn_id, "approval_request", event_data)
         appr.event.wait()  # released by resolve_approval() or by cancel()
         with self._lock:
             decision = appr.decision
@@ -483,6 +511,47 @@ def _self_test():
     assert kinds == ["delta", "approval_request", "tool_call", "done"], kinds
     tool_call_event = next(e for e in all_events if e["kind"] == "tool_call")
     assert tool_call_event["data"]["decision"] == "allow"
+
+    # --- injection_finding, when the engine passes one, rides on the ---
+    # --- approval_request event verbatim; when omitted (the ordinary ---
+    # --- case, exercised just above by ScriptedEngine), the key is not -
+    # --- present at all rather than present-and-None. This is session.py's
+    # --- own slice of the wiring; engine.py's self-test (section L) proves
+    # --- the other half, that a real hearth_injection.scan() finding
+    # --- actually reaches this parameter in the first place. ---
+    sample_finding = {"source": "read_file", "severity": "high", "score": 42,
+                       "category": "imperative_override", "matched": "ignore all previous instructions",
+                       "explanation": "tells the assistant to discard prior instructions"}
+
+    class FindingEngine:
+        def run(self, ctx):
+            decision = ctx.request_approval("write_file", {"path": "y.txt"},
+                                             injection_finding=sample_finding)
+            ctx.emit("tool_call", {"tool": "write_file", "decision": decision})
+
+    s_finding = Session("/tmp/ws-finding", "m", "edit", engine=FindingEngine())
+    s_finding.submit_prompt("write something suspicious")
+    deadline = time.monotonic() + 5
+    appr_data = None
+    while appr_data is None and time.monotonic() < deadline:
+        seen = s_finding.events_after(0, timeout=1)
+        for e in seen:
+            if e["kind"] == "approval_request":
+                appr_data = e["data"]
+                break
+    assert appr_data is not None, "approval_request never arrived"
+    assert appr_data.get("injection_finding") == sample_finding, appr_data
+    s_finding.resolve_approval(appr_data["id"], True)
+    deadline = time.monotonic() + 5
+    while s_finding.to_dict()["status"] != STATUS_IDLE and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    # the ordinary path (no injection_finding passed at all) never gets the
+    # key -- checked again here directly, not only inferred from the earlier
+    # ScriptedEngine assertions, so this fixture is self-contained.
+    no_finding_events = s2.events_after(0, timeout=1)
+    appr_no_finding = next(e for e in no_finding_events if e["kind"] == "approval_request")
+    assert "injection_finding" not in appr_no_finding["data"], appr_no_finding
 
     # --- cancellation wakes a blocked approval and reports "deny" ---
     class WaitingEngine:
