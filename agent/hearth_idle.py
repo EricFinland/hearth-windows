@@ -27,12 +27,51 @@ SIGNALS, AND WHICH ONES ARE HONEST.
   bounded timeout and clean degrade-to-nothing on any failure; the
   subprocess helper below follows that exact pattern (same timeout
   discipline, same encoding="utf-8", errors="replace" safety, same "any
-  failure at all becomes no data, never an exception"). This reports the
-  card as a whole, not per-process: it cannot distinguish "someone else is
-  using the GPU" from "Hearth's own inference is already running". A
-  caller deciding whether to start a *second* heavy job should treat that
-  as an acceptable conservative default; a caller that already knows its
-  own usage can subtract it before calling probe().
+  failure at all becomes no data, never an exception").
+
+  This was wrong in an earlier version of this module, in two ways found
+  by testing against real machines rather than by inspection, and both are
+  worth recording because the fix depends on understanding why they broke:
+
+  1. Utilization and memory are not interchangeable evidence, and treating
+     a low memory threshold as independently decisive was the bug.
+     Sustained utilization means the GPU is actively computing right now.
+     Resting memory means something is merely resident - a desktop
+     compositor's framebuffer alone holds VRAM at every idle machine with
+     a display attached (observed empirically: 10% resident, 0%
+     utilization, on a real Windows desktop untouched for 52 minutes).
+     A memory-only threshold anywhere near that baseline reads every idle
+     machine as busy essentially forever - the exact failure the module
+     exists to avoid, and silently worse than having no detection at all,
+     because it looks like the feature is working. So utilization is now
+     the primary, decisive signal; memory is corroboration only, at a
+     threshold (gpu_busy_mem_percent, default 40%) picked to sit well
+     above what a compositor and background apps hold at rest across
+     common GPU sizes, not just nudged up from the old number.
+
+  2. "The card as a whole" conflates two different processes: something
+     else competing for the GPU, versus Hearth's own inference stack
+     already having a model loaded. Reading raw total memory used, that
+     distinction is invisible - and a model Hearth itself loaded and left
+     idle would then read as permanent contention, meaning the feature
+     disables itself the first time it is actually used (observed on a
+     real host: Ollama holding a model resident, 76% of VRAM, nothing
+     generating, and the module answering "busy" anyway). OWNERSHIP is
+     resolved by asking Ollama directly: GET {ollama_base_url}/api/ps
+     reports size_vram per currently-loaded model - the same field
+     agent/hearth_bench.py's residency() already reads - and the sum of
+     that is treated as "ours". Only nvidia-smi's total memory used minus
+     that sum ("other") ever counts toward the memory threshold. A model
+     resident but idle is exactly the state a caller wants to run in, so
+     it must read as idle; a model actively generating is genuinely
+     contention for compute cycles regardless of who asked for the
+     generation, which utilization already catches without needing to
+     know who "who" is. If Ollama's own residency cannot be determined
+     (unreachable, not running), this falls back to treating the full
+     reading as "other" - the conservative direction, since getting
+     ownership wrong should widen what looks like contention, not narrow
+     it - and the raised memory threshold from fix 1 keeps that fallback
+     from tripping on ordinary desktop baseline anyway.
 
   Full-screen foreground state (Windows only). GetForegroundWindow plus
   GetWindowRect compared against GetSystemMetrics(SM_CXSCREEN/CYSCREEN) is
@@ -110,12 +149,19 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 
 STATE_IDLE = "idle"
 STATE_BUSY = "busy"
 STATE_UNKNOWN = "unknown"
 
 GPU_SUBPROCESS_TIMEOUT = 3  # seconds; polled frequently, must never hang the caller.
+OLLAMA_PS_TIMEOUT = 2  # seconds; also polled frequently, same bounded-and-cheap contract.
+
+# Same default and env override as agent/hearth_bench.py, agent/hearth_doctor.py,
+# etc: local Ollama's fixed default port.
+DEFAULT_OLLAMA = os.environ.get("HEARTH_OLLAMA", "http://127.0.0.1:11434")
 
 
 # ---------------------------------------------------------------------------
@@ -130,9 +176,10 @@ class IdlePolicy:
     idle_after_seconds: float = 300.0   # persistence required before -> idle
     active_after_seconds: float = 15.0  # persistence required before -> busy
     block_on_battery: bool = True
-    gpu_busy_util_percent: float = 15.0
-    gpu_busy_mem_percent: float = 10.0
+    gpu_busy_util_percent: float = 15.0  # primary, decisive: real compute happening
+    gpu_busy_mem_percent: float = 40.0   # secondary corroboration only; see module docstring
     cpu_busy_frac: float = 0.90  # corroboration only, never decisive alone
+    ollama_base_url: str = DEFAULT_OLLAMA  # where to ask what Hearth's own inference stack owns
 
 
 DEFAULT_POLICY = IdlePolicy()
@@ -376,12 +423,63 @@ def _run_bounded(cmd, timeout=GPU_SUBPROCESS_TIMEOUT):
     return proc.stdout
 
 
-def _gpu_contention(policy):
-    """(busy, util_percent, mem_percent, available) from nvidia-smi.
+def _ollama_resident_vram_bytes(base_url=None):
+    """Total bytes of VRAM Ollama itself currently reports resident, summed
+    across every model GET {base_url}/api/ps lists. This is "ours": the
+    same size_vram field agent/hearth_bench.py's residency() already reads
+    off the identical endpoint, so this reuses Ollama's own accounting
+    rather than guessing at process names via nvidia-smi.
 
-    Reports the busiest GPU on the machine: one contended card is enough
-    reason to stay out of the way even if a second card is idle. This is
-    whole-card usage, not per-process - see module docstring caveat.
+    Returns (bytes, True) on a clean read, (None, False) on any failure at
+    all - unreachable server, non-2xx response, malformed JSON, unexpected
+    shape - never raises. A caller must treat False as "ownership unknown",
+    not as "Ollama owns nothing": see _gpu_contention for how the two are
+    handled differently.
+    """
+    base_url = (base_url or DEFAULT_OLLAMA or "").rstrip("/")
+    if not base_url:
+        return None, False
+    try:
+        req = urllib.request.Request(base_url + "/api/ps", method="GET")
+        with urllib.request.urlopen(req, timeout=OLLAMA_PS_TIMEOUT) as resp:
+            raw = resp.read()
+        data = json.loads(raw)
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+        return None, False
+    if not isinstance(data, dict):
+        return None, False
+    models = data.get("models")
+    if not isinstance(models, list):
+        return None, False
+    total = 0
+    for entry in models:
+        if not isinstance(entry, dict):
+            continue
+        size_vram = entry.get("size_vram")
+        if isinstance(size_vram, (int, float)) and size_vram > 0:
+            total += size_vram
+    return int(total), True
+
+
+def _gpu_contention(policy):
+    """(busy, util_percent, other_mem_percent, available) from nvidia-smi,
+    with Ollama's own resident VRAM subtracted out before the memory
+    threshold is ever checked. See the module docstring's GPU contention
+    section for the full reasoning; summary:
+
+      - busy is driven primarily by utilization (real compute happening,
+        regardless of whose request caused it).
+      - other_mem_percent is memory used that is NOT accounted for by
+        Ollama's own /api/ps residency - i.e. memory some other process is
+        holding - and only trips the (deliberately high) memory threshold
+        as corroboration, never as the sole reason.
+      - a model Hearth's own Ollama has loaded and left resident, but is
+        not generating with, must read as idle - that is the state a
+        caller wants to run heavy work in, not a reason to refuse.
+
+    Reports the busiest GPU's utilization and the aggregate memory picture
+    across every GPU nvidia-smi lists: one contended card is enough reason
+    to stay out of the way even if a second card is idle.
     """
     exe = shutil.which("nvidia-smi")
     if not exe:
@@ -392,8 +490,11 @@ def _gpu_contention(policy):
     ])
     if not out:
         return None, None, None, False
+
     best_util = None
-    best_mem_pct = None
+    total_mem_used_bytes = 0.0
+    total_mem_capacity_bytes = 0.0
+    saw_a_line = False
     for line in out.splitlines():
         line = line.strip()
         if not line:
@@ -403,19 +504,38 @@ def _gpu_contention(policy):
             continue
         try:
             util = float(parts[0])
-            mem_used = float(parts[1])
-            mem_total = float(parts[2])
+            mem_used_mib = float(parts[1])
+            mem_total_mib = float(parts[2])
         except ValueError:
             continue
-        mem_pct = (mem_used / mem_total * 100.0) if mem_total > 0 else 0.0
+        saw_a_line = True
         if best_util is None or util > best_util:
             best_util = util
-        if best_mem_pct is None or mem_pct > best_mem_pct:
-            best_mem_pct = mem_pct
-    if best_util is None:
+        total_mem_used_bytes += mem_used_mib * 1024 * 1024
+        total_mem_capacity_bytes += mem_total_mib * 1024 * 1024
+    if not saw_a_line or best_util is None:
         return None, None, None, False
-    busy = best_util >= policy.gpu_busy_util_percent or best_mem_pct >= policy.gpu_busy_mem_percent
-    return busy, best_util, best_mem_pct, True
+
+    own_vram_bytes, own_available = _ollama_resident_vram_bytes(policy.ollama_base_url)
+    if own_available and own_vram_bytes is not None:
+        other_mem_bytes = max(0.0, total_mem_used_bytes - own_vram_bytes)
+    else:
+        # Ollama's own residency could not be determined (not running,
+        # unreachable, bad response). Falling back to the unsubtracted
+        # total is the conservative direction: an unknown ownership split
+        # should widen what counts as possible contention, not quietly
+        # ignore memory altogether. The raised gpu_busy_mem_percent default
+        # (see module docstring, fix 1) keeps this fallback from tripping
+        # on an ordinary idle desktop's compositor baseline regardless.
+        other_mem_bytes = total_mem_used_bytes
+
+    other_mem_pct = (
+        (other_mem_bytes / total_mem_capacity_bytes * 100.0)
+        if total_mem_capacity_bytes > 0 else 0.0
+    )
+
+    busy = best_util >= policy.gpu_busy_util_percent or other_mem_pct >= policy.gpu_busy_mem_percent
+    return busy, best_util, other_mem_pct, True
 
 
 # ---------------------------------------------------------------------------
@@ -446,8 +566,11 @@ def _classify(signals, policy):
 
     if signals.get("gpu_busy") is True:
         util = signals.get("gpu_util_percent") or 0.0
-        mem = signals.get("gpu_mem_percent") or 0.0
-        reasons.append("GPU already under contention (util {:.0f}%, mem {:.0f}%)".format(util, mem))
+        other_mem = signals.get("gpu_other_mem_percent") or 0.0
+        reasons.append(
+            "GPU already under contention (util {:.0f}%, other-process mem {:.0f}%)"
+            .format(util, other_mem)
+        )
         return STATE_BUSY, "medium", reasons
 
     if signals.get("input_idle_available"):
@@ -493,7 +616,7 @@ def probe(policy=None):
     system = platform.system()
 
     input_idle_seconds, input_available = _input_idle_seconds()
-    gpu_busy, gpu_util, gpu_mem_pct, gpu_available = _gpu_contention(policy)
+    gpu_busy, gpu_util, gpu_other_mem_pct, gpu_available = _gpu_contention(policy)
     fullscreen, fullscreen_available = _foreground_fullscreen()
     on_battery, power_available = _on_battery()
     cpu_load_frac, cpu_available = _cpu_load_frac()
@@ -504,7 +627,7 @@ def probe(policy=None):
         "input_idle_available": input_available,
         "gpu_busy": gpu_busy,
         "gpu_util_percent": gpu_util,
-        "gpu_mem_percent": gpu_mem_pct,
+        "gpu_other_mem_percent": gpu_other_mem_pct,
         "gpu_signal_available": gpu_available,
         "fullscreen_foreground": fullscreen,
         "fullscreen_signal_available": fullscreen_available,
@@ -646,7 +769,7 @@ def _make_raw(state, confidence="high", reason="synthetic", **signal_overrides):
         "input_idle_available": False,
         "gpu_busy": None,
         "gpu_util_percent": None,
-        "gpu_mem_percent": None,
+        "gpu_other_mem_percent": None,
         "gpu_signal_available": False,
         "fullscreen_foreground": None,
         "fullscreen_signal_available": False,
@@ -681,7 +804,7 @@ def _self_test():
     # -- _classify: GPU contention -------------------------------------------
     s, c, r = _classify(
         {"fullscreen_foreground": False, "on_battery": False, "gpu_busy": True,
-         "gpu_util_percent": 40.0, "gpu_mem_percent": 55.0, "platform": "Linux"},
+         "gpu_util_percent": 40.0, "gpu_other_mem_percent": 55.0, "platform": "Linux"},
         DEFAULT_POLICY,
     )
     assert s == STATE_BUSY and "GPU" in r[0], (s, c, r)
@@ -717,6 +840,86 @@ def _self_test():
     }
     s, c, r = _classify(nothing, DEFAULT_POLICY)
     assert s == STATE_UNKNOWN and c == "low", (s, c, r)
+
+    # -- _gpu_contention: ownership-aware, regression fixtures for both real -
+    # -- bugs a coordinator review found by testing against real machines ---
+    # Both _run_bounded (the nvidia-smi call) and _ollama_resident_vram_bytes
+    # (the /api/ps call) are swapped for canned fixtures, exactly like
+    # hearth_hw.py's self-test does for its Windows WMI/CIM parsers - this
+    # never touches a real GPU or a real Ollama server, so it is
+    # deterministic on a machine with neither.
+    old_run_bounded = globals()["_run_bounded"]
+    old_ollama_resident = globals()["_ollama_resident_vram_bytes"]
+    try:
+        # Regression fixture for finding 1: a genuinely idle Windows
+        # desktop - 0% utilization, ~10% VRAM resident from the compositor's
+        # framebuffer alone. This is the exact reading a coordinator review
+        # captured against a real Windows machine untouched for 52 minutes.
+        # No Ollama reachable. Must NOT read as busy.
+        def _fixture_idle_desktop(cmd, timeout=GPU_SUBPROCESS_TIMEOUT):
+            return "0, 1024, 10240\n"  # util%, mem.used MiB, mem.total MiB -> 10% used
+        globals()["_run_bounded"] = _fixture_idle_desktop
+        globals()["_ollama_resident_vram_bytes"] = lambda base_url=None: (None, False)
+        busy, util, other_pct, avail = _gpu_contention(DEFAULT_POLICY)
+        assert avail is True, (busy, util, other_pct, avail)
+        assert util == 0.0 and abs(other_pct - 10.0) < 0.01, (util, other_pct)
+        assert busy is False, (
+            "an idle desktop's resting VRAM baseline must never read as GPU "
+            "contention on its own: got busy={} util={} other_mem_pct={}"
+            .format(busy, util, other_pct)
+        )
+
+        # Regression fixture for finding 2: Ollama holding a model resident
+        # (76% of VRAM, matching the coordinator's reported reading) and
+        # idle - no generation happening (util 0%). That memory is ours, and
+        # it is resting: this must NOT read as busy, or the feature disables
+        # itself the first time it is actually used.
+        def _fixture_ollama_loaded_idle(cmd, timeout=GPU_SUBPROCESS_TIMEOUT):
+            return "0, 18240, 24000\n"  # 76% used, 0% util: resident, not generating
+        globals()["_run_bounded"] = _fixture_ollama_loaded_idle
+        own_bytes = int(18240 * 1024 * 1024 * 0.995)  # nearly all of the resident memory is ours
+        globals()["_ollama_resident_vram_bytes"] = lambda base_url=None: (own_bytes, True)
+        busy, util, other_pct, avail = _gpu_contention(DEFAULT_POLICY)
+        assert busy is False, (
+            "Hearth's own resident-but-idle model must not make the module "
+            "declare itself busy - this is the exact deadlock a coordinator "
+            "review reported against a real Linux host: got busy={} util={} "
+            "other_mem_pct={}".format(busy, util, other_pct)
+        )
+        assert other_pct < DEFAULT_POLICY.gpu_busy_mem_percent, (other_pct, "ownership subtraction should leave 'other' near zero")
+
+        # Genuine contention, memory-driven: something that is NOT Ollama
+        # holding a large chunk of VRAM, Ollama not even running. Must
+        # still read as busy - the ownership fix must not blind this module
+        # to a real competing process just because Ollama is uninvolved.
+        def _fixture_other_app_heavy_vram(cmd, timeout=GPU_SUBPROCESS_TIMEOUT):
+            return "5, 14400, 24000\n"  # 60% used, only 5% util
+        globals()["_run_bounded"] = _fixture_other_app_heavy_vram
+        globals()["_ollama_resident_vram_bytes"] = lambda base_url=None: (None, False)
+        busy, util, other_pct, avail = _gpu_contention(DEFAULT_POLICY)
+        assert busy is True, (
+            "60% of VRAM held by something that is not Ollama, with Ollama "
+            "not even running, must read as contention: got busy={} util={} "
+            "other_mem_pct={}".format(busy, util, other_pct)
+        )
+
+        # Genuine contention, utilization-driven: Ollama actively generating
+        # (does not matter for whom - the GPU is computing right now), even
+        # though the resident memory itself is entirely ours. Utilization
+        # must override ownership attribution here.
+        def _fixture_ollama_generating(cmd, timeout=GPU_SUBPROCESS_TIMEOUT):
+            return "70, 18240, 24000\n"
+        globals()["_run_bounded"] = _fixture_ollama_generating
+        globals()["_ollama_resident_vram_bytes"] = lambda base_url=None: (own_bytes, True)
+        busy, util, other_pct, avail = _gpu_contention(DEFAULT_POLICY)
+        assert busy is True, (
+            "sustained high utilization must read as busy even when all of "
+            "the resident memory is ours: got busy={} util={} other_mem_pct={}"
+            .format(busy, util, other_pct)
+        )
+    finally:
+        globals()["_run_bounded"] = old_run_bounded
+        globals()["_ollama_resident_vram_bytes"] = old_ollama_resident
 
     # -- IdleTracker: fake clock, synthetic raw samples only -----------------
     clock = {"t": 0.0}
