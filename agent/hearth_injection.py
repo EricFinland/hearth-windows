@@ -83,8 +83,26 @@ Known limitations, stated plainly rather than discovered the hard way:
   shebang anywhere in it, is not recognized as "looks like Python" and gets
   no discount at all, the same as any other file this module does not
   recognize as code.
+- The exfiltration co-occurrence detector (_scan_exfiltration) originally
+  treated a fixed character window as "close enough to be one sentence,"
+  which is a reasonable approximation in prose and a wrong one in source
+  code: a verb near the end of one string literal and an unrelated constant
+  name starting the next tuple entry in a pattern table can be close in
+  characters and unrelated in meaning (found in review on
+  agent/hearth_secrets.py's own pattern table: "post," inside one entry's
+  explanation string, combined with the next entry's KIND_GOOGLE_API_KEY
+  constant into a fabricated exfiltration finding). _python_construct_
+  boundaries uses tokenize to find the commas and statement-ending newlines
+  Python itself puts between constructs, and _scan_exfiltration refuses to
+  combine a verb match with a target or destination match on the far side of
+  one. Gated the same way as the code-structure discount: only active when
+  the text looks like Python source, and only ever withholds evidence, never
+  adds it, so it cannot make a real attack invisible in ordinary prose. See
+  the "pattern_table_tuple_boundary" fixture below for the minimal
+  reproduction this was tuned against.
 """
 
+import bisect
 import io
 import os
 import re
@@ -418,6 +436,98 @@ def _merge_adjacent_spans(spans, text):
 
 def _in_code_structure(code_spans, start, end):
     return any(s <= start and end <= e for s, e in code_spans)
+
+
+# ---------------------------------------------------------------------------
+# False-positive suppression: construct boundaries for co-occurrence
+# ---------------------------------------------------------------------------
+#
+# The exfiltration co-occurrence detector (_scan_exfiltration, below) treats
+# a fixed character window as "close enough to be one sentence." In prose
+# that is a reasonable approximation. In source code it is not: a directive
+# verb sitting near the end of one string literal and an unrelated constant
+# name at the start of the next tuple entry are close in characters and have
+# nothing to do with each other. This is not hypothetical -- it is the exact
+# false positive reported against agent/hearth_secrets.py's _KNOWN_FORMATS
+# table:
+#
+#     (KIND_SLACK_WEBHOOK, "high", 0.8,
+#      re.compile(...),
+#      "matches a Slack incoming-webhook URL, which can post to a channel "
+#      "without further auth"),
+#     (KIND_GOOGLE_API_KEY, "high", 0.75,
+#      re.compile(...),
+#      "matches the Google API key shape ..."),
+#
+# "post" (the verb, inside the first tuple's explanation string) and
+# KIND_GOOGLE_API_KEY (a bare constant name starting the *next* tuple) fell
+# inside the same fixed-distance window and combined into a fabricated
+# "exfiltration" finding. The span crosses a real syntactic boundary: the
+# closing `")`, the tuple-separating `,`, a newline, and the indentation of
+# the next entry. A fixed character count cannot see that; tokenize can,
+# because Python already put a COMMA token exactly at that boundary.
+#
+# The fix: tokenize also reports every comma that separates elements of a
+# tuple, list, or call, and every logical NEWLINE that ends a statement
+# (distinct from the NL token tokenize emits for a line break inside an open
+# bracket, which does NOT end a statement and must not count here -- most of
+# a multi-line list literal like _KNOWN_FORMATS is exactly that: many NL
+# tokens and no NEWLINE at all until the closing `]`). Collecting the offsets
+# of those two token kinds gives a mechanical, structure-derived answer to
+# "are these two matches part of the same statement or literal," instead of
+# another guess based on nearby wording the way the quote/meta discount is.
+# _scan_exfiltration uses it to refuse to combine a verb match with a target
+# or destination match that sits on the far side of one of these offsets.
+#
+# Gated the same way as the code-structure discount above: only computed
+# when _looks_like_python_source says the text is shaped like Python at all,
+# and only ever used to withhold evidence, never to add it, so it cannot
+# turn a real attack invisible outside of code, and cannot raise a score.
+_BOUNDARY_TOKEN_TYPES = (tokenize.NEWLINE,)
+
+
+def _python_construct_boundaries(text):
+    """Best-effort sorted list of absolute offsets where tokenize reports a
+    construct boundary: a comma separating tuple/list/call entries, or a
+    logical NEWLINE ending a statement.
+
+    Same best-effort contract as _python_code_spans (see its docstring):
+    most non-Python text either fails to tokenize at all (empty list,
+    correct -- nothing to separate) or tokenizes with none of these tokens
+    present (also an empty list, also correct). Text that starts as valid
+    Python and breaks down partway through still yields every boundary
+    collected up to the break.
+    """
+    boundaries = []
+    offsets = _line_start_offsets(text)
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            is_boundary = tok.type in _BOUNDARY_TOKEN_TYPES or (
+                tok.type == tokenize.OP and tok.string == ","
+            )
+            if is_boundary:
+                start_line, start_col = tok.start
+                if start_line < len(offsets):
+                    boundaries.append(offsets[start_line] + start_col)
+    except Exception:
+        # Same reasoning as _python_code_spans above: tokenize raises
+        # several different exception types depending on exactly what is
+        # malformed and which Python version is running; all of them mean
+        # "stop collecting" here, never a crash for the caller.
+        pass
+    boundaries.sort()
+    return boundaries
+
+
+def _crosses_construct_boundary(boundaries, start, end):
+    """True if a construct-separator offset (a comma or a logical statement
+    newline) falls in [start, end) -- meaning that span is not one
+    contiguous statement or literal, and evidence found on either side of it
+    should not be combined at full strength."""
+    if not boundaries:
+        return False
+    i = bisect.bisect_left(boundaries, start)
+    return i < len(boundaries) and boundaries[i] < end
 
 
 def _context_multiplier(chunk, start, end, code_spans=None):
@@ -832,7 +942,7 @@ _EXFIL_WINDOW_BEFORE = 60
 _EXFIL_WINDOW_AFTER = 100
 
 
-def _scan_exfiltration(chunk, base_offset, code_spans=None):
+def _scan_exfiltration(chunk, base_offset, code_spans=None, boundaries=None):
     findings = []
     covered = []
     for vm in _EXFIL_VERB_RE.finditer(chunk):
@@ -841,6 +951,26 @@ def _scan_exfiltration(chunk, base_offset, code_spans=None):
         window = chunk[w_start:w_end]
         tmatch = _EXFIL_TARGET_RE.search(window) or _EXFIL_TARGET_ENVVAR_RE.search(window)
         dmatch = _EXFIL_DEST_RE.search(window)
+
+        # A target or destination match separated from the verb by a real
+        # construct boundary (see _python_construct_boundaries above) is not
+        # evidence about the verb's own sentence or statement -- it is
+        # evidence about whatever unrelated construct sits on the other side
+        # of the comma or statement break. Drop it before it ever reaches
+        # the severity decision below, rather than let a fixed character
+        # window keep treating "close" as "connected."
+        if tmatch and boundaries and _crosses_construct_boundary(
+            boundaries,
+            min(vm.start(), w_start + tmatch.start()),
+            max(vm.end(), w_start + tmatch.end()),
+        ):
+            tmatch = None
+        if dmatch and boundaries and _crosses_construct_boundary(
+            boundaries,
+            min(vm.start(), w_start + dmatch.start()),
+            max(vm.end(), w_start + dmatch.end()),
+        ):
+            dmatch = None
 
         if tmatch and dmatch:
             severity, confidence = "critical", 0.8
@@ -1029,6 +1159,17 @@ def scan(text, source=None):
     full_code_spans = (
         _python_code_spans(text) if looks_python and len(text) <= MAX_CODE_TOKENIZE_CHARS else None
     )
+    # Same full-document, decoupled-from-MAX_SCAN_CHARS reasoning as
+    # full_code_spans immediately above (see MAX_CODE_TOKENIZE_CHARS): a
+    # comma or statement boundary near the edge of a scan window is a real
+    # construct boundary whether or not tokenize can see the rest of the
+    # document, but tokenize only tokenizes reliably starting from position
+    # 0, so this has to run over the whole text once, not per window.
+    full_boundaries = (
+        _python_construct_boundaries(text)
+        if looks_python and len(text) <= MAX_CODE_TOKENIZE_CHARS
+        else None
+    )
 
     findings = []
     scanned_chars = 0
@@ -1045,8 +1186,15 @@ def scan(text, source=None):
             code_spans = _python_code_spans(chunk)
         else:
             code_spans = []
+        if full_boundaries is not None:
+            chunk_end = offset + len(chunk)
+            boundaries = [b - offset for b in full_boundaries if offset <= b < chunk_end]
+        elif looks_python:
+            boundaries = _python_construct_boundaries(chunk)
+        else:
+            boundaries = []
         findings.extend(_scan_patterns(chunk, offset, code_spans))
-        findings.extend(_scan_exfiltration(chunk, offset, code_spans))
+        findings.extend(_scan_exfiltration(chunk, offset, code_spans, boundaries))
         findings.extend(_scan_invisible(chunk, offset, code_spans))
         findings.extend(_scan_homoglyphs(chunk, offset, code_spans))
         findings.extend(_scan_base64(chunk, offset, code_spans))
@@ -1248,6 +1396,31 @@ def load_config(path):
         "saw, an authority-spoofing pattern security researchers call prompt "
         "injection."
     )),
+    # Minimal reproduction of the exact false positive reported against
+    # agent/hearth_secrets.py's _KNOWN_FORMATS table: the exfiltration
+    # co-occurrence detector's fixed-distance window combined "post" (a verb,
+    # inside one pattern's explanation string) with KIND_GOOGLE_API_KEY (a
+    # bare constant name starting the *next*, unrelated tuple) into a
+    # fabricated "exfiltration" finding, because the two are close in
+    # characters despite the "),\n    (" tuple boundary between them. Kept
+    # here as a permanent fixture, trimmed to the smallest shape that still
+    # reproduces the bug, so this exact construct cannot regress. Needs an
+    # `import` so _looks_like_python_source gates this in as code-shaped;
+    # without that gate this fixture would not exercise the fix at all. See
+    # _python_construct_boundaries / _crosses_construct_boundary.
+    ("pattern_table_tuple_boundary", '''
+import re
+
+_KNOWN_FORMATS = [
+    (KIND_SLACK_WEBHOOK, "high", 0.8,
+     re.compile(r"https://hooks\\.slack\\.com/services/T[A-Za-z0-9]{6,}"),
+     "matches a Slack incoming-webhook URL, which can post to a channel "
+     "without further auth"),
+    (KIND_GOOGLE_API_KEY, "high", 0.75,
+     re.compile(r"AIza[0-9A-Za-z_-]{35}"),
+     "matches the Google API key shape (AIza prefix, 39 characters total)"),
+]
+'''),
 ]
 
 _THREAT_MODEL_PATH = os.path.join(
