@@ -25,6 +25,7 @@ Standard library only.
 """
 
 import os
+import re
 import sys
 
 import hearth_paths
@@ -47,6 +48,271 @@ _RESERVED = (
 )
 
 _ILLEGAL = set('<>"|?*')
+
+
+# --------------------------------------------------------------------------
+# .hearthignore: gitignore-flavoured patterns that additionally scope a run's
+# workspace, on top of safe_join. This is a NARROWING-ONLY filter, never a
+# second way to resolve a path. Every function below only ever classifies a
+# path that safe_join (or an os.walk rooted at one) has already produced --
+# there is no code path here from a pattern string to a filesystem location,
+# only from an already-resolved, already-contained location to a yes/no
+# visibility bit. That is what makes a hostile pattern -- a leading '!', a
+# '..', a drive letter -- structurally unable to widen access: it has
+# nothing to widen. See is_ignored's docstring for the precise guarantee,
+# and the module self-test for a hostile-file regression proof.
+# --------------------------------------------------------------------------
+
+class _Rule:
+    """One compiled .hearthignore pattern."""
+    __slots__ = ("regex", "negate", "dir_only")
+
+    def __init__(self, regex, negate, dir_only):
+        self.regex = regex
+        self.negate = negate
+        self.dir_only = dir_only
+
+
+def _segment_to_regex(seg):
+    """Translate one path segment (no '/' in it) into a regex fragment.
+
+    Supports '*' (any run of non-separator characters), '?' (exactly one),
+    and '[seq]' / '[!seq]' character classes; everything else is literal.
+    Hand-rolled rather than built on fnmatch.translate, whose exact wrapper
+    format is not part of its documented contract and has changed across
+    Python versions; the matching semantics here are the familiar ones.
+    """
+    out = []
+    i, n = 0, len(seg)
+    while i < n:
+        c = seg[i]
+        if c == "*":
+            out.append("[^/]*")
+            i += 1
+        elif c == "?":
+            out.append("[^/]")
+            i += 1
+        elif c == "[":
+            j = i + 1
+            if j < n and seg[j] in ("!", "^"):
+                j += 1
+            if j < n and seg[j] == "]":
+                j += 1
+            while j < n and seg[j] != "]":
+                j += 1
+            if j >= n:
+                out.append(re.escape(c))  # unterminated '[' -> literal
+                i += 1
+            else:
+                inner = seg[i + 1:j]
+                if inner.startswith("!"):
+                    inner = "^" + inner[1:]
+                out.append("[" + inner + "]")
+                i = j + 1
+        else:
+            out.append(re.escape(c))
+            i += 1
+    return "".join(out)
+
+
+def _pattern_to_regex(body, anchored, flags):
+    """Translate a gitignore-style pattern body (negation and the
+    directory-only trailing slash already stripped by the caller) into a
+    compiled, fully-anchored regex matched against a '/'-separated,
+    workspace-relative path with no leading slash.
+
+    '**' is only special as its own path segment: 'a/**/b' matches zero or
+    more whole directories between a and b, '**/x' matches x at any depth,
+    and 'x/**' matches x and everything under it. '**' fused into a larger
+    segment (e.g. 'a**b') is not expanded; it falls back to two ordinary
+    '*'s, the same degrade-quietly behaviour a real gitignore gives that
+    construct.
+    """
+    raw_segs = body.split("/")
+    segs = []
+    for s in raw_segs:
+        if s == "**" and segs and segs[-1] == "**":
+            continue  # collapse a run of consecutive '**' into one
+        segs.append(s)
+    parts = []
+    n = len(segs)
+    for i, seg in enumerate(segs):
+        if seg == "**":
+            if n == 1:
+                parts.append(".*")
+            elif i == 0:
+                parts.append("(?:.*/)?")
+            elif i == n - 1:
+                parts.append("(?:/.*)?")
+            else:
+                parts.append("/(?:.*/)?")
+        else:
+            if parts and segs[i - 1] != "**":
+                parts.append("/")
+            parts.append(_segment_to_regex(seg))
+    body_re = "".join(parts)
+    prefix = r"\A" if anchored else r"\A(?:.*/)?"
+    return re.compile(prefix + body_re + r"\Z", flags)
+
+
+def _parse_hearthignore(lines):
+    """Parse .hearthignore lines into a list of _Rule, in file order (a
+    later rule takes precedence over an earlier one for a given path,
+    exactly like gitignore's own last-match-wins rule).
+
+    Supported: blank lines and full-line '#' comments; '\\#' and '\\!' to
+    match a literal leading '#' or '!'; a leading '!' to negate a pattern
+    (un-ignore a path an earlier or later rule in the same file also
+    matches -- this can only re-include a path already inside the
+    workspace; see IgnoreSpec.is_ignored); a trailing '/' for a
+    directory-only pattern; '*', '?', '[seq]'/'[!seq]' globbing; and '**'
+    as a whole path segment for "zero or more directories" ('**/x', 'x/**',
+    'a/**/b'). A pattern containing '/' anywhere but its very end is
+    anchored to the workspace root; a pattern with no interior '/' matches
+    at any depth.
+
+    Deliberately not supported: nested per-directory .hearthignore files
+    (only a single workspace-root file is ever read); any backslash escape
+    other than a leading '\\#' or '\\!'; trailing-whitespace escaping; and
+    '**' fused into a larger segment. An unsupported construct degrades to
+    a literal or a partial match rather than raising, the same way an
+    unmatched gitignore pattern quietly matches nothing.
+    """
+    flags = re.IGNORECASE if hearth_paths.is_windows() else 0
+    rules = []
+    for raw in lines:
+        line = raw.rstrip("\r\n").rstrip()
+        if not line or line.startswith("#"):
+            continue
+        negate = False
+        if line.startswith("\\#") or line.startswith("\\!"):
+            line = line[1:]
+        elif line.startswith("!"):
+            negate = True
+            line = line[1:]
+        if not line:
+            continue
+        dir_only = line.endswith("/")
+        if dir_only:
+            line = line[:-1]
+        if not line:
+            continue
+        anchored = "/" in line
+        line = line.lstrip("/")
+        if not line:
+            continue
+        try:
+            regex = _pattern_to_regex(line, anchored, flags)
+        except re.error:
+            continue  # a malformed pattern matches nothing, rather than crashing
+        rules.append(_Rule(regex, negate, dir_only))
+    return rules
+
+
+class IgnoreSpec:
+    """Compiled .hearthignore rules for one workspace, in file order."""
+    __slots__ = ("rules",)
+
+    def __init__(self, rules):
+        self.rules = rules
+
+    def _match_one(self, relpath, is_dir):
+        result = False
+        for rule in self.rules:
+            if rule.dir_only and not is_dir:
+                continue
+            if rule.regex.match(relpath):
+                result = not rule.negate
+        return result
+
+    def is_ignored(self, relpath, is_dir=False):
+        """True if `relpath` (workspace-relative, either slash style, no
+        leading separator) -- or any directory above it -- is ignored.
+
+        Every ancestor is checked, not just the leaf, so a negation
+        pattern cannot re-include a file merely by naming it once its
+        parent directory is already ignored (the same restriction
+        gitignore itself applies). This is also why a pruning walk gets
+        the restriction for free without doing anything special: once a
+        directory is dropped from `dirs`, os.walk never redescends into it
+        to ask about a file inside; this method exists for the tools that
+        check one path directly, without a walk, and must reach the same
+        answer.
+        """
+        if not self.rules:
+            return False
+        parts = [p for p in relpath.replace("\\", "/").split("/") if p and p != "."]
+        for i in range(len(parts)):
+            seg = "/".join(parts[:i + 1])
+            seg_is_dir = is_dir if i == len(parts) - 1 else True
+            if self._match_one(seg, seg_is_dir):
+                return True
+        return False
+
+
+_EMPTY_IGNORE = IgnoreSpec(())
+_IGNORE_CACHE = {}  # realpath(root) -> (mtime_or_None, IgnoreSpec)
+
+
+def load_ignore(root):
+    """Load and compile `.hearthignore` at the workspace root, once per
+    session: cached by root and by the file's own mtime, so a long-running
+    agent that never touches it pays the parse cost exactly once, while an
+    agent (or a user, between runs) that does edit it sees the change on
+    the next call rather than a stale compiled copy.
+
+    Returns an IgnoreSpec whose is_ignored() always returns False when no
+    `.hearthignore` exists at the workspace root -- absence changes
+    nothing. Nested per-directory ignore files are not read; a single
+    workspace-root file is the whole feature.
+    """
+    root_real = os.path.realpath(root)
+    path = os.path.join(root_real, ".hearthignore")
+    try:
+        mtime = os.stat(hearth_paths.long_path(path)).st_mtime
+    except OSError:
+        mtime = None
+    cached = _IGNORE_CACHE.get(root_real)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    if mtime is None:
+        spec = _EMPTY_IGNORE
+    else:
+        try:
+            with open(hearth_paths.long_path(path), "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            lines = []
+        spec = IgnoreSpec(_parse_hearthignore(lines)) if lines else _EMPTY_IGNORE
+    _IGNORE_CACHE[root_real] = (mtime, spec)
+    return spec
+
+
+def is_ignored(root, full, is_dir=None):
+    """True if `full` -- an absolute path already produced by safe_join (or
+    discovered inside a walk rooted at one) -- is excluded by the
+    workspace's `.hearthignore`.
+
+    This is the only entry point a tool should call, and it must always be
+    called AFTER safe_join has already approved the path, never in place
+    of it: is_ignored never resolves or joins anything itself, it only
+    classifies a location that is already known to be inside the
+    workspace. That ordering is what makes a hostile `.hearthignore`
+    structurally unable to grant access -- there is no route through this
+    function from a pattern string to an escaping filesystem location, only
+    from an already-contained one to a yes/no visibility bit.
+    """
+    root_real = os.path.realpath(root)
+    full_real = os.path.realpath(full)
+    if full_real == root_real:
+        return False  # the workspace root itself can never be ignored
+    rel = os.path.relpath(full_real, root_real)
+    if is_dir is None:
+        try:
+            is_dir = os.path.isdir(hearth_paths.long_path(full_real))
+        except OSError:
+            is_dir = False
+    return load_ignore(root_real).is_ignored(rel, is_dir=is_dir)
 
 
 def _components(rel):
@@ -132,18 +398,34 @@ def is_reparse(path):
         return True  # unreadable: treat as unsafe and skip
 
 
-def prune(dirpath, dirs, skip_names=()):
+def prune(dirpath, dirs, skip_names=(), root=None, ignore_spec=None):
     """Filter a walk's directory list in place. Drops skip-listed names
     (case-insensitively, because NTFS is case-insensitive and ".GIT" is ".git")
     and every reparse point.
 
+    When `root` and `ignore_spec` are both given, also drops any directory
+    excluded by `.hearthignore` (computed relative to `root`). The
+    exclusion happens here, before os.walk descends -- not by filtering
+    results afterward -- so a caller passing both never opens, reads, or
+    rewrites a single file underneath an ignored directory, and never pays
+    to walk it either.
+
     Must be called in every os.walk loop that touches workspace content.
     """
     skip = {s.lower() for s in skip_names}
-    dirs[:] = [
-        d for d in dirs
-        if d.lower() not in skip and not is_reparse(os.path.join(dirpath, d))
-    ]
+    kept = []
+    for d in dirs:
+        if d.lower() in skip:
+            continue
+        full_d = os.path.join(dirpath, d)
+        if is_reparse(full_d):
+            continue
+        if ignore_spec is not None and root is not None:
+            rel = os.path.relpath(full_d, root)
+            if ignore_spec.is_ignored(rel, is_dir=True):
+                continue
+        kept.append(d)
+    dirs[:] = kept
     return dirs
 
 
@@ -274,6 +556,178 @@ def _self_test():
             assert d2 == ["sub"], d2
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+    # --- .hearthignore -----------------------------------------------------
+
+    # Absence changes nothing: no file at all means never ignored.
+    ig_none = os.path.realpath(tempfile.mkdtemp(prefix="hearth-ignore-none-"))
+    try:
+        os.makedirs(os.path.join(ig_none, "sub"))
+        with open(os.path.join(ig_none, "sub", "f.txt"), "w", encoding="utf-8") as fh:
+            fh.write("x")
+        spec0 = load_ignore(ig_none)
+        assert not spec0.rules, "no .hearthignore must produce an empty spec"
+        assert not is_ignored(ig_none, os.path.join(ig_none, "sub", "f.txt"))
+        assert not is_ignored(ig_none, os.path.join(ig_none, "sub"))
+    finally:
+        shutil.rmtree(ig_none, ignore_errors=True)
+
+    # Parsing/matching: comments, blank lines, directory-only, negation,
+    # anchoring, and '**'.
+    ig_root = os.path.realpath(tempfile.mkdtemp(prefix="hearth-ignore-parse-"))
+    try:
+        os.makedirs(os.path.join(ig_root, "vendor", "deep"))
+        os.makedirs(os.path.join(ig_root, "build"))
+        os.makedirs(os.path.join(ig_root, "src", "vendor"))
+        os.makedirs(os.path.join(ig_root, "logs"))
+        for rel in ("vendor/a.txt", "vendor/deep/b.txt", "build/out.bin",
+                    "src/vendor/c.txt", "src/keep.py", "logs/app.log",
+                    "logs/important.log", "top.log"):
+            full = os.path.join(ig_root, *rel.split("/"))
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w", encoding="utf-8") as fh:
+                fh.write("x")
+        with open(os.path.join(ig_root, ".hearthignore"), "w", encoding="utf-8") as fh:
+            fh.write(
+                "# a comment, and a blank line follow\n"
+                "\n"
+                "vendor/\n"          # dir-only, unanchored: matches at any depth
+                "/build\n"           # anchored: only the top-level 'build'
+                "*.log\n"            # unanchored file pattern: any depth
+                "!important.log\n"   # narrows the ignore set back down
+            )
+        spec = load_ignore(ig_root)
+        assert len(spec.rules) == 4, [r.regex.pattern for r in spec.rules]
+
+        def _ig(rel, is_dir=False):
+            return is_ignored(ig_root, os.path.join(ig_root, *rel.split("/")), is_dir=is_dir)
+
+        assert _ig("vendor", is_dir=True), "unanchored dir-only pattern must match at the top level"
+        assert _ig("vendor/a.txt"), "a file under an ignored directory is ignored too"
+        assert _ig("src/vendor", is_dir=True), "unanchored dir-only pattern must match at any depth"
+        assert _ig("src/vendor/c.txt")
+        assert not _ig("src/keep.py"), "an unrelated file must not be ignored"
+        assert _ig("build", is_dir=True), "anchored pattern matches the top-level name"
+        assert _ig("build/out.bin")
+        assert _ig("logs/app.log"), "unanchored file pattern matches at any depth"
+        assert _ig("top.log")
+        assert not _ig("logs/important.log"), "a later negation narrows the ignore set"
+
+        # A directory-only pattern must not match a same-named FILE.
+        with open(os.path.join(ig_root, "vendor_file_placeholder"), "w", encoding="utf-8") as fh:
+            fh.write("x")
+        assert not _ig("vendor_file_placeholder"), "dir-only pattern must not match a differently-named file"
+
+        # Negating a file inside a still-ignored directory does not surface
+        # it: this is the "cannot re-include inside an ignored parent"
+        # restriction gitignore itself applies, and it is what a pruning
+        # walk enforces for free (see the walk test in hearth_tools).
+        with open(os.path.join(ig_root, ".hearthignore"), "a", encoding="utf-8") as fh:
+            fh.write("!vendor/a.txt\n")
+        _IGNORE_CACHE.pop(os.path.realpath(ig_root), None)
+        assert _ig("vendor/a.txt"), \
+            "negating a file cannot re-include it while its parent directory is still ignored"
+    finally:
+        shutil.rmtree(ig_root, ignore_errors=True)
+
+    # '**' matching: leading, trailing, and interior.
+    ig_star = os.path.realpath(tempfile.mkdtemp(prefix="hearth-ignore-star-"))
+    try:
+        with open(os.path.join(ig_star, ".hearthignore"), "w", encoding="utf-8") as fh:
+            fh.write("**/cache\na/**/z\ndata/**\n")
+        s = load_ignore(ig_star)
+
+        def _sig(rel, is_dir=False):
+            return is_ignored(ig_star, os.path.join(ig_star, *rel.split("/")), is_dir=is_dir)
+
+        assert _sig("cache", is_dir=True), "'**/x' must match at the root too"
+        assert _sig("p/q/cache", is_dir=True), "'**/x' must match at any depth"
+        assert _sig("a/z"), "'a/**/z' must match with zero directories in between"
+        assert _sig("a/mid/z")
+        assert _sig("a/mid1/mid2/z")
+        assert not _sig("a/z_other"), "'a/**/z' must not match an unrelated sibling"
+        assert _sig("data", is_dir=True), "'x/**' matches x itself"
+        assert _sig("data/anything/deep")
+    finally:
+        shutil.rmtree(ig_star, ignore_errors=True)
+
+    # --- The hard rule: a hostile .hearthignore cannot widen safe_join. ---
+    # These patterns are exactly the shapes that would matter if the ignore
+    # check were ever wired into path RESOLUTION instead of applied as a
+    # post-containment filter: a negation of a traversal, a negation of a
+    # drive-qualified Windows path, a bare traversal pattern, and a
+    # negate-everything catch-all. None of them are ever consulted by
+    # safe_join at all -- it does not know .hearthignore exists -- so this
+    # is a regression guard against that ever changing by accident.
+    hostile_root = os.path.realpath(tempfile.mkdtemp(prefix="hearth-ignore-hostile-"))
+    try:
+        with open(os.path.join(hostile_root, ".hearthignore"), "w", encoding="utf-8") as fh:
+            fh.write(
+                "!/../../etc/passwd\n"
+                "!C:\\Windows\\*\n"
+                "../../*\n"
+                "!*\n"
+                "!**\n"
+            )
+        loaded = load_ignore(hostile_root)  # must not raise
+        assert isinstance(loaded, IgnoreSpec)
+        for bad in ("../../etc/passwd", "../evil.txt", "../../../evil.txt",
+                    "sub/../../../evil.txt"):
+            try:
+                safe_join(hostile_root, bad)
+                raise AssertionError("hostile .hearthignore widened safe_join: {}".format(bad))
+            except ValueError:
+                pass
+        if hearth_paths.is_windows():
+            try:
+                safe_join(hostile_root, "C:\\Windows\\win.ini")
+                raise AssertionError("hostile .hearthignore widened safe_join (drive path)")
+            except ValueError:
+                pass
+        # And ordinary containment inside the workspace is unaffected by the
+        # hostile file's presence.
+        with open(os.path.join(hostile_root, "ok.txt"), "w", encoding="utf-8") as fh:
+            fh.write("x")
+        assert safe_join(hostile_root, "ok.txt") == os.path.realpath(os.path.join(hostile_root, "ok.txt"))
+    finally:
+        shutil.rmtree(hostile_root, ignore_errors=True)
+
+    # Caching: compiled once, reused until the file's mtime changes.
+    cache_root = os.path.realpath(tempfile.mkdtemp(prefix="hearth-ignore-cache-"))
+    try:
+        with open(os.path.join(cache_root, ".hearthignore"), "w", encoding="utf-8") as fh:
+            fh.write("a.txt\n")
+        first = load_ignore(cache_root)
+        second = load_ignore(cache_root)
+        assert first is second, "load_ignore must reuse the cached spec when the file is unchanged"
+        import time as _t
+        _t.sleep(0.05)
+        with open(os.path.join(cache_root, ".hearthignore"), "w", encoding="utf-8") as fh:
+            fh.write("b.txt\n")
+        os.utime(os.path.join(cache_root, ".hearthignore"), None)
+        third = load_ignore(cache_root)
+        assert third is not first, "an mtime change must invalidate the cache"
+    finally:
+        _IGNORE_CACHE.pop(cache_root, None)
+        shutil.rmtree(cache_root, ignore_errors=True)
+
+    # prune() drops an ignored directory before a walk ever descends into it.
+    prune_root = os.path.realpath(tempfile.mkdtemp(prefix="hearth-ignore-prune-"))
+    try:
+        with open(os.path.join(prune_root, ".hearthignore"), "w", encoding="utf-8") as fh:
+            fh.write("secret/\n")
+        pspec = load_ignore(prune_root)
+        dlist = ["secret", "public"]
+        prune(prune_root, dlist, SKIP_DIRS, root=prune_root, ignore_spec=pspec)
+        assert dlist == ["public"], dlist
+        # Backward compatibility: the 3-positional-argument call (every
+        # existing caller) still works with no ignore filtering applied.
+        dlist2 = ["secret", ".git"]
+        prune(prune_root, dlist2, SKIP_DIRS)
+        assert dlist2 == ["secret"], dlist2
+    finally:
+        shutil.rmtree(prune_root, ignore_errors=True)
+
     print("hearth-contain self-test OK")
     return 0
 

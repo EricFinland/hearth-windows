@@ -317,11 +317,35 @@ def tool_run_command(args, workspace):
     return "exit={}\nstdout:\n{}\nstderr:\n{}".format(rc, (out or "")[-MAX_OUT:], (err or "")[-2000:])
 
 
+def _ignored_error(workspace, full, requested_path):
+    """Return an error string if `full` is excluded by the workspace's
+    `.hearthignore`, else None.
+
+    Called only AFTER hearth_contain.safe_join has already approved `full`
+    -- every call site below follows that order -- so this can only narrow
+    which already-contained paths a tool is willing to touch. It never
+    participates in resolving a path itself, so it cannot be the thing
+    that lets a path out of the workspace; see hearth_contain.is_ignored's
+    docstring for the full guarantee.
+
+    The message names .hearthignore explicitly (rather than a generic
+    "not found" or "permission denied") because a model that does not
+    understand why a path was refused will just retry it.
+    """
+    root = os.path.realpath(workspace)
+    if hearth_contain.is_ignored(root, full):
+        return "error: '{}' is excluded by .hearthignore".format(requested_path)
+    return None
+
+
 def tool_write_file(args, workspace):
     try:
         full = hearth_contain.safe_join(workspace, args.get("path"))
     except ValueError as exc:
         return "error: {}".format(exc)
+    blocked = _ignored_error(workspace, full, args.get("path"))
+    if blocked:
+        return blocked
     conflict = _case_conflict(args.get("path"), full)
     if conflict:
         return ("error: {} already exists as {} (this filesystem is "
@@ -353,6 +377,9 @@ def tool_read_file(args, workspace):
         full = hearth_contain.safe_join(workspace, args.get("path"))
     except ValueError as exc:
         return "error: {}".format(exc)
+    blocked = _ignored_error(workspace, full, args.get("path"))
+    if blocked:
+        return blocked
     try:
         return _read_text(full)[:MAX_OUT]
     except UnicodeDecodeError:
@@ -366,10 +393,27 @@ def tool_list_files(args, workspace):
         full = hearth_contain.safe_join(workspace, args.get("path", "."))
     except ValueError as exc:
         return "error: {}".format(exc)
+    blocked = _ignored_error(workspace, full, args.get("path", "."))
+    if blocked:
+        return blocked
+    root = os.path.realpath(workspace)
+    spec = hearth_contain.load_ignore(root)
     try:
-        return "\n".join(sorted(os.listdir(full))) or "(empty)"
+        names = os.listdir(full)
     except OSError as exc:
         return "error: {}".format(exc)
+    visible = []
+    for name in names:
+        entry = os.path.join(full, name)
+        rel = os.path.relpath(entry, root)
+        try:
+            is_dir = os.path.isdir(hearth_paths.long_path(entry))
+        except OSError:
+            is_dir = False
+        if spec.is_ignored(rel, is_dir=is_dir):
+            continue
+        visible.append(name)
+    return "\n".join(sorted(visible)) or "(empty)"
 
 
 # Sourced from hearth_contain.SKIP_DIRS, the one authoritative list, rather
@@ -390,15 +434,19 @@ def tool_search_files(args, workspace):
         base = hearth_contain.safe_join(workspace, args.get("path", "."))
     except ValueError as exc:
         return "error: {}".format(exc)
+    blocked = _ignored_error(workspace, base, args.get("path", "."))
+    if blocked:
+        return blocked
     try:
         rx = re.compile(query)
     except re.error:
         rx = re.compile(re.escape(query))
     pattern = args.get("glob")
     root = os.path.realpath(workspace)
+    spec = hearth_contain.load_ignore(root)
     hits = []
     for dirpath, dirs, files in os.walk(base):
-        hearth_contain.prune(dirpath, dirs, _TREE_SKIP)
+        hearth_contain.prune(dirpath, dirs, _TREE_SKIP, root=root, ignore_spec=spec)
         for fn in sorted(files):
             if pattern and not _glob_match(fn, pattern):
                 continue
@@ -407,6 +455,8 @@ def tool_search_files(args, workspace):
                 hearth_contain.safe_join(root, os.path.relpath(fp, root))
             except ValueError:
                 continue  # a link or an odd name that resolves outside the workspace
+            if spec.is_ignored(os.path.relpath(fp, root), is_dir=False):
+                continue
             try:
                 if os.path.getsize(hearth_paths.long_path(fp)) > 2_000_000:
                     continue
@@ -427,11 +477,15 @@ def tool_list_tree(args, workspace):
         base = hearth_contain.safe_join(workspace, args.get("path", "."))
     except ValueError as exc:
         return "error: {}".format(exc)
+    blocked = _ignored_error(workspace, base, args.get("path", "."))
+    if blocked:
+        return blocked
     try:
         max_depth = max(1, int(args.get("max_depth", 4) or 4))
     except (TypeError, ValueError):
         max_depth = 4
     root = os.path.realpath(workspace)
+    spec = hearth_contain.load_ignore(root)
     base_depth = base.rstrip(os.sep).count(os.sep)
     lines = []
     for dirpath, dirs, files in os.walk(base):
@@ -439,11 +493,13 @@ def tool_list_tree(args, workspace):
         if depth >= max_depth:
             dirs[:] = []
             continue
-        dirs[:] = sorted(hearth_contain.prune(dirpath, dirs, _TREE_SKIP))
+        dirs[:] = sorted(hearth_contain.prune(dirpath, dirs, _TREE_SKIP, root=root, ignore_spec=spec))
         rel = os.path.relpath(dirpath, root)
         indent = "  " * depth
         lines.append("{}{}/".format(indent, "." if rel == "." else os.path.basename(dirpath)))
         for fn in sorted(files):
+            if spec.is_ignored(os.path.relpath(os.path.join(dirpath, fn), root), is_dir=False):
+                continue
             lines.append("{}  {}".format(indent, fn))
         if len(lines) >= 400:
             lines.append("... (truncated)")
@@ -459,6 +515,9 @@ def tool_edit_file(args, workspace):
         full = hearth_contain.safe_join(workspace, args.get("path"))
     except ValueError as exc:
         return "error: {}".format(exc)
+    blocked = _ignored_error(workspace, full, args.get("path"))
+    if blocked:
+        return blocked
     find = args.get("find")
     if not find:
         return "error: no 'find' text given"
@@ -1004,11 +1063,15 @@ def tool_replace_in_files(args, workspace):
         base = hearth_contain.safe_join(workspace, args.get("path", "."))
     except ValueError as exc:
         return "error: {}".format(exc)
+    blocked = _ignored_error(workspace, base, args.get("path", "."))
+    if blocked:
+        return blocked
     root = os.path.realpath(workspace)
+    spec = hearth_contain.load_ignore(root)
     files_changed = 0
     total = 0
     for dirpath, dirs, files in os.walk(base):
-        hearth_contain.prune(dirpath, dirs, _TREE_SKIP)
+        hearth_contain.prune(dirpath, dirs, _TREE_SKIP, root=root, ignore_spec=spec)
         for fn in sorted(files):
             if pattern and not _glob_match(fn, pattern):
                 continue
@@ -1017,6 +1080,8 @@ def tool_replace_in_files(args, workspace):
                 hearth_contain.safe_join(root, os.path.relpath(fp, root))
             except ValueError:
                 continue  # a link or an odd name that resolves outside the workspace
+            if spec.is_ignored(os.path.relpath(fp, root), is_dir=False):
+                continue
             try:
                 if os.path.getsize(hearth_paths.long_path(fp)) > 2_000_000:
                     continue
@@ -2051,6 +2116,88 @@ def _self_test():
         assert "wrote" in r, r
     finally:
         _shutil.rmtree(_ws7, ignore_errors=True)
+
+    # --- .hearthignore: every file tool must respect it. ---
+    #
+    # A walk must not descend into an ignored directory, asserted on REAL
+    # ON-DISK STATE (the sentinel file's content and mtime), not merely on
+    # the string a tool returns -- a broken implementation could still
+    # print a plausible "no matches" while having opened the file first.
+    _wsi = os.path.realpath(_tempfile.mkdtemp(prefix="hearth-ignore-walk-"))
+    try:
+        with open(os.path.join(_wsi, ".hearthignore"), "w", encoding="utf-8") as fh:
+            fh.write("secrets/\n*.secret\n")
+        os.makedirs(os.path.join(_wsi, "secrets"))
+        secret_path = os.path.join(_wsi, "secrets", "creds.txt")
+        with open(secret_path, "w", encoding="utf-8") as fh:
+            fh.write("SENTINEL_IGNORE_WALK\n")
+        loose_secret = os.path.join(_wsi, "top.secret")
+        with open(loose_secret, "w", encoding="utf-8") as fh:
+            fh.write("SENTINEL_LOOSE_SECRET\n")
+        with open(os.path.join(_wsi, "visible.txt"), "w", encoding="utf-8") as fh:
+            fh.write("ordinary\n")
+
+        hits = execute_tool("search_files", {"query": "SENTINEL_IGNORE_WALK"}, _wsi)
+        assert hits == "no matches", ("search_files walked into an ignored directory", hits)
+        hits2 = execute_tool("search_files", {"query": "SENTINEL_LOOSE_SECRET"}, _wsi)
+        assert hits2 == "no matches", ("search_files matched a file excluded by *.secret", hits2)
+
+        tree = execute_tool("list_tree", {}, _wsi)
+        assert "secrets" not in tree and "creds.txt" not in tree and "top.secret" not in tree, \
+            ("list_tree showed an ignored path", tree)
+        assert "visible.txt" in tree, tree
+
+        listing = execute_tool("list_files", {}, _wsi)
+        assert "secrets" not in listing and "top.secret" not in listing, listing
+        assert "visible.txt" in listing, listing
+
+        before_secret_mtime = os.stat(secret_path).st_mtime
+        before_secret_body = open(secret_path, encoding="utf-8").read()
+        rep = execute_tool("replace_in_files", {"find": "SENTINEL", "replace": "PWNED"}, _wsi)
+        assert os.stat(secret_path).st_mtime == before_secret_mtime, \
+            "replace_in_files touched a file inside an ignored directory (mtime changed)"
+        assert open(secret_path, encoding="utf-8").read() == before_secret_body, \
+            "replace_in_files rewrote a file inside an ignored directory"
+        assert open(loose_secret, encoding="utf-8").read() == "SENTINEL_LOOSE_SECRET\n", \
+            "replace_in_files rewrote a file excluded by *.secret"
+
+        # Direct single-path tools error clearly, naming .hearthignore, so a
+        # model that does not understand the refusal does not just retry it.
+        r = execute_tool("read_file", {"path": "secrets/creds.txt"}, _wsi)
+        assert "excluded by .hearthignore" in r, r
+        r2 = execute_tool("read_file", {"path": "top.secret"}, _wsi)
+        assert "excluded by .hearthignore" in r2, r2
+        w = execute_tool("write_file", {"path": "secrets/creds.txt", "content": "x"}, _wsi)
+        assert "excluded by .hearthignore" in w, w
+        w2 = execute_tool("write_file", {"path": "secrets/new_file.txt", "content": "x"}, _wsi)
+        assert "excluded by .hearthignore" in w2, \
+            ("writing a NEW file inside an ignored directory must still be refused", w2)
+        assert not os.path.exists(os.path.join(_wsi, "secrets", "new_file.txt")), \
+            "a refused write must not create the file anyway"
+        e = execute_tool("edit_file", {"path": "top.secret", "find": "SENTINEL", "replace": "X"}, _wsi)
+        assert "excluded by .hearthignore" in e, e
+
+        # A directory-level assertion directly against hearth_contain.prune
+        # (not through a tool's formatted output): 'secrets' must be
+        # dropped from the walk's own dirs list before os.walk ever visits
+        # it, and an unrelated sibling directory must survive.
+        _root_i = os.path.realpath(_wsi)
+        _spec_i = hearth_contain.load_ignore(_root_i)
+        _dirlist = ["secrets", "visible_dir"]
+        hearth_contain.prune(_wsi, _dirlist, _TREE_SKIP, root=_root_i, ignore_spec=_spec_i)
+        assert _dirlist == ["visible_dir"], _dirlist
+
+        # Absence changes nothing: delete .hearthignore and the same paths
+        # become visible and writable again -- proves the earlier refusals
+        # came from the ignore file, not from some unrelated bug.
+        os.remove(os.path.join(_wsi, ".hearthignore"))
+        tree2 = execute_tool("list_tree", {}, _wsi)
+        assert "creds.txt" in tree2 and "top.secret" in tree2, \
+            ("removing .hearthignore must restore visibility", tree2)
+        r3 = execute_tool("read_file", {"path": "top.secret"}, _wsi)
+        assert r3.rstrip("\r\n") == "SENTINEL_LOOSE_SECRET", r3
+    finally:
+        _shutil.rmtree(_wsi, ignore_errors=True)
 
     print("hearth-tools self-test OK")
     return 0
