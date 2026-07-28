@@ -79,8 +79,9 @@ a model already pulled), how a model and a context length get chosen for
 your specific GPU, how a model download reports honest progress, what the
 permission modes (`plan`, `edit`, `auto`, `bypass`) mean, how Hearth flags
 content that looks like it is trying to steer the model or a write that
-looks like it is leaking a credential, how `.hearthignore` scopes what an
-agent can see, and how undo works.
+looks like it is leaking a credential, how `.hearthignore` narrows which
+paths the file tools will touch (and why that is not a secrecy boundary),
+and how undo works.
 
 Also worth reading before you trust it with anything real:
 

@@ -150,9 +150,12 @@ calling the right functions in the right order:
      one cheap check, not a multi-step diagnosis, every single time. Only
      once that cheap check already says "not ready" does this module pay
      for hearth_setup.diagnose() (self._setup_diagnose_fn()), to build a
-     single "error" event carrying the diagnosis's own next_action message
-     and remedy verbatim -- never a message invented here -- so a user
-     whose Ollama is stopped gets that sentence instead of a stack trace.
+     single "error" event carrying the diagnosis's own next_action dict
+     ({message, remedy}, not a sentence): its "message" prefixed with
+     "Ollama is not ready: " and its "remedy" passed through untouched, so
+     a user whose Ollama is stopped gets hearth_setup's own wording instead
+     of a stack trace. The only text invented here is the fallback used
+     when the diagnosis itself fails or returns no next_action at all.
      Wired to the real hearth_setup module only when this engine is
      actually going to call real hearth_loop.chat (chat_fn is None); an
      engine built with an injected chat_fn (every self-test scenario in
@@ -214,12 +217,15 @@ _CANCELLED = "cancelled"
 # Severity band, from hearth_injection.SEVERITY, at or above which a tool
 # result's prompt-injection scan is worth surfacing on the very next gated
 # approval. "high" is the exact line hearth_injection.py's own self-test
-# draws between real attack payloads (10/10 scored high or critical against
-# that module's fixtures) and this repository's own benign source and docs
-# (all 45 files scored below it) -- see that module's docstring. Reusing its
-# own stated line, rather than picking a new cutoff here, keeps this wiring
-# layer from quietly re-tuning a scorer it was explicitly told not to
-# re-tune.
+# draws between real attack payloads (every payload in that module's
+# regression fixture set must score high or critical) and this repository's
+# own benign source and docs (every file in that module's sweep must score
+# below it) -- see that module's docstring. Stated as a property rather
+# than a payload/file count on purpose: those counts drifted out of date
+# here and in the docs once already, and the property is what holds.
+# Reusing its own stated line, rather than picking a new cutoff here, keeps
+# this wiring layer from quietly re-tuning a scorer it was explicitly told
+# not to re-tune.
 INJECTION_SURFACE_THRESHOLD = "high"
 
 # Severity band, from hearth_secrets.SEVERITY, at or above which a gated

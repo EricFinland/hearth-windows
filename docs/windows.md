@@ -56,7 +56,8 @@ everything else on this page.
 - The sidecar HTTP layer (`desktop/server/`): a standard-library-only HTTP
   server wiring the permission engine, the tool layer, and checkpoint/undo
   to real routes (`/session`, `/prompt`, `/events`, `/approve`, `/cancel`,
-  `/restore`, `/models`, `/checkpoints`). Every route but `/healthz` requires
+  `/restore`, `/models`, `/checkpoints`, `/setup`, `/idle`, and an
+  unauthenticated `/healthz`). Every route but `/healthz` requires
   a bearer token plus `Host`/`Origin` validation, and the server binds
   `127.0.0.1` on an ephemeral port only. Self-tested, and exercised end to
   end against a real Ollama by `scripts/e2e_live.py`: 16 of 16 steps pass,
@@ -82,12 +83,15 @@ everything else on this page.
   how hard a turn looks from its prompt, history, and tool signals into a
   small/medium/large tier; `route()` turns that into a concrete, installed,
   hardware-appropriate model; `escalate()` moves up exactly one tier after
-  a demonstrated failure (a malformed tool call, a retry). Verified against
-  9 test prompts, all 9 classified into the expected tier, including a
-  malformed tool call correctly escalating a turn one tier up. A heuristic,
-  not a guarantee: it will misroute sometimes, and it is deliberately
-  biased toward starting cheap, since escalating after a bad turn is a
-  tested recovery path and there is no equivalent for the opposite mistake.
+  a demonstrated failure (a malformed tool call, a retry). Checked by hand
+  against nine prompts when it landed, all nine classified into the tier
+  expected; the module's own self-test pins a subset of those as permanent
+  regression fixtures along with the full escalation chain, and the sidecar
+  self-test proves a malformed tool call really does escalate a turn one
+  tier up. A heuristic, not a guarantee: it will misroute sometimes, and it
+  is deliberately biased toward starting cheap, since escalating after a bad
+  turn is a tested recovery path and there is no equivalent for the
+  opposite mistake.
 - Idle-aware compute (`agent/hearth_idle.py`): holds off on heavy
   background work while you are actively using the machine, and gets out
   of the way again quickly once you stop. See "Staying out of your way"
@@ -98,9 +102,11 @@ everything else on this page.
   so a new user gets a sentence they can act on instead of a raw
   connection error from deep inside the agent loop.
 - `.hearthignore` support (`agent/hearth_contain.py`, `agent/hearth_tools.py`):
-  a gitignore-flavoured file that narrows what an agent can see inside an
-  already-permitted workspace. See "Scoping what Hearth Code can see"
-  below for the full syntax reference.
+  a gitignore-flavoured file that narrows which paths the *file tools* will
+  touch inside an already-permitted workspace. It is a filter on those
+  tools, not a secrecy boundary: `run_command` does not consult it. See
+  "Scoping what the file tools will touch" below for the full syntax
+  reference and the exact limits.
 
 **Not built yet.** There is no Tauri desktop shell, no UI, no installer, no
 code signing, and nothing published anywhere. The model shop described below
@@ -259,12 +265,35 @@ rule, stated in their own source and repeated here because it is the single
 most important thing to understand about them: **they detect and surface,
 they do not block.** Neither one refuses a tool call, strips anything from
 what the model sees, or stops a write from landing. Each one scans a blob
-of text, returns structured findings with a severity and a plain-English
-reason, and hands that to the same approval step you already see in `edit`
-and `auto` mode. Blocking on a heuristic was considered and rejected for
-both: a false positive that silently dropped or mangled content would
-corrupt what the model sees, or corrupt a file you meant to write, which is
-a worse failure than an occasional miss.
+of text and returns structured findings with a severity and a plain-English
+reason. Blocking on a heuristic was considered and rejected for both: a
+false positive that silently dropped or mangled content would corrupt what
+the model sees, or corrupt a file you meant to write, which is a worse
+failure than an occasional miss.
+
+Be precise about where a finding actually goes, because "it reaches the
+approval step" is only half true. **A finding never creates an approval.**
+It annotates one the permission mode had already decided to ask for:
+
+- When the permission engine gates a call, the finding rides along on that
+  call's `approval_request` (`injection_finding` and `secrets_finding` are
+  separate fields, so neither can be mistaken for the other), and a gated
+  write whose content trips the secret scanner also has the secret redacted
+  out of the arguments shown in every event. The write itself, if you
+  approve it, still uses the real unredacted text.
+- When the permission engine allows a call outright, which is what `auto`
+  mode does for every file write, there is no approval to annotate. The
+  secret scan still runs, and a finding is emitted as its own
+  `secrets_finding` event next to the ordinary tool call. Nothing pauses.
+  So in `auto` mode a credential-shaped write is *recorded*, not
+  *intercepted*.
+- The injection scanner only ever surfaces on a gated call. A tool result
+  that scored `high` is dropped from view entirely if the very next tool
+  call is one the mode allows without asking.
+
+There is also no UI reading any of this yet (see "Where this actually
+stands today"): today these are fields on events the sidecar emits, not
+something on a screen.
 
 **The prompt-injection scanner** (`agent/hearth_injection.py`) looks at
 content the agent reads: repo files, web pages, dependency READMEs, tool
@@ -276,9 +305,11 @@ approved this"), exfiltration shapes (a directive verb plus a
 sensitive-looking target plus an outbound destination), escalation
 language ("skip the approval"), structural spoofing (fake system-message
 formatting), and obfuscation (invisible characters, homoglyphs, long
-base64 blobs). Verified against 10 real adversarial payloads, all 10 of
-which scored `high` or `critical`, while all 48 files in this repository
-scanned clean.
+base64 blobs). Its self-test verifies every adversarial payload in its
+regression fixture set scores `high` or `critical`, and that its benign
+sweep stays clean: every Python module under `agent/`, plus this
+repository's README, limitations page, and threat model. Both directions
+run on every self-test, so neither can rot quietly.
 
 It will miss things, by design and by disclosure. Two gaps worth knowing
 specifically:
@@ -308,10 +339,13 @@ explaining a fix instead of referencing it out of band. The scanner
 recognizes known key shapes (AWS, GitHub, Slack, Stripe, Google, OpenAI-
 style, JWT, PEM blocks) and a generic high-entropy value sitting next to a
 suspicious name (`api_key`, `secret`, `token`, `password`, `credential`).
-Verified against 7 freshly generated, real-shaped keys (all 7 caught) and 6
-placeholder forms including AWS's own documented example key,
-`AKIAIOSFODNN7EXAMPLE` (all 6 stayed silent), with the same 48 repository
-files scanning clean.
+Its self-test builds a fresh, real-shaped key for every format it claims to
+know at runtime (never as a literal in its own source, which would then
+trip its own sweep) and requires each one to be caught; it requires every
+placeholder form in its known-negative list to stay silent, including AWS's
+own documented example key `AKIAIOSFODNN7EXAMPLE`; and it sweeps every
+Python module in `agent/` and `desktop/server/` plus every page under
+`docs/`, all of which must scan clean.
 
 Its known gap is the harder half of the problem it was built to solve: a
 passphrase-style secret made of real words ("correct horse battery
@@ -319,15 +353,27 @@ staple") has low character-level entropy, the same as a placeholder does,
 and this scanner cannot tell the two apart. A weak-but-real secret phrased
 that way will not be flagged.
 
-## Scoping what Hearth Code can see: `.hearthignore`
+## Scoping what the file tools will touch: `.hearthignore`
 
 Everything above assumes the agent operates inside a workspace boundary it
 cannot escape (`agent/hearth_contain.py`'s `safe_join`, see
 [docs/limitations.md](limitations.md) for exactly how strong that boundary
 is). `.hearthignore`, placed at the root of a workspace, narrows that
 further: a gitignore-flavoured pattern file that hides matching paths from
-every file tool (read, write, edit, search, list, replace, and directory
-walks) without changing where the workspace boundary itself sits.
+the file tools (`read_file`, `write_file`, `edit_file`, `list_files`,
+`list_tree`, `search_files`, `replace_in_files`, and the directory walks
+underneath them) without changing where the workspace boundary itself sits.
+
+**Read this before you trust it with anything sensitive.** `.hearthignore`
+is a filter on those seven tools, not a secrecy boundary around the files
+it names. Three of the ten Windows tools never consult it: `run_command`
+runs a shell, so a command can read or overwrite an ignored file and hand
+its contents back as ordinary tool output; `git_status` lists an ignored
+path that changed; and `git_diff` names it in a `--stat` summary. Use
+`.hearthignore` to keep a vendored tree out of a search or to stop the
+agent rewriting generated code. Do not use it to hide a credential file
+from a model that can also run commands. See
+[docs/limitations.md](limitations.md) for the full statement of this gap.
 
 This is the one piece of configuration in this document you will actually
 write yourself, so here is the real reference rather than a mention.
@@ -357,8 +403,10 @@ expanding). An unsupported construct degrades to a literal or partial
 match rather than raising, the same way an unmatched `.gitignore` pattern
 quietly matches nothing.
 
-**The guarantee that matters:** `.hearthignore` can only narrow access,
-never widen it. Every function that consults it classifies a path
+**The guarantee that matters,** and it is narrower than the feature's name
+suggests: `.hearthignore` can only narrow access, never widen it. It does
+not follow that an ignored path is unreachable, only that the seven tools
+above will refuse it. Every function that consults it classifies a path
 `safe_join` has already approved; there is no code path from a pattern
 string to a filesystem location, only from an already-contained path to a
 yes/no visibility bit. A hostile `.hearthignore` (a pattern like `!/../../etc/passwd`,

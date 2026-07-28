@@ -127,6 +127,41 @@ hard-capped capability manifest that applies in every mode including
 `bypass`. What it cannot do is contain what happens once a `run_command`
 call is allowed to proceed - see above.
 
+## `.hearthignore` is a tool-level filter, not a secrecy boundary
+
+This one is worth stating flatly, because the name invites the wrong
+reading. `.hearthignore` narrows which paths the *file tools* will touch
+inside an already-permitted workspace. Seven of the ten Windows tools call
+`hearth_contain.is_ignored()` after `safe_join` has already approved a path,
+and refuse an ignored one: `read_file`, `write_file`, `edit_file`,
+`list_files`, `list_tree`, `search_files`, and `replace_in_files`. That is
+the entire feature.
+
+The other three never consult it at all:
+
+- **`run_command` is not `.hearthignore`-aware.** `tool_run_command` in
+  `agent/hearth_tools.py` hands the command string to `hearth_proc` and
+  never looks at the ignore list. A shell command can read, print, copy, or
+  overwrite any ignored file in the workspace, and its contents come back
+  as ordinary tool output. This is the same gap as the section above: a
+  shell command is not a path Hearth can classify before it runs.
+- **`git_status` lists ignored paths** like any other changed file. It
+  leaks the path name, not the contents.
+- **`git_diff` runs `git diff --stat`**, so an ignored path that changed
+  shows up in the summary. Again a name, not a file body.
+
+So `.hearthignore` is genuinely useful for keeping a vendored directory out
+of a search, or keeping the agent from rewriting generated code it should
+leave alone. It is not a way to keep a credential file secret from a model
+that can also run shell commands. If something must stay unreadable, it has
+to sit outside the workspace, not behind an ignore rule.
+
+What it *does* guarantee is narrowing-only: it can never widen access,
+because every function that consults it classifies a path `safe_join`
+already approved, and no pattern string ever reaches path resolution. A
+hostile `.hearthignore` has nothing to widen. That guarantee is real and
+tested; it is just a smaller claim than "the agent cannot see this file."
+
 ## Two scanners that detect and surface, and nothing more
 
 `agent/hearth_injection.py` (prompt injection in content the agent reads)
@@ -156,11 +191,14 @@ implicit:
 
 Both scanners are also bounded to a head-and-tail scan window on anything
 larger than about 60-80K characters; a payload or a secret placed only in
-the untouched middle of a very large document is not seen. Both stayed
-quiet on this repository's own files during testing (48 files each) and
-both caught real adversarial fixtures at high confidence, but "caught
-these" is not the same claim as "catches everything," and this page will
-not pretend otherwise.
+the untouched middle of a very large document is not seen. Each one sweeps
+this repository's own files as a benign fixture set on every self-test run
+and stays quiet on all of them (the injection scanner over every module in
+`agent/` plus the README, this page, and the threat model; the secret
+scanner over every module in `agent/` and `desktop/server/` plus every page
+under `docs/`), and both catch real adversarial fixtures at high
+confidence. "Caught these" is not the same claim as "catches everything,"
+and this page will not pretend otherwise.
 
 ## Idle detection has a blind spot on headless Linux
 

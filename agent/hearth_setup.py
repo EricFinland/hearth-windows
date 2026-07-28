@@ -989,6 +989,28 @@ def _self_test():
         detect_installed = orig_detect_installed
         _http_get_json = orig_get_json
 
+        # -- next_action is a DICT, and every consumer reads it as one --------
+        # The contract is {"message": str, "remedy": str|None} or None, never
+        # a pre-rendered sentence. This is pinned here because format_report's
+        # own next_action branch was otherwise only ever exercised on the
+        # READY path above, where next_action is None -- so a consumer that
+        # treated it as a string would not have been caught by anything. The
+        # docstrings on diagnose() and _result() state the dict shape; this
+        # asserts it, and asserts that the one in-module renderer really does
+        # index into it rather than interpolating the whole object.
+        detect_installed = lambda: {"installed": False, "path": None, "source": None}
+        r_na = diagnose("http://x:11434", hw=hw_strong)
+        detect_installed = orig_detect_installed
+        assert isinstance(r_na["next_action"], dict), (
+            "next_action must be a dict, not a rendered sentence: {!r}".format(r_na["next_action"]))
+        assert set(r_na["next_action"]) == {"message", "remedy"}, r_na["next_action"]
+        assert isinstance(r_na["next_action"]["message"], str), r_na["next_action"]
+        rep_na = format_report(r_na)
+        assert r_na["next_action"]["remedy"] in rep_na, rep_na
+        assert "{" not in rep_na and "'message'" not in rep_na, (
+            "format_report interpolated the next_action dict instead of "
+            "indexing into it: {!r}".format(rep_na))
+
         # ==================================================================
         # Real, unstubbed smoke tests: must never raise regardless of
         # whether THIS machine has Ollama absent, stopped, or running with

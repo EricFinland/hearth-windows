@@ -85,6 +85,14 @@ of the ones that felt free on NixOS are gone.
   the sidecar process, which is itself running unsandboxed. A compromise of
   the sidecar (or of the model driving it, in `bypass` mode) sits on the
   trusted side of this boundary already.
+- **`.hearthignore` is not a trust boundary.** It is a filter applied by the
+  seven file tools that call `hearth_contain.is_ignored()` after `safe_join`
+  has already approved a path. It can only narrow what those tools will
+  touch; it can never widen access, since no pattern string ever reaches
+  path resolution. But `run_command` does not consult it at all, so a shell
+  command reads an ignored file exactly as it reads any other file in the
+  workspace, and `git_status` / `git_diff` will name an ignored path that
+  changed. Treat it as scoping, never as secrecy.
 - **There is no boundary around `run_command`.** Its own module comment says
   it plainly: a working directory is not a security boundary. Anything the
   permission engine "allows" for `run_command` is a real shell, with the
@@ -169,7 +177,7 @@ means exactly that, and is listed so nobody assumes otherwise later.
 | Designed | The workspace boundary (`safe_join`) limits *where* file tools can act, regardless of why the model chose a path. An injected instruction to read or write `C:\Users\<name>\.ssh\id_rsa` is refused the same way a buggy model's own mistake would be. |
 | Designed | Permission modes gate file writes and dangerous tools behind user approval in `edit` mode (the desktop default) and in `auto` mode for anything not pre-approved. An injected instruction still has to get a human to click approve for anything beyond a safe read. |
 | Designed | The capability manifest (`allowed_tools` in `agent/permissions.py`) is a hard cap enforced in every mode including `bypass`. A run scoped to fewer tools cannot be talked into using one outside the manifest no matter what the model reads. |
-| Designed (signal, not a boundary) | `agent/hearth_injection.py` scans content the agent reads for injection patterns (imperative overrides, authority spoofing, exfiltration shapes, escalation language, structural spoofing, obfuscation) and surfaces a severity and explanation alongside the approval prompt. It does not block, sanitize, or strip anything - a payload can still be paraphrased, split across the scan window, or wrapped in framing that reads as narration past this scanner, and the module's own docstring says so. Verified against 10 real adversarial payloads (all scored high or critical) and 48 repository files (all clean), but a clean scan is never proof of safety. |
+| Designed (signal, not a boundary) | `agent/hearth_injection.py` scans content the agent reads for injection patterns (imperative overrides, authority spoofing, exfiltration shapes, escalation language, structural spoofing, obfuscation) and surfaces a severity and explanation alongside the approval prompt. It does not block, sanitize, or strip anything - a payload can still be paraphrased, split across the scan window, or wrapped in framing that reads as narration past this scanner, and the module's own docstring says so. Its self-test requires every adversarial payload in its regression fixture set to score high or critical, and requires its benign sweep (every module under `agent/`, plus the README, the limitations page, and this document) to stay clean, but a clean scan is never proof of safety. |
 | Not mitigated | There is still no isolation between "trusted" and "untrusted" text in the model's context. The model sees repo content, web content, and the user's own instructions in the same channel, and the scanner above informs the human reviewing a tool call, it does not change what the model itself was shown. This is an open problem across the industry, not something Hearth claims to solve. |
 | Not mitigated | `run_command` itself (see 3.5 below) is not contained, so if an injected instruction reaches a mode where shell execution is allowed or gets approved, it runs with the user's full reach outside any workspace boundary. |
 
