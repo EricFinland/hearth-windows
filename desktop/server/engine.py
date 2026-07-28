@@ -315,6 +315,42 @@ class RealEngine:
         # the most recent untrusted content the agent has read.
         self._last_scan = None
 
+    # ---- restart survival (session_state.py) ----
+    #
+    # get_state()/load_state() are the seam session_state.py's snapshot()/
+    # restore_session() drive through session.Session's engine attribute
+    # (duck-typed: Session and session_state.py never import RealEngine
+    # directly, only call these methods if present -- see session.py's and
+    # session_state.py's own module docstrings). The conversation is the
+    # one piece of session state genuinely expensive to lose, hence its own
+    # pair of methods rather than reaching into self._messages from outside.
+
+    def get_state(self):
+        """A JSON-safe snapshot of this engine's conversation, or None
+        before any turn has ever run (self._messages is still None) --
+        there is nothing yet worth persisting in that case. The dict shape
+        returned here is exactly what load_state expects back."""
+        if self._messages is None:
+            return None
+        return {"messages": self._messages, "turn_starts": self._turn_starts}
+
+    def load_state(self, state):
+        """Restore a previously persisted conversation (see get_state).
+        Only ever called immediately after construction, before any turn
+        has run -- exactly how session_state.restore_session uses it -- so
+        this simply replaces self._messages/self._turn_starts outright
+        rather than trying to merge with anything. Malformed input (not a
+        dict, or missing/wrong-typed fields) is ignored rather than raised:
+        a corrupt persisted conversation must degrade to "start this
+        engine's history fresh", not take the whole restore down with it."""
+        if not isinstance(state, dict):
+            return
+        messages = state.get("messages")
+        turn_starts = state.get("turn_starts")
+        if isinstance(messages, list) and isinstance(turn_starts, list):
+            self._messages = messages
+            self._turn_starts = turn_starts
+
     def _chat(self, ctx, messages):
         if self._chat_fn is not None:
             return self._chat_fn(messages)
@@ -1207,6 +1243,44 @@ def _self_test():
     sessU.resolve_approval(apprU["data"]["id"], True)
     _wait_for_kind(sessU, "done")
     _wait_idle(sessU)
+
+    # === M: get_state()/load_state() -- the seam session_state.py drives ===
+    # === for restart survival (see that module and session.py) -- round- ===
+    # === trips a real conversation through a real RealEngine, not a stand-in
+    engineM_a = RealEngine(chat_fn=_scripted_chat(chat_script), execute_tool_fn=fake_execute_tool,
+                          checkpoint_fn=fake_checkpoint)
+    assert engineM_a.get_state() is None, \
+        "before any turn has run there is nothing yet worth persisting"
+    sessM_a = session_mod.Session(ws, "fake-model", "edit", engine=engineM_a)
+    sessM_a.submit_prompt("please tidy the project")
+    apprM, _ = _wait_for_kind(sessM_a, "approval_request")
+    sessM_a.resolve_approval(apprM["data"]["id"], True)
+    _wait_for_kind(sessM_a, "done")
+    _wait_idle(sessM_a)
+    state_m = engineM_a.get_state()
+    assert state_m is not None and state_m["messages"] and state_m["turn_starts"], state_m
+    assert state_m["messages"][0]["role"] == "system", state_m
+
+    # A fresh RealEngine, never run, restores that exact conversation.
+    engineM_b = RealEngine()
+    engineM_b.load_state(state_m)
+    assert engineM_b._messages == state_m["messages"], engineM_b._messages
+    assert engineM_b._turn_starts == state_m["turn_starts"], engineM_b._turn_starts
+    assert engineM_b.get_state() == state_m, \
+        "get_state() after load_state() must reproduce exactly what was loaded"
+
+    # Malformed input degrades silently rather than raising or corrupting
+    # whatever state already existed.
+    engineM_c = RealEngine()
+    engineM_c.load_state("not a dict")
+    assert engineM_c._messages is None, "malformed load_state input must be ignored, not raise"
+    engineM_c.load_state({"messages": "not a list", "turn_starts": []})
+    assert engineM_c._messages is None, "wrong-typed fields must be ignored, not partially applied"
+    engineM_c.load_state({"messages": state_m["messages"], "turn_starts": state_m["turn_starts"]})
+    assert engineM_c._messages == state_m["messages"]
+    engineM_c.load_state("not a dict")  # must not clobber a previously-good load
+    assert engineM_c._messages == state_m["messages"], \
+        "a subsequent malformed load_state call must not wipe out a good prior load"
 
     print("hearth-desktop-engine self-test OK")
     return 0

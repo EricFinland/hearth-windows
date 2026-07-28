@@ -99,6 +99,30 @@ without limit:
      consults the flag itself. So clearing the dict at the top of each new
      submit_prompt cannot drop a flag anything still needs.
 
+Restart survival (session_state.py, a sibling module, owns the actual disk
+format and the atomic write): a Session never touches disk itself. Instead
+it accepts an optional `persist_hook(session)` callable and invokes it --
+always best-effort, a failure here must never break a live turn or an HTTP
+request, see _persist() -- at the moments worth making durable: when a turn
+starts (submit_prompt, before any blocking work), when an approval gate is
+raised (_request_approval, right after the approval_request event -- this
+is deliberately the exact moment a crash would otherwise strand an
+unanswerable, half-live approval), and when a turn ends (_run's finally,
+after status has flipped back to idle). app.py wires the actual hook and is
+responsible for making sure only the *current* session (not one a POST
+/session replaced, whose abandoned worker -- see is_workspace_busy above --
+might still be finishing up on its own thread) ever wins a write; this
+module only calls the hook it was given, unconditionally, since it has no
+way to know about sibling sessions itself.
+
+What is NOT persisted, and why, lives in session_state.py's module
+docstring; the short version is: the conversation and workspace/model/mode,
+yes; a bounded tail of recent events, yes; checkpoint ids, no (the shadow
+store is authoritative); a pending approval, never as something a restarted
+process could still resolve -- see record_restart_interruption() and
+seed_events(), used only by session_state.restore_session() to rebuild a
+Session from a prior process's last snapshot.
+
 Standard library only.
 """
 
@@ -191,7 +215,7 @@ class Session:
     """
 
     def __init__(self, workspace, model, mode=DEFAULT_MODE, engine=None, events_cap=None,
-                 approvals_cap=None):
+                 approvals_cap=None, persist_hook=None):
         if not workspace:
             raise ValueError("workspace is required")
         if not model:
@@ -216,6 +240,11 @@ class Session:
         self._cancel_flags = {}  # turn_id -> threading.Event; cleared per-turn, see submit_prompt
         self._thread = None
         self._live_workers = 0  # abandoned/in-flight _run_cancellable calls; see is_workspace_busy()
+        # Restart survival: see the module docstring. None (the default,
+        # used by every existing caller and every test that does not care
+        # about persistence) means "never write anything" -- _persist()
+        # below is a no-op in that case.
+        self._persist_hook = persist_hook
 
     def to_dict(self):
         with self._lock:
@@ -226,6 +255,107 @@ class Session:
                 "status": self.status,
                 "turn_id": self.turn_id,
             }
+
+    # ---- restart survival (session_state.py) ----
+
+    def set_persist_hook(self, hook):
+        """Attach (or replace) the persist hook after construction. Used
+        only by app.py when adopting a session that session_state.py just
+        rebuilt from a prior process's disk snapshot (main.py's startup
+        path): that Session is built before the hook can be safely wired
+        (the hook needs to know it is "the current session", which is a
+        fact only app.py's SidecarState can answer -- see the module
+        docstring), so it starts with none and gets one attached right
+        after app.py adopts it."""
+        with self._lock:
+            self._persist_hook = hook
+
+    def _persist(self):
+        """Best-effort: hand this session to the injected persist hook, if
+        any. Must never raise -- a disk-full, permissions, or Windows
+        sharing-violation failure here must never take down a live turn or
+        an HTTP request; the worst case of a failed persist is that the
+        next restart recovers a little less history than it otherwise
+        would have, not a broken session right now."""
+        hook = self._persist_hook
+        if hook is None:
+            return
+        try:
+            hook(self)
+        except Exception:  # noqa: BLE001 - persistence must never break a live session
+            pass
+
+    def recent_events(self, n=50):
+        """The most recent `n` events, oldest first -- a bounded tail for
+        session_state.py to persist, so a UI reconnecting after a restart
+        sees recent history without this module (or the state file) ever
+        having to hold the unbounded log. Already the same JSON-safe dicts
+        _emit builds and app.py's _write_sse serialises, so nothing here
+        needs its own sanitisation pass."""
+        with self._lock:
+            return list(self._events)[-n:]
+
+    def seed_events(self, events):
+        """Pre-populate the event ring from a persisted tail. For
+        session_state.restore_session()'s use only, and only immediately
+        after construction, before this session has emitted anything of
+        its own: continues the event id sequence past the highest
+        restored id, so the first newly emitted event (typically
+        record_restart_interruption's own marker) can never collide with,
+        or sort before, a restored one."""
+        if not events:
+            return
+        with self._lock:
+            max_id = 0
+            for ev in events[-self._events_cap:]:
+                self._events.append(ev)
+                max_id = max(max_id, ev.get("id") or 0)
+            self._event_id_seq = itertools.count(max_id + 1)
+
+    def pending_approval_tools(self):
+        """Tool names of every currently-pending (unresolved) approval, for
+        session_state.py's snapshot to note as "this may be abandoned" --
+        deliberately just the tool name, never the full args (which, for
+        write_file in edit mode, can be an entire file body): the point of
+        recording this is an honest note in the history, not a second copy
+        of a payload the approval itself already isn't allowed to
+        resurrect. See record_restart_interruption for the other half."""
+        with self._lock:
+            return [a.tool for a in self._approvals.values() if a.decision is None]
+
+    def record_restart_interruption(self, turn_id, pending_tool=None):
+        """Called at most once, by session_state.restore_session(), right
+        after rebuilding a Session whose last known status (per the
+        persisted snapshot) was STATUS_RUNNING: the process that owned
+        that turn is gone. There is no thread left to resume it, and no
+        way to know whether its last tool call actually finished against
+        the workspace -- so this never resumes anything. It only appends
+        to the event log, honestly, that the turn was interrupted (and,
+        if one was pending, that an approval was abandoned and can never
+        be resolved -- resurrecting it would let a user "approve" an
+        action with no caller left to carry it out, or one that would now
+        run against a workspace that has since changed underneath it).
+
+        self.status/self.turn_id are forced to idle/None (they should
+        already be that way for a freshly constructed Session, but this
+        makes it explicit and immune to future construction changes) so a
+        fresh POST /prompt is never blocked by a turn nothing is running
+        anymore.
+        """
+        with self._lock:
+            self.status = STATUS_IDLE
+            self.turn_id = None
+        if pending_tool:
+            self._emit(turn_id, "approval_abandoned", {
+                "tool": pending_tool,
+                "reason": "the sidecar restarted while this approval was still "
+                          "pending; it can no longer be resolved",
+            })
+        self._emit(turn_id, "turn_interrupted", {
+            "reason": "the sidecar restarted while this turn was still in "
+                      "progress; its last tool call may or may not have "
+                      "completed. Review the workspace before continuing.",
+        })
 
     # ---- driving a turn ----
 
@@ -256,10 +386,21 @@ class Session:
                 with self._lock:
                     if self.turn_id == turn_id:
                         self.status = STATUS_IDLE
+                # Persist once the turn is over (normal completion, denial,
+                # cancellation, or an engine bug -- every path above reaches
+                # this finally): the conversation the engine just extended
+                # is worth being durable now, not just when the next turn
+                # happens to start. See the module docstring.
+                self._persist()
 
         t = threading.Thread(target=_run, daemon=True)
         self._thread = t
         t.start()
+        # Persist the "a turn just started" moment too, before any blocking
+        # model or tool call -- if the process dies mid-turn, the state
+        # file's status_at_save is what tells session_state.restore_session
+        # to mark this turn interrupted rather than silently forgotten.
+        self._persist()
         return turn_id
 
     def cancel(self):
@@ -419,6 +560,11 @@ class Session:
         if injection_finding is not None:
             event_data["injection_finding"] = injection_finding
         self._emit(turn_id, "approval_request", event_data)
+        # Persist right here, before blocking on the wait below: this is
+        # deliberately the exact moment a crash would otherwise strand an
+        # approval a restarted process has no thread left to resolve. See
+        # the module docstring and record_restart_interruption.
+        self._persist()
         appr.event.wait()  # released by resolve_approval() or by cancel()
         with self._lock:
             decision = appr.decision
@@ -772,6 +918,163 @@ def _self_test():
         assert len(s_flags._cancel_flags) == 1, \
             "cancel flags must never accumulate across turns of one session: {}".format(
                 s_flags._cancel_flags)
+
+    # === restart survival: persist_hook is invoked at the moments the ======
+    # === module docstring promises -- turn start, an approval gate, and ===
+    # === turn end -- and never otherwise, and never with anything but ====
+    # === `self` ============================================================
+    persist_calls = []
+
+    def recording_hook(sess):
+        persist_calls.append(sess.to_dict())
+
+    class HookEngine:
+        def run(self, ctx):
+            ctx.emit("delta", {"text": "..."})
+            decision = ctx.request_approval("write_file", {"path": "h.txt"})
+            ctx.emit("tool_call", {"tool": "write_file", "decision": decision})
+            ctx.emit("done", {})
+
+    s_hook = Session("/tmp/ws-hook", "m", "edit", engine=HookEngine(), persist_hook=recording_hook)
+    assert persist_calls == [], "persist_hook must not fire at construction time"
+    s_hook.submit_prompt("go")
+    # call #1: right after submit_prompt starts the turn, status "running"
+    deadline = time.monotonic() + 5
+    while len(persist_calls) < 1 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert len(persist_calls) >= 1, "persist_hook never fired at turn start"
+    assert persist_calls[0]["status"] == STATUS_RUNNING, persist_calls[0]
+
+    appr_h = None
+    deadline = time.monotonic() + 5
+    while appr_h is None and time.monotonic() < deadline:
+        pending = s_hook.pending_approvals()
+        if pending:
+            appr_h = pending[0]
+        time.sleep(0.005)
+    assert appr_h, "approval never arrived"
+    # call #2 (or later, if the turn-start call above raced ahead): fired at
+    # the approval gate, before it was resolved -- this is the exact crash
+    # window record_restart_interruption exists for.
+    deadline = time.monotonic() + 5
+    while len(persist_calls) < 2 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert len(persist_calls) >= 2, "persist_hook never fired at the approval gate"
+    assert s_hook.resolve_approval(appr_h, True) is True
+    deadline = time.monotonic() + 5
+    while s_hook.to_dict()["status"] != STATUS_IDLE and time.monotonic() < deadline:
+        time.sleep(0.01)
+    # call #3: fired again once the turn actually finished.
+    deadline = time.monotonic() + 5
+    while len(persist_calls) < 3 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert len(persist_calls) >= 3, "persist_hook never fired at turn end"
+    assert persist_calls[-1]["status"] == STATUS_IDLE, persist_calls[-1]
+
+    # A persist_hook that raises must never take the session down with it.
+    def broken_hook(sess):
+        raise RuntimeError("disk is on fire")
+
+    s_broken = Session("/tmp/ws-broken-hook", "m", "edit", engine=HookEngine(), persist_hook=broken_hook)
+    s_broken.submit_prompt("go")
+    deadline = time.monotonic() + 5
+    while not s_broken.pending_approvals() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert s_broken.pending_approvals(), "a broken persist_hook must not prevent the turn from proceeding"
+    s_broken.resolve_approval(s_broken.pending_approvals()[0], True)
+    deadline = time.monotonic() + 5
+    while s_broken.to_dict()["status"] != STATUS_IDLE and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert s_broken.to_dict()["status"] == STATUS_IDLE, \
+        "a broken persist_hook must not prevent the turn from ever completing"
+
+    # set_persist_hook attaches one after construction (the main.py restore
+    # path: the hook needs to know it is "the current session", a fact only
+    # available after app.py has adopted the rebuilt Session -- see the
+    # module docstring).
+    late_calls = []
+    s_late = Session("/tmp/ws-late-hook", "m", "edit", engine=HookEngine())
+    s_late.set_persist_hook(lambda sess: late_calls.append(sess.to_dict()))
+    s_late.submit_prompt("go")
+    deadline = time.monotonic() + 5
+    while not late_calls and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert late_calls, "set_persist_hook did not actually attach a working hook"
+    s_late.cancel()
+    deadline = time.monotonic() + 5
+    while s_late.to_dict()["status"] != STATUS_IDLE and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    # === recent_events / seed_events / pending_approval_tools / ===========
+    # === record_restart_interruption: the building blocks session_state.py
+    # === composes to persist a snapshot and rebuild a Session from one =====
+    class ManyEventsEngine:
+        def run(self, ctx):
+            for i in range(5):
+                ctx.emit("delta", {"text": "chunk-{}".format(i)})
+            ctx.emit("done", {})
+
+    s_re = Session("/tmp/ws-recent-events", "m", "edit", engine=ManyEventsEngine())
+    s_re.submit_prompt("go")
+    deadline = time.monotonic() + 5
+    while s_re.to_dict()["status"] != STATUS_IDLE and time.monotonic() < deadline:
+        time.sleep(0.01)
+    all_re = s_re.events_after(0, timeout=1)
+    tail = s_re.recent_events(3)
+    assert len(tail) == 3, tail
+    assert [e["id"] for e in tail] == [e["id"] for e in all_re[-3:]], (tail, all_re)
+    assert s_re.recent_events(1000) == all_re, "recent_events(n >= total) must return everything, oldest first"
+
+    # seed_events rebuilds the ring on a freshly constructed session and
+    # continues the id sequence past the highest seeded id -- a newly
+    # emitted event must never collide with, or sort before, a seeded one.
+    s_seed = Session("/tmp/ws-seed", "m", "edit")
+    assert list(s_seed._events) == [], "a fresh session must start with an empty ring"
+    s_seed.seed_events(tail)
+    assert [e["id"] for e in s_seed.recent_events(10)] == [e["id"] for e in tail]
+    new_id = s_seed._emit(None, "marker", {})
+    assert new_id > max(e["id"] for e in tail), \
+        "an event emitted after seed_events must sort after every seeded event"
+
+    # pending_approval_tools: the tool name of a still-pending approval,
+    # never its args -- and empty once nothing is pending.
+    class PendingToolEngine:
+        def run(self, ctx):
+            ctx.request_approval("run_command", {"command": "rm -rf /", "secret": "shh"})
+
+    s_pt = Session("/tmp/ws-pending-tool", "m", "auto", engine=PendingToolEngine())
+    assert s_pt.pending_approval_tools() == []
+    s_pt.submit_prompt("go")
+    deadline = time.monotonic() + 5
+    while not s_pt.pending_approvals() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert s_pt.pending_approval_tools() == ["run_command"], s_pt.pending_approval_tools()
+    s_pt.cancel()
+    deadline = time.monotonic() + 5
+    while s_pt.to_dict()["status"] != STATUS_IDLE and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    # record_restart_interruption: forces idle/None, and appends an honest
+    # marker (plus an abandoned-approval marker when one was pending) --
+    # never anything that looks like a resolvable approval.
+    s_ri = Session("/tmp/ws-restart", "m", "edit")
+    s_ri.status = "running"  # simulate what a freshly-constructed-then-reconstructed session looked like
+    s_ri.turn_id = "some-turn-id"
+    s_ri.record_restart_interruption("some-turn-id", pending_tool="write_file")
+    d_ri = s_ri.to_dict()
+    assert d_ri["status"] == STATUS_IDLE and d_ri["turn_id"] is None, d_ri
+    ri_events = s_ri.events_after(0, timeout=1)
+    ri_kinds = [e["kind"] for e in ri_events]
+    assert ri_kinds == ["approval_abandoned", "turn_interrupted"], ri_kinds
+    assert ri_events[0]["data"]["tool"] == "write_file", ri_events[0]
+    assert s_ri.pending_approvals() == [], \
+        "record_restart_interruption must never leave anything resolvable"
+
+    s_ri2 = Session("/tmp/ws-restart-2", "m", "edit")
+    s_ri2.record_restart_interruption("turn-x", pending_tool=None)
+    ri2_kinds = [e["kind"] for e in s_ri2.events_after(0, timeout=1)]
+    assert ri2_kinds == ["turn_interrupted"], \
+        "no approval_abandoned marker when nothing was actually pending: {}".format(ri2_kinds)
 
     print("hearth-desktop-session self-test OK")
     return 0

@@ -157,7 +157,7 @@ class SidecarState:
     """
 
     def __init__(self, token, engine_factory=None, port=0, models_fetcher=None,
-                 max_sse_connections=None):
+                 max_sse_connections=None, persist_hook=None):
         self.token = token
         self.port = port  # main.py sets this to the real bound port after listen
         self.engine_factory = engine_factory or (lambda: session_mod.NullEngine())
@@ -173,10 +173,51 @@ class SidecarState:
         # SSE streams are capped; see acquire_sse_slot/release_sse_slot.
         self.max_sse_connections = max_sse_connections or MAX_SSE_CONNECTIONS
         self._sse_count = 0
+        # Restart survival (session_state.py). None (the default, and what
+        # every test that does not care about persistence passes) means no
+        # session this state ever creates or adopts writes anything to disk
+        # -- _persist_if_current short-circuits before ever touching
+        # self._raw_persist_hook. main.py is the only production caller
+        # that supplies a real one.
+        self._raw_persist_hook = persist_hook
 
     def get_session(self):
         with self._lock:
             return self.session
+
+    def _persist_if_current(self, session):
+        """The persist_hook every Session this state creates or adopts is
+        actually given (see create_session and set_restored_session) --
+        never self._raw_persist_hook directly. A session that POST /session
+        has already replaced can still have work in flight on its own
+        thread for a while afterward (a cancelled-but-abandoned worker --
+        see Session.is_workspace_busy's docstring in session.py), and that
+        old session's own _run() finally block still calls its persist_hook
+        once that work actually finishes. Without this guard, that stale
+        write could land on disk AFTER the new session's own, newer write,
+        silently clobbering it with older data -- a lost-update race, not a
+        crash, but a silent one. Comparing against self.session (read
+        fresh, under lock, at the moment of the actual write, not captured
+        once at hook-creation time) is what makes "current" mean the same
+        thing here as it does to GET /session or POST /cancel."""
+        if self._raw_persist_hook is None:
+            return
+        with self._lock:
+            is_current = self.session is session
+        if is_current:
+            self._raw_persist_hook(session)
+
+    def set_restored_session(self, session):
+        """Adopt a session session_state.restore_session() rebuilt from a
+        prior process's disk snapshot as the live one -- main.py's startup
+        path, called once, before the server starts accepting requests.
+        Wired up exactly like a session born from create_session: the same
+        _persist_if_current guard, so a session recovered from disk is not
+        treated any differently than one created fresh over HTTP for every
+        purpose persistence cares about afterward."""
+        with self._lock:
+            self.session = session
+        session.set_persist_hook(self._persist_if_current if self._raw_persist_hook else None)
 
     def acquire_sse_slot(self):
         """True and reserves a slot if under max_sse_connections, else False
@@ -234,7 +275,9 @@ class SidecarState:
                         "cannot replace session: this workspace has running or abandoned "
                         "work in progress; wait for it to finish and try again")
                 old.cancel()
-            s = session_mod.Session(workspace, model, mode, engine=self.engine_factory())
+            hook = self._persist_if_current if self._raw_persist_hook is not None else None
+            s = session_mod.Session(workspace, model, mode, engine=self.engine_factory(),
+                                    persist_hook=hook)
             self.session = s
             return s
 
@@ -1335,6 +1378,113 @@ def _self_test():
         thread_get.join(timeout=5)
         assert state_atomic.get_session().workspace == "/tmp/ws-atomic-a", \
             "thread A's session must be the one left live"
+
+        # === restart survival wiring: SidecarState only ever persists on ===
+        # === behalf of whichever session is CURRENTLY self.session -- a ===
+        # === session POST /session already replaced, whose own abandoned =
+        # === worker (see Session.is_workspace_busy) later finishes its ===
+        # === turn and fires its own persist_hook, must not be allowed to =
+        # === clobber the new session's already-persisted state with =====
+        # === stale data. Exercised with a fake recording hook, not real ===
+        # === disk -- session_state.py's own self-test proves the disk ====
+        # === format; this proves app.py's guard around it. ================
+        persisted_snapshots = []
+
+        def _recording_hook(sess):
+            persisted_snapshots.append(sess.to_dict())
+
+        release_old = threading.Event()
+        entered_old = threading.Event()
+
+        class _SlowGateEngine:
+            """Blocks in run() until released, so its Session can be
+            replaced by POST /session while this turn is still "running",
+            simulating the abandoned-worker window the guard exists for."""
+
+            def run(self, ctx):
+                entered_old.set()
+                release_old.wait(timeout=10)
+                ctx.emit("done", {})
+
+        class _QuickEngine:
+            def run(self, ctx):
+                ctx.emit("done", {})
+
+        # The first session gets the slow engine (the one whose replacement
+        # simulates an abandoned worker); every later session on this state
+        # gets a quick one, so its own persist calls are easy to tell apart
+        # from the slow one's without sharing a release gate between them.
+        guard_call_count = {"n": 0}
+
+        def _guard_engine_factory():
+            guard_call_count["n"] += 1
+            return _SlowGateEngine() if guard_call_count["n"] == 1 else _QuickEngine()
+
+        state_guard = SidecarState("guard-token", engine_factory=_guard_engine_factory,
+                                   persist_hook=_recording_hook)
+        old_sess = state_guard.create_session("/tmp/ws-guard-old", "m", "edit")
+        old_sess.submit_prompt("hang")
+        assert entered_old.wait(timeout=5), "old session's turn never started"
+        # A persist fired for the OLD session while it was still current
+        # (submit_prompt's own turn-start persist) -- this one is legitimate.
+        assert len(persisted_snapshots) >= 1
+        assert all(s["workspace"] == "/tmp/ws-guard-old" for s in persisted_snapshots)
+
+        # Replace it with a different workspace while the old turn is still
+        # blocked in run() -- exactly the abandoned-worker window.
+        new_sess = state_guard.create_session("/tmp/ws-guard-new", "m", "edit")
+        assert state_guard.get_session() is new_sess
+        new_sess.submit_prompt("go")  # the new (current) session persists normally
+        deadline = time.monotonic() + 5
+        while new_sess.to_dict()["status"] != "idle" and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        # Now let the OLD session's blocked turn finish. Its own _run()
+        # finally block will call its persist_hook (session._persist), which
+        # is state_guard._persist_if_current -- and by now self.session is
+        # new_sess, not old_sess, so this must be silently suppressed.
+        n_before_release = len(persisted_snapshots)
+        release_old.set()
+        deadline = time.monotonic() + 5
+        while old_sess.to_dict()["status"] != "idle" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert old_sess.to_dict()["status"] == "idle", "old session's turn never finished"
+        time.sleep(0.2)  # give its finally-block persist call a chance to (wrongly) fire
+        assert all(s["workspace"] != "/tmp/ws-guard-old"
+                  for s in persisted_snapshots[n_before_release:]), (
+            "an old, already-replaced session's persist_hook fired after replacement -- "
+            "it must be suppressed, or it can silently clobber the new session's state: "
+            "{}".format(persisted_snapshots[n_before_release:])
+        )
+        # The new session, meanwhile, persists normally.
+        assert any(s["workspace"] == "/tmp/ws-guard-new" for s in persisted_snapshots), \
+            "the new (current) session's own persist calls must NOT be suppressed"
+
+        # === set_restored_session wires the identical guard onto a session
+        # === adopted at startup (main.py's path), not just one built ======
+        # === through create_session ========================================
+        restored_snapshots = []
+
+        def _restored_hook(sess):
+            restored_snapshots.append(sess.to_dict())
+
+        state_restore_guard = SidecarState("restore-guard-token", persist_hook=_restored_hook)
+        restored_sess = session_mod.Session("/tmp/ws-restored", "m", "edit", engine=_FakeEngine())
+        state_restore_guard.set_restored_session(restored_sess)
+        assert state_restore_guard.get_session() is restored_sess
+        restored_sess.submit_prompt("go")
+        deadline = time.monotonic() + 5
+        while not restored_snapshots and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert restored_snapshots, "a session adopted via set_restored_session must still persist"
+        deadline = time.monotonic() + 5
+        while restored_sess.to_dict()["status"] != "idle" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        # Replacing it must suppress ITS late persist calls too, the same as
+        # any other session -- prove the guard, not just that the hook fires
+        # once for a freshly adopted session.
+        replaced_sess = state_restore_guard.create_session("/tmp/ws-restored-2", "m", "edit")
+        assert state_restore_guard.get_session() is replaced_sess
 
         # === malformed JSON body is rejected, not a 500 ===
         status, data = _raw_request(port, "POST", "/session", headers=auth_headers, body="{not json")
