@@ -7,7 +7,7 @@
 
 import { Sidecar, HttpError, readHandshake, pickFolder, hasShellBridge } from "./api.js";
 import { Transcript } from "./transcript.js";
-import { el, icon, appendAll, clear, $ } from "./dom.js";
+import { el, icon, appendAll, clear, setText, neutralize, $ } from "./dom.js";
 import { blob } from "./safe-text.js";
 import { ShopView } from "./shop.js";
 
@@ -90,13 +90,15 @@ function setView(name) {
 
 function setConn(kind, label) {
   ui.conn.dataset.state = kind;
-  ui.connLabel.textContent = label;
+  setText(ui.connLabel, label);
 }
 
 function setChip(node, value, mono) {
-  node.querySelector(".chip-text").textContent = value;
+  setText(node.querySelector(".chip-text"), value);
   node.classList.toggle("mono", Boolean(mono));
-  node.title = value;
+  // A tooltip is displayed text too, and a model name arrives from whoever
+  // published the repository it was downloaded from.
+  node.title = neutralize(value);
 }
 
 // ------------------------------------------------------------------- helpers
@@ -143,7 +145,7 @@ function paintRecents() {
 let modalDismiss = null;
 
 function openModal(title, bodyNodes, actions) {
-  ui.modalTitle.textContent = title;
+  setText(ui.modalTitle, title);
   clear(ui.modalBody);
   appendAll(ui.modalBody, bodyNodes);
   clear(ui.modalActions);
@@ -375,7 +377,7 @@ async function refreshModels() {
   } catch (err) {
     ui.model.appendChild(el("option", { value: "", text: "could not list models", disabled: true }));
     ui.sessionNote.className = "panel-note is-error";
-    ui.sessionNote.textContent = "Model list unavailable: " + errorText(err);
+    setText(ui.sessionNote, "Model list unavailable: " + errorText(err));
     // null, not 0: "the list could not be read" is a different thing from
     // "the list is empty", and only the second one means a first run.
     state.modelCount = null;
@@ -397,7 +399,7 @@ async function refreshModels() {
   if (!entries.length) {
     ui.model.appendChild(el("option", { value: "", text: "no models available on either engine", disabled: true }));
     ui.sessionNote.className = "panel-note";
-    ui.sessionNote.textContent = "No model is installed yet. Open the model shop to download one.";
+    setText(ui.sessionNote, "No model is installed yet. Open the model shop to download one.");
   }
   const values = entries.map((e) => e.value);
   if (previous && values.includes(previous)) ui.model.value = previous;
@@ -421,9 +423,9 @@ function paintDownloadBadge(jobs) {
   }
   ui.tabShopBadge.hidden = false;
   if (active.length === 1 && Number.isFinite(active[0].fraction)) {
-    ui.tabShopBadge.textContent = `${Math.round(active[0].fraction * 100)}%`;
+    setText(ui.tabShopBadge, `${Math.round(active[0].fraction * 100)}%`);
   } else {
-    ui.tabShopBadge.textContent = String(active.length);
+    setText(ui.tabShopBadge, String(active.length));
   }
 }
 
@@ -484,15 +486,16 @@ async function useDownloadedModel(job) {
   setView("chat");
   if (!matched) {
     ui.sessionNote.className = "panel-note is-error";
-    ui.sessionNote.textContent =
-      "The download finished, but the bundled engine did not list it. Reload the model list, or check that llama-server is installed.";
+    setText(ui.sessionNote,
+      "The download finished, but the bundled engine did not list it. "
+      + "Reload the model list, or check that llama-server is installed.");
     return;
   }
   ui.model.value = matched;
   ui.sessionNote.className = "panel-note";
-  ui.sessionNote.textContent = state.session
+  setText(ui.sessionNote, state.session
     ? "Model selected. Press Restart session to use it."
-    : "Model selected. Choose a workspace and press Start session.";
+    : "Model selected. Choose a workspace and press Start session.");
   ui.connect.focus({ preventScroll: true });
 }
 
@@ -502,7 +505,7 @@ async function refreshCheckpoints() {
   if (!state.session) {
     clear(ui.cpList);
     ui.cpNote.className = "panel-note";
-    ui.cpNote.textContent = "No session yet.";
+    setText(ui.cpNote, "No session yet.");
     return;
   }
   // GET /checkpoints runs `git log` against the workspace's shadow store, and
@@ -519,7 +522,7 @@ async function refreshCheckpoints() {
       if (attempt === 0) { await sleep(700); continue; }
       clear(ui.cpList);
       ui.cpNote.className = "panel-note is-error";
-      ui.cpNote.textContent = "Could not read checkpoint history: " + errorText(err);
+      setText(ui.cpNote, "Could not read checkpoint history: " + errorText(err));
       return;
     }
   }
@@ -527,11 +530,11 @@ async function refreshCheckpoints() {
   clear(ui.cpList);
   if (!list.length) {
     ui.cpNote.className = "panel-note";
-    ui.cpNote.textContent = "No checkpoints yet. One is taken automatically at the start of every turn.";
+    setText(ui.cpNote, "No checkpoints yet. One is taken automatically at the start of every turn.");
     return;
   }
   ui.cpNote.className = "panel-note";
-  ui.cpNote.textContent = `${list.length} checkpoint${list.length === 1 ? "" : "s"}, newest first.`;
+  setText(ui.cpNote, `${list.length} checkpoint${list.length === 1 ? "" : "s"}, newest first.`);
 
   list.forEach((cp, index) => {
     const restore = el("button", { class: "btn btn-ghost btn-icon btn-sm", type: "button", title: "Restore this checkpoint" });
@@ -640,9 +643,9 @@ function applySession(session) {
   if (!ui.workspace.value) ui.workspace.value = session.workspace;
   if (session.mode) ui.mode.value = session.mode;
 
-  ui.connect.textContent = "Restart session";
+  setText(ui.connect, "Restart session");
   ui.sessionNote.className = "panel-note";
-  ui.sessionNote.textContent = "Restarting replaces the session and clears its transcript.";
+  setText(ui.sessionNote, "Restarting replaces the session and clears its transcript.");
 
   updateTurnUi();
   if (isNew) refreshCheckpoints();
@@ -655,13 +658,13 @@ async function startSession() {
 
   if (!workspace) {
     ui.sessionNote.className = "panel-note is-error";
-    ui.sessionNote.textContent = "A workspace path is required.";
+    setText(ui.sessionNote, "A workspace path is required.");
     ui.workspace.focus();
     return;
   }
   if (!model) {
     ui.sessionNote.className = "panel-note is-error";
-    ui.sessionNote.textContent = "Pick a model. If the list is empty, download one from the model shop.";
+    setText(ui.sessionNote, "Pick a model. If the list is empty, download one from the model shop.");
     return;
   }
 
@@ -671,7 +674,7 @@ async function startSession() {
   // outgoing session while the new one is being created.
   setComposerEnabled(false, "Starting session...");
   ui.sessionNote.className = "panel-note";
-  ui.sessionNote.textContent = "Starting...";
+  setText(ui.sessionNote, "Starting...");
   try {
     stopEventStream();
     const session = await sidecar.createSession({ workspace, model, mode });
@@ -684,7 +687,7 @@ async function startSession() {
     await refreshCheckpoints();
   } catch (err) {
     ui.sessionNote.className = "panel-note is-error";
-    ui.sessionNote.textContent = errorText(err);
+    setText(ui.sessionNote, errorText(err));
     updateTurnUi();
   } finally {
     ui.connect.disabled = false;
@@ -696,7 +699,7 @@ async function startSession() {
 function setComposerEnabled(enabled, statusText) {
   ui.composer.disabled = !enabled;
   ui.send.disabled = !enabled || !ui.composer.value.trim();
-  if (statusText !== undefined) ui.composerStatus.textContent = statusText;
+  if (statusText !== undefined) setText(ui.composerStatus, statusText);
 }
 
 function updateTurnUi() {
@@ -937,14 +940,14 @@ async function browseForFolder() {
     if (body.path) {
       ui.workspace.value = body.path;
       ui.sessionNote.className = "panel-note";
-      ui.sessionNote.textContent = "";
+      setText(ui.sessionNote, "");
     } else if (body.error) {
       ui.sessionNote.className = "panel-note";
-      ui.sessionNote.textContent = body.error + " Type the path instead.";
+      setText(ui.sessionNote, body.error + " Type the path instead.");
     }
   } catch {
     ui.sessionNote.className = "panel-note";
-    ui.sessionNote.textContent = "No folder picker available here. Type the path instead.";
+    setText(ui.sessionNote, "No folder picker available here. Type the path instead.");
   } finally {
     ui.browse.disabled = false;
   }
@@ -997,7 +1000,7 @@ async function boot() {
       hasShellBridge()
         ? "The shell started but did not hand over a handshake. Restarting Hearth should fix this."
         : "The dev host did not return a handshake. Start it with: node desktop/ui/dev-host.mjs");
-    ui.setupBody.textContent = "";
+    setText(ui.setupBody, "");
     ui.setupBody.appendChild(el("p", { class: "panel-note is-error", text: errorText(err) }));
     return;
   }

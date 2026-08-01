@@ -116,7 +116,16 @@ body { overflow: hidden; }
 }
 .chip .i { width: 13px; height: 13px; color: var(--fg-faint); }
 .chip-text { overflow: hidden; text-overflow: ellipsis; }
-.chip.mono .chip-text { font-family: var(--font-mono); font-size: 11.5px; direction: rtl; text-align: left; }
+/* direction: rtl here is a truncation trick, not a language claim: it makes a
+ * long workspace path overflow (and ellipsise) on the LEFT, so the tail of the
+ * path -- the part that identifies it -- stays visible. unicode-bidi: plaintext
+ * keeps that box behaviour while taking the TEXT's direction from its own first
+ * strong character, so `C:\Users\eric\proj` still reads left to right instead
+ * of having its punctuation shuffled to the wrong end by the rtl box. */
+.chip.mono .chip-text {
+  font-family: var(--font-mono); font-size: 11.5px;
+  direction: rtl; unicode-bidi: plaintext; text-align: left;
+}
 
 .conn {
   margin-left: auto; flex: none;
@@ -380,6 +389,38 @@ select.input option { background: var(--panel-2); color: var(--fg); }
   color: var(--fg-faint);
 }
 .msg-user .msg-role { text-align: right; }
+
+/* ---------------------------------------------------------------------------
+ * Bidi containment for untrusted text.
+ *
+ * The real fix for the Trojan Source problem is in js/dom.js: every string
+ * from the model, a file, a tool result or Hugging Face passes through
+ * neutralize(), which turns U+202E and its relatives into a visible <U+202E>
+ * marker before it ever reaches a text node. This block is the second layer,
+ * and it is worth having because it covers what the first cannot: an isolate
+ * confines the Unicode bidi algorithm's ordinary, unavoidable effects -- the
+ * ones ordinary Arabic or Hebrew content legitimately produces -- to the
+ * element that owns the untrusted string, so a right-to-left repository name
+ * cannot drag the neighbouring label, badge or number around it.
+ *
+ * `isolate`, deliberately, and not `isolate-override`. Override would force
+ * every one of these into left-to-right order, which renders genuine Arabic
+ * and Hebrew as gibberish. Isolate leaves the algorithm working correctly
+ * INSIDE the element and only stops it leaking OUT of it.
+ *
+ * This is not sufficient on its own and is not treated as if it were: it does
+ * nothing about reordering within a single string, and it does not travel with
+ * text that gets copied out of the page. Both of those are the neutralize()
+ * step's job.
+ * ------------------------------------------------------------------------- */
+.prose p, .prose .code-inline, .prose pre.code-block, .bubble,
+.card-sub, .kv-v, .blob, .finding p, .notice-text,
+.setup-remedy, .setup-message, .engine-message, .shop-status, .hw-v,
+.model-name, .model-repo, .model-desc, .model-note, .quant-name, .quant-msg,
+.quant-tags, .quant-file, .verdict-pill, .verdict-msg, .verdict-facts,
+.dl-name, .dl-repo, .dl-detail, .cp-label, details.fold > summary {
+  unicode-bidi: isolate;
+}
 
 .prose p { margin: 0 0 10px; white-space: pre-wrap; }
 .prose p:last-child { margin-bottom: 0; }

@@ -31,7 +31,8 @@
       "enableNodeCliInspectArguments": false,
       "onlyLoadAppFromAsar": true,
       "enableEmbeddedAsarIntegrityValidation": true,
-      "enableCookieEncryption": true
+      "enableCookieEncryption": true,
+      "grantFileProtocolExtraPrivileges": false
     },
     "directories": {
       "buildResources": "build",

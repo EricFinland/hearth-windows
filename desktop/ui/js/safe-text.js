@@ -18,10 +18,17 @@
  * grammar without adding much for a coding agent's output, and every added
  * rule is another place a mistake could turn text into structure.
  *
+ * The other half of the same guarantee lives in dom.js: every text node this
+ * file makes goes through `textNode`/`setText`, so a bidi override or a
+ * control character inside model output becomes a visible `<U+202E>` marker
+ * rather than silently reordering the glyphs around it. Text that cannot
+ * become structure is only half the property; it also has to display the
+ * characters it actually contains.
+ *
  * See xss-check.html for the hostile payloads this is actually tested with.
  */
 
-import { el, appendAll } from "./dom.js";
+import { el, appendAll, textNode, setText } from "./dom.js";
 
 const FENCE = /^[ \t]*```([^\n`]*)$/;
 
@@ -79,7 +86,7 @@ function renderTextBlock(body) {
     if (paired && i % 2 === 1) {
       p.appendChild(el("span", { class: "code-inline", text: part }));
     } else {
-      p.appendChild(document.createTextNode(i > 0 && !paired ? "`" + part : part));
+      p.appendChild(textNode(i > 0 && !paired ? "`" + part : part));
     }
   });
   return p;
@@ -118,8 +125,7 @@ export function renderProse(source) {
  *  command output). Always textContent, never parsed. */
 export function blob(value, { tall = false } = {}) {
   const node = el("pre", { class: tall ? "blob is-tall" : "blob" });
-  node.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
-  return node;
+  return setText(node, typeof value === "string" ? value : JSON.stringify(value, null, 2));
 }
 
 /** A labelled blob, used for "content", "output", and similar. */

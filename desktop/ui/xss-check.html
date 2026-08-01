@@ -15,6 +15,16 @@
     A pass means the payload exists in the page only as literal text: no element it
     named was created, no event-handler attribute survived, and no side effect fired.
   </p>
+  <p class="lede">
+    The second half of the page asks a different question: not whether text can become
+    structure, but whether the text on screen is the text that is there. A U+202E in a
+    tool argument reorders the glyphs without touching a byte of what runs, which turns
+    the approval card into the attack. Those rows measure each character's on-screen x
+    coordinate and compare the resulting left-to-right reading order against the string
+    itself, because textContent cannot answer that question. Right-to-left languages are
+    checked in the same way and must still read right to left: the fix removes the
+    explicit override controls, not the bidi algorithm.
+  </p>
   <div class="verdict" id="verdict">running...</div>
   <table>
     <thead><tr><th>Surface</th><th>Payload</th><th>Result</th></tr></thead>
@@ -22,6 +32,13 @@
   </table>
 
   <div id="probes"></div>
+
+  <!-- Laid out rather than display:none, because a hidden element has no
+       geometry and the whole point of these probes is to read geometry. -->
+  <div id="bidi-stage">
+    <h2>bidi and control characters (every one must show as a visible marker)</h2>
+    <div id="bidi-probes"></div>
+  </div>
 
   <div id="stage">
     <h2>rendered output (all of this should read as literal text)</h2>

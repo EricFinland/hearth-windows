@@ -16,6 +16,13 @@
  *    xss-check.html can drive hostile payloads through the exact code paths
  *    the live screen uses, rather than through a lookalike.
  *
+ *    The same values also have to DISPLAY the characters they contain, which
+ *    is a separate property from not becoming markup: a repository id carrying
+ *    U+202E would otherwise render its own name backwards, and a model
+ *    description could paint a different sentence than the one it holds. Every
+ *    string above reaches the page through dom.js's el/appendAll/setText,
+ *    which turn those controls into a visible `<U+202E>` marker.
+ *
  * 2. THE VERDICT IS THE PRODUCT. hearth_shop grades every quantisation
  *    against this machine's real VRAM, RAM and free disk, and writes a
  *    sentence explaining the grade. That sentence is rendered verbatim, next
@@ -30,7 +37,7 @@
  *    download that has not moved shows the bytes it actually has.
  */
 
-import { el, icon, appendAll, clear } from "./dom.js";
+import { el, icon, appendAll, clear, setText } from "./dom.js";
 
 // ------------------------------------------------------------------ formatting
 
@@ -582,9 +589,9 @@ export class ShopView {
     this.searching = true;
     this.searchBtn.disabled = true;
     this.status.className = "shop-status";
-    this.status.textContent = query
+    setText(this.status, query
       ? `Searching Hugging Face for "${query}" and grading each result against this machine...`
-      : "Loading the most downloaded GGUF models and grading each against this machine...";
+      : "Loading the most downloaded GGUF models and grading each against this machine...");
     clear(this.results);
     clear(this.banner);
     try {
@@ -593,7 +600,7 @@ export class ShopView {
       this._paint();
     } catch (err) {
       this.status.className = "shop-status is-error";
-      this.status.textContent = "The shop search failed: " + (err?.message || String(err));
+      setText(this.status, "The shop search failed: " + (err?.message || String(err)));
     } finally {
       this.searching = false;
       this.searchBtn.disabled = false;
@@ -620,9 +627,9 @@ export class ShopView {
     clear(this.results);
     if (!models.length) {
       this.status.className = "shop-status";
-      this.status.textContent = listing.error
+      setText(this.status, listing.error
         ? String(listing.error)
-        : "No GGUF repositories matched that search. Try a shorter query: model families are usually one word.";
+        : "No GGUF repositories matched that search. Try a shorter query: model families are usually one word.");
       return;
     }
     const gated = models.filter((m) => m.gated).length;
@@ -631,7 +638,7 @@ export class ShopView {
     else parts.push("from Hugging Face, best fit for this machine first");
     if (gated) parts.push(`${gated} gated and not downloadable`);
     this.status.className = "shop-status";
-    this.status.textContent = parts.join(" · ") + ".";
+    setText(this.status, parts.join(" · ") + ".");
 
     const handlers = this._handlers();
     for (const entry of models) this.results.appendChild(renderModelCard(entry, handlers));
@@ -655,7 +662,7 @@ export class ShopView {
       button.textContent = "Grade this model against my machine";
     } catch (err) {
       button.disabled = false;
-      button.textContent = "Could not read it: " + (err?.message || String(err));
+      setText(button, "Could not read it: " + (err?.message || String(err)));
     }
   }
 
@@ -668,7 +675,7 @@ export class ShopView {
       await this.sidecar.startDownload(entry.repo_id, filename);
     } catch (err) {
       this.status.className = "shop-status is-error";
-      this.status.textContent = "Could not start that download: " + (err?.message || String(err));
+      setText(this.status, "Could not start that download: " + (err?.message || String(err)));
       return;
     }
     await this.refreshDownloads();

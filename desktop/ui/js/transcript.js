@@ -29,9 +29,20 @@
  * Both are textContent-only paths -- see safe-text.js -- so a partial token
  * cannot become markup at any point in between. xss-check.html drives real
  * payloads through this fragment by fragment for exactly that reason.
+ *
+ * Bidi. The approval card is the only thing standing between a hostile or
+ * prompt-injected model and the user's machine, so it has to display the
+ * characters it is actually going to execute. A U+202E in a tool argument
+ * reorders the glyphs on screen while leaving the bytes alone, which turns the
+ * card from a defence into the attack's delivery mechanism. Every text node
+ * built here therefore comes from dom.js's textNode/setText/neutralize, which
+ * render those controls as a visible `<U+202E>` marker. The raw string is kept
+ * intact in `stream.full`, because the delta bookkeeping indexes into it and
+ * because it is what closeAgent has to re-tokenize; only what reaches a text
+ * node is neutralized.
  */
 
-import { el, icon, appendAll, clear } from "./dom.js";
+import { el, icon, appendAll, clear, textNode, neutralize } from "./dom.js";
 import { renderProse, blob, labelledBlob } from "./safe-text.js";
 
 const READ_TOOLS = new Set(["read_file", "list_files", "list_tree", "git_status", "git_diff"]);
@@ -187,7 +198,7 @@ function findingBlock(kind, finding) {
   const wrap = el("div", { class: isSecret ? "finding is-secret" : "finding" });
   wrap.appendChild(appendAll(el("div", { class: "finding-head" }), [
     icon(isSecret ? "i-key" : "i-alert", "i"),
-    document.createTextNode(isSecret
+    textNode(isSecret
       ? `possible credential in this write (${finding.severity ?? "?"})`
       : `prompt injection in what was just read (${finding.severity ?? "?"})`),
   ]));
@@ -330,9 +341,13 @@ export class Transcript {
     }
 
     if (!this.stream) {
-      const textNode = document.createTextNode("");
+      // Named streamText rather than textNode so it cannot shadow dom.js's
+      // textNode() helper, which is what every other text node here is built
+      // with. This one starts empty and is only ever written through
+      // neutralize() below.
+      const streamText = document.createTextNode("");
       const caret = el("span", { class: "caret" });
-      const paragraph = appendAll(el("p"), [textNode, caret]);
+      const paragraph = appendAll(el("p"), [streamText, caret]);
       const prose = appendAll(el("div", { class: "prose" }), [paragraph]);
       const bubble = appendAll(el("div", { class: "bubble" }), [prose]);
       const msgEl = appendAll(el("div", { class: "msg msg-agent" }), [
@@ -340,15 +355,22 @@ export class Transcript {
         bubble,
       ]);
       this._append(msgEl);
-      this.stream = { msgEl, bubble, textNode, full: "", id: streamId };
+      this.stream = { msgEl, bubble, textNode: streamText, full: "", id: streamId };
     }
     if (this.stream.id === null) this.stream.id = streamId;
 
     // Straight to the text node. No queue, no frame budget, no reveal rate:
     // the text is drawn the instant it arrives, because it arrives at the
-    // rate the model produces it.
+    // rate the model produces it. `full` keeps the raw string, because the
+    // overlap arithmetic above and closeAgent's tokenizer both index into it;
+    // only the copy that reaches the screen is neutralized. The whole
+    // accumulation is neutralized rather than each delta on its own: that is
+    // one linear scan of a string this line then assigns wholesale anyway, so
+    // it is the same order of work as the assignment it feeds, and it needs no
+    // argument about what a control character split across a delta boundary
+    // would do.
     this.stream.full += String(text);
-    this.stream.textNode.data = this.stream.full;
+    this.stream.textNode.data = neutralize(this.stream.full);
     this._autoscroll();
   }
 
@@ -554,7 +576,7 @@ export class Transcript {
     text.appendChild(el("strong", { text: title }));
     if (detail) {
       text.appendChild(document.createTextNode(" "));
-      text.appendChild(document.createTextNode(String(detail)));
+      text.appendChild(textNode(detail));
     }
     if (blobText) text.appendChild(blob(String(blobText)));
     const inner = appendAll(el("div", { class: "notice-inner" }), [icon(iconId), text]);

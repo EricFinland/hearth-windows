@@ -34,6 +34,17 @@
 // loose directory next to it, or from a modified asar, so an attacker with
 // write access to the install directory inherits the signature without
 // touching the binary.
+//
+// grantFileProtocolExtraPrivileges is the last one, and it is here because it
+// costs this app nothing. Enabled, it hands file:// pages the privileges of a
+// normal web origin: a local HTML file can then be treated as same-origin with
+// other local files and reach them with fetch and XMLHttpRequest. Hearth never
+// loads a file:// page at all -- main.js serves the UI from a loopback HTTP
+// origin and refuses to navigate anywhere else (see origin.js for why the
+// sidecar's own Host and Origin checks force that) -- so turning the privileges
+// off removes a capability the product does not use. It was verified by
+// building with the fuse disabled and running a full turn against the packaged
+// binary, not by reasoning about it alone.
 
 const path = require("path");
 const { getCurrentFuseWire, FuseV1Options } = require("@electron/fuses");
@@ -48,6 +59,7 @@ const REQUIRED = {
   OnlyLoadAppFromAsar: true,
   EnableEmbeddedAsarIntegrityValidation: true,
   EnableCookieEncryption: true,
+  GrantFileProtocolExtraPrivileges: false,
 };
 
 // getCurrentFuseWire reports each fuse as the character that sits in the

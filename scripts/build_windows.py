@@ -331,6 +331,13 @@ def verify_fuses():
     ELECTRON_RUN_AS_NODE environment variable. See desktop/shell/verify-fuses.js
     for why that must never be signed. Checking here is the only place the
     result of the request can actually be observed.
+
+    verify-fuses.js keeps its own copy of the required wire rather than
+    reading package.json, so this step fails the build both when a fuse was
+    not applied AND when someone quietly relaxes what is asked for. All
+    seven fuses this build sets are covered, including
+    GrantFileProtocolExtraPrivileges, which is disabled because Hearth serves
+    its UI from a loopback HTTP origin and never loads a file:// page.
     """
     print("\n== verifying electron fuses ==")
     exe = os.path.join(DIST_DIR, "win-unpacked", "Hearth.exe")
