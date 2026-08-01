@@ -376,20 +376,72 @@ def model_kind_hint(model):
 # Chat result
 # --------------------------------------------------------------------------
 
-def _ollama_shaped_message(content, tool_calls):
-    """An Ollama-shaped assistant message from content plus OpenAI-shaped
-    tool calls.
+def wire_safe_tool_calls(tool_calls):
+    """Tool calls in the one shape BOTH engines will accept back.
 
-    hearth_loop reads `msg["tool_calls"][i]["function"]["name"]` and
-    `["arguments"]`, and accepts arguments as either a dict or a JSON
-    string (it json.loads a string and reports a parse failure as a
-    notice). llama-server streams arguments as a string fragment per
-    delta, reassembled by hearth_llama.consume_stream. This decodes that
-    string into a dict when it parses, and passes the raw string through
-    when it does not, which keeps hearth_loop's own "could not parse
-    arguments" path reachable instead of swallowing a malformed call here.
+    A tool call is read twice, and both readers have to be satisfied by
+    the one shape this returns. hearth_loop reads it to decide which tool
+    to run; then hearth_loop appends the whole assistant message to
+    `messages` and the SAME dict is posted straight back to an engine on
+    the next turn (hearth_llama.chat forwards `messages` to llama-server
+    untranslated). A field that only the first reader needs is optional. A
+    field the ENGINE needs is not, and omitting one does not fail here --
+    it fails one turn later, as a 500 on the follow-up request, with the
+    tool already executed and its result thrown away.
+
+    That is not hypothetical for the Ollama path either. A session's
+    `messages` list outlives a single turn (desktop/server/engine.py keeps
+    it across the whole conversation) while the model a turn runs on does
+    not: hearth_router picks per turn, so a tool call Ollama produced can
+    be replayed to llama.cpp two turns later. Both engines' output is
+    normalised here so that whichever one reads it next, it parses.
+
+    WHAT LLAMA-SERVER REQUIRES, measured against build 10105 by posting
+    each variant and reading the status back, not taken from the OpenAI
+    docs:
+
+      type          REQUIRED, and must be exactly "function". Omitting it
+                    is `500 Failed to parse messages: Missing tool call
+                    type`; any other value is `Unsupported tool call
+                    type`. This is the field that made Hearth Code
+                    unusable on the bundled engine: Ollama ignores its
+                    absence, so nothing showed until llama.cpp became the
+                    default.
+      function      REQUIRED. Absent is `Missing tool call function`.
+      function.name REQUIRED as a KEY. Absent is `Missing tool call name`;
+                    an empty string is accepted. This one is always
+                    written below, so it is a constraint being held rather
+                    than a bug being fixed.
+      function.arguments
+                    REQUIRED as a key -- absent is `500 ... key
+                    'arguments' not found`. The value may be a JSON
+                    object, a string that parses as JSON, or null. An
+                    EMPTY string is `500 Failed to parse tool call
+                    arguments as JSON`, which matters because
+                    hearth_llama.consume_stream starts every slot's
+                    arguments at "" and only appends what the deltas
+                    carry: a call to one of hearth_tools' no-argument
+                    tools can legitimately produce "" and would take the
+                    turn down. It is normalised to {} here.
+      id            OPTIONAL. Verified accepted both present and absent.
+
+    And on the `tool` messages hearth_loop appends beside the assistant
+    one: `content` is REQUIRED (400 `All non-assistant messages must
+    contain 'content'`), while `tool_call_id` is optional and is not even
+    checked against the ids on the assistant turn -- results pair
+    positionally.
+
+    Ollama's own tool calls arrive with `arguments` already a dict, no
+    `type`, and an `index` inside the function object. Rebuilding rather
+    than patching drops that `index`, which nothing reads and which is not
+    part of the request schema either engine documents.
+
+    Arguments that are non-empty and still will not parse are passed
+    through as the raw string, so hearth_loop's own "could not parse
+    arguments" notice stays reachable instead of being swallowed here.
+    That string is what the model actually emitted; inventing {} for it
+    would hide a real failure behind a tool call with no arguments.
     """
-    out = {"role": "assistant", "content": content or ""}
     shaped = []
     for call in tool_calls or []:
         fn = (call or {}).get("function") or {}
@@ -398,14 +450,47 @@ def _ollama_shaped_message(content, tool_calls):
             try:
                 parsed = json.loads(args)
             except (ValueError, TypeError):
-                parsed = args
+                # "" is not a malformed call, it is a call with no
+                # arguments; the engine rejects it either way.
+                parsed = {} if not args.strip() else args
             args = parsed
-        entry = {"function": {"name": fn.get("name") or "", "arguments": args}}
+        entry = {"type": "function",
+                 "function": {"name": fn.get("name") or "", "arguments": args}}
         if call.get("id"):
             entry["id"] = call["id"]
         shaped.append(entry)
+    return shaped
+
+
+def _ollama_shaped_message(content, tool_calls):
+    """An assistant message from content plus OpenAI-shaped tool calls.
+
+    The llama.cpp path's entry point into wire_safe_tool_calls; see there
+    for what each engine requires of a tool call and why it is enforced on
+    the way out rather than trusted on the way in.
+    """
+    out = {"role": "assistant", "content": content or ""}
+    shaped = wire_safe_tool_calls(tool_calls)
     if shaped:
         out["tool_calls"] = shaped
+    return out
+
+
+def wire_safe_assistant_message(message):
+    """An engine's own assistant message, made safe to replay to either
+    engine.
+
+    For the Ollama paths, which get a whole message dict from the response
+    body rather than the (content, tool_calls) pair the llama.cpp path
+    hands over. Only "tool_calls" is touched, and only when there are
+    some; every other key Ollama sent (content, thinking, images) is
+    passed through untouched, and a message with no tool calls is returned
+    as it came in. See wire_safe_tool_calls for what is being enforced.
+    """
+    if not isinstance(message, dict) or not message.get("tool_calls"):
+        return message
+    out = dict(message)
+    out["tool_calls"] = wire_safe_tool_calls(message["tool_calls"])
     return out
 
 
@@ -581,10 +666,17 @@ def ollama_message_from_stream(folded):
     hearth_loop and engine.py both branch on truthiness there and an empty
     list would read the same as a missing key today but is a difference
     waiting to matter.
+
+    The tool calls go through wire_safe_tool_calls on the way out for the
+    same reason the llama.cpp path's do: this message is appended to a
+    session's `messages` and may be posted back to EITHER engine on a
+    later turn, and Ollama's own shape is missing the "type" llama-server
+    refuses a request without.
     """
     out = {"role": "assistant", "content": folded.get("content") or ""}
-    if folded.get("tool_calls"):
-        out["tool_calls"] = folded["tool_calls"]
+    shaped = wire_safe_tool_calls(folded.get("tool_calls"))
+    if shaped:
+        out["tool_calls"] = shaped
     return out
 
 
@@ -1263,7 +1355,7 @@ class OllamaBackend(Backend):
         try:
             if not stream:
                 data = _http_json(url, timeout, body)
-                message = data.get("message") or {}
+                message = wire_safe_assistant_message(data.get("message") or {})
                 return {
                     "message": message,
                     "tokens_in": int(data.get("prompt_eval_count") or 0),
@@ -1872,6 +1964,62 @@ def _self_test(live=False):
     d = _ollama_shaped_message("", [{"function": {"name": "x", "arguments": {"a": 1}}}])
     assert d["tool_calls"][0]["function"]["arguments"] == {"a": 1}, d
 
+    # -- the shape llama-server will actually accept back ------------------
+    #
+    # Every assertion below is a 500 llama-server (build 10105) was
+    # measured returning for the shape it rejects. This message is not
+    # only read by hearth_loop -- it is posted BACK to the engine on the
+    # next turn, so a missing field kills the turn after the tool has
+    # already run. See wire_safe_tool_calls.
+    #
+    # "Missing tool call type". The whole reason Hearth Code could not
+    # complete a tool turn on the bundled engine.
+    for _call in _ollama_shaped_message("", [
+            {"id": "c1", "function": {"name": "read_file", "arguments": '{"path":"a"}'}},
+            {"function": {"name": "now", "arguments": {}}}])["tool_calls"]:
+        assert _call.get("type") == "function", (
+            "llama-server answers `500 Missing tool call type` without this, "
+            "one turn after the tool has already run", _call)
+        # "Missing tool call function" / "Missing tool call name" /
+        # "key 'arguments' not found": all three keys must be present.
+        assert "function" in _call, _call
+        assert "name" in _call.get("function", {}), _call
+        assert "arguments" in _call.get("function", {}), _call
+    # "Failed to parse tool call arguments as JSON" on an empty string.
+    # consume_stream starts every slot's arguments at "" and only appends
+    # what the deltas carry, so a call to one of hearth_tools' five
+    # no-argument tools reaches here as "". A call with no arguments is
+    # {}, not a parse failure.
+    for _empty in ("", "   "):
+        _noargs = _ollama_shaped_message("", [{"function": {"name": "now", "arguments": _empty}}])
+        assert _noargs["tool_calls"][0]["function"]["arguments"] == {}, _noargs
+    # An id is optional (verified accepted both ways), so a call the
+    # engine gave no id for must not grow an empty one.
+    assert "id" not in _ollama_shaped_message(
+        "", [{"function": {"name": "now", "arguments": {}}}])["tool_calls"][0]
+
+    # Ollama's own shape is normalised the same way, because a session's
+    # `messages` outlives the turn: a tool call Ollama produced can be
+    # posted to llama.cpp on a later turn of the same conversation.
+    _oll = wire_safe_assistant_message({
+        "role": "assistant", "content": "",
+        "tool_calls": [{"id": "call_x",
+                        "function": {"index": 0, "name": "get_weather",
+                                     "arguments": {"city": "Paris"}}}]})
+    assert _oll["tool_calls"][0].get("type") == "function", (
+        "Ollama omits the type llama-server requires, and a session's "
+        "messages outlive the turn that produced them", _oll)
+    assert _oll["tool_calls"][0]["function"]["arguments"] == {"city": "Paris"}, _oll
+    assert _oll["tool_calls"][0]["id"] == "call_x", _oll
+    # Everything that is not a tool call is left exactly as Ollama sent it,
+    # and a message without tool calls is not copied at all.
+    _plain = {"role": "assistant", "content": "hi", "thinking": "hmm"}
+    assert wire_safe_assistant_message(_plain) is _plain
+    _kept = wire_safe_assistant_message({
+        "role": "assistant", "content": "hi", "thinking": "hmm",
+        "tool_calls": [{"function": {"name": "now", "arguments": {}}}]})
+    assert _kept["thinking"] == "hmm", _kept
+
     # -- Ollama's stream format, folded ------------------------------------
     #
     # Transcribed verbatim from a live capture against Ollama 0.30.7 through
@@ -1924,6 +2072,11 @@ def _self_test(live=False):
     assert _f2["tool_calls"][0]["function"]["arguments"] == {"city": "Paris"}, _f2
     _m2 = ollama_message_from_stream(_f2)
     assert _m2["tool_calls"][0]["function"]["arguments"] == {"city": "Paris"}, _m2
+    # The streaming Ollama path goes through wire_safe_tool_calls too. Its
+    # output is appended to a `messages` list that outlives this turn, and
+    # hearth_router can put the next turn of the same conversation on the
+    # llama.cpp engine, which rejects a tool call with no type.
+    assert _m2["tool_calls"][0].get("type") == "function", _m2
     # Two complete calls sharing function.index must stay two calls. The
     # per-index MERGE that llama.cpp's fragmented arguments require would
     # fuse these into one; that is the trap this format inverts.

@@ -462,7 +462,13 @@ def chat(base_url, model, messages, tools, timeout=300, options=None, backend=No
         if not stream:
             data = json.loads(resp.read().decode())
             tokens_in, tokens_out = _usage_from_response(data)
-            return data.get("message") or {}, tokens_in, tokens_out
+            # Ollama omits the "type" on a tool call that llama-server
+            # refuses a request without, and this message is appended to a
+            # `messages` list that outlives the turn it was produced in.
+            # See hearth_backend.wire_safe_tool_calls.
+            message = hearth_backend.wire_safe_assistant_message(
+                data.get("message") or {})
+            return message, tokens_in, tokens_out
         # Iterating the response hands over each newline-delimited frame as
         # the socket delivers it. Reading it whole first, as the branch
         # above does, is what would turn this back into fake streaming.
