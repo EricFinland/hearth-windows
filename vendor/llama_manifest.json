@@ -1,0 +1,186 @@
+{
+  "build_number": 10105,
+  "bundled_variant": "win-cpu-x64",
+  "commit": "e6dd0e29a6751d4859abaa8899959f5ddf756f4e",
+  "download_prefix": "https://github.com/ggml-org/llama.cpp/releases/download/b10105/",
+  "pinned_at": "2026-08-01",
+  "policy": {
+    "bundled_reason": "A CPU build is the only Windows artifact that cannot fail to start: the GPU builds link vendor runtimes that are absent on machines without the matching driver, and a missing DLL is a launch failure rather than slow inference. It is also the smallest x64 artifact.",
+    "bundled_variant": "win-cpu-x64",
+    "first_run_gpu_fetch": {
+      "amd": "win-vulkan-x64",
+      "intel": "win-vulkan-x64",
+      "nvidia_blackwell_or_newer": "win-cuda-13.3-x64",
+      "nvidia_older": "win-cuda-13.3-x64",
+      "other_or_none": null
+    },
+    "first_run_reason": "Vulkan is 33.5 MB and covers every desktop GPU vendor, so it is the cheapest fetch that turns on offload. CUDA is faster on NVIDIA but is 537 MB with its cudart companion, which is why it is fetched on demand for NVIDIA hardware rather than bundled for everyone."
+  },
+  "project": "llama.cpp",
+  "release_tag": "b10105",
+  "released_at": "2026-07-24T09:34:02Z",
+  "schema": 1,
+  "sha256_source_meanings": {
+    "downloaded_and_hashed": "the asset was downloaded and hashed on the machine that pinned it, and that hash equalled the digest GitHub's API published for it",
+    "github_api_digest": "only the digest GitHub's API published was recorded; the bytes were not fetched and hashed at pin time"
+  },
+  "upstream": "https://github.com/ggml-org/llama.cpp",
+  "variants": {
+    "cudart-cuda-12.4-x64": {
+      "arch": "x86_64",
+      "asset": "cudart-llama-bin-win-cuda-12.4-x64.zip",
+      "backend": "runtime",
+      "gpu_vendors": [
+        "nvidia"
+      ],
+      "note": "The CUDA 12 runtime DLLs, not an engine. Extracted beside win-cuda-12.4-x64.",
+      "os": "windows",
+      "requires": [],
+      "sha256": "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6",
+      "sha256_source": "github_api_digest",
+      "size_bytes": 391443627
+    },
+    "cudart-cuda-13.3-x64": {
+      "arch": "x86_64",
+      "asset": "cudart-llama-bin-win-cuda-13.3-x64.zip",
+      "backend": "runtime",
+      "gpu_vendors": [
+        "nvidia"
+      ],
+      "note": "The CUDA 13 runtime DLLs, not an engine. Extracted beside win-cuda-13.3-x64.",
+      "os": "windows",
+      "requires": [],
+      "sha256": "1462a050eb4c684921ba51dcc4cc488a036674c3e73e9945ee705b854808d03e",
+      "sha256_source": "github_api_digest",
+      "size_bytes": 390970417
+    },
+    "win-cpu-arm64": {
+      "arch": "arm64",
+      "asset": "llama-b10105-bin-win-cpu-arm64.zip",
+      "backend": "cpu",
+      "gpu_vendors": [],
+      "note": "Windows on ARM. No GPU offload.",
+      "os": "windows",
+      "requires": [],
+      "sha256": "3d8599f096b44782ea493e336adb984bbeaefa9eee736fe16223a55324224859",
+      "sha256_source": "github_api_digest",
+      "size_bytes": 12061831
+    },
+    "win-cpu-x64": {
+      "arch": "x86_64",
+      "asset": "llama-b10105-bin-win-cpu-x64.zip",
+      "backend": "cpu",
+      "gpu_vendors": [],
+      "note": "Runs on any x64 Windows. No GPU offload. Hearth's bundled floor.",
+      "os": "windows",
+      "requires": [],
+      "sha256": "e4a9dca1a1302f66af8748bdd6cbe4242d7ecb763c1886c21a646fd35a542874",
+      "sha256_source": "downloaded_and_hashed",
+      "size_bytes": 18213703
+    },
+    "win-cuda-12.4-x64": {
+      "arch": "x86_64",
+      "asset": "llama-b10105-bin-win-cuda-12.4-x64.zip",
+      "backend": "cuda",
+      "gpu_vendors": [
+        "nvidia"
+      ],
+      "note": "For NVIDIA drivers too old for CUDA 13. Built against a toolkit that predates Blackwell, so RTX 50-series cards want the 13.3 build instead.",
+      "os": "windows",
+      "requires": [
+        "cudart-cuda-12.4-x64"
+      ],
+      "sha256": "7b9e8c9275b8309a94c3af4c051aa0660309caafc25cf071b54ff16d536d9d93",
+      "sha256_source": "github_api_digest",
+      "size_bytes": 250246304
+    },
+    "win-cuda-13.3-x64": {
+      "arch": "x86_64",
+      "asset": "llama-b10105-bin-win-cuda-13.3-x64.zip",
+      "backend": "cuda",
+      "gpu_vendors": [
+        "nvidia"
+      ],
+      "note": "Fastest on NVIDIA. Covers Blackwell (RTX 50-series). Needs the matching cudart archive unless the CUDA 13 runtime is already installed.",
+      "os": "windows",
+      "requires": [
+        "cudart-cuda-13.3-x64"
+      ],
+      "sha256": "b8e89d8408ea19d11cc1a367b79bcf41fbff3891c09e33d33f60d8df5f02f251",
+      "sha256_source": "github_api_digest",
+      "size_bytes": 146346685
+    },
+    "win-hip-radeon-x64": {
+      "arch": "x86_64",
+      "asset": "llama-b10105-bin-win-hip-radeon-x64.zip",
+      "backend": "rocm",
+      "gpu_vendors": [
+        "amd"
+      ],
+      "note": "AMD only, and larger than the Vulkan build that also covers AMD.",
+      "os": "windows",
+      "requires": [],
+      "sha256": "07c29b72a2a50ca976fb3471d90f346edbad93093b8307d6de3423d66c47ae34",
+      "sha256_source": "github_api_digest",
+      "size_bytes": 320903047
+    },
+    "win-opencl-adreno-arm64": {
+      "arch": "arm64",
+      "asset": "llama-b10105-bin-win-opencl-adreno-arm64.zip",
+      "backend": "opencl",
+      "gpu_vendors": [
+        "qualcomm"
+      ],
+      "note": "Qualcomm Adreno on Windows on ARM.",
+      "os": "windows",
+      "requires": [],
+      "sha256": "712be94cd2865c521b1c28806fa17b4de6002807f62209244dd370dd0da7766f",
+      "sha256_source": "github_api_digest",
+      "size_bytes": 12752712
+    },
+    "win-openvino-x64": {
+      "arch": "x86_64",
+      "asset": "llama-b10105-bin-win-openvino-2026.2.1-x64.zip",
+      "backend": "openvino",
+      "gpu_vendors": [
+        "intel"
+      ],
+      "note": "Intel only. The filename carries an OpenVINO toolkit version.",
+      "os": "windows",
+      "requires": [],
+      "sha256": "f4bd1c71dc46ffb6a73caf47ace89fefa414828a0ab0492573576da67167e0bb",
+      "sha256_source": "github_api_digest",
+      "size_bytes": 80447134
+    },
+    "win-sycl-x64": {
+      "arch": "x86_64",
+      "asset": "llama-b10105-bin-win-sycl-x64.zip",
+      "backend": "sycl",
+      "gpu_vendors": [
+        "intel"
+      ],
+      "note": "Intel GPUs. Needs the Intel oneAPI runtime.",
+      "os": "windows",
+      "requires": [],
+      "sha256": "b9f3521d6ad21c3c64b8fb3c1e7d856ec5027874db7db99929a9157f93ab8786",
+      "sha256_source": "github_api_digest",
+      "size_bytes": 119691872
+    },
+    "win-vulkan-x64": {
+      "arch": "x86_64",
+      "asset": "llama-b10105-bin-win-vulkan-x64.zip",
+      "backend": "vulkan",
+      "gpu_vendors": [
+        "nvidia",
+        "amd",
+        "intel"
+      ],
+      "note": "One artifact covering every desktop GPU vendor. Needs a Vulkan-capable driver (vulkan-1.dll). Recommended first-run GPU fetch.",
+      "os": "windows",
+      "requires": [],
+      "sha256": "d6d49121c7cd772c728dc458e592ace40d383f4c765be193db9d43900a788ebe",
+      "sha256_source": "downloaded_and_hashed",
+      "size_bytes": 33479612
+    }
+  }
+}

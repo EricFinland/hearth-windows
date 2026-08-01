@@ -19,3 +19,10 @@ __pycache__/
 
 # agent worktrees and session scratch
 .claude/
+
+# vendored llama.cpp binaries. Fetched by scripts/vendor_llama.py from the
+# release pinned in vendor/llama_manifest.json, which IS committed. Native
+# binaries are not: they are large, platform-specific, and reproducible from
+# the pin, so the manifest is the thing worth reviewing in a diff.
+vendor/llama/
+vendor/cache/
