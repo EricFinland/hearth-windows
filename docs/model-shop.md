@@ -91,6 +91,19 @@ When nothing fits in VRAM at all the size preference inverts to the
 smallest, which spills least. Every other quantisation stays in the listing
 with its own verdict, so the choice is visible rather than hidden.
 
+One row per quantisation, not one per file. Qwen's official GGUF
+repositories publish most quantisations twice, once as a single file and
+once split into numbered parts a couple of hundred bytes apart in total, so
+a listing built straight off the file tree shows two visually identical rows
+for nearly every quantisation and reads as a bug. The two editions collapse
+into one row: the single file, since it is one request with one hash to
+verify and nothing to reassemble, unless the split lands in a better verdict
+tier, which the collapse will not trade away. The other edition is not
+thrown away. It rides on the surviving row, fully graded, with a part count
+alongside it, because "this download arrives in four pieces" and "there is a
+version of this that fits my filesystem's file size limit" are real
+questions.
+
 The Hub reports sizes and filenames. It does not report layer counts or KV
 head counts, which is what the KV arithmetic above needs. So the shop
 resolves that figure from a table of known model families first, falling

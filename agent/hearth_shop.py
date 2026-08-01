@@ -38,6 +38,20 @@ one and wins. When nothing fits in VRAM at all the size preference inverts
 to the smallest, which is the one that spills least and gives back the most
 context. See rank_quants() and best_quant().
 
+One row per quantisation, not per file. Qwen's official GGUF repositories
+publish most quantisations twice, once as a single file and once split into
+numbered parts a couple of hundred bytes apart in total, and listing both
+puts two visually identical rows in front of the user for nearly every
+quantisation in the repository. The editions of one quantisation are
+collapsed into the row _edition_sort_key prefers - the single file, at an
+equal verdict - and the other edition rides on that row as
+alternate_editions, with split_part_count saying how many pieces the split
+arrives in, because "this download is four files" and "there is a version of
+this that fits my filesystem's file size limit" are real questions. That
+preference lives in exactly one place, and the listing (quant_verdicts) and
+the offer (best_quant) both reach it through _edition_groups, so they cannot
+disagree about which edition survives.
+
 ## Where kv_bytes_per_token comes from now
 
 The Hub's search and tree APIs report sizes, filenames, and hashes. They do
@@ -1366,6 +1380,96 @@ def rank_quants(quants):
     return sorted(quants or [], key=_quant_sort_key)
 
 
+# -- editions of one quantisation ---------------------------------------------
+#
+# Qwen's official GGUF repositories publish most quantisations TWICE: once as
+# one file, "<stem>.gguf", and once split into "<stem>-00001-of-0000N.gguf"
+# parts, which hearth_hf groups into a second logical entry named "<stem>".
+# The two hold the same weights at the same quantisation and differ by a
+# couple of hundred bytes of container header, so both land in the same
+# verdict tier and a listing that shows both shows the user two rows that
+# look identical and are, for every purpose except how the download arrives.
+#
+# They are collapsed to one row per quantisation, and the surviving row
+# carries the other edition rather than discarding it: a user whose
+# filesystem will not take a 15GB file, or who wants to know a download
+# arrives in four pieces, is asking a real question.
+
+# Every GGUF filename ends in this, and a split's grouped name is exactly the
+# single file's name without it. That is the whole matching rule.
+_GGUF_SUFFIX = ".gguf"
+
+
+def _edition_id(quant):
+    """Which quantisation this entry is an EDITION OF: two entries share an
+    id when one is "<stem>.gguf" and the other is the split of "<stem>" in
+    the same directory.
+
+    Deliberately not keyed on the quantisation label. Genuinely different
+    builds can share one label: hearth_hf.parse_quant reads both
+    "foo-Q4_K_M.gguf" and the imatrix build "foo-i1-Q4_K_M.gguf" as Q4_K_M,
+    and those are two real choices, not one duplicated. Matching on the
+    filename matches only the case this is about, the same file published
+    whole and in parts, and leaves everything else alone.
+
+    An entry with no usable name is given an id of its own, so a listing that
+    somehow carries several nameless entries never collapses them into one on
+    no evidence.
+    """
+    parts = quant.get("parts") or []
+    path = quant.get("path")
+    if not path and parts and isinstance(parts[0], dict):
+        # A split model has no single path of its own; its parts carry the
+        # directory, which is part of the identity (a repository can put each
+        # quantisation in its own folder).
+        path = parts[0].get("path")
+    text = str(path or "")
+    directory = text.rsplit("/", 1)[0] if "/" in text else ""
+    base = str(quant.get("name") or "").rsplit("/", 1)[-1]
+    if base.lower().endswith(_GGUF_SUFFIX):
+        base = base[: -len(_GGUF_SUFFIX)]
+    if not base:
+        return (directory, "", id(quant))
+    return (directory, base)
+
+
+def _edition_sort_key(quant):
+    """Ordering WITHIN one edition group, i.e. between editions of the same
+    quantisation. _quant_sort_key first, with one component inserted: at an
+    equal verdict, the SINGLE-FILE edition beats the split one.
+
+    One request, one hash to verify, nothing to reassemble, and no way to
+    end up with a half-downloaded model that llama.cpp refuses to load. The
+    two editions differ by a couple of hundred bytes, so ranking them on size
+    alone picks between them essentially at random.
+
+    The preference sits BELOW the verdict rank on purpose: preferring the
+    single file must never trade a "great" down to a "good". It sits ABOVE
+    size, but only inside a group - as a component of the listing-wide
+    _quant_sort_key it would make a smaller single-file quantisation beat a
+    larger split one of a DIFFERENT quantisation in the same tier, which is
+    the opposite of what the shop wants.
+
+    This is the one place the single-file preference is expressed. The
+    listing (quant_verdicts) and the offer (best_quant) both reach it through
+    _edition_groups, so they cannot disagree about which edition survives.
+    """
+    incomplete, rank, size, name = _quant_sort_key(quant)
+    return (incomplete, rank, 1 if quant.get("multipart") else 0, size, name)
+
+
+def _edition_groups(quants):
+    """`quants` grouped by _edition_id, each group ordered by
+    _edition_sort_key (the edition to surface first), the groups themselves
+    in the order their first member appeared. Returns new lists; the entries
+    inside them are the caller's own objects, not copies.
+    """
+    groups = {}
+    for quant in quants or []:
+        groups.setdefault(_edition_id(quant), []).append(quant)
+    return [sorted(group, key=_edition_sort_key) for group in groups.values()]
+
+
 # A GGUF whose base name starts with this is a multimodal vision projector,
 # not a language model: it is the image encoder that rides ALONGSIDE one.
 # hearth_hf's own filename survey found these among the files that carry no
@@ -1398,32 +1502,20 @@ def _offerable(quant):
 def best_quant(quants):
     """The single quantisation to offer for this repository, or None.
 
-    The first ranked entry that is offerable (see _offerable), with one
-    correction afterwards: when that entry is a SPLIT edition of a
-    quantisation the repository also ships as a single file at the same
-    verdict, the single file is taken instead. Qwen's own GGUF repositories
-    really do publish both editions of each quant, and their sizes differ by
-    a fraction of a percent, so ranking on size alone picks between them
-    essentially at random. The same model in one file is the better download:
-    one request, one hash to verify, nothing to assemble. Both editions stay
-    in the listing, since a user with a filesystem that dislikes very large
-    files may want the split one.
+    One edition per quantisation is considered (see _edition_sort_key: the
+    single-file edition wins at an equal verdict, a split that lands in a
+    better tier still wins outright), and the offer is the first of those in
+    rank_quants() order that is offerable (see _offerable).
 
     None when every quantisation in the repository is unusable on this
     hardware, which is the honest answer and is what keeps a repository
     nothing can run from being recommended.
+
+    The returned entry is one of the objects in `quants`, never a copy, so a
+    caller can find it again by identity. `quants` is not modified.
     """
-    ranked = rank_quants(quants)
-    chosen = next((q for q in ranked if _offerable(q)), None)
-    if chosen is None or not chosen.get("multipart") or not chosen.get("quant"):
-        return chosen
-    for quant in ranked:
-        if quant is chosen or quant.get("multipart") or not _offerable(quant):
-            continue
-        if (quant.get("quant") == chosen["quant"]
-                and quant["verdict"]["verdict"] == chosen["verdict"]["verdict"]):
-            return quant
-    return chosen
+    surviving = [group[0] for group in _edition_groups(quants)]
+    return next((q for q in rank_quants(surviving) if _offerable(q)), None)
 
 
 def quant_verdicts(files, hw=None, context_tokens=None, kv=None, free_disk=None):
@@ -1446,6 +1538,22 @@ def quant_verdicts(files, hw=None, context_tokens=None, kv=None, free_disk=None)
       free_disk_bytes  - what disk_ok was judged against.
       kv_bytes_per_token / kv_confidence - the KV figure the verdict used and
                          how much to trust it.
+      alternate_editions - the other editions of this same quantisation, each
+                         a fully graded entry of the same shape. Almost
+                         always empty or one entry: the split edition of a
+                         quantisation this row publishes as a single file.
+      split_part_count - how many files this quantisation arrives in if
+                         downloaded as a split, whether that split is this
+                         row or its alternate edition. None when the
+                         repository publishes no split edition of it.
+
+    ONE ROW PER QUANTISATION. Every file in `files` is graded, but the
+    editions of one quantisation (see _edition_id: the same weights published
+    both whole and split) collapse into a single row, the one
+    _edition_sort_key prefers, with the others hanging off it in
+    alternate_editions. Returning both as sibling rows puts two visually
+    identical lines in front of the user for every quantisation a repository
+    publishes twice, which in Qwen's own repositories is most of them.
 
     `kv` is a kv_for_model()/kv_for_repo() result; when None it is resolved
     from the files themselves. Every verdict goes through verdict_for(), so
@@ -1479,8 +1587,20 @@ def quant_verdicts(files, hw=None, context_tokens=None, kv=None, free_disk=None)
         quant["kv_bytes_per_token"] = kv["kv_bytes_per_token"]
         quant["kv_confidence"] = kv["kv_confidence"]
         quant["projector"] = is_projector(entry)
+        # Set on every entry, including the ones that end up as an alternate
+        # edition, so nothing in a listing has to be read with a .get().
+        quant["alternate_editions"] = []
+        quant["split_part_count"] = quant.get("part_count") if quant.get("multipart") else None
         graded.append(quant)
-    return rank_quants(graded)
+
+    listed = []
+    for group in _edition_groups(graded):
+        surviving, alternates = group[0], group[1:]
+        surviving["alternate_editions"] = alternates
+        split = next((q for q in group if q.get("multipart")), None)
+        surviving["split_part_count"] = split.get("part_count") if split else None
+        listed.append(surviving)
+    return rank_quants(listed)
 
 
 # -- shop listings -------------------------------------------------------------
@@ -1556,9 +1676,17 @@ def _attach_files(entry, files, hw, context_tokens, free_disk):
         "kv_family": kv["kv_family"],
     })
     quants = quant_verdicts(files, hw, context_tokens=context_tokens, kv=kv, free_disk=free_disk)
+    # quant_verdicts() has already collapsed the editions, so best_quant()
+    # here is choosing among the very rows the listing shows, and returns one
+    # of them by identity rather than a lookalike.
     chosen = best_quant(quants)
     for quant in quants:
         quant["recommended"] = chosen is not None and quant is chosen
+        for alternate in quant["alternate_editions"]:
+            # An alternate edition is never the offer: it is the same
+            # quantisation at the same verdict as the row it hangs off, which
+            # is the row that was chosen.
+            alternate["recommended"] = False
     entry["quants"] = quants
     entry["quant_count"] = len(quants)
     entry["quants_loaded"] = True
@@ -1720,9 +1848,14 @@ def search_shop(query="", hw=None, context_tokens=None, limit=DEFAULT_SEARCH_LIM
     last_modified, gated/gated_mode, tags, url, focus, downloadable, the
     resolved params_b/params_source and kv_* fields, and:
 
-      quants        - every quantisation in the repository, each the
-                      hearth_hf file entry plus its own verdict, ordered
-                      best-choice-first. Empty when quants_loaded is False.
+      quants        - every quantisation in the repository, ONE ROW EACH,
+                      each the hearth_hf file entry plus its own verdict,
+                      ordered best-choice-first. Empty when quants_loaded is
+                      False. A quantisation the repository publishes both as
+                      one file and as a split is one row, not two: the other
+                      edition rides on that row as alternate_editions, and
+                      split_part_count says how many pieces the split
+                      arrives in. See quant_verdicts().
       quants_loaded - False for results past detail_limit, which were not
                       fetched. Call repo_quants() to fill one in.
       best_quant    - the quantisation to offer, or None when nothing in the
@@ -2427,6 +2560,11 @@ def _fixture_tree(entries):
     return out
 
 
+# Qwen's own GGUF repository, whose real contents are the fixture further
+# down. A constant because the fixture, the search stub, and the test that
+# reads them all name it.
+_EDITION_REPO_ID = "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF"
+
 # Sizes are the real orders of magnitude for these quantisations of these
 # models. The 7B repo is the calibration case: on a 6GB card at 8192 tokens
 # it spans every verdict tier from great to wont_fit, which is what makes it
@@ -2474,7 +2612,82 @@ _FIXTURE_REPO_FILES = {
     "mystery/Mystery-Model-GGUF": _fixture_tree([
         ("Mystery-Model-Q4_K_M.gguf", 4_683_073_344),
     ]),
+    # The real thing, captured from the live Hub. Every path and every byte
+    # below is what Qwen's own repository actually contains, because the
+    # duplicate-editions bug this pins survived a fixture that had one
+    # hand-written split twin in it: a fixture where every quantisation is
+    # simple except one cannot show that a listing is systematically twice as
+    # long as it should be. Note the SHAPE, which is what makes it a test:
+    #   Q4_0, Q4_K_M, Q5_K_M, Q6_K, Q8_0, FP16 - both editions
+    #   Q2_K, Q3_K_M                           - single file only
+    #   Q5_0                                   - SPLIT ONLY, no single file,
+    #                                            so a rule that just drops
+    #                                            splits would lose it entirely
+    # and that the splits are 2, 3, and 4 parts, so part counts cannot be
+    # assumed.
+    _EDITION_REPO_ID: _fixture_tree([
+        ("qwen2.5-coder-7b-instruct-q2_k.gguf", 3_015_940_032),
+        ("qwen2.5-coder-7b-instruct-q3_k_m.gguf", 3_808_391_104),
+        ("qwen2.5-coder-7b-instruct-q4_0.gguf", 4_431_390_720),
+        ("qwen2.5-coder-7b-instruct-q4_0-00001-of-00002.gguf", 3_983_228_352),
+        ("qwen2.5-coder-7b-instruct-q4_0-00002-of-00002.gguf", 448_162_496),
+        ("qwen2.5-coder-7b-instruct-q4_k_m.gguf", 4_683_073_536),
+        ("qwen2.5-coder-7b-instruct-q4_k_m-00001-of-00002.gguf", 3_993_201_376),
+        ("qwen2.5-coder-7b-instruct-q4_k_m-00002-of-00002.gguf", 689_872_288),
+        ("qwen2.5-coder-7b-instruct-q5_0-00001-of-00002.gguf", 4_001_112_160),
+        ("qwen2.5-coder-7b-instruct-q5_0-00002-of-00002.gguf", 1_314_064_416),
+        ("qwen2.5-coder-7b-instruct-q5_k_m.gguf", 5_444_831_232),
+        ("qwen2.5-coder-7b-instruct-q5_k_m-00001-of-00002.gguf", 3_989_841_792),
+        ("qwen2.5-coder-7b-instruct-q5_k_m-00002-of-00002.gguf", 1_454_989_568),
+        ("qwen2.5-coder-7b-instruct-q6_k.gguf", 6_254_198_784),
+        ("qwen2.5-coder-7b-instruct-q6_k-00001-of-00002.gguf", 3_950_642_496),
+        ("qwen2.5-coder-7b-instruct-q6_k-00002-of-00002.gguf", 2_303_556_416),
+        ("qwen2.5-coder-7b-instruct-q8_0.gguf", 8_098_525_184),
+        ("qwen2.5-coder-7b-instruct-q8_0-00001-of-00003.gguf", 3_980_069_280),
+        ("qwen2.5-coder-7b-instruct-q8_0-00002-of-00003.gguf", 3_942_935_680),
+        ("qwen2.5-coder-7b-instruct-q8_0-00003-of-00003.gguf", 175_520_480),
+        ("qwen2.5-coder-7b-instruct-fp16.gguf", 15_237_853_184),
+        ("qwen2.5-coder-7b-instruct-fp16-00001-of-00004.gguf", 3_951_521_376),
+        ("qwen2.5-coder-7b-instruct-fp16-00002-of-00004.gguf", 3_864_909_312),
+        ("qwen2.5-coder-7b-instruct-fp16-00003-of-00004.gguf", 3_864_894_976),
+        ("qwen2.5-coder-7b-instruct-fp16-00004-of-00004.gguf", 3_556_527_872),
+    ]),
 }
+
+# What the live repository really publishes: quantisation label -> (how many
+# editions of it exist, how many parts the split edition has, or None when
+# there is no split edition). Written out separately from the file list above
+# so the expectation is stated rather than derived from the same data it is
+# checking.
+_EDITION_REPO_SHAPE = {
+    "Q2_K": (1, None),
+    "Q3_K_M": (1, None),
+    "Q4_0": (2, 2),
+    "Q4_K_M": (2, 2),
+    "Q5_0": (1, 2),
+    "Q5_K_M": (2, 2),
+    "Q6_K": (2, 2),
+    "Q8_0": (2, 3),
+    "FP16": (2, 4),
+}
+
+
+def _edition_search_fn(query, limit=DEFAULT_SEARCH_LIMIT, timeout=None):
+    """A one-result search onto _EDITION_REPO_ID, so the same repository can
+    be checked through search_shop() and through repo_quants().
+    """
+    return {
+        "ok": True, "error": None, "error_kind": None, "query": query,
+        "models": [{"repo_id": _EDITION_REPO_ID, "author": "Qwen",
+                    "downloads": 123456, "likes": 300,
+                    "last_modified": "2024-11-12T00:00:00.000Z",
+                    "gated": False, "gated_mode": None, "private": False,
+                    "tags": ["gguf", "code"],
+                    "url": "https://huggingface.co/" + _EDITION_REPO_ID}][:limit],
+        "rate_limit": None,
+        "url": "https://huggingface.co/api/models?search=" + str(query),
+    }
+
 
 _FIXTURE_SEARCH_MODELS = [
     {"repo_id": "bartowski/Qwen2.5-Coder-7B-Instruct-GGUF", "author": "bartowski",
@@ -2711,11 +2924,8 @@ def _self_test_hf(_hw):
     great = [q for q in qwen7["quants"]
              if q["verdict"] and q["verdict"]["verdict"] == VERDICT_GREAT
              and not q["projector"]]
-    single_great = [q for q in great if not q["multipart"]]
-    assert best["size_bytes"] == max(q["size_bytes"] for q in single_great), (
-        "within the winning tier, the largest file wins (a split edition of "
-        "a quantisation the repository also ships whole is a separate rule, "
-        "see best_quant)", best["quant"],
+    assert best["size_bytes"] == max(q["size_bytes"] for q in great), (
+        "within the winning tier, the largest quantisation wins", best["quant"],
     )
     bigger_that_also_runs = [
         q for q in qwen7["quants"]
@@ -2733,17 +2943,24 @@ def _self_test_hf(_hw):
         "when a repository ships the same quantisation as one file and as a "
         "split, the single file is the better download", best["name"],
     )
-    split_twin = next(q for q in qwen7["quants"]
-                      if q["quant"] == "Q4_K_M" and q["multipart"])
+    assert [q["name"] for q in qwen7["quants"] if q["quant"] == "Q4_K_M"] == [best["name"]], (
+        "the two editions of Q4_K_M must be ONE row, not two rows that look "
+        "identical to a user", [q["name"] for q in qwen7["quants"]],
+    )
+    assert len(best["alternate_editions"]) == 1, best["alternate_editions"]
+    split_twin = best["alternate_editions"][0]
+    assert split_twin["multipart"] is True and split_twin["quant"] == "Q4_K_M", split_twin
     assert split_twin["size_bytes"] > best["size_bytes"], (
         "fixture must make the split edition rank first on size, or this "
         "proves nothing", split_twin["size_bytes"], best["size_bytes"],
     )
     assert split_twin["verdict"]["verdict"] == best["verdict"]["verdict"], split_twin
-    assert split_twin in qwen7["quants"], (
-        "the split edition stays in the listing; it is just not the default "
-        "offer, since someone may want it"
-    )
+    assert best["split_part_count"] == split_twin["part_count"] == 2, best
+    assert split_twin["recommended"] is False, split_twin
+    # The split edition is not thrown away: it is still fully graded, and
+    # still carries everything needed to download it, for the user whose
+    # filesystem will not take one enormous file.
+    assert split_twin["disk_ok"] is not None and split_twin["parts"], split_twin
 
     # Preferring the single-file edition must never cost a verdict tier. A
     # repository can ship a split that lands in "great" and a single file of
@@ -2752,20 +2969,141 @@ def _self_test_hf(_hw):
     # convenience.
     def _edition(name, size, multipart):
         return {"name": name, "quant": "Q4_K_M", "size_bytes": size,
-                "multipart": multipart, "complete": True,
+                "multipart": multipart, "complete": True, "part_count": 2 if multipart else 1,
                 "verdict": verdict_for(
                     {"size_bytes": size, "kv_bytes_per_token": 57_344},
                     hw_2060, context_tokens=8192)}
 
-    split_great = _edition("split-edition", 4_600_000_000, True)
-    single_good = _edition("single-edition.gguf", 5_200_000_000, False)
+    # Same stem, so these two really are editions of one another by
+    # _edition_id's rule; only the verdict separates them.
+    split_great = _edition("tier-guard-Q4_K_M", 4_600_000_000, True)
+    single_good = _edition("tier-guard-Q4_K_M.gguf", 5_200_000_000, False)
+    assert _edition_id(split_great) == _edition_id(single_good), (
+        "fixture is wrong: these must be editions of the same quantisation, "
+        "or the rule under test never fires",
+        _edition_id(split_great), _edition_id(single_good),
+    )
     assert split_great["verdict"]["verdict"] == VERDICT_GREAT, split_great["verdict"]
     assert single_good["verdict"]["verdict"] == VERDICT_GOOD, single_good["verdict"]
-    assert best_quant([split_great, single_good])["name"] == "split-edition", (
+    assert best_quant([split_great, single_good])["name"] == "tier-guard-Q4_K_M", (
         "the single-file preference only applies at an equal verdict; it "
         "must never trade a great down to a good",
         best_quant([split_great, single_good])["name"],
     )
+    # ... and the listing must survive with the same edition the offer chose,
+    # not with the other one. This is the coincidence-versus-construction
+    # point: both answers come out of _edition_groups.
+    tier_guard = quant_verdicts(
+        [split_great, single_good], hw_2060, context_tokens=8192,
+        kv={"kv_bytes_per_token": 57_344, "kv_confidence": "published_config"},
+        free_disk=10 ** 15,
+    )
+    assert [q["name"] for q in tier_guard] == ["tier-guard-Q4_K_M"], (
+        "the listing must keep the edition in the better tier, exactly as "
+        "best_quant does", [q["name"] for q in tier_guard],
+    )
+    assert [a["name"] for a in tier_guard[0]["alternate_editions"]] == [
+        "tier-guard-Q4_K_M.gguf"], tier_guard[0]["alternate_editions"]
+
+    # An entry with no name is never folded into another on no evidence.
+    nameless = [{"name": None, "quant": "Q4_K_M", "size_bytes": 1_000_000_000,
+                 "multipart": False, "complete": True},
+                {"name": "", "quant": "Q4_K_M", "size_bytes": 2_000_000_000,
+                 "multipart": False, "complete": True}]
+    assert len(_edition_groups(nameless)) == 2, _edition_groups(nameless)
+
+    # Two genuinely different builds can share one quantisation label, and
+    # they are two real choices rather than one duplicated. This is why
+    # editions are matched on the filename and not on the label.
+    assert hf.parse_quant("foo-Q4_K_M.gguf") == hf.parse_quant("foo-i1-Q4_K_M.gguf") == "Q4_K_M"
+    imatrix = [{"name": "foo-Q4_K_M.gguf", "path": "foo-Q4_K_M.gguf", "quant": "Q4_K_M",
+                "size_bytes": 4_000_000_000, "multipart": False, "complete": True},
+               {"name": "foo-i1-Q4_K_M.gguf", "path": "foo-i1-Q4_K_M.gguf", "quant": "Q4_K_M",
+                "size_bytes": 4_100_000_000, "multipart": False, "complete": True}]
+    assert len(_edition_groups(imatrix)) == 2, _edition_groups(imatrix)
+
+    # -- CRITICAL: one row per quantisation, against the REAL repository -----
+    # Everything above is a fixture with one hand-placed split twin in it, and
+    # a listing can pass all of it while still showing the user every
+    # quantisation twice: a repository where one quant is duplicated and a
+    # repository where nearly all of them are look the same to a test that
+    # only ever asks about one quant. _EDITION_REPO_ID is Qwen's own
+    # repository, file for file and byte for byte off the live Hub, where six
+    # quantisations ship in two editions, two ship as a single file only, and
+    # one ships ONLY as a split.
+    raw_files = _fixture_list_fn(_EDITION_REPO_ID)["files"]
+    assert len(raw_files) == sum(count for count, _ in _EDITION_REPO_SHAPE.values()) == 15, (
+        "fixture is wrong: the repository must really publish more files than "
+        "it has quantisations, or the collapse below is untested", len(raw_files),
+    )
+
+    detailed = repo_quants(_EDITION_REPO_ID, hw=hw_5080, context_tokens=8192,
+                           list_fn=_fixture_list_fn)
+    assert detailed["ok"] is True, detailed
+    rows = detailed["model"]["quants"]
+    labels = [q["quant"] for q in rows]
+    assert len(labels) == len(set(labels)), (
+        "every quantisation must appear EXACTLY ONCE in the listing; two rows "
+        "for one quantisation differ only in how the download arrives and "
+        "read to a user as a bug", labels,
+    )
+    assert sorted(labels) == sorted(_EDITION_REPO_SHAPE), labels
+    assert detailed["model"]["quant_count"] == len(rows) == 9, detailed["model"]["quant_count"]
+
+    by_quant = {q["quant"]: q for q in rows}
+    for label, (editions, split_parts) in sorted(_EDITION_REPO_SHAPE.items()):
+        row = by_quant[label]
+        assert len(row["alternate_editions"]) == editions - 1, (label, row)
+        assert row["split_part_count"] == split_parts, (label, row["split_part_count"])
+        if editions == 1:
+            continue
+        assert row["multipart"] is False, (
+            "where a repository publishes a quantisation both whole and "
+            "split, the surviving row is the single file", label, row["name"],
+        )
+        alternate = row["alternate_editions"][0]
+        assert alternate["multipart"] is True and alternate["quant"] == label, (label, alternate)
+        assert alternate["verdict"]["verdict"] == row["verdict"]["verdict"], (
+            "the two editions of one quantisation are the same weights and "
+            "must land in the same tier; if they do not, collapsing them is "
+            "hiding a different answer rather than a duplicate", label,
+        )
+
+    # A rule that simply dropped split entries would lose Q5_0 entirely: this
+    # repository publishes it in no other form.
+    q5_0 = by_quant["Q5_0"]
+    assert q5_0["multipart"] is True and q5_0["part_count"] == 2, q5_0
+    assert q5_0["alternate_editions"] == [], q5_0
+
+    # Nothing is silently discarded: every logical file the Hub reported is
+    # still reachable, as a row or as that row's alternate edition.
+    reachable = {q["name"] for q in rows}
+    reachable |= {a["name"] for q in rows for a in q["alternate_editions"]}
+    assert reachable == {f["name"] for f in raw_files}, (
+        sorted(reachable ^ {f["name"] for f in raw_files}),
+    )
+
+    # The offer is one of the rows on screen, by identity, not a lookalike.
+    offer = detailed["model"]["best_quant"]
+    assert any(q is offer for q in rows), (offer or {}).get("name")
+    assert offer["quant"] == "Q8_0" and offer["multipart"] is False, offer["name"]
+    assert sum(1 for q in rows if q["recommended"]) == 1, rows
+
+    # search_shop() builds its entries down the same path, so it must produce
+    # the same rows. A fix that reached only one of the two would leave a UI
+    # showing duplicates on the search screen and not on the detail screen.
+    searched = search_shop("qwen coder", hw=hw_5080, context_tokens=8192, detail_limit=1,
+                           search_fn=_edition_search_fn, list_fn=_fixture_list_fn)
+    assert searched["ok"] is True, searched
+    shape = [(q["name"], q["quant"], q["split_part_count"],
+              [a["name"] for a in q["alternate_editions"]]) for q in rows]
+    assert [(q["name"], q["quant"], q["split_part_count"],
+             [a["name"] for a in q["alternate_editions"]])
+            for q in searched["models"][0]["quants"]] == shape, (
+        "search_shop() and repo_quants() must agree on the listing",
+        searched["models"][0]["quants"],
+    )
+    assert searched["models"][0]["best_quant"]["name"] == offer["name"], searched["models"][0]
 
     # rank_quants() and best_quant() are public and must do their own
     # ordering: the Hub returns files in its own order, and a caller can hand
@@ -3152,6 +3490,25 @@ def _live_check():
             entry["repo_id"], entry["params_b"], entry["kv_bytes_per_token"],
             entry["kv_source"], outcome,
         ))
+    # One repository's full listing, quantisation by quantisation. This is
+    # where duplicate editions would show up, and a per-repository summary
+    # line cannot show them, so print the rows themselves.
+    detailed = next((e for e in listing["models"] if e["quants_loaded"] and e["quants"]), None)
+    if detailed:
+        print("quantisations of {}:".format(detailed["repo_id"]))
+        for quant in detailed["quants"]:
+            alternates = ", ".join(
+                "{} ({} parts)".format(a["name"], a["part_count"])
+                for a in quant["alternate_editions"]
+            )
+            print("  {:<8} {:>9} {:<16} {:<7} split_parts={} {}{}".format(
+                quant["quant"] or "-", _gb(quant["size_bytes"]),
+                quant["verdict"]["verdict"] if quant["verdict"] else "ungraded",
+                "split" if quant["multipart"] else "single",
+                quant["split_part_count"],
+                "<- offered " if quant.get("recommended") else "",
+                ("also as " + alternates) if alternates else "",
+            ))
     for pick in recommend(listing=listing):
         print("{}: {}".format(pick["recommended_role"], pick["reasoning"]))
     return 0 if listing["ok"] else 1
