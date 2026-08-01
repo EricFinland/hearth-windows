@@ -170,9 +170,77 @@ calling the right functions in the right order:
      submitted a prompt has said what they want, and refusing because the
      mouse moved would be exactly backwards.
 
+  7. Assistant text reaches the UI while the model is still writing it,
+     and at a bounded event rate. This used to be a lie in two places at
+     once: hearth_loop.chat posted with "stream": False, this module
+     emitted exactly ONE "delta" event carrying the entire finished
+     message, and the UI then dribbled that already-arrived block onto the
+     screen over about three quarters of a second so it would look like
+     streaming. Nothing arrived early; a user watching a long local
+     generation waited in silence and then got everything at once.
+
+     hearth_loop.chat now takes an optional on_token callback (an added
+     keyword argument with a default -- its 3-tuple return and every
+     existing call site are untouched, which its own arity guard enforces)
+     and hearth_backend normalises both engines' wire formats down to one
+     token stream. _DeltaStream below is this module's sink for that
+     stream.
+
+     WHY IT COALESCES, RATHER THAN EMITTING ONE EVENT PER TOKEN. The
+     session's event log is not a pipe, it is a bounded ring:
+     session.Session._events is a collections.deque(maxlen=EVENTS_CAP),
+     EVENTS_CAP is 500, and it is the ONLY thing a reconnecting client can
+     be resumed from -- events_after() serves ?since=/Last-Event-ID out of
+     it, and a bookmark that has fallen out of the retained window gets a
+     synthetic "events_dropped" marker instead of its history. One event
+     per token spends that entire budget on a single reply: a 600-token
+     answer evicts the whole session's tool cards, approvals and
+     checkpoints, and every client that reconnects during it is told it
+     missed something. Worse, events_after() rescans the ring on every
+     wakeup while holding the session lock, so a per-token event rate
+     makes a reader O(events^2) and puts that cost on the lock a live turn
+     is emitting into.
+
+     So text is accumulated and flushed on a short window: whenever
+     DELTA_FLUSH_SECONDS (0.1s) have passed since the last flush, or the
+     buffer reaches DELTA_FLUSH_CHARS. 0.1s is the standard threshold below
+     which a change reads as instantaneous rather than as a step, so this
+     is not perceptibly different from per-token while bounding the event
+     rate at ten a second. Measured on a real turn (qwen2.5-coder through
+     Ollama, 3468 characters generated over 43.3 seconds): 313 delta
+     events, mean gap 0.139s, versus roughly 900 tokens had each become its
+     own. So the 500-entry ring holds about a minute of continuous
+     generation, where per-token it would hold about twenty seconds. The
+     char cap is a burst valve, not the usual path -- the same measurement
+     averaged 11 characters per delta, two orders of magnitude under it --
+     and it exists so that a fast remote model, or a stall followed by a
+     dump, cannot put an unbounded string into one event.
+
+     Each delta carries stream_id and index alongside its text. stream_id
+     names which assistant message the fragment belongs to (a turn has one
+     per chat attempt, since a tool-using turn interleaves several), and
+     index is the character offset of the fragment within that message.
+     Together they make the UI's rendering idempotent: on a reconnect that
+     replays overlapping deltas, the client can drop what it already has
+     instead of duplicating it, and can see a gap instead of silently
+     concatenating across one. That is a property the old single-delta
+     design never had to think about, because there was only ever one.
+
+     The stream LATCHES on any terminal path (cancel, error, done) before
+     that terminal event is emitted, under the same lock the sink emits
+     under. Without that, a cancellation could interleave: the turn thread
+     emits "cancelled" while the abandoned worker thread is still inside a
+     flush, and a stray delta lands after the terminal event and opens a
+     new bubble in the UI containing text from a turn that is already over.
+     Latching also means cancellation genuinely stops generation rather
+     than draining it -- the sink raises hearth_backend.StopStream, which
+     hangs up on the engine, which is the only thing either llama-server or
+     Ollama treats as "stop".
+
 Standard library only.
 """
 
+import inspect
 import json
 import os
 import sys
@@ -187,6 +255,7 @@ _AGENT_DIR = os.path.join(_REPO_ROOT, "agent")
 if _AGENT_DIR not in sys.path:
     sys.path.insert(0, _AGENT_DIR)
 
+import hearth_backend  # noqa: E402
 import hearth_checkpoint  # noqa: E402
 import hearth_hw  # noqa: E402
 import hearth_idle  # noqa: E402
@@ -213,6 +282,21 @@ MAX_MESSAGES = 200
 
 _DONE = "done"
 _CANCELLED = "cancelled"
+
+# Delta coalescing -- see the module docstring's point 7 for why this is a
+# window and not one event per token, and why these two numbers.
+#
+# 0.1s is the perceptual threshold below which a change reads as
+# instantaneous, so flushing on it is indistinguishable from per-token to
+# the person watching, while capping the event rate at ten a second against
+# a 500-entry ring that is also the only replay buffer a reconnecting client
+# has.
+DELTA_FLUSH_SECONDS = 0.1
+# A burst valve, not the usual path: at ten flushes a second a model would
+# have to sustain over 5000 characters a second to reach this. It bounds the
+# size of any single delta event when generation arrives in a lump (a stall
+# then a dump, or a fast remote model) rather than at a steady rate.
+DELTA_FLUSH_CHARS = 512
 
 # Severity band, from hearth_injection.SEVERITY, at or above which a tool
 # result's prompt-injection scan is worth surfacing on the very next gated
@@ -373,6 +457,177 @@ def _run_cancellable(fn, is_cancelled, poll_interval=POLL_INTERVAL, session=None
     return _DONE, box.get("value")
 
 
+def _accepts_on_token(fn):
+    """True when `fn` can be called with an on_token= keyword argument.
+
+    Used once per engine to decide how to call an injected chat_fn. A
+    signature inspection rather than a call-and-catch, because a TypeError
+    raised from inside a test double would otherwise be misread as "this
+    double does not stream" and the double would be run a second time.
+    Anything whose signature cannot be read at all (a builtin, a C
+    callable) is treated as not streaming, which is the safe direction:
+    the reply still renders, just in one delta rather than many.
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == "on_token" and param.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY):
+            return True
+    return False
+
+
+class _DeltaStream:
+    """The engine's sink for hearth_loop.chat's token callback.
+
+    Accumulates fragments and emits them as "delta" events on a short time
+    window rather than one per token, latches shut on any terminal path, and
+    raises hearth_backend.StopStream the moment the turn is cancelled so the
+    engine hangs up instead of draining a generation nobody is watching. See
+    the module docstring's point 7 for the reasoning behind every one of
+    those three behaviours.
+
+    Called from the chat worker thread (see _run_cancellable), while the
+    turn thread is polling cancellation and may emit a terminal event at any
+    moment. `_lock` is what makes "check the latch, then emit" and "set the
+    latch" mutually exclusive, so a delta can never land after the terminal
+    event that closed the stream.
+
+    `clock` is injectable so the self-test can drive the flush window
+    deterministically instead of sleeping through it.
+    """
+
+    def __init__(self, emit, is_cancelled, flush_seconds=DELTA_FLUSH_SECONDS,
+                 flush_chars=DELTA_FLUSH_CHARS, clock=time.monotonic):
+        self._emit = emit
+        self._is_cancelled = is_cancelled
+        self._flush_seconds = flush_seconds
+        self._flush_chars = flush_chars
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._buffer = []
+        self._buffered = 0
+        self._last_flush = clock()
+        self._latched = False
+        # Identity of the assistant message currently being streamed, and how
+        # many characters of it have already been emitted. Both ride on every
+        # delta so the UI can render a replayed stream idempotently.
+        self._stream_id = 0
+        self._sent = 0
+        self.events = 0  # delta events emitted, for the self-test and for callers
+
+    # -- lifecycle --------------------------------------------------------
+
+    def open(self, stream_id):
+        """Begin a new assistant message. One per chat attempt: a tool-using
+        turn produces several, and they must not share an index space or the
+        UI would read the second one's offsets as a replay of the first."""
+        with self._lock:
+            self._stream_id = stream_id
+            self._sent = 0
+            self._buffer = []
+            self._buffered = 0
+            self._last_flush = self._clock()
+
+    def latch(self):
+        """Close the stream permanently. Called on every terminal path
+        BEFORE the terminal event is emitted, so an abandoned worker thread
+        still inside a flush cannot slip a delta in behind it."""
+        with self._lock:
+            self._latched = True
+            self._buffer = []
+            self._buffered = 0
+
+    @property
+    def sent(self):
+        with self._lock:
+            return self._sent
+
+    # -- the token callback -----------------------------------------------
+
+    def __call__(self, piece):
+        """hearth_loop.chat's on_token. Raises StopStream once cancelled.
+
+        The cancellation check happens before anything is buffered or
+        emitted, so a cancelled turn's last observed token is never rendered
+        after its "cancelled" event, and the raise unwinds the HTTP read
+        immediately rather than at the end of the generation.
+        """
+        if self._is_cancelled():
+            raise hearth_backend.StopStream
+        with self._lock:
+            if self._latched:
+                raise hearth_backend.StopStream
+            self._buffer.append(piece)
+            self._buffered += len(piece)
+            now = self._clock()
+            due = (self._buffered >= self._flush_chars
+                   or now - self._last_flush >= self._flush_seconds)
+            if not due:
+                return
+            self._flush_locked(now)
+
+    # -- flushing ---------------------------------------------------------
+
+    def _flush_locked(self, now=None):
+        if self._latched or not self._buffered:
+            return
+        text = "".join(self._buffer)
+        self._buffer = []
+        self._buffered = 0
+        self._last_flush = self._clock() if now is None else now
+        index = self._sent
+        self._sent += len(text)
+        self.events += 1
+        self._emit("delta", {"text": text, "stream_id": self._stream_id,
+                             "index": index})
+
+    def flush(self):
+        """Emit whatever is buffered right now. Called once the chat call has
+        returned, so the tail of a message is not held back waiting for a
+        window that will never close."""
+        with self._lock:
+            self._flush_locked()
+
+    def close_message(self, content):
+        """Finish the current assistant message against the authoritative
+        `content` the backend returned, and report how much of it the UI has
+        now been told about.
+
+        This is what lets one code path serve both a streaming and a
+        non-streaming chat call. A non-streaming one never called the sink
+        at all, so nothing was sent and the whole content is emitted here as
+        a single delta -- byte for byte what this module did before
+        streaming existed. A streaming one has already emitted all of it, so
+        only the tail (usually nothing) is left.
+
+        The tail is taken by LENGTH, not by matching text: the streamed
+        characters are deliberately not kept (a second copy of every
+        assistant message, held for the life of a turn, is exactly the kind
+        of growth this file bounds elsewhere), and `self._sent` is the only
+        thing that needs to be. That is correct whenever the stream and the
+        final content agree, which is the only case in which a tail exists
+        at all -- and when they somehow do not, the streamed text wins and
+        nothing further is emitted, because the user has already read those
+        characters and re-emitting the whole content would duplicate the
+        message on screen to fix a discrepancy invisible to them.
+        """
+        self.flush()
+        content = content or ""
+        with self._lock:
+            if self._latched or self._sent >= len(content):
+                return
+            tail = content[self._sent:]
+            self._buffer = [tail]
+            self._buffered = len(tail)
+            self._flush_locked()
+
+
 def list_installed_models(ollama_url=None, timeout=3):
     """Models Ollama already has pulled locally, via GET /api/tags. Returns []
     on any failure whatsoever (Ollama not running, unreachable, malformed
@@ -525,6 +780,15 @@ class RealEngine:
                  setup_ready_fn=None, setup_diagnose_fn=None):
         self.ollama_url = ollama_url or hearth_loop.DEFAULT_OLLAMA
         self._chat_fn = chat_fn
+        # Whether an injected chat_fn can stream. The real hearth_loop.chat
+        # always can; a test double is written to whatever shape its test
+        # needs, and the vast majority of them take only `messages`. Asked
+        # once here rather than guessed at per call, and by inspecting the
+        # signature rather than by calling and catching TypeError -- a
+        # TypeError raised INSIDE a double would otherwise be silently
+        # reinterpreted as "this one does not stream" and the call retried,
+        # running the double twice.
+        self._chat_fn_streams = _accepts_on_token(chat_fn) if chat_fn is not None else True
         self._execute_tool_fn = execute_tool_fn or hearth_tools.execute_tool
         self._checkpoint_fn = checkpoint_fn or hearth_checkpoint.checkpoint
         # Setup-readiness gate (module docstring's point 6). Real
@@ -569,6 +833,11 @@ class RealEngine:
         self._current_model = None  # the concrete model actually in use right now, for stickiness
         self._last_emitted_model = None  # dedupes "model_selected" so it fires only on an actual change
         self._turn_count = 0  # classify()'s turn_index signal; incremented once per run() call
+        # Names each streamed assistant message. Engine-wide and monotonic
+        # (not per-turn), so a client that reconnects across a turn boundary
+        # can still tell two messages apart by stream_id alone -- see the
+        # module docstring's point 7.
+        self._stream_seq = 0
         # Escalation signals recorded since the last _resolve_model() call,
         # consumed exactly once by the very next one -- see
         # _mark_malformed_tool_call/_mark_turn_failed and the module
@@ -629,11 +898,22 @@ class RealEngine:
         by the restore path and is dropped rather than loaded."""
         return _system_prompt(mode)
 
-    def _chat(self, ctx, messages, model):
+    def _chat(self, ctx, messages, model, on_token=None):
+        """One chat attempt, streaming into `on_token` when there is one.
+
+        The injected-chat_fn branch only passes on_token to a double that
+        declares it (see self._chat_fn_streams): a double that does not is
+        simply a non-streaming model call, and close_message() below already
+        renders that identically to how this module rendered every reply
+        before streaming existed.
+        """
         if self._chat_fn is not None:
+            if on_token is not None and self._chat_fn_streams:
+                return self._chat_fn(messages, on_token=on_token)
             return self._chat_fn(messages)
         tools = hearth_tools.ollama_tool_specs(hearth_tools.WINDOWS_TOOLS)
-        return hearth_loop.chat(self.ollama_url, model, messages, tools)
+        return hearth_loop.chat(self.ollama_url, model, messages, tools,
+                                on_token=on_token)
 
     def _hw(self):
         """Real local hardware, probed at most once per engine instance and
@@ -816,13 +1096,23 @@ class RealEngine:
         self._turn_starts.append(len(self._messages) - 1)
         self._trim_messages()
 
+        # One sink for the whole turn (a turn opens a fresh message on it per
+        # chat attempt), and one helper that latches it before any terminal
+        # event so a still-running worker thread cannot emit a delta behind
+        # that event -- see the module docstring's point 7.
+        stream = _DeltaStream(ctx.emit, ctx.cancelled)
+
+        def _terminal(kind, data):
+            stream.latch()
+            ctx.emit(kind, data)
+
         try:
             tokens_in = 0
             tokens_out = 0
 
             for _ in range(self.max_iters):
                 if ctx.cancelled():
-                    ctx.emit("cancelled", {"tokens_in": tokens_in, "tokens_out": tokens_out})
+                    _terminal("cancelled", {"tokens_in": tokens_in, "tokens_out": tokens_out})
                     return
 
                 turn_model, routing_decision = self._resolve_model(ctx)
@@ -843,11 +1133,49 @@ class RealEngine:
                         "hardware_limited": routing_decision.get("hardware_limited"),
                     })
 
-                status, result = _run_cancellable(
-                    lambda msgs=list(self._messages), m=turn_model: self._chat(ctx, msgs, m),
-                    ctx.cancelled, self.poll_interval, session=ctx.session)
-                if status == _CANCELLED:
-                    ctx.emit("cancelled", {"tokens_in": tokens_in, "tokens_out": tokens_out})
+                # A fresh assistant message on the sink for this attempt.
+                # The id is engine-wide and monotonic rather than per-turn,
+                # so a client that reconnects across a turn boundary can
+                # still tell two messages apart by it alone.
+                self._stream_seq += 1
+                stream.open(self._stream_seq)
+
+                try:
+                    status, result = _run_cancellable(
+                        lambda msgs=list(self._messages), m=turn_model: self._chat(
+                            ctx, msgs, m, on_token=stream),
+                        ctx.cancelled, self.poll_interval, session=ctx.session)
+                except hearth_backend.StopStream:
+                    # The sink raised StopStream (this turn was cancelled, or
+                    # the stream was already latched) and the chat call let it
+                    # escape instead of absorbing it. Both hearth_backend
+                    # backends do absorb it and return the partial reply, so
+                    # in production this is the losing side of a race:
+                    # _run_cancellable normally observes the cancellation flag
+                    # first and reports _CANCELLED, but if the worker's raise
+                    # gets there first the exception is what surfaces. It
+                    # means exactly the same thing either way, and letting it
+                    # through would turn a cancelled turn into a failed one --
+                    # an "error" event, and a spurious escalation signal for
+                    # the router.
+                    status, result = _CANCELLED, None
+                # ctx.cancelled() is re-read here, and that second read is not
+                # belt and braces -- it closes a race that streaming created.
+                # _run_cancellable's loop tests `finished` BEFORE it tests
+                # cancellation, so a chat call that returns in the window
+                # between the cancel flag being set and the next poll tick
+                # comes back as _DONE even though the turn was cancelled.
+                # That window used to be unreachable: an unstreamed chat call
+                # had no reason to return early, so cancellation always won by
+                # a whole generation. Now the sink raises StopStream the
+                # instant the flag is set, the backend absorbs it and returns
+                # the partial reply within microseconds, and _DONE is the
+                # likely outcome rather than the impossible one. Left
+                # unhandled, a cancelled turn ends with a "done" event
+                # carrying a truncated message -- measured happening on a real
+                # Ollama turn before this line existed.
+                if status == _CANCELLED or ctx.cancelled():
+                    _terminal("cancelled", {"tokens_in": tokens_in, "tokens_out": tokens_out})
                     return
 
                 msg, tin, tout = result
@@ -856,8 +1184,11 @@ class RealEngine:
                 self._messages.append(msg)
 
                 content = msg.get("content") or ""
-                if content:
-                    ctx.emit("delta", {"text": content})
+                # Emits nothing when the whole message already streamed, and
+                # emits it whole when nothing did -- see close_message. Either
+                # way this happens before any tool_call event below, so the
+                # transcript's text-then-tool ordering is unchanged.
+                stream.close_message(content)
 
                 calls = msg.get("tool_calls") or []
                 if not calls:
@@ -865,12 +1196,13 @@ class RealEngine:
                     if parsed:
                         calls = [{"function": c} for c in parsed]
                     else:
-                        ctx.emit("done", {"tokens_in": tokens_in, "tokens_out": tokens_out, "final": content})
+                        _terminal("done", {"tokens_in": tokens_in, "tokens_out": tokens_out,
+                                           "final": content})
                         return
 
                 for call in calls:
                     if ctx.cancelled():
-                        ctx.emit("cancelled", {"tokens_in": tokens_in, "tokens_out": tokens_out})
+                        _terminal("cancelled", {"tokens_in": tokens_in, "tokens_out": tokens_out})
                         return
 
                     fn = call.get("function") or {}
@@ -968,7 +1300,8 @@ class RealEngine:
                             ctx.emit("tool_result", {"tool": name, "denied": True, "output": result_text})
                             self._messages.append({"role": "tool", "content": result_text})
                             if cancelled_now:
-                                ctx.emit("cancelled", {"tokens_in": tokens_in, "tokens_out": tokens_out})
+                                _terminal("cancelled", {"tokens_in": tokens_in,
+                                                        "tokens_out": tokens_out})
                                 return
                             continue
 
@@ -1007,7 +1340,7 @@ class RealEngine:
                         lambda nm=name, ar=cargs: self._execute_tool_fn(nm, ar, ctx.workspace),
                         ctx.cancelled, self.poll_interval, session=ctx.session)
                     if status == _CANCELLED:
-                        ctx.emit("cancelled", {"tokens_in": tokens_in, "tokens_out": tokens_out})
+                        _terminal("cancelled", {"tokens_in": tokens_in, "tokens_out": tokens_out})
                         return
                     output = result if isinstance(result, str) else str(result)
                     # Scan the tool result exactly once, here, before it is
@@ -1020,7 +1353,7 @@ class RealEngine:
                     ctx.emit("tool_result", {"tool": name, "output": truncated})
                     self._messages.append({"role": "tool", "content": truncated})
 
-            ctx.emit("error", {"message": "hit iteration cap ({})".format(self.max_iters)})
+            _terminal("error", {"message": "hit iteration cap ({})".format(self.max_iters)})
             self._mark_turn_failed()
         except Exception:
             # A failed turn is hearth_router's other escalation trigger,
@@ -1031,6 +1364,11 @@ class RealEngine:
             # and returns the turn to idle), only add a side-channel note
             # for the next _resolve_model() call.
             self._mark_turn_failed()
+            # session.py's own `except Exception` emits the "error" event for
+            # this and returns the turn to idle. Latching here is what stops
+            # a chat worker that is still streaming from emitting deltas into
+            # a turn that has already failed.
+            stream.latch()
             raise
         finally:
             # Enforce the cap at the end of the turn too (not only at the
@@ -2256,6 +2594,275 @@ def _self_test():
     kindsQ2 = [e["kind"] for e in _all_events(sessQ2)]
     assert "secrets_finding" not in kindsQ2, kindsQ2
     assert "approval_request" not in kindsQ2, kindsQ2
+
+    # === R: token streaming =============================================
+    # === (module docstring's point 7) ===================================
+
+    # --- R1: the coalescer, driven directly on a fake clock -------------
+    #
+    # A fake clock rather than sleeps, so this asserts the WINDOW rather
+    # than asserting that a machine was fast enough today.
+    clockR = {"t": 1000.0}
+    emittedR = []
+    streamR = _DeltaStream(lambda kind, data: emittedR.append((kind, data)),
+                           lambda: False, flush_seconds=0.1, flush_chars=512,
+                           clock=lambda: clockR["t"])
+    streamR.open(1)
+    # Four tokens inside one window coalesce into a single event...
+    for piece in ("Hel", "lo ", "the", "re"):
+        clockR["t"] += 0.02
+        streamR(piece)
+    assert emittedR == [], ("tokens inside one window must not each become an "
+                            "event", emittedR)
+    # ...and the fifth, which crosses it, flushes all five together.
+    clockR["t"] += 0.05
+    streamR("!")
+    assert len(emittedR) == 1, emittedR
+    assert emittedR[0][0] == "delta", emittedR[0]
+    assert emittedR[0][1] == {"text": "Hello there!", "stream_id": 1, "index": 0}, emittedR[0]
+    # The next window starts a new event, and its index continues where the
+    # previous one ended -- that offset is what makes a replayed stream
+    # renderable without duplicating or losing text.
+    clockR["t"] += 0.2
+    streamR(" More.")
+    assert emittedR[-1][1] == {"text": " More.", "stream_id": 1, "index": 12}, emittedR[-1]
+    # The char cap is the burst valve: a single huge token flushes at once
+    # even though no time has passed.
+    clockR["t"] += 0.001
+    streamR("x" * 600)
+    assert emittedR[-1][1]["text"] == "x" * 600, len(emittedR[-1][1]["text"])
+    # A tail left inside an open window is not stranded there.
+    clockR["t"] += 0.001
+    streamR("tail")
+    n_before = len(emittedR)
+    streamR.flush()
+    assert len(emittedR) == n_before + 1 and emittedR[-1][1]["text"] == "tail", emittedR[-1]
+    # Latching is permanent and silent: nothing buffered survives it, and
+    # further tokens raise rather than emitting.
+    streamR("buffered but doomed")
+    streamR.latch()
+    n_latched = len(emittedR)
+    streamR.flush()
+    assert len(emittedR) == n_latched, ("latch must discard the buffer", emittedR[-1])
+    try:
+        streamR("after the end")
+        raise AssertionError("a latched stream must refuse further tokens")
+    except hearth_backend.StopStream:
+        pass
+
+    # A cancelled turn's sink raises immediately, before buffering anything,
+    # so no token observed after cancellation can ever be rendered.
+    cancelledR = {"v": False}
+    emitted2R = []
+    stream2R = _DeltaStream(lambda kind, data: emitted2R.append((kind, data)),
+                            lambda: cancelledR["v"], clock=lambda: clockR["t"])
+    stream2R.open(9)
+    cancelledR["v"] = True
+    try:
+        stream2R("nope")
+        raise AssertionError("a cancelled stream must raise StopStream")
+    except hearth_backend.StopStream:
+        pass
+    assert emitted2R == [], emitted2R
+
+    # close_message with nothing streamed emits the whole content as one
+    # delta: exactly what this module did before streaming existed, which is
+    # what keeps a non-streaming chat_fn working unchanged.
+    emitted3R = []
+    stream3R = _DeltaStream(lambda kind, data: emitted3R.append((kind, data)),
+                            lambda: False, clock=lambda: clockR["t"])
+    stream3R.open(3)
+    stream3R.close_message("the whole message at once")
+    assert len(emitted3R) == 1 and emitted3R[0][1]["text"] == "the whole message at once"
+    assert emitted3R[0][1]["index"] == 0, emitted3R[0]
+    # And with everything already streamed, it emits nothing more.
+    clockR["t"] += 1
+    stream3R.open(4)
+    stream3R("abc")
+    stream3R.flush()
+    n3 = len(emitted3R)
+    stream3R.close_message("abc")
+    assert len(emitted3R) == n3, ("close_message must not re-emit streamed text",
+                                  emitted3R[n3:])
+    # A tail the stream never saw is emitted, once, by length.
+    stream3R.close_message("abcdef")
+    assert emitted3R[-1][1] == {"text": "def", "stream_id": 4, "index": 3}, emitted3R[-1]
+
+    # --- R2: a streaming chat_fn, end to end through a real Session -----
+    def streaming_chat(messages, on_token=None):
+        # on_token is guarded rather than assumed, so that removing the
+        # streaming wiring in _chat() fails on the DELTA COUNT below (the
+        # property this section is about) instead of dying earlier with a
+        # TypeError -- a kill either way, but only one of them names the
+        # thing that broke.
+        for piece in ("Stream", "ing ", "really ", "works."):
+            if on_token is not None:
+                on_token(piece)
+            time.sleep(0.06)  # two flush windows' worth across four tokens
+        return ({"role": "assistant", "content": "Streaming really works.",
+                 "tool_calls": []}, 3, 9)
+
+    engineR = RealEngine(chat_fn=streaming_chat, execute_tool_fn=fake_execute_tool,
+                         checkpoint_fn=fake_checkpoint)
+    assert engineR._chat_fn_streams is True, "a chat_fn declaring on_token must be streamed to"
+    sessR = session_mod.Session(ws, "fake-model", "bypass", engine=engineR)
+    sessR.submit_prompt("stream me something")
+    _wait_for_kind(sessR, "done")
+    _wait_idle(sessR)
+    deltasR = [e for e in _all_events(sessR) if e["kind"] == "delta"]
+    # More than one delta: the whole point. Fewer than one per token,
+    # because they coalesce. Both halves matter -- one delta means the old
+    # fake streaming is back, four means the coalescing stopped working.
+    assert len(deltasR) > 1, ("the reply arrived as a single delta; that is the "
+                              "fake streaming this section exists to prevent",
+                              deltasR)
+    assert len(deltasR) < 4, ("one event per token defeats the coalescing "
+                              "window", [d["data"] for d in deltasR])
+    # Reassembling the deltas by their own index reproduces the message
+    # exactly, with no overlap and no gap.
+    joinedR = ""
+    for d in deltasR:
+        assert d["data"]["index"] == len(joinedR), (
+            "delta indices must tile the message exactly", d["data"], len(joinedR))
+        assert d["data"]["stream_id"] == deltasR[0]["data"]["stream_id"], d["data"]
+        joinedR += d["data"]["text"]
+    assert joinedR == "Streaming really works.", joinedR
+    # And the deltas were spread across the generation rather than arriving
+    # together at the end: the last one lands well after the first.
+    spanR = deltasR[-1]["ts"] - deltasR[0]["ts"]
+    assert spanR > 0.05, ("deltas arrived together, not as the model produced "
+                          "them", spanR)
+
+    # --- R3: a non-streaming chat_fn still works, unchanged -------------
+    engineR2 = RealEngine(chat_fn=fake_chat, execute_tool_fn=fake_execute_tool,
+                          checkpoint_fn=fake_checkpoint)
+    assert engineR2._chat_fn_streams is False, \
+        "a chat_fn that takes only `messages` must not be handed on_token"
+
+    # --- R4: a tool call interrupts the text, and the next message gets --
+    # --- its own stream_id, restarting the index space ------------------
+    def two_message_chat(messages, on_token=None):
+        # First attempt: some prose, then a tool call. Second: prose only.
+        if any(m.get("role") == "tool" for m in messages):
+            for piece in ("Read ", "it."):
+                if on_token is not None:
+                    on_token(piece)
+            return ({"role": "assistant", "content": "Read it.", "tool_calls": []}, 1, 2)
+        for piece in ("Let me ", "look."):
+            if on_token is not None:
+                on_token(piece)
+        return ({"role": "assistant", "content": "Let me look.", "tool_calls": [
+            {"function": {"name": "list_tree", "arguments": {}}}]}, 1, 2)
+
+    engineR3 = RealEngine(chat_fn=two_message_chat, execute_tool_fn=fake_execute_tool,
+                          checkpoint_fn=fake_checkpoint)
+    sessR3 = session_mod.Session(ws, "fake-model", "bypass", engine=engineR3)
+    sessR3.submit_prompt("look at the tree")
+    _wait_for_kind(sessR3, "done")
+    _wait_idle(sessR3)
+    orderedR3 = [e for e in _all_events(sessR3)
+                 if e["kind"] in ("delta", "tool_call", "tool_result")]
+    kindsR3 = [e["kind"] for e in orderedR3]
+    # Every delta of the first message precedes the tool_call, and every
+    # delta of the second follows the tool_result. A flush that leaked past
+    # the tool boundary would show up here as an out-of-order kind.
+    assert kindsR3.index("tool_call") > 0, kindsR3
+    assert kindsR3[-1] == "delta", kindsR3
+    ids_before = {e["data"]["stream_id"] for e in orderedR3[:kindsR3.index("tool_call")]}
+    ids_after = {e["data"]["stream_id"] for e in orderedR3[kindsR3.index("tool_result") + 1:]}
+    assert len(ids_before) == 1 and len(ids_after) == 1, (ids_before, ids_after)
+    assert ids_before != ids_after, (
+        "a message after a tool call must be its own stream, or the UI would "
+        "read its offsets as a replay of the previous one", ids_before, ids_after)
+    assert orderedR3[kindsR3.index("tool_result") + 1]["data"]["index"] == 0, \
+        "a new stream restarts the index space at 0"
+
+    # --- R5: cancelling mid-stream stops it, and no delta lands after ---
+    # --- the "cancelled" event ------------------------------------------
+    stopped_atR = {"n": 0}
+
+    def endless_stream_chat(messages, on_token=None):
+        for i in range(10000):
+            on_token("tok{} ".format(i))
+            stopped_atR["n"] = i + 1
+            time.sleep(0.005)
+        return ({"role": "assistant", "content": "never", "tool_calls": []}, 1, 1)
+
+    engineR4 = RealEngine(chat_fn=endless_stream_chat, execute_tool_fn=fake_execute_tool,
+                          checkpoint_fn=fake_checkpoint)
+    sessR4 = session_mod.Session(ws, "fake-model", "bypass", engine=engineR4)
+    sessR4.submit_prompt("go forever")
+    _wait_for_kind(sessR4, "delta")
+    t_cancelR = time.monotonic()
+    assert sessR4.cancel() is True
+    cancelled_evR, _ = _wait_for_kind(sessR4, "cancelled")
+    cancel_elapsedR = time.monotonic() - t_cancelR
+    _wait_idle(sessR4)
+    # Cancellation is prompt -- the poll interval, not the length of the
+    # generation. This is the property streaming must not regress.
+    assert cancel_elapsedR < 2.0, ("cancel took too long", cancel_elapsedR)
+    # The generator really stopped rather than being left to run: StopStream
+    # out of the sink unwinds the chat call itself.
+    stopped_when_cancelledR = stopped_atR["n"]
+    time.sleep(0.3)
+    assert stopped_atR["n"] - stopped_when_cancelledR <= 1, (
+        "a cancelled stream kept producing tokens; StopStream did not unwind "
+        "the chat call", stopped_when_cancelledR, stopped_atR["n"])
+    # And nothing was rendered after the turn ended.
+    afterR = [e for e in _all_events(sessR4) if e["id"] > cancelled_evR["id"]]
+    assert not [e for e in afterR if e["kind"] == "delta"], (
+        "a delta landed after the cancelled event", [e["kind"] for e in afterR])
+
+    # --- R5b: a chat call that ABSORBS StopStream and returns normally --
+    # --- still ends the turn cancelled, not done ------------------------
+    #
+    # This is the shape production actually takes: both hearth_backend
+    # backends catch StopStream and return the partial reply, so the chat
+    # call finishes within microseconds of the cancel flag being set --
+    # inside _run_cancellable's poll window, which tests `finished` before
+    # it tests cancellation and therefore reports _DONE. Without the
+    # re-read of ctx.cancelled() in run(), that lands as a "done" event
+    # carrying a truncated message. Measured happening against a real
+    # Ollama before that line existed, which is why it is pinned here.
+    class _CancelOnFirstToken:
+        """Cancels the turn from inside the token callback, then returns a
+        partial reply the way a real backend does after StopStream."""
+
+        def __init__(self):
+            self.session = None
+
+        def __call__(self, messages, on_token=None):
+            self.session.cancel()
+            try:
+                on_token("partial")
+            except hearth_backend.StopStream:
+                pass
+            return ({"role": "assistant", "content": "partial", "tool_calls": []}, 1, 1)
+
+    absorberR = _CancelOnFirstToken()
+    engineR5 = RealEngine(chat_fn=absorberR, execute_tool_fn=fake_execute_tool,
+                          checkpoint_fn=fake_checkpoint)
+    sessR5 = session_mod.Session(ws, "fake-model", "plan", engine=engineR5)
+    absorberR.session = sessR5
+    sessR5.submit_prompt("cancel me from inside the stream")
+    _wait_idle(sessR5)
+    kindsR5 = [e["kind"] for e in _all_events(sessR5)]
+    assert "cancelled" in kindsR5, (
+        "a turn cancelled mid-stream must end cancelled even when the chat "
+        "call absorbed StopStream and returned before the next poll tick",
+        kindsR5)
+    assert "done" not in kindsR5, (
+        "a cancelled turn reported done; the truncated reply was presented as "
+        "a finished one", kindsR5)
+
+    # --- R6: _accepts_on_token, the one decision R2/R3 hang on ----------
+    assert _accepts_on_token(lambda messages, on_token=None: None) is True
+    assert _accepts_on_token(lambda messages: None) is False
+    assert _accepts_on_token(lambda messages, **kw: None) is True, \
+        "**kwargs can take on_token"
+    assert _accepts_on_token(hearth_loop.chat) is True, \
+        "the real chat function must be recognised as streaming"
+    assert _accepts_on_token(len) is False, "an unreadable signature must not stream"
 
     print("hearth-desktop-engine self-test OK")
     return 0

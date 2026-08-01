@@ -163,6 +163,29 @@ class BackendError(RuntimeError):
     """Anything this module refuses to paper over."""
 
 
+class StopStream(Exception):
+    """Raised BY an on_token callback to abandon a generation immediately.
+
+    Deliberately not a BackendError and deliberately not caught by any
+    `except BackendError` a caller may already have: this is control flow, a
+    consumer saying "I am not listening any more", not an engine failure.
+
+    It is the only mechanism either engine has for stopping a generation
+    early. Neither llama-server nor Ollama exposes a cancel endpoint; what
+    stops them is the client hanging up. Raising out of the token callback
+    unwinds the response-body iterator, which closes the socket inside the
+    `with resp:` block, which is what the server sees as a disconnect and
+    what makes it stop producing tokens. That matters more with streaming
+    than it did without it: before, a cancelled turn left a whole generation
+    running to completion in the background, holding the GPU.
+
+    Both backends catch it, stop reading, and return the tokens that had
+    already arrived, with "stopped": True on the result. A caller therefore
+    never has to choose between prompt cancellation and knowing what was
+    generated before it.
+    """
+
+
 class ModelKindError(BackendError):
     """A ModelRef of one kind reached a backend that speaks the other.
 
@@ -309,6 +332,196 @@ def _ollama_shaped_message(content, tool_calls):
 
 
 # --------------------------------------------------------------------------
+# Streaming
+# --------------------------------------------------------------------------
+#
+# One token stream, two wire formats. Callers see exactly one thing --
+# on_token(text) called once per fragment of assistant text, in order, as it
+# arrives -- and this is where the two engines' genuinely different framing
+# is absorbed rather than leaked upward.
+#
+# The two formats, both transcribed from live captures rather than docs:
+#
+#   llama-server (hearth_llama.consume_stream, already written and not
+#   duplicated here): OpenAI-shaped SSE. `data: {json}` frames, a terminating
+#   `data: [DONE]`, the opening frame carrying "content": null rather than
+#   "", a usage frame with an EMPTY choices list, usage present only when the
+#   request asked for stream_options.include_usage, and tool-call arguments
+#   arriving as string FRAGMENTS that have to be reassembled per index.
+#
+#   Ollama (consume_ollama_stream, below): newline-delimited JSON. No `data:`
+#   prefix, no sentinel line, no separate usage frame. Measured against
+#   Ollama 0.30.7 with llama3.2:3b, mistral:7b and qwen2.5-coder:latest:
+#
+#     {"model":"llama3.2:3b","message":{"role":"assistant","content":"Here"},"done":false}
+#     {"model":"llama3.2:3b","message":{"role":"assistant","content":" we"},"done":false}
+#     {"model":"llama3.2:3b","message":{"role":"assistant","content":""},"done":true,
+#      "done_reason":"stop","prompt_eval_count":38,"eval_count":28,...}
+#
+# Four places they differ, and each is handled here rather than pushed onto
+# a caller:
+#
+#   1. Usage rides on the FINAL frame (the one with "done": true), not on a
+#      frame of its own, and needs no opt-in flag. llama.cpp needs
+#      include_usage or reports none at all.
+#   2. content is always a string, never null. The llama.cpp trap of a
+#      TypeError on the very first frame does not exist here, so this does
+#      not carry a defence against it that would never fire.
+#   3. Tool calls arrive COMPLETE in a single frame, with `arguments`
+#      already a parsed dict:
+#        "tool_calls":[{"id":"call_2rxkg38p",
+#                       "function":{"index":0,"name":"get_weather",
+#                                   "arguments":{"city":"Paris"}}}]
+#      There is nothing to reassemble, and the per-index accumulation
+#      llama.cpp requires would be wrong here: appending fragments of two
+#      separate complete calls that happen to share an index would fuse
+#      them. So complete entries are appended, not merged.
+#   4. `index` sits INSIDE the function object, not on the tool call, which
+#      is why nothing here reads a top-level "index".
+#
+# The result dict has the same keys either way, so LlamaBackend.chat and
+# OllamaBackend.chat below fold their two engines into one return shape
+# without either of them special-casing the other.
+
+
+def _ollama_stream_error(frame):
+    """Ollama's mid-stream error text, or None when `frame` is not one.
+
+    Ollama reports a failure that happens after the response has already
+    begun as an ordinary NDJSON line carrying an "error" key, not as an HTTP
+    status (the status was already 200 by then). Accepts both the string
+    form Ollama actually sends and the nested-object form llama.cpp uses,
+    since a caller reading this module should not have to know which engine
+    produced a failure to be told about it.
+    """
+    err = frame.get("error")
+    if isinstance(err, str) and err.strip():
+        return err.strip()
+    if isinstance(err, dict):
+        return str(err.get("message") or err)
+    return None
+
+
+def consume_ollama_stream(lines, on_token=None):
+    """Fold Ollama's newline-delimited JSON chat frames into one result.
+
+    A pure function over an iterable of already-decoded lines, exactly like
+    hearth_llama.consume_stream is for SSE, so the frame handling is
+    testable against a captured real transcript with no daemon, no socket,
+    and no model. See the block comment above for the measured format.
+
+    `on_token(text)` is called once per non-empty content fragment, in
+    order, before anything else is done with that fragment -- a consumer
+    hears a token at the moment it lands, not at the end of the frame loop.
+
+    Returns {"content", "tool_calls", "finish_reason", "tokens_in",
+    "tokens_out", "model", "complete", "stopped"}, where "tool_calls" is in
+    Ollama's own shape (arguments as a dict) because that is the shape
+    hearth_loop already reads, "complete" means a frame with "done": true
+    was seen, and "stopped" means on_token raised StopStream and the rest of
+    the generation was abandoned.
+
+    Raises BackendError on a mid-stream error frame; a stream that simply
+    ends early (the server hung up) is NOT an error here, it comes back with
+    complete=False and whatever had arrived, because the caller can tell
+    those apart and only one of them is worth a traceback.
+    """
+    content = []
+    tool_calls = []
+    finish_reason = None
+    tokens_in = 0
+    tokens_out = 0
+    model = None
+    complete = False
+    stopped = False
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            frame = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(frame, dict):
+            continue
+
+        problem = _ollama_stream_error(frame)
+        if problem:
+            raise BackendError("Ollama streamed an error: {}".format(problem))
+
+        model = frame.get("model") or model
+        message = frame.get("message")
+        if isinstance(message, dict):
+            piece = message.get("content")
+            if piece:
+                content.append(piece)
+                if on_token is not None:
+                    try:
+                        on_token(piece)
+                    except StopStream:
+                        # The consumer has hung up. Stop reading right here:
+                        # returning promptly is what closes the response body
+                        # and makes Ollama stop generating, and the tokens
+                        # already collected are still worth reporting.
+                        stopped = True
+                        break
+            for call in message.get("tool_calls") or []:
+                if isinstance(call, dict):
+                    tool_calls.append(call)
+
+        if frame.get("done"):
+            complete = True
+            finish_reason = frame.get("done_reason") or finish_reason
+            # Usage rides on this frame and nowhere else. int() rather than
+            # `or 0` on a possibly-absent key, matching _usage_from_response
+            # in hearth_loop: an undercounted prompt is exactly the defect
+            # that module's own docstring records.
+            tokens_in = int(frame.get("prompt_eval_count") or tokens_in)
+            tokens_out = int(frame.get("eval_count") or tokens_out)
+            break
+
+    return {
+        "content": "".join(content),
+        "tool_calls": tool_calls,
+        "finish_reason": finish_reason,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "model": model,
+        "complete": complete,
+        "stopped": stopped,
+    }
+
+
+def ollama_message_from_stream(folded):
+    """The Ollama-shaped assistant message a folded stream describes.
+
+    The non-streaming path gets this dict straight from the response body;
+    the streaming path has to rebuild it, and it must come out identical in
+    shape so nothing downstream can tell which path produced it. In
+    particular "tool_calls" is present only when there are some, because
+    hearth_loop and engine.py both branch on truthiness there and an empty
+    list would read the same as a missing key today but is a difference
+    waiting to matter.
+    """
+    out = {"role": "assistant", "content": folded.get("content") or ""}
+    if folded.get("tool_calls"):
+        out["tool_calls"] = folded["tool_calls"]
+    return out
+
+
+def _iter_body_lines(resp):
+    """Decoded lines from an HTTP response body, newline stripped.
+
+    Iterating the response object rather than reading it whole is the entire
+    point: http.client yields each line as the socket delivers it, so a
+    token reaches on_token while the model is still generating the next one.
+    """
+    for raw in resp:
+        yield raw.decode("utf-8", "replace").rstrip("\r\n")
+
+
+# --------------------------------------------------------------------------
 # Backend interface
 # --------------------------------------------------------------------------
 
@@ -347,8 +560,19 @@ class Backend:
     def chat(self, ref, messages, tools=None, timeout=DEFAULT_CHAT_TIMEOUT,
              options=None, on_token=None):
         """One chat turn. Returns {"message", "tokens_in", "tokens_out",
-        "model", "backend"}, where "message" is an Ollama-shaped assistant
-        message dict."""
+        "model", "backend", "stopped"}, where "message" is an Ollama-shaped
+        assistant message dict.
+
+        `on_token(text)` is called once per fragment of assistant text as it
+        arrives off the wire, in order, on the calling thread. It is the one
+        piece of this interface that must behave identically on both
+        engines despite their wire formats having nothing in common; see the
+        Streaming block comment above for what each of them actually sends.
+
+        A callback that raises StopStream abandons the generation and hangs
+        up on the engine. That is not an error: chat() returns normally,
+        with the text that had already arrived and "stopped": True.
+        """
         raise NotImplementedError
 
     def own_vram_bytes(self):
@@ -567,6 +791,20 @@ class LlamaBackend(Backend):
         server already loaded at another size would be a silent no-op, so
         it is dropped here rather than pretended about. Construct the
         backend with ctx_size= to set it.
+
+        Streaming is not optional on this path and never was: hearth_llama's
+        chat() only speaks SSE, so tokens are already arriving one at a time
+        whether or not anybody asked. All `on_token` changes is whether they
+        are handed onward as they land or only summed up at the end.
+
+        StopStream out of `on_token` is caught HERE rather than being left
+        to propagate, and the text collected up to that point is returned
+        with "stopped": True. That needs a local accumulator, because the
+        exception unwinds hearth_llama.consume_stream, which owns the only
+        other copy of the partial content and cannot hand it back once it
+        has been unwound. hearth_llama is not this iteration's to change,
+        and it should not have to be: a control-flow signal that a consumer
+        invented is this module's to absorb.
         """
         ref = self.check_ref(ref)
         server = self._ensure(ref)
@@ -578,17 +816,31 @@ class LlamaBackend(Backend):
             for key in ("temperature", "top_p", "top_k", "seed"):
                 if options.get(key) is not None:
                     params[key] = options[key]
+
+        seen = []
+        stopped = False
+
+        def _sink(piece):
+            seen.append(piece)
+            if on_token is not None:
+                on_token(piece)
+
         try:
-            got = server.chat(messages, on_token=on_token, tools=tools,
+            got = server.chat(messages, on_token=_sink, tools=tools,
                               timeout=timeout, **params)
         except hearth_llama.LlamaError as exc:
             raise BackendError(str(exc)) from exc
+        except StopStream:
+            stopped = True
+            got = {"content": "".join(seen), "tool_calls": [],
+                   "tokens_in": 0, "tokens_out": 0, "model": None}
         return {
             "message": _ollama_shaped_message(got.get("content"), got.get("tool_calls")),
             "tokens_in": int(got.get("tokens_in") or 0),
             "tokens_out": int(got.get("tokens_out") or 0),
             "model": got.get("model") or ref.display,
             "backend": self.name,
+            "stopped": stopped,
         }
 
     def own_vram_bytes(self):
@@ -893,35 +1145,63 @@ class OllamaBackend(Backend):
 
     def chat(self, ref, messages, tools=None, timeout=DEFAULT_CHAT_TIMEOUT,
              options=None, on_token=None):
-        """One non-streaming /api/chat turn.
+        """One /api/chat turn, streamed when somebody is listening.
 
-        `on_token` is accepted for interface compatibility and is called
-        once with the whole content when the response arrives, because this
-        request is not streamed. It is not a token-by-token callback here,
-        and a caller that needs real incremental output should use the
-        llama backend.
+        `on_token` decides the wire mode, and that is a real decision rather
+        than an oversight. With a listener, "stream": true is sent and each
+        newline-delimited frame is folded as it lands (see
+        consume_ollama_stream), so a token reaches the callback while the
+        model is still producing the next one. Without one, "stream": false
+        is sent and the body is read whole: streaming to nobody buys nothing
+        and costs a frame parser plus one socket read per token, and the
+        non-streaming response is Ollama's own most-tested path.
+
+        Both modes return the same shape, including token counts: Ollama
+        puts prompt_eval_count/eval_count on the terminal streamed frame
+        just as it puts them on a non-streamed body, so nothing is given up
+        by streaming. That is not true of llama.cpp, which needs
+        stream_options.include_usage or reports no usage at all.
+
+        A callback raising StopStream ends the read and hangs up, which is
+        what makes Ollama stop generating; the result carries what had
+        arrived and "stopped": True.
         """
         ref = self.check_ref(ref)
+        stream = on_token is not None
         body = {"model": ref.value, "messages": messages, "tools": tools,
-                "stream": False}
+                "stream": stream}
         if options:
             body["options"] = options
+        url = self.base_url + "/api/chat"
         try:
-            data = _http_json(self.base_url + "/api/chat", timeout, body)
+            if not stream:
+                data = _http_json(url, timeout, body)
+                message = data.get("message") or {}
+                return {
+                    "message": message,
+                    "tokens_in": int(data.get("prompt_eval_count") or 0),
+                    "tokens_out": int(data.get("eval_count") or 0),
+                    "model": data.get("model") or ref.value,
+                    "backend": self.name,
+                    "stopped": False,
+                }
+            req = urllib.request.Request(
+                url, data=json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                folded = consume_ollama_stream(_iter_body_lines(resp), on_token=on_token)
         except urllib.error.HTTPError as exc:
             raise BackendError("Ollama rejected the request (HTTP {})".format(exc.code)) from exc
         except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
             raise BackendError("could not reach Ollama at {}: {}".format(
                 self.base_url, exc)) from exc
-        message = data.get("message") or {}
-        if on_token is not None and message.get("content"):
-            on_token(message["content"])
         return {
-            "message": message,
-            "tokens_in": int(data.get("prompt_eval_count") or 0),
-            "tokens_out": int(data.get("eval_count") or 0),
-            "model": data.get("model") or ref.value,
+            "message": ollama_message_from_stream(folded),
+            "tokens_in": int(folded["tokens_in"]),
+            "tokens_out": int(folded["tokens_out"]),
+            "model": folded["model"] or ref.value,
             "backend": self.name,
+            "stopped": folded["stopped"],
         }
 
     def own_vram_bytes(self):
@@ -1337,6 +1617,166 @@ def _self_test(live=False):
     d = _ollama_shaped_message("", [{"function": {"name": "x", "arguments": {"a": 1}}}])
     assert d["tool_calls"][0]["function"]["arguments"] == {"a": 1}, d
 
+    # -- Ollama's stream format, folded ------------------------------------
+    #
+    # Transcribed verbatim from a live capture against Ollama 0.30.7 through
+    # a tunnel to a real GPU host, not from documentation. See the Streaming
+    # block comment for the four ways this differs from llama.cpp's SSE.
+    _cap = [
+        '{"model":"llama3.2:3b","created_at":"2026-08-01T04:18:58.310102705Z",'
+        '"message":{"role":"assistant","content":"Here"},"done":false}',
+        '{"model":"llama3.2:3b","created_at":"2026-08-01T04:18:58.323879385Z",'
+        '"message":{"role":"assistant","content":" we"},"done":false}',
+        '{"model":"llama3.2:3b","created_at":"2026-08-01T04:18:58.336314326Z",'
+        '"message":{"role":"assistant","content":" go"},"done":false}',
+        '{"model":"llama3.2:3b","created_at":"2026-08-01T04:18:58.6557908Z",'
+        '"message":{"role":"assistant","content":""},"done":true,"done_reason":"stop",'
+        '"total_duration":13810303034,"load_duration":13411707438,'
+        '"prompt_eval_count":38,"prompt_eval_duration":51058000,'
+        '"eval_count":28,"eval_duration":345445000}',
+    ]
+    _heard = []
+    _folded = consume_ollama_stream(iter(_cap), on_token=_heard.append)
+    assert _folded["content"] == "Here we go", _folded
+    # Each fragment was announced separately and in order. This is the whole
+    # point: a caller must see three arrivals, not one string at the end.
+    assert _heard == ["Here", " we", " go"], _heard
+    # The empty content on the terminal frame is not announced as a token.
+    assert "" not in _heard, _heard
+    # Usage rides on the done frame, and BOTH halves are read -- an
+    # undercounted prompt is the exact defect hearth_loop._usage_from_response
+    # exists to record.
+    assert (_folded["tokens_in"], _folded["tokens_out"]) == (38, 28), _folded
+    assert _folded["complete"] is True and _folded["stopped"] is False, _folded
+    assert _folded["finish_reason"] == "stop", _folded
+    assert _folded["model"] == "llama3.2:3b", _folded
+    # No tool calls means the key is absent from the message, not present
+    # and empty: hearth_loop and engine.py both branch on truthiness there.
+    assert "tool_calls" not in ollama_message_from_stream(_folded)
+
+    # Tool calls arrive COMPLETE in one frame with arguments already a dict,
+    # so nothing is reassembled. Also captured live (llama3.2:3b).
+    _tc = [
+        '{"model":"llama3.2:3b","message":{"role":"assistant","content":"",'
+        '"tool_calls":[{"id":"call_2rxkg38p","function":{"index":0,'
+        '"name":"get_weather","arguments":{"city":"Paris"}}}]},"done":false}',
+        '{"model":"llama3.2:3b","message":{"role":"assistant","content":""},'
+        '"done":true,"done_reason":"stop","prompt_eval_count":156,"eval_count":17}',
+    ]
+    _f2 = consume_ollama_stream(iter(_tc))
+    assert len(_f2["tool_calls"]) == 1, _f2
+    assert _f2["tool_calls"][0]["function"]["name"] == "get_weather", _f2
+    assert _f2["tool_calls"][0]["function"]["arguments"] == {"city": "Paris"}, _f2
+    _m2 = ollama_message_from_stream(_f2)
+    assert _m2["tool_calls"][0]["function"]["arguments"] == {"city": "Paris"}, _m2
+    # Two complete calls sharing function.index must stay two calls. The
+    # per-index MERGE that llama.cpp's fragmented arguments require would
+    # fuse these into one; that is the trap this format inverts.
+    _two = consume_ollama_stream(iter([
+        '{"message":{"content":"","tool_calls":[{"function":{"index":0,"name":"a",'
+        '"arguments":{"x":1}}}]},"done":false}',
+        '{"message":{"content":"","tool_calls":[{"function":{"index":0,"name":"b",'
+        '"arguments":{"x":2}}}]},"done":false}',
+        '{"message":{"content":""},"done":true}',
+    ]))
+    assert [c["function"]["name"] for c in _two["tool_calls"]] == ["a", "b"], _two
+
+    # StopStream out of the callback abandons the read at that fragment and
+    # keeps what had already arrived. Nothing after it is consumed, which is
+    # what makes cancellation stop the generation rather than drain it.
+    _pulled = []
+
+    def _lines_with_a_tail():
+        for line in _cap:
+            _pulled.append(line)
+            yield line
+
+    def _stop_after_two(piece):
+        _heard2.append(piece)
+        if len(_heard2) == 2:
+            raise StopStream
+
+    _heard2 = []
+    _f3 = consume_ollama_stream(_lines_with_a_tail(), on_token=_stop_after_two)
+    assert _f3["stopped"] is True and _f3["complete"] is False, _f3
+    assert _f3["content"] == "Here we", _f3
+    assert len(_pulled) == 2, ("the stream must not be drained past the stop", _pulled)
+
+    # A mid-stream error frame is an error. Ollama sends it as a plain
+    # "error" string on an ordinary line, after the status was already 200.
+    try:
+        consume_ollama_stream(iter(['{"error":"model requires more system memory"}']))
+        raise AssertionError("a streamed error frame must raise")
+    except BackendError as exc:
+        assert "more system memory" in str(exc), str(exc)
+    # A stream that just stops is NOT an error: the caller can tell
+    # complete=False apart from a raise, and only one of them is a bug.
+    _short = consume_ollama_stream(iter([_cap[0]]))
+    assert _short["complete"] is False and _short["content"] == "Here", _short
+    # Junk lines and blank lines are skipped rather than fatal.
+    assert consume_ollama_stream(iter(["", "not json", _cap[3]]))["tokens_out"] == 28
+
+    # StopStream is control flow, not a failure, so a caller that catches
+    # BackendError around a chat call does not accidentally swallow it.
+    assert not issubclass(StopStream, BackendError), \
+        "StopStream must not be caught by `except BackendError`"
+
+    # -- OllamaBackend.chat: the wire mode follows the listener ------------
+    #
+    # No daemon: urlopen and _http_json are both replaced, so this proves
+    # the branch and the request body rather than the network.
+    _seen_bodies = []
+
+    class _FakeResp:
+        def __init__(self, lines):
+            self._lines = [ln.encode("utf-8") + b"\n" for ln in lines]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def __iter__(self):
+            return iter(self._lines)
+
+    _real_urlopen = urllib.request.urlopen
+    _real_http_json = globals()["_http_json"]
+    try:
+        def _fake_urlopen(req, timeout=None):
+            _seen_bodies.append(json.loads(req.data.decode("utf-8")))
+            return _FakeResp(_cap)
+
+        def _fake_http_json(url, timeout, body=None):
+            _seen_bodies.append(body)
+            return {"model": "llama3.2:3b", "message": {"role": "assistant",
+                                                        "content": "whole thing"},
+                    "prompt_eval_count": 5, "eval_count": 7}
+
+        urllib.request.urlopen = _fake_urlopen
+        globals()["_http_json"] = _fake_http_json
+
+        _ob = OllamaBackend("http://127.0.0.1:11434")
+        got = _ob.chat("llama3.2:3b", [{"role": "user", "content": "hi"}])
+        assert _seen_bodies[-1]["stream"] is False, _seen_bodies[-1]
+        assert got["message"]["content"] == "whole thing", got
+        assert (got["tokens_in"], got["tokens_out"]) == (5, 7), got
+        assert got["stopped"] is False, got
+
+        _tokens = []
+        got = _ob.chat("llama3.2:3b", [{"role": "user", "content": "hi"}],
+                       on_token=_tokens.append)
+        assert _seen_bodies[-1]["stream"] is True, _seen_bodies[-1]
+        assert _tokens == ["Here", " we", " go"], _tokens
+        assert got["message"] == {"role": "assistant", "content": "Here we go"}, got
+        # Streaming gives up nothing: the counts are the same fields, just
+        # carried on the terminal frame instead of the whole body.
+        assert (got["tokens_in"], got["tokens_out"]) == (38, 28), got
+        assert got["backend"] == BACKEND_OLLAMA, got
+    finally:
+        urllib.request.urlopen = _real_urlopen
+        globals()["_http_json"] = _real_http_json
+
     # -- selection: every branch, no binary and no daemon needed -----------
     yes = lambda: {"found": True, "path": "/x/llama-server"}   # noqa: E731
     no = lambda: {"found": False, "path": None}                # noqa: E731
@@ -1627,10 +2067,11 @@ def _self_test(live=False):
         # what hearth_loop reads.
         assert got["message"]["tool_calls"][0]["function"]["name"] == "t", got
 
-        # on_token is called once with the whole content, as documented.
-        tokens = []
-        ob.chat("m", [], on_token=tokens.append)
-        assert tokens == ["hi"], tokens
+        # Passing on_token does NOT take this branch at all: it switches the
+        # request to "stream": true and leaves _http_json unused, which is
+        # why the fake above is never consulted for it. The streamed branch
+        # is proven in full in the Streaming section earlier in this test.
+        assert seen["body"]["stream"] is False, seen["body"]
 
         # An unreachable daemon is a BackendError, not a raw URLError.
         globals()["_http_json"] = _unreachable
@@ -1641,6 +2082,21 @@ def _self_test(live=False):
             assert "could not reach Ollama" in str(exc), str(exc)
     finally:
         globals()["_http_json"] = _real_http
+
+    # The streamed branch degrades the same way, through its own transport.
+    _real_urlopen2 = urllib.request.urlopen
+    try:
+        def _refuse(req, timeout=None):
+            raise urllib.error.URLError("refused")
+        urllib.request.urlopen = _refuse
+        try:
+            ob.chat("m", [], on_token=lambda _t: None)
+            raise AssertionError("an unreachable Ollama must raise BackendError "
+                                 "on the streaming branch too")
+        except BackendError as exc:
+            assert "could not reach Ollama" in str(exc), str(exc)
+    finally:
+        urllib.request.urlopen = _real_urlopen2
 
     # -- OllamaBackend.available_models / diagnose -------------------------
     try:

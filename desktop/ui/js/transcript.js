@@ -1,26 +1,38 @@
 /* The transcript: messages, tool cards, approval cards, notices.
  *
- * Streaming note, stated plainly because it would be easy to overclaim.
- * The sidecar's model call is not a streaming call: agent/hearth_loop.py posts
- * to Ollama with `"stream": False`, and desktop/server/engine.py emits one
- * `delta` event carrying the whole assistant message. So text arrives at this
- * UI a message at a time, not a token at a time. A long reply slamming into
- * the page as one block reads as a hang followed by a dump, so the reveal
- * below paces text into the bubble over roughly three quarters of a second
- * per delta. That is client-side pacing of text that has already arrived, not
- * per-token streaming. Across a multi-step tool-using turn the transcript does
- * genuinely grow incrementally, because each model round trip is its own
- * delta, interleaved with real tool cards as they happen.
+ * Streaming. This file used to carry a note explaining that the sidecar did
+ * not stream -- hearth_loop.chat posted with `"stream": False`, engine.py
+ * emitted one `delta` event holding the entire finished message, and this
+ * class dribbled that already-arrived block onto the screen over about three
+ * quarters of a second so it would look live. Nothing arrived early. That is
+ * gone in both halves: the model call streams, engine.py emits deltas as
+ * tokens land (coalesced on a 100ms window, see its module docstring's point
+ * 7), and this file renders each one the moment it arrives. There is no
+ * pacing left to disable, which is why `prefers-reduced-motion` no longer
+ * appears here -- text appearing as it is generated is not motion, it is the
+ * content arriving.
  *
- * `prefers-reduced-motion` disables the pacing entirely.
+ * Every delta carries `stream_id` (which assistant message it belongs to) and
+ * `index` (its character offset within that message), and appendAgent uses
+ * both rather than blindly concatenating. That is what makes rendering
+ * idempotent across a reconnect: GET /events resumes from a bookmark, and a
+ * resumed stream that replays a delta the page already drew must not draw it
+ * twice. An overlapping delta is trimmed to its new tail; a delta that starts
+ * beyond what has been drawn is a genuine gap (the session's event ring wrapped
+ * while this window was away, which also produces its own `events_dropped`
+ * notice) and is appended rather than silently discarded. A new stream_id
+ * always opens a new bubble, which is also how a tool call interrupting the
+ * text comes out right.
+ *
+ * Text is rendered into a plain text node while it streams and re-rendered
+ * through renderProse (code fences, inline code) once the message closes.
+ * Both are textContent-only paths -- see safe-text.js -- so a partial token
+ * cannot become markup at any point in between. xss-check.html drives real
+ * payloads through this fragment by fragment for exactly that reason.
  */
 
 import { el, icon, appendAll, clear } from "./dom.js";
 import { renderProse, blob, labelledBlob } from "./safe-text.js";
-
-const REDUCED_MOTION = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-const REVEAL_FRAMES = 45;   // ~750ms at 60fps for whatever is currently pending
-const MIN_CHARS_PER_FRAME = 3;
 
 const READ_TOOLS = new Set(["read_file", "list_files", "list_tree", "git_status", "git_diff"]);
 const WRITE_TOOLS = new Set(["write_file", "edit_file", "replace_in_files"]);
@@ -203,7 +215,6 @@ export class Transcript {
     this.openToolCards = [];     // tool_call cards still awaiting a tool_result
     this.approvals = new Map();  // approval id -> {outer, badgeEl, actions}
     this.pinned = true;          // stick to the bottom unless the user scrolls up
-    this._frame = null;
 
     this.root.addEventListener("scroll", () => {
       const gap = this.root.scrollHeight - this.root.scrollTop - this.root.clientHeight;
@@ -256,84 +267,91 @@ export class Transcript {
     ]));
   }
 
-  /** Queue assistant text for the active bubble, opening one if needed. */
-  appendAgent(text) {
+  /** Render one delta into the active agent bubble, opening one if needed.
+   *
+   *  `meta` is the delta event's own `stream_id` and `index`. Both are
+   *  optional so a caller with neither (a test, or a replayed event from a
+   *  sidecar older than this) still renders correctly by plain append; when
+   *  they are present they are what makes a replayed or resumed stream
+   *  idempotent. See this file's header.
+   */
+  appendAgent(text, meta) {
     if (!text) return;
     this.clearPlaceholder();
-    if (!this.stream && isToolCallText(text)) {
-      const fold = el("details", { class: "fold" });
-      fold.appendChild(el("summary", { text: "the model wrote its tool call as text" }));
-      fold.appendChild(blob(String(text)));
-      this._append(appendAll(el("div", { class: "notice notice-quiet" }), [
-        appendAll(el("div", { class: "notice-inner" }), [icon("i-terminal"), fold]),
-      ]));
-      return;
+    const streamId = meta && meta.streamId !== undefined && meta.streamId !== null
+      ? String(meta.streamId) : null;
+    const index = meta && Number.isFinite(meta.index) ? meta.index : null;
+
+    // A different message than the one open: close the old bubble first, so
+    // a tool call interrupting the text (or a turn boundary) never appends
+    // the next message into the previous one's bubble.
+    if (this.stream && streamId !== null && this.stream.id !== null
+        && this.stream.id !== streamId) {
+      this.closeAgent();
     }
+
+    if (this.stream && index !== null) {
+      const drawn = this.stream.full.length;
+      if (index + text.length <= drawn) return;   // wholly a replay; already on screen
+      if (index < drawn) text = text.slice(drawn - index);  // partial overlap: keep the tail
+      // index > drawn is a real gap (the sidecar's event ring wrapped while
+      // this window was disconnected, which arrives with its own
+      // events_dropped notice). Append it rather than dropping text the
+      // model really produced.
+    }
+
     if (!this.stream) {
       const textNode = document.createTextNode("");
       const caret = el("span", { class: "caret" });
       const paragraph = appendAll(el("p"), [textNode, caret]);
       const prose = appendAll(el("div", { class: "prose" }), [paragraph]);
       const bubble = appendAll(el("div", { class: "bubble" }), [prose]);
-      this._append(appendAll(el("div", { class: "msg msg-agent" }), [
+      const msgEl = appendAll(el("div", { class: "msg msg-agent" }), [
         el("span", { class: "msg-role", text: "hearth" }),
         bubble,
-      ]));
-      this.stream = { bubble, textNode, shown: "", pending: "", full: "", closed: false };
+      ]);
+      this._append(msgEl);
+      this.stream = { msgEl, bubble, textNode, full: "", id: streamId };
     }
-    this.stream.pending += String(text);
+    if (this.stream.id === null) this.stream.id = streamId;
+
+    // Straight to the text node. No queue, no frame budget, no reveal rate:
+    // the text is drawn the instant it arrives, because it arrives at the
+    // rate the model produces it.
     this.stream.full += String(text);
-    if (REDUCED_MOTION) this._drain();
-    else this._schedule();
-  }
-
-  _schedule() {
-    if (this._frame !== null) return;
-    this._frame = requestAnimationFrame(() => {
-      this._frame = null;
-      this._step();
-    });
-  }
-
-  _step() {
-    const s = this.stream;
-    if (!s) return;
-    const take = Math.max(MIN_CHARS_PER_FRAME, Math.ceil(s.pending.length / REVEAL_FRAMES));
-    s.shown += s.pending.slice(0, take);
-    s.pending = s.pending.slice(take);
-    s.textNode.data = s.shown;
-    this._autoscroll();
-    if (s.pending.length) this._schedule();
-    else if (s.closed) this._finalize();
-  }
-
-  _drain() {
-    const s = this.stream;
-    if (!s) return;
-    s.shown += s.pending;
-    s.pending = "";
-    s.textNode.data = s.shown;
-    if (s.closed) this._finalize();
-    else this._autoscroll();
-  }
-
-  /** Replace the paced plain-text node with the structured render (code
-   *  fences, inline code). Both paths only ever set textContent. */
-  _finalize() {
-    const s = this.stream;
-    if (!s) return;
-    clear(s.bubble);
-    s.bubble.appendChild(renderProse(s.full));
-    this.stream = null;
+    this.stream.textNode.data = this.stream.full;
     this._autoscroll();
   }
 
-  /** Mark the active bubble complete. It finishes revealing first. */
+  /** Close the active bubble, replacing the streamed plain-text node with the
+   *  structured render (code fences, inline code). Both paths only ever set
+   *  textContent, so nothing about closing can turn text into markup.
+   *
+   *  The "the model wrote its tool call as text" fold is decided HERE rather
+   *  than on the first delta, and that moved because of streaming: any prefix
+   *  of a JSON tool call is just an incomplete fragment, so mid-stream the
+   *  question cannot be answered. By the time a message closes it can, and the
+   *  bubble is swapped for the fold so the raw call does not sit in the
+   *  transcript next to the tool card engine.py is about to render for it.
+   *  Nothing is discarded: the fold still holds the exact text.
+   */
   closeAgent() {
     const s = this.stream;
     if (!s) return;
-    s.closed = true;
-    if (!s.pending.length) this._finalize();
+    this.stream = null;
+    if (isToolCallText(s.full)) {
+      const fold = el("details", { class: "fold" });
+      fold.appendChild(el("summary", { text: "the model wrote its tool call as text" }));
+      fold.appendChild(blob(s.full));
+      s.msgEl.replaceWith(appendAll(el("div", { class: "notice notice-quiet" }), [
+        appendAll(el("div", { class: "notice-inner" }), [icon("i-terminal"), fold]),
+      ]));
+      this._autoscroll();
+      return;
+    }
+    clear(s.bubble);
+    s.bubble.appendChild(renderProse(s.full));
+    this._autoscroll();
   }
 
   // ---- tool cards ----

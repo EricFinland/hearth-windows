@@ -539,8 +539,18 @@ function startEventStream() {
 function handleEvent(event) {
   const data = event.data || {};
   switch (event.kind) {
+    // A delta is a fragment of assistant text, emitted by engine.py as
+    // tokens arrive (coalesced on a short window, see its module docstring's
+    // point 7). stream_id names which assistant message it belongs to and
+    // index is its offset within that message; both are forwarded so a
+    // stream resumed after a reconnect is rendered without duplicating or
+    // losing text. A sidecar that predates them simply sends neither, and
+    // the transcript falls back to plain append.
     case "delta":
-      transcript.appendAgent(data.text || "");
+      transcript.appendAgent(data.text || "", {
+        streamId: data.stream_id,
+        index: data.index,
+      });
       break;
 
     case "tool_call":

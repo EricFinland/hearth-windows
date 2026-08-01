@@ -98,8 +98,29 @@ for (const payload of PAYLOADS) {
 // The live transcript surfaces, rendered into the visible stage so the result
 // can be read by eye as well as asserted.
 transcript.addUser(PAYLOADS[0]);
-transcript.appendAgent(
-  "Here is what I found:\n\n```html\n" + PAYLOADS[1] + "\n```\n\nAnd inline " + PAYLOADS[5]);
+
+// Assistant text now arrives as a token stream, so it is fed here the way the
+// sidecar feeds it: many small deltas carrying stream_id and index, with the
+// payloads deliberately CUT ACROSS delta boundaries. That is the new thing
+// streaming introduced and the reason this file drives the transcript rather
+// than only safe-text.js -- a payload that is inert when rendered whole could
+// in principle escape if the renderer ever reassembled fragments through
+// anything but a text node. Splitting at 7 characters guarantees every
+// payload below is torn apart, including across the code fence.
+const AGENT_MESSAGE =
+  "Here is what I found:\n\n```html\n" + PAYLOADS[1] + "\n```\n\nAnd inline " + PAYLOADS[5];
+const CHUNK = 7;
+let at = 0;
+while (at < AGENT_MESSAGE.length) {
+  transcript.appendAgent(AGENT_MESSAGE.slice(at, at + CHUNK), { streamId: 1, index: at });
+  at += CHUNK;
+}
+// A reconnect replays deltas the page has already drawn. Re-feeding the tail
+// with its original index must be a no-op, not a second copy -- and it must
+// not be a no-op achieved by dropping the payload, which the literal-text
+// assertions below would catch either way.
+transcript.appendAgent(AGENT_MESSAGE.slice(AGENT_MESSAGE.length - CHUNK),
+                       { streamId: 1, index: AGENT_MESSAGE.length - CHUNK });
 transcript.closeAgent();
 transcript.addToolCall({
   tool: "write_file",
@@ -122,7 +143,10 @@ transcript.addApproval({
 }, () => {});
 transcript.addNotice("warn", PAYLOADS[0], PAYLOADS[2], PAYLOADS[4]);
 
-await new Promise((done) => setTimeout(done, 500)); // let the paced reveal finish
+// Nothing here is deferred any more -- the paced reveal this used to wait out
+// is gone, and every render path above is synchronous. One turn of the event
+// loop, so a failure here can never be blamed on timing.
+await new Promise((done) => setTimeout(done, 0));
 
 for (const payload of [PAYLOADS[0], PAYLOADS[1], PAYLOADS[2], PAYLOADS[3],
                        PAYLOADS[4], PAYLOADS[6], PAYLOADS[7], PAYLOADS[9]]) {

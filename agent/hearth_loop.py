@@ -367,7 +367,8 @@ def _resolve_num_ctx(base_url, model):
     return ctx
 
 
-def chat(base_url, model, messages, tools, timeout=300, options=None, backend=None):
+def chat(base_url, model, messages, tools, timeout=300, options=None, backend=None,
+         on_token=None):
     """One chat turn with tools, on whichever engine is active.
 
     RETURNS A 3-TUPLE: (message, tokens_in, tokens_out). That arity is load
@@ -380,11 +381,35 @@ def chat(base_url, model, messages, tools, timeout=300, options=None, backend=No
     against this signature; see the "arity" section there before changing
     anything about this line.
 
+    STREAMING WAS ADDED WITHOUT TOUCHING ANY OF THAT. `on_token` is an
+    optional trailing keyword argument with a default, so every existing
+    call site binds exactly as before and every existing unpacking still
+    unpacks three values. A streaming caller learns what it needs through
+    the callback, as generation happens, and still gets the same three
+    values at the end -- the incremental channel is additive to the return
+    value, not a replacement for it, because half the callers here
+    (hearth_evolve, hearth_grow, hearth_marathon) have nowhere to put a
+    token and should not have to care that one exists.
+
+    `on_token(text)` is called once per fragment of assistant text as it
+    arrives off the wire, in order, on the calling thread. It behaves
+    identically on both engines even though their wire formats have nothing
+    in common; hearth_backend owns that normalisation (see its Streaming
+    section, and hearth_llama.consume_stream for the SSE half). Raising
+    hearth_backend.StopStream from the callback abandons the generation and
+    hangs up on the engine, which is what actually stops a local model
+    producing tokens; chat() then returns normally with the text that had
+    already arrived.
+
     `base_url` and `options` are Ollama's, and are used as-is when that
     backend is active: options is the request-level dict (e.g.
     {"num_ctx": ...}), and when omitted a hardware-aware num_ctx is chosen
     automatically (see _resolve_num_ctx), overridable process-wide via
-    HEARTH_NUM_CTX.
+    HEARTH_NUM_CTX. Whether "stream" is sent as true follows `on_token`
+    alone: streaming to nobody costs a frame parser and one socket read per
+    token and buys nothing, and the unstreamed body is Ollama's own
+    most-tested path, so a caller that did not ask for tokens still gets
+    exactly the request it got before this existed.
 
     On the bundled llama.cpp engine `base_url` is ignored (Hearth starts
     that server itself on an ephemeral port), `model` is a GGUF path rather
@@ -400,7 +425,7 @@ def chat(base_url, model, messages, tools, timeout=300, options=None, backend=No
 
     if backend.name != hearth_backend.BACKEND_OLLAMA:
         got = backend.chat(model, messages, tools=tools, timeout=timeout,
-                           options=options)
+                           options=options, on_token=on_token)
         return got["message"], got["tokens_in"], got["tokens_out"]
 
     if options is None:
@@ -409,14 +434,24 @@ def chat(base_url, model, messages, tools, timeout=300, options=None, backend=No
         except Exception:  # noqa: BLE001 - num_ctx selection must never break chat()
             num_ctx = FALLBACK_NUM_CTX
         options = {"num_ctx": num_ctx}
+    stream = on_token is not None
     body = json.dumps({"model": model, "messages": messages, "tools": tools,
-                       "options": options, "stream": False}).encode()
+                       "options": options, "stream": stream}).encode()
     req = urllib.request.Request(base_url.rstrip("/") + "/api/chat", data=body,
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = json.loads(resp.read().decode())
-    tokens_in, tokens_out = _usage_from_response(data)
-    return data.get("message") or {}, tokens_in, tokens_out
+        if not stream:
+            data = json.loads(resp.read().decode())
+            tokens_in, tokens_out = _usage_from_response(data)
+            return data.get("message") or {}, tokens_in, tokens_out
+        # Iterating the response hands over each newline-delimited frame as
+        # the socket delivers it. Reading it whole first, as the branch
+        # above does, is what would turn this back into fake streaming.
+        folded = hearth_backend.consume_ollama_stream(
+            (raw.decode("utf-8", "replace").rstrip("\r\n") for raw in resp),
+            on_token=on_token)
+    return (hearth_backend.ollama_message_from_stream(folded),
+            folded["tokens_in"], folded["tokens_out"])
 
 
 def _balanced_obj(s, start):
@@ -1708,9 +1743,13 @@ def _self_test():
         def __init__(self):
             self.seen = None
 
-        def chat(self, model, messages, tools=None, timeout=None, options=None):
+        def chat(self, model, messages, tools=None, timeout=None, options=None,
+                 on_token=None):
             self.seen = {"model": model, "tools": tools, "options": options,
-                         "timeout": timeout}
+                         "timeout": timeout, "on_token": on_token}
+            if on_token is not None:
+                for piece in ("from ", "llama"):
+                    on_token(piece)
             return {"message": {"role": "assistant", "content": "from llama"},
                     "tokens_in": 11, "tokens_out": 4,
                     "model": model, "backend": self.name}
@@ -1734,6 +1773,94 @@ def _self_test():
     assert _lb.seen["options"] is None, (
         "chat() must not synthesise Ollama options for the llama backend",
         _lb.seen)
+    # A caller that did not ask for tokens must not silently be opted in:
+    # on_token reaches the backend as None, so the backend keeps whatever
+    # its own default wire mode is.
+    assert _lb.seen["on_token"] is None, _lb.seen
+
+    # -- streaming: additive, and it does not disturb the 3-tuple ----------
+    #
+    # Both branches, because chat() has two returns and pinning only one
+    # leaves the other free to drift -- the exact shape of the break this
+    # module's arity guard exists for.
+    _heard_llama = []
+    _s_result = chat("http://ignored", r"C:\models\a.gguf", [{"role": "user"}],
+                     ["toolspec"], backend=_lb, on_token=_heard_llama.append)
+    assert len(_s_result) == 3, ("streaming must not change chat()'s arity", _s_result)
+    assert _heard_llama == ["from ", "llama"], _heard_llama
+    assert _s_result[0] == {"role": "assistant", "content": "from llama"}, _s_result
+    assert (_s_result[1], _s_result[2]) == (11, 4), _s_result
+
+    # The Ollama branch, against the real newline-delimited frames Ollama
+    # 0.30.7 was measured emitting (see hearth_backend's Streaming section
+    # for the capture and the four ways it differs from llama.cpp's SSE).
+    _ndjson = [
+        b'{"model":"m","message":{"role":"assistant","content":"Here"},"done":false}\n',
+        b'{"model":"m","message":{"role":"assistant","content":" we"},"done":false}\n',
+        b'{"model":"m","message":{"role":"assistant","content":" go"},"done":false}\n',
+        b'{"model":"m","message":{"role":"assistant","content":""},"done":true,'
+        b'"done_reason":"stop","prompt_eval_count":38,"eval_count":28}\n',
+    ]
+
+    class _FakeStreamResp:
+        """Yields frames one at a time, and records how many were pulled, so
+        a test can prove a stop really stopped the read rather than letting
+        it drain into a discarded buffer."""
+
+        def __init__(self, lines):
+            self.lines = lines
+            self.pulled = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def __iter__(self):
+            for line in self.lines:
+                self.pulled += 1
+                yield line
+
+    _stream_bodies = []
+    _live_resp = {}
+
+    def _fake_stream_urlopen(req, timeout=300):
+        _stream_bodies.append(json.loads(req.data.decode()))
+        resp = _FakeStreamResp(_ndjson)
+        _live_resp["r"] = resp
+        return resp
+
+    urllib.request.urlopen = _fake_stream_urlopen
+    try:
+        _heard_ollama = []
+        _o_result = chat("http://fake", "mock", [], [], backend=_ob,
+                         on_token=_heard_ollama.append)
+        assert len(_o_result) == 3, ("streaming must not change chat()'s arity",
+                                     _o_result)
+        assert _stream_bodies[-1]["stream"] is True, _stream_bodies[-1]
+        assert _heard_ollama == ["Here", " we", " go"], _heard_ollama
+        assert _o_result[0] == {"role": "assistant", "content": "Here we go"}, _o_result
+        assert (_o_result[1], _o_result[2]) == (38, 28), _o_result
+
+        # StopStream out of the callback ends the read where it was raised.
+        # `pulled` is what makes this a real assertion rather than a hope:
+        # a stop that merely set a flag and let the body drain would read
+        # all four frames and look identical from the outside.
+        def _stop_at_two(piece):
+            _partial.append(piece)
+            if len(_partial) == 2:
+                raise hearth_backend.StopStream
+
+        _partial = []
+        _c_result = chat("http://fake", "mock", [], [], backend=_ob,
+                         on_token=_stop_at_two)
+        assert _c_result[0]["content"] == "Here we", _c_result
+        assert _live_resp["r"].pulled == 2, (
+            "a cancelled stream must stop reading, not drain its buffer",
+            _live_resp["r"].pulled)
+    finally:
+        urllib.request.urlopen = _real_urlopen
 
     # -- static: every real call site in the repo, bound to this signature -
     import ast  # noqa: PLC0415 - only the guard needs these
