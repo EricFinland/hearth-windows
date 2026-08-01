@@ -1,0 +1,25 @@
+/* Styles for xss-check.html. Kept in its own file so the dev host can serve
+ * every page under a strict Content-Security-Policy with no 'unsafe-inline'. */
+
+body { overflow: auto; padding: 28px; }
+.wrap { max-width: 900px; margin: 0 auto; }
+h1 { font-size: 18px; margin: 0 0 4px; }
+.lede { color: var(--fg-dim); font-size: 13px; margin: 0 0 20px; max-width: 62ch; }
+
+.verdict { padding: 12px 14px; border-radius: 10px; font-weight: 600; margin-bottom: 18px; }
+.verdict.pass { background: rgba(111,207,127,.12); border: 1px solid rgba(111,207,127,.45); color: var(--ok); }
+.verdict.fail { background: rgba(239,118,118,.12); border: 1px solid rgba(239,118,118,.45); color: var(--danger); }
+
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line-soft); vertical-align: top; }
+th { color: var(--fg-faint); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .07em; }
+td.r { font-weight: 600; }
+td.r.ok { color: var(--ok); }
+td.r.bad { color: var(--danger); }
+td.p { font-family: var(--font-mono); font-size: 11.5px; color: var(--fg-dim); overflow-wrap: anywhere; }
+
+.probe { display: none; }
+
+#stage { margin-top: 26px; border: 1px dashed var(--line); border-radius: 10px; padding: 8px; }
+#stage h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--fg-faint); margin: 4px 8px 10px; }
+#transcript { max-height: 460px; overflow-y: auto; }

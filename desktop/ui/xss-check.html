@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>hearth UI - untrusted content check</title>
+<link rel="stylesheet" href="./styles.css" />
+<link rel="stylesheet" href="./xss-check.css" />
+</head>
+<body>
+<div class="wrap">
+  <h1>Untrusted content check</h1>
+  <p class="lede">
+    Feeds hostile payloads through every rendering path the UI uses for model output,
+    tool output, file content, and tool arguments, then inspects the resulting DOM.
+    A pass means the payload exists in the page only as literal text: no element it
+    named was created, no event-handler attribute survived, and no side effect fired.
+  </p>
+  <div class="verdict" id="verdict">running...</div>
+  <table>
+    <thead><tr><th>Surface</th><th>Payload</th><th>Result</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+
+  <div id="probes"></div>
+
+  <div id="stage">
+    <h2>rendered output (all of this should read as literal text)</h2>
+    <div class="transcript" id="transcript"></div>
+  </div>
+</div>
+
+<script type="module" src="./js/xss-check.js"></script>
+</body>
+</html>

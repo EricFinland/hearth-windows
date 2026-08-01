@@ -1,0 +1,190 @@
+/* Sidecar client.
+ *
+ * SSE authentication, and why this does not use EventSource
+ * ---------------------------------------------------------
+ * Every sidecar route except GET /healthz requires an `Authorization: Bearer`
+ * header (desktop/server/auth.py, check_bearer). `EventSource` cannot set
+ * request headers at all, and desktop/server/app.py's _get_events offers no
+ * alternative: reading it, the only two things GET /events takes besides the
+ * bearer header are `?since=<id>` and a `Last-Event-ID` header, and both of
+ * those are resumption bookmarks, not credentials. There is no token query
+ * parameter, and adding one would have meant putting the token in a URL, which
+ * is exactly what must not happen (URLs land in history, in referrers, and in
+ * any logging the transport does).
+ *
+ * So this reads the stream with `fetch()` and consumes `response.body` as a
+ * ReadableStream, parsing the SSE framing here. `fetch` can set the header,
+ * `AbortController` gives a clean way to tear the stream down on reconnect,
+ * and the token stays in an `Authorization` header on the wire and in a
+ * module-private variable in memory. It is never written to localStorage or
+ * sessionStorage, never placed in a URL or query string, and never put in the
+ * document title.
+ *
+ * The `since` bookmark is carried in the query string, which is fine: it is an
+ * event sequence number, not a secret. app.py replays from the session's event
+ * ring, and emits a synthetic `events_dropped` event if the bookmark has fallen
+ * out of that ring, so a reconnect can tell "caught up" from "missed some".
+ */
+
+const SIDECAR_ROUTES = new Set([
+  "/healthz", "/session", "/prompt", "/events", "/approve",
+  "/cancel", "/models", "/checkpoints", "/restore", "/setup", "/idle",
+]);
+
+export class HttpError extends Error {
+  constructor(status, body) {
+    super(typeof body?.error === "string" ? body.error : `HTTP ${status}`);
+    this.status = status;
+    this.body = body;
+  }
+}
+
+export class Sidecar {
+  /** `origin` is where the requests are sent. In the browser dev host that is
+   *  the page's own origin, which reverse-proxies to the sidecar's ephemeral
+   *  port (see dev-host.mjs); the sidecar refuses a cross-origin browser
+   *  request outright, so a same-origin proxy is not a convenience here, it is
+   *  the only way a page can reach it at all. */
+  constructor(origin = "") {
+    this.origin = origin.replace(/\/$/, "");
+    this._token = null;
+  }
+
+  /** Kept in a private field for the lifetime of the page and nowhere else. */
+  setToken(token) {
+    this._token = token || null;
+  }
+
+  get authenticated() {
+    return Boolean(this._token);
+  }
+
+  _headers(extra) {
+    const headers = new Headers(extra || {});
+    if (this._token) headers.set("Authorization", "Bearer " + this._token);
+    return headers;
+  }
+
+  async request(method, path, body) {
+    if (!SIDECAR_ROUTES.has(path.split("?")[0])) {
+      throw new Error(`refusing to call unknown sidecar route: ${path}`);
+    }
+    const headers = this._headers();
+    let payload;
+    if (body !== undefined) {
+      headers.set("Content-Type", "application/json");
+      payload = JSON.stringify(body);
+    }
+    const response = await fetch(this.origin + path, {
+      method,
+      headers,
+      body: payload,
+      cache: "no-store",
+      credentials: "omit",
+      redirect: "error",
+    });
+    const raw = await response.text();
+    let parsed = null;
+    if (raw) {
+      try { parsed = JSON.parse(raw); } catch { parsed = { error: raw.slice(0, 500) }; }
+    }
+    if (!response.ok) throw new HttpError(response.status, parsed);
+    return parsed;
+  }
+
+  health()                 { return this.request("GET", "/healthz"); }
+  setup()                  { return this.request("GET", "/setup"); }
+  models()                 { return this.request("GET", "/models"); }
+  getSession()             { return this.request("GET", "/session"); }
+  createSession(body)      { return this.request("POST", "/session", body); }
+  prompt(message)          { return this.request("POST", "/prompt", { message }); }
+  approve(id, decision)    { return this.request("POST", "/approve", { id, decision }); }
+  cancel()                 { return this.request("POST", "/cancel"); }
+  checkpoints()            { return this.request("GET", "/checkpoints"); }
+  restore(checkpointId)    { return this.request("POST", "/restore", { checkpoint_id: checkpointId }); }
+
+  /** Open GET /events and call `onEvent({id, kind, turn_id, data, ts})` for
+   *  each frame until `signal` aborts or the connection ends. Resolves when
+   *  the stream closes; rejects only on a transport failure. */
+  async streamEvents({ since = 0, onEvent, onOpen, signal }) {
+    const url = `${this.origin}/events?since=${encodeURIComponent(since)}`;
+    const response = await fetch(url, {
+      headers: this._headers({ Accept: "text/event-stream" }),
+      cache: "no-store",
+      credentials: "omit",
+      redirect: "error",
+      signal,
+    });
+    if (!response.ok) {
+      let body = null;
+      try { body = JSON.parse(await response.text()); } catch { /* body is not JSON */ }
+      throw new HttpError(response.status, body);
+    }
+    if (onOpen) onOpen();
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        // Frames are separated by a blank line. Keep the trailing partial.
+        let split;
+        while ((split = buffer.indexOf("\n\n")) !== -1) {
+          const frame = buffer.slice(0, split);
+          buffer = buffer.slice(split + 2);
+          const parsed = parseFrame(frame);
+          if (parsed && onEvent) onEvent(parsed);
+        }
+      }
+    } finally {
+      // cancel() returns a promise that rejects if the stream was already torn
+      // down by an abort, which is the normal path on reconnect. Swallow it
+      // here rather than leaving an unhandled rejection behind.
+      try { reader.cancel().catch(() => {}); } catch { /* already released */ }
+    }
+  }
+}
+
+/** Parse one SSE frame. Comment lines (": keep-alive") and frames without a
+ *  JSON data payload yield null. app.py writes exactly one `data:` line per
+ *  frame, containing a single-line JSON object. */
+function parseFrame(frame) {
+  let id = null;
+  let data = null;
+  for (const line of frame.split("\n")) {
+    if (!line || line.startsWith(":")) continue;
+    const colon = line.indexOf(":");
+    const field = colon === -1 ? line : line.slice(0, colon);
+    let value = colon === -1 ? "" : line.slice(colon + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+    if (field === "id") id = Number(value);
+    else if (field === "data") data = data === null ? value : data + "\n" + value;
+  }
+  if (data === null) return null;
+  let payload;
+  try { payload = JSON.parse(data); } catch { return null; }
+  return {
+    id: Number.isFinite(id) ? id : null,
+    kind: payload.kind,
+    turn_id: payload.turn_id,
+    data: payload.data || {},
+    ts: payload.ts,
+  };
+}
+
+/** Ask the dev host for the sidecar handshake it read off the sidecar's
+ *  stdout. Only the dev host serves this; a Tauri build would hand the same
+ *  two values to the webview over IPC instead, and nothing else here would
+ *  change. */
+export async function fetchHandshake(origin = "") {
+  const response = await fetch(origin + "/__hearth/handshake", {
+    cache: "no-store",
+    credentials: "omit",
+    redirect: "error",
+  });
+  if (!response.ok) throw new HttpError(response.status, null);
+  return response.json();
+}
