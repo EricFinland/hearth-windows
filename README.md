@@ -28,10 +28,11 @@ forms today.
 
 **Hearth is a Windows desktop application in development. There is no
 download yet.** The engine underneath it (permissions, containment,
-checkpoint/undo, model downloads, the sidecar HTTP layer) is built and
-self-tested; the desktop shell, the UI, and the installer are not built.
-Once it exists, the pitch is simple: point it at a model through
-[Ollama](https://ollama.com) and it works the way a hosted AI assistant
+checkpoint/undo, model downloads, the sidecar HTTP layer), the desktop
+shell, the interface and the installer are all built; the installer is
+unsigned, so it is not something to hand to a stranger yet. Hearth brings
+its own inference engine and its own Python, so nothing else has to be
+installed first. The pitch is simple: it works the way a hosted AI assistant
 does, except every token comes from your own GPU at no cost, it tells you
 honestly what your hardware can actually run instead of leaving you to
 guess, it downloads that model with a progress bar that does not lie, it
@@ -64,12 +65,17 @@ first. NixOS users, skip ahead to [the NixOS system](#the-nixos-system).
 > calculator, workspace containment, git-backed checkpoint/undo, model
 > downloads with honest progress, a prompt-injection scanner, an outbound
 > secret scanner, task-aware model routing, idle-aware compute, and
-> first-run setup diagnosis are all built and self-tested on Windows. The
-> desktop shell, the UI, the installer, and the model shop's actual
-> interface are not built yet. There is no download. [Hearth for
-> Windows](docs/windows.md) says exactly what exists today; [the Windows
-> threat model](docs/security/windows-threat-model.md) says exactly what
-> does not.
+> first-run setup diagnosis are all built and self-tested on Windows. So are
+> the desktop shell, the interface, and a Windows installer that carries its
+> own inference engine and its own Python: `python
+> scripts/build_windows.py` produces it, and
+> [docs/packaging-windows.md](docs/packaging-windows.md) documents it. That
+> installer is **unsigned**, which means the first person to run it meets a
+> full-screen SmartScreen warning whose only visible button is "Don't run".
+> Until there is a code-signing certificate there is no download and nothing
+> to hand to a stranger. [Hearth for Windows](docs/windows.md) says exactly
+> what exists today; [the Windows threat
+> model](docs/security/windows-threat-model.md) says exactly what does not.
 
 ## Hearth for Windows
 

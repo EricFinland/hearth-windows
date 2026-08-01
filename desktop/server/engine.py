@@ -649,8 +649,15 @@ def list_installed_models(ollama_url=None, timeout=3):
     on any failure whatsoever (Ollama not running, unreachable, malformed
     response): a models listing must degrade gracefully rather than ever
     raising, since GET /models should stay useful even when Ollama is down
-    (the shop's catalog verdicts are still worth showing on their own)."""
-    url = (ollama_url or hearth_loop.DEFAULT_OLLAMA).rstrip("/") + "/api/tags"
+    (the shop's catalog verdicts are still worth showing on their own).
+
+    The default URL is hearth_backend's, not hearth_loop's bare constant, so
+    that HEARTH_OLLAMA means one thing everywhere. It used to be read here
+    from a hardcoded 127.0.0.1:11434 while GET /setup and every chat turn
+    honoured the environment variable, which made a machine with HEARTH_OLLAMA
+    pointed elsewhere report models in the picker that nothing would then run.
+    """
+    url = (ollama_url or hearth_backend.DEFAULT_OLLAMA_URL).rstrip("/") + "/api/tags"
     try:
         req = urllib.request.Request(url)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -1989,6 +1996,27 @@ def _self_test():
 
     # === list_installed_models degrades to [] when Ollama is unreachable ===
     assert list_installed_models(ollama_url="http://127.0.0.1:1", timeout=1) == []
+
+    # === and it asks the SAME Ollama the rest of the sidecar talks to =====
+    # A caller that sets HEARTH_OLLAMA gets one answer everywhere, or the
+    # model picker offers models that no turn can then run. The source of
+    # the default is what is asserted, because the value itself is whatever
+    # the environment said at import time.
+    _urls_seen = []
+
+    def _spy(req, timeout=None):  # noqa: ARG001 - urlopen signature
+        _urls_seen.append(req.full_url)
+        raise OSError("no Ollama here")
+
+    _real_urlopen = urllib.request.urlopen
+    urllib.request.urlopen = _spy
+    try:
+        assert list_installed_models() == []
+    finally:
+        urllib.request.urlopen = _real_urlopen
+    assert _urls_seen == [hearth_backend.DEFAULT_OLLAMA_URL.rstrip("/") + "/api/tags"], \
+        ("list_installed_models must default to hearth_backend's Ollama URL, the one "
+         "HEARTH_OLLAMA configures, not a constant of its own: {}".format(_urls_seen))
 
     # === Minor: the sidecar's system prompt matches the manifest it =======
     # === actually enforces -- it must never claim network capability, ====

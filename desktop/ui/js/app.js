@@ -5,7 +5,7 @@
  * the sidecar itself.
  */
 
-import { Sidecar, HttpError, fetchHandshake } from "./api.js";
+import { Sidecar, HttpError, readHandshake, pickFolder, hasShellBridge } from "./api.js";
 import { Transcript } from "./transcript.js";
 import { el, icon, appendAll, clear, $ } from "./dom.js";
 import { blob } from "./safe-text.js";
@@ -61,6 +61,9 @@ const state = {
   checkpoints: [],
   backendHealthy: false,
   view: "chat",
+  // How many models GET /models listed. null means the list could not be
+  // read at all, which is not the same as zero: only zero is a first run.
+  modelCount: null,
 };
 
 // ---------------------------------------------------------------------- views
@@ -231,7 +234,10 @@ async function refreshModels() {
     ui.model.appendChild(el("option", { value: "", text: "could not list models", disabled: true }));
     ui.sessionNote.className = "panel-note is-error";
     ui.sessionNote.textContent = "Model list unavailable: " + errorText(err);
-    return;
+    // null, not 0: "the list could not be read" is a different thing from
+    // "the list is empty", and only the second one means a first run.
+    state.modelCount = null;
+    return null;
   }
   // Every entry names the backend that runs it, and carries the exact "ref"
   // string POST /session expects. The value sent back is that ref, never a
@@ -255,6 +261,8 @@ async function refreshModels() {
   if (previous && values.includes(previous)) ui.model.value = previous;
   else if (state.session?.model && values.includes(state.session.model)) ui.model.value = state.session.model;
   else if (values.length) ui.model.value = values[0];
+  state.modelCount = entries.length;
+  return entries.length;
 }
 
 // ---------------------------------------------------------------------- shop
@@ -783,12 +791,7 @@ function handleEvent(event) {
 async function browseForFolder() {
   ui.browse.disabled = true;
   try {
-    const response = await fetch("/__hearth/pick-folder", {
-      method: "POST",
-      cache: "no-store",
-      credentials: "omit",
-    });
-    const body = await response.json();
+    const body = await pickFolder();
     if (body.path) {
       ui.workspace.value = body.path;
       ui.sessionNote.className = "panel-note";
@@ -839,16 +842,19 @@ document.addEventListener("keydown", (event) => {
 
 async function boot() {
   paintRecents();
-  transcript.showPlaceholder("Connecting", "Reading the sidecar handshake from the dev host.");
+  transcript.showPlaceholder("Connecting", "Asking the shell where the Hearth service is.");
   setConn("busy", "connecting");
 
   try {
-    state.handshake = await fetchHandshake("");
+    state.handshake = await readHandshake();
+    sidecar.setOrigin(state.handshake.origin);
     sidecar.setToken(state.handshake.token);
   } catch (err) {
     setConn("down", "no handshake");
-    transcript.showPlaceholder("Cannot reach the sidecar",
-      "The dev host did not return a handshake. Start it with: node desktop/ui/dev-host.mjs");
+    transcript.showPlaceholder("Cannot reach the Hearth service",
+      hasShellBridge()
+        ? "The shell started but did not hand over a handshake. Restarting Hearth should fix this."
+        : "The dev host did not return a handshake. Start it with: node desktop/ui/dev-host.mjs");
     ui.setupBody.textContent = "";
     ui.setupBody.appendChild(el("p", { class: "panel-note is-error", text: errorText(err) }));
     return;
@@ -887,6 +893,23 @@ async function boot() {
     transcript.showPlaceholder("Session restored",
       `${session.mode} mode in ${session.workspace}. Earlier events replay below.`);
     startEventStream();
+  } else if (state.modelCount === 0) {
+    // A brand new install: the engine is bundled but no model is, because a
+    // model is gigabytes and which one to fetch depends on the machine. So
+    // the first screen is not an empty chat with a dead dropdown; it is the
+    // three things that have to happen, and the button that starts them.
+    transcript.showFirstRun(
+      "Welcome to Hearth",
+      "Everything Hearth needs to run a model is already installed. The one "
+      + "thing missing is a model, because they are several gigabytes each and "
+      + "which one fits depends on your machine.",
+      [
+        "Open the model shop and search Hugging Face.",
+        "Download a model. Hearth suggests sizes that fit your hardware.",
+        "Come back here, pick a folder to work in, and start chatting.",
+      ],
+      { label: "Open the model shop", onClick: () => setView("shop") },
+    );
   }
 
   // A light poll keeps `status` honest even if an event is missed: the sidecar

@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "project": "CPython",
+  "upstream": "https://www.python.org/downloads/release/python-31210/",
+  "download_prefix": "https://www.python.org/ftp/python/3.12.10/",
+  "version": "3.12.10",
+  "pinned_at": "2026-08-01",
+  "policy": {
+    "distribution": "windows-embeddable",
+    "reason": "The embeddable package is a directory of files, not an installer. It writes nothing to the registry, touches no PATH entry, creates no py.exe launcher association and never collides with a Python the user already has. It is also plain CPython, so agent/ and desktop/server/ import exactly as they do from a checkout, with no freezing step to keep in sync.",
+    "version_reason": "3.12.10 is the interpreter the test suite is run against on this machine, so the shipped interpreter is the tested interpreter.",
+    "sys_path": "python312._pth is rewritten at build time with exactly two entries, python312.zip and the interpreter directory, so the packaged interpreter's sys.path is stated by this repository rather than inherited from whatever a future stock file happens to contain. Its presence keeps CPython in isolated mode, which is the property worth having: PYTHONPATH, PYTHONHOME, user site-packages and the registry are all ignored, so a Python the user already has cannot contribute modules to ours. Isolated mode also does not prepend a script's directory to sys.path (verified: a script run by the stock embeddable cannot import its own siblings), which desktop/server/main.py handles itself in its first few lines rather than encoding the packaged layout into the interpreter."
+  },
+  "sha256_source_meanings": {
+    "downloaded_and_hashed_md5_cross_checked": "the archive was downloaded and hashed on the machine that pinned it, and its MD5 equalled the MD5 python.org publishes on the release page. python.org publishes no SHA-256 for this artifact, so the cross-check is over MD5 (a second, independently served value) and the SHA-256 recorded here is the locally computed digest of those same verified bytes."
+  },
+  "artifact": {
+    "asset": "python-3.12.10-embed-amd64.zip",
+    "os": "windows",
+    "arch": "x86_64",
+    "size": 11133606,
+    "sha256": "4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3",
+    "md5_published": "fe8ef205f2e9c3ba44d0cf9954e1abd3",
+    "sha256_source": "downloaded_and_hashed_md5_cross_checked"
+  }
+}

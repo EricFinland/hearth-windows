@@ -16,7 +16,30 @@ fixed port lets a leftover orphan process from a previous run answer a new
 UI's requests as if it were the current session.
 
 Run with no arguments to actually serve:  python main.py
+Stop when the shell that started us does: python main.py --watch-parent
 Run the self-test instead of serving:     python main.py --self-test
+
+Why --watch-parent exists
+-------------------------
+This process can be holding a llama-server child with several gigabytes of
+VRAM. That child is inside a kill-on-close Windows Job Object owned by this
+process (hearth_llama._win_job), so it dies whenever this process dies, by
+any means, including a hard kill. The missing link was this process itself:
+orphan it and it survives happily, keeping the model resident forever, and
+the user's only clue is a fan and a missing 6 GB.
+
+--watch-parent closes that link, using the sidecar's own stdin as a liveness
+handle rather than a parent pid (Windows recycles pids, and killing a
+healthy sidecar because an unrelated process inherited a number is worse
+than the problem) or any platform-specific process handle. Two signals, and
+either one shuts the sidecar down: the shell's end of the pipe closing, and
+a shell that had been heartbeating going silent. watch_parent's own
+docstring says why one signal was not enough, with the measurement that
+showed it.
+
+Without the flag, stdin is untouched and nothing about the old behaviour
+changes, so a run from a terminal, or from scripts/e2e_live.py, is
+unaffected.
 
 Restart survival: make_server() also wires up session_state.py so a Session
 is durable across a process restart -- see session.py's and
@@ -47,9 +70,26 @@ import json
 import os
 import secrets
 import sys
+import threading
+import time
 from http.server import ThreadingHTTPServer
 
-import app as app_mod
+# This directory has to be importable before the three imports below, and
+# there is exactly one way to guarantee that from inside the file itself.
+# Running `python main.py` from a checkout gets it for free, because CPython
+# prepends a script's own directory to sys.path -- but not when the
+# interpreter is in isolated mode, which is the mode the embeddable
+# distribution the packaged app ships runs in (verified: a script run by the
+# stock embeddable cannot import its own siblings). Doing it here rather
+# than in the interpreter's path configuration means the sidecar can be
+# started from any directory, by any interpreter, in any layout, which is
+# what keeps the packaging layer from having a say in whether the imports
+# work. engine.py does the same thing for the agent/ directory next door.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+import app as app_mod  # noqa: E402
 import engine as engine_mod
 import session_state
 
@@ -117,8 +157,159 @@ def print_handshake(state, stream=None):
     stream.flush()
 
 
+#: How long a shutdown triggered by a dead parent is allowed to take before
+#: the process leaves anyway. serve_forever's loop exits within one poll
+#: interval, so this is generous; the point is that no wedged worker thread
+#: can turn "the shell died" into "the model stays resident".
+PARENT_EXIT_GRACE = 5.0
+
+
+#: How long a heartbeating shell may go quiet before it is presumed dead.
+#: Only enforced once a first heartbeat has arrived -- see watch_parent.
+PARENT_HEARTBEAT_TIMEOUT = 60.0
+
+#: How often the deadline above is checked.
+PARENT_HEARTBEAT_POLL = 2.0
+
+
+def _private_stdin():
+    """Take the shell's pipe off file descriptor 0 and return it.
+
+    Descriptor 0 is duplicated to a private descriptor for the watcher, and
+    0 itself is repointed at the null device. Every process the sidecar
+    starts afterwards -- git, llama-server, a shell tool -- therefore
+    inherits the null device as its standard input, and cannot see or touch
+    the channel the shell uses to say it is still alive.
+
+    This is not tidiness. Leaving the pipe on descriptor 0 was measured to
+    make the first turn take over two minutes instead of five seconds: every
+    checkpoint git invocation in hearth_checkpoint inherited the pipe,
+    subprocess's reader threads then sat until their timeouts expired, and
+    init_store makes several such calls in a row. A thread dump taken during
+    the stall showed exactly that, and the same turn with the sidecar's
+    stdin untouched completed in five seconds. Beyond the speed, an
+    inherited pipe is a correctness problem in its own right: a child that
+    reads standard input would eat the shell's heartbeats and eventually
+    convince the sidecar its shell had died.
+
+    Falls back to whatever sys.stdin offers if descriptor 0 cannot be
+    manipulated (no handle at all, a closed descriptor). The watcher treats
+    an unreadable stream as a dead shell, which is the safe direction.
+    """
+    try:
+        private_fd = os.dup(0)
+    except OSError:
+        return getattr(sys.stdin, "buffer", sys.stdin)
+    try:
+        null_fd = os.open(os.devnull, os.O_RDONLY)
+        try:
+            os.dup2(null_fd, 0)
+        finally:
+            os.close(null_fd)
+    except OSError:
+        # Descriptor 0 could not be replaced. The watcher still works off
+        # its private copy; children just keep inheriting the pipe.
+        pass
+    return os.fdopen(private_fd, "rb", buffering=0)
+
+
+def watch_parent(on_gone, stream=None, heartbeat_timeout=PARENT_HEARTBEAT_TIMEOUT,
+                 poll=PARENT_HEARTBEAT_POLL, clock=time.monotonic):
+    """Call `on_gone` when the shell that started us stops being there.
+
+    Two independent signals, because one of them turned out not to be
+    universally reliable.
+
+    1. END OF STREAM. The shell holds our stdin open for as long as it
+       lives; when it stops living the OS closes its end and the read below
+       returns EOF. This is the fast path and it fires within a second.
+
+       It depends on the shell being the ONLY holder of the write end of
+       that pipe, and that is not something the sidecar can enforce.
+       Measured on Windows: a parent using CPython's own subprocess module
+       leaks an inheritable copy of the write handle into the child, so
+       killing that parent produces no EOF at all and the sidecar lives
+       forever. A parent using Node (libuv), which is what Hearth's shell
+       is, does not, and the sidecar dies within two seconds. Relying on
+       the shell's process library to get handle inheritance right is not
+       a guarantee, and the thing at stake is several gigabytes of VRAM.
+
+    2. HEARTBEAT SILENCE. A shell may also write a byte periodically. Once
+       one has arrived, the sidecar requires another within
+       `heartbeat_timeout` and shuts down if none comes. This needs no EOF,
+       no parent pid (which Windows recycles, so polling one risks killing
+       a healthy sidecar because an unrelated process inherited the
+       number), and no platform-specific process handle.
+
+       Enforcement starts only after the first heartbeat, so a caller that
+       never sends one -- a terminal, a test harness, scripts/e2e_live.py --
+       keeps exactly the old EOF-only behaviour and is never shut down for
+       being quiet.
+
+    Bytes are read and discarded. The sidecar has no stdin protocol and
+    never will: everything it accepts arrives over the authenticated
+    loopback HTTP API. Returns the reader thread, for tests.
+
+    An unreadable stdin (no handle at all, already closed) counts as "the
+    shell is gone", which is the safe direction: a sidecar with no shell to
+    talk to has nothing to serve.
+    """
+    stream = _private_stdin() if stream is None else stream
+    fired = threading.Event()
+    beat = {"seen": False, "at": clock()}
+
+    def fire():
+        if fired.is_set():
+            return
+        fired.set()
+        on_gone()
+
+    def read_loop():
+        try:
+            while True:
+                chunk = stream.read(1)
+                if not chunk:
+                    break
+                beat["seen"] = True
+                beat["at"] = clock()
+        except Exception:  # noqa: BLE001 - any read failure means the pipe is gone
+            pass
+        fire()
+
+    def deadline_loop():
+        while not fired.is_set():
+            time.sleep(poll)
+            if beat["seen"] and clock() - beat["at"] > heartbeat_timeout:
+                fire()
+                return
+
+    reader = threading.Thread(target=read_loop, name="hearth-parent-watch", daemon=True)
+    reader.start()
+    threading.Thread(target=deadline_loop, name="hearth-parent-heartbeat", daemon=True).start()
+    return reader
+
+
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
     server, state = make_server()
+
+    if "--watch-parent" in argv:
+        def _parent_gone():
+            print("[hearth-main] the shell closed our stdin; shutting down",
+                  file=sys.stderr, flush=True)
+            # A hard exit after the grace period, in case shutdown() is
+            # blocked behind a request that will not finish. Terminating
+            # this process is what releases the job object holding
+            # llama-server, so "leave anyway" is strictly better than "hang
+            # forever with the model loaded".
+            timer = threading.Timer(PARENT_EXIT_GRACE, lambda: os._exit(0))
+            timer.daemon = True
+            timer.start()
+            server.shutdown()
+
+        watch_parent(_parent_gone)
+
     print_handshake(state)
     try:
         server.serve_forever(poll_interval=0.2)
@@ -362,6 +553,92 @@ def _self_test_body():
         server_b.shutdown()
         server_b.server_close()
         tb.join(timeout=5)
+
+    # === --watch-parent: the sidecar must not outlive the shell ===========
+    # This is the thing standing between a Task-Manager kill of the shell
+    # and a llama-server left holding several GB of VRAM until the machine
+    # reboots, so it gets a real pipe rather than a mock.
+    read_fd, write_fd = os.pipe()
+    reader = os.fdopen(read_fd, "rb", buffering=0)
+    fired = threading.Event()
+    watcher = watch_parent(fired.set, stream=reader)
+
+    # A parent that has never heartbeated and is merely quiet must NOT
+    # trigger it. This is what keeps a terminal run, or e2e_live.py, from
+    # being shut down for saying nothing: silence only becomes evidence
+    # once the shell has shown it does heartbeat.
+    assert not fired.wait(0.3), "the watcher fired while the parent was still alive"
+
+    # Traffic does not trigger it either: there is no stdin protocol, bytes
+    # are read and dropped.
+    os.write(write_fd, b"noise the sidecar must ignore\n")
+    assert not fired.wait(0.3), "the watcher fired on stdin traffic rather than on EOF"
+
+    os.close(write_fd)
+    assert fired.wait(5), "closing the parent's end of stdin did not wake the watcher"
+    watcher.join(timeout=5)
+    assert not watcher.is_alive()
+    reader.close()
+
+    # A stdin that cannot be read at all (no handle, already closed) counts
+    # as "the parent is gone" rather than as "carry on serving".
+    class _DeadStream:
+        def read(self, _n):
+            raise OSError("the handle is closed")
+
+    fired2 = threading.Event()
+    watch_parent(fired2.set, stream=_DeadStream()).join(timeout=5)
+    assert fired2.is_set(), "an unreadable stdin must be treated as a dead parent"
+
+    # === descriptor 0 is taken away from every child ======================
+    # Leaving the shell's pipe on descriptor 0 was measured to turn a
+    # five-second first turn into a two-minute one, because every git
+    # invocation hearth_checkpoint makes inherited it and subprocess's
+    # reader threads then sat until their timeouts expired. A child must
+    # inherit the null device instead, and this is the check that says so.
+    r3, w3 = os.pipe()
+    saved_stdin = os.dup(0)
+    try:
+        os.dup2(r3, 0)
+        os.close(r3)
+        private = _private_stdin()
+        # Descriptor 0 no longer refers to the pipe: writing to the pipe
+        # must not be readable through descriptor 0, and reading descriptor
+        # 0 must give EOF the way the null device does.
+        os.write(w3, b"heartbeat\n")
+        assert os.read(0, 32) == b"", \
+            "descriptor 0 must be the null device after the watcher takes its copy"
+        # The watcher's private copy still sees the shell.
+        assert private.read(1) == b"h", "the watcher lost the shell's channel"
+        private.close()
+    finally:
+        os.dup2(saved_stdin, 0)
+        os.close(saved_stdin)
+        os.close(w3)
+
+    # === the second net: a heartbeating shell that goes silent ============
+    # A parent can die WITHOUT the pipe ever reporting EOF -- measured on
+    # Windows with a CPython subprocess parent, which leaks an inheritable
+    # copy of the write handle into the child, so the child holds its own
+    # stdin open forever. Nothing here can stop a shell doing that, so the
+    # sidecar must not depend on EOF alone. Once a heartbeat has been seen,
+    # silence past the deadline means gone.
+    r2, w2 = os.pipe()
+    reader2 = os.fdopen(r2, "rb", buffering=0)
+    fired3 = threading.Event()
+    watch_parent(fired3.set, stream=reader2, heartbeat_timeout=0.6, poll=0.05)
+    # No heartbeat yet: the deadline must not apply, however long we wait.
+    assert not fired3.wait(1.5), \
+        "silence from a parent that never heartbeated must not shut the sidecar down"
+    os.write(w2, b"\n")            # the shell proves it heartbeats
+    time.sleep(0.2)
+    os.write(w2, b"\n")            # and keeps its promise once
+    assert not fired3.wait(0.3), "a heartbeat inside the deadline must keep the sidecar up"
+    # Now it stops. The pipe stays OPEN the whole time, so EOF never comes
+    # and only the deadline can catch this.
+    assert fired3.wait(5), "a heartbeating shell that went silent was not noticed"
+    os.close(w2)
+    reader2.close()
 
     print("hearth-desktop-main self-test OK")
 

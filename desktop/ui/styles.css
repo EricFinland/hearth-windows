@@ -298,6 +298,25 @@ select.input option { background: var(--panel-2); color: var(--fg); }
 .empty h1 { margin: 0 0 8px; font-size: 17px; font-weight: 560; color: var(--fg-dim); }
 .empty p { margin: 0; font-size: 13px; line-height: 1.65; }
 
+/* first run: nothing is downloaded yet, so the empty state has to teach */
+.empty-steps {
+  margin: 18px 0 0; padding: 0; list-style: none; counter-reset: step;
+  text-align: left; font-size: 13px; line-height: 1.7;
+}
+.empty-steps li {
+  counter-increment: step;
+  position: relative; padding-left: 30px; margin-bottom: 6px;
+}
+.empty-steps li::before {
+  content: counter(step);
+  position: absolute; left: 0; top: 1px;
+  width: 19px; height: 19px; border-radius: 50%;
+  background: var(--panel-2); border: 1px solid var(--line);
+  color: var(--fg-dim); font-size: 11px; font-weight: 600;
+  display: flex; align-items: center; justify-content: center;
+}
+.empty-action { margin-top: 20px; }
+
 /* ---------- messages ---------- */
 
 .msg { max-width: 860px; margin: 0 auto 18px; padding: 0 28px; }

@@ -26,3 +26,17 @@ __pycache__/
 # the pin, so the manifest is the thing worth reviewing in a diff.
 vendor/llama/
 vendor/cache/
+.gstack/
+
+# vendored CPython, same reasoning as the llama binaries above. Fetched by
+# scripts/vendor_python.py from the release pinned in
+# vendor/python_manifest.json, which IS committed.
+vendor/python/
+
+# windows packaging. build/stage is the assembled payload and build/dist is
+# electron-builder's output; both are reproducible from a checkout by
+# scripts/build_windows.py, and both are hundreds of megabytes. Anchored to
+# the repository root on purpose: an unanchored "build/" would also swallow
+# desktop/shell/build/, which holds the committed application icon.
+/build/
+desktop/shell/node_modules/

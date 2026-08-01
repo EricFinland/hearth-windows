@@ -52,6 +52,14 @@ export class Sidecar {
     this._token = null;
   }
 
+  /** Point the client at the origin the shell reported. Empty string means
+   *  "wherever this page came from", which is what both current shells give
+   *  us; it is settable so a shell that serves the UI and the API from
+   *  different places does not need this file changed. */
+  setOrigin(origin) {
+    this.origin = (origin || "").replace(/\/$/, "");
+  }
+
   /** Kept in a private field for the lifetime of the page and nowhere else. */
   setToken(token) {
     this._token = token || null;
@@ -243,16 +251,62 @@ function parseFrame(frame) {
   };
 }
 
-/** Ask the dev host for the sidecar handshake it read off the sidecar's
- *  stdout. Only the dev host serves this; a Tauri build would hand the same
- *  two values to the webview over IPC instead, and nothing else here would
- *  change. */
-export async function fetchHandshake(origin = "") {
-  const response = await fetch(origin + "/__hearth/handshake", {
+/* ------------------------------------------------------------ the shell
+ *
+ * Everything below is the whole contract between this UI and whatever is
+ * hosting it. Two calls: where the sidecar is and how to authenticate to it,
+ * and a native folder chooser. Nothing here names Electron, or Tauri, or the
+ * dev host, and nothing else in desktop/ui/ talks to the host at all, so
+ * changing hosts is a change to the host.
+ *
+ * `globalThis.hearth` is the packaged path: the shell reads the handshake off
+ * the sidecar's stdout in its own process and passes it in over a private
+ * channel. The HTTP fallback is dev-host.mjs, which serves the same values at
+ * GET /__hearth/handshake to anything on loopback that asks. That is a real
+ * widening and it is why the dev host is a development tool and not the
+ * shipped app -- see the note at the top of dev-host.mjs. Preferring the
+ * bridge whenever one exists means the packaged app never takes that path.
+ */
+
+/** True when a shell has injected its bridge. */
+export function hasShellBridge() {
+  const bridge = globalThis.hearth;
+  return Boolean(bridge && typeof bridge.handshake === "function");
+}
+
+/** {origin, token, default_workspace} for the sidecar to talk to. */
+export async function readHandshake() {
+  if (hasShellBridge()) {
+    const shell = await globalThis.hearth.handshake();
+    return {
+      origin: shell.origin || "",
+      token: shell.token,
+      default_workspace: shell.defaultWorkspace || "",
+    };
+  }
+  const response = await fetch("/__hearth/handshake", {
     cache: "no-store",
     credentials: "omit",
     redirect: "error",
   });
   if (!response.ok) throw new HttpError(response.status, null);
-  return response.json();
+  const body = await response.json();
+  return { origin: "", token: body.token, default_workspace: body.default_workspace || "" };
+}
+
+/** Native folder chooser. Resolves {path} or {error}; never throws. */
+export async function pickFolder() {
+  try {
+    if (globalThis.hearth && typeof globalThis.hearth.pickFolder === "function") {
+      return await globalThis.hearth.pickFolder();
+    }
+    const response = await fetch("/__hearth/pick-folder", {
+      method: "POST",
+      cache: "no-store",
+      credentials: "omit",
+    });
+    return await response.json();
+  } catch {
+    return { error: "No folder picker available here." };
+  }
 }

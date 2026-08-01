@@ -251,6 +251,35 @@ export class Transcript {
     ]));
   }
 
+  /** The placeholder a brand new install lands on.
+   *
+   *  A first run has no model downloaded, so there is nothing to chat with
+   *  and the model dropdown has nothing in it. Saying so and offering the
+   *  one button that fixes it is the difference between an empty app and an
+   *  app that tells you what to do first. `steps` are rendered as plain
+   *  text lines; `action` is {label, onClick}.
+   */
+  showFirstRun(title, body, steps = [], action = null) {
+    this.reset();
+    const box = el("div", { class: "empty" }, [
+      el("h1", { text: title }),
+      el("p", { text: body }),
+    ]);
+    if (steps.length) {
+      appendAll(box, [el("ol", { class: "empty-steps" },
+        steps.map((step) => el("li", { text: step })))]);
+    }
+    if (action) {
+      appendAll(box, [el("button", {
+        class: "btn btn-primary empty-action",
+        type: "button",
+        text: action.label,
+        on: { click: action.onClick },
+      })]);
+    }
+    this._append(box);
+  }
+
   clearPlaceholder() {
     const placeholder = this.root.querySelector(".empty");
     if (placeholder) placeholder.remove();
