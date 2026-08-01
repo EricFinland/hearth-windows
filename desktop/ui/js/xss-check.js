@@ -19,6 +19,10 @@
 import { renderProse, blob } from "./safe-text.js";
 import { Transcript } from "./transcript.js";
 import { el } from "./dom.js";
+import {
+  renderModelCard, renderQuantRow, renderDownloadRow, renderDownloads,
+  renderSourceNotice, renderHardware, renderVerdict,
+} from "./shop.js";
 
 // Any payload that manages to execute sets this. It must stay false.
 window.__xssFired = false;
@@ -94,6 +98,139 @@ for (const payload of PAYLOADS) {
   check("inline code span", payload,
     probe((host) => host.appendChild(renderProse("look: `" + payload + "` done"))));
 }
+
+// ---------------------------------------------------------------------------
+// The model shop.
+//
+// Everything a shop listing carries is chosen by whoever uploaded the
+// repository: the repo id, its label, the author, the tags, every GGUF
+// filename, and -- when the Hub returns an error for a repository -- the error
+// string too. hearth_shop passes all of it through untouched, correctly, so
+// this UI is the only place it can be made inert. Each payload is driven
+// through the same render functions shop.js's live view calls, not through
+// lookalikes, and it is planted in every one of those fields at once so a
+// single missed `text:` shows up as a failure rather than being masked by the
+// nine neighbouring fields that were done right.
+// ---------------------------------------------------------------------------
+
+function hostileQuant(payload, extra = {}) {
+  return {
+    name: payload,
+    path: payload,
+    quant: payload,
+    size_bytes: 4_400_000_000,
+    complete: true,
+    recommended: true,
+    split_part_count: null,
+    projector: false,
+    disk_ok: true,
+    local: { present: false, partial_bytes: 1_100_000_000, parts_present: 0 },
+    alternate_editions: [],
+    verdict: {
+      verdict: payload,           // an unrecognised grade must render as text
+      message: payload,
+      requested_context_tokens: 8192,
+      max_context_tokens: 4424,
+      required_bytes: 5_000_000_000,
+      headroom_bytes: -600_000_000,
+      vram_approximate: true,
+    },
+    ...extra,
+  };
+}
+
+function hostileEntry(payload) {
+  const quant = hostileQuant(payload);
+  return {
+    source: "live",
+    repo_id: payload,
+    label: payload,
+    author: payload,
+    description: payload,
+    focus: payload,
+    downloads: 12345,
+    likes: 67,
+    params_b: 7,
+    gated: false,
+    gated_mode: payload,
+    downloadable: true,
+    quants_loaded: true,
+    quants: [quant, hostileQuant(payload, { recommended: false })],
+    best_quant: quant,
+    verdict: quant.verdict,
+    files_error: payload,
+  };
+}
+
+function hostileJob(payload, status) {
+  return {
+    id: "dl-x",
+    repo_id: payload,
+    filename: payload,
+    label: payload,
+    quant: payload,
+    status,
+    bytes_done: 1_100_000_000,
+    bytes_total: 4_400_000_000,
+    fraction: 0.25,
+    speed_bytes_per_sec: 18_000_000,
+    eta_seconds: 160,
+    part_index: 1,
+    part_count: 3,
+    resumed_from: 900_000_000,
+    queue_position: null,
+    path: payload,
+    error: payload,
+    error_kind: payload,
+    verified: false,
+    verification: payload,
+    already_present: false,
+    cancellable: status === "downloading",
+  };
+}
+
+for (const payload of PAYLOADS) {
+  check("shop model card", payload,
+    probe((host) => host.appendChild(renderModelCard(hostileEntry(payload), {}))));
+  check("shop quantisation row", payload,
+    probe((host) => host.appendChild(
+      renderQuantRow(hostileEntry(payload), hostileQuant(payload), {}))));
+  check("shop verdict", payload,
+    probe((host) => host.appendChild(renderVerdict(hostileQuant(payload).verdict))));
+  for (const status of ["downloading", "error", "cancelled", "done"]) {
+    check(`shop download row (${status})`, payload,
+      probe((host) => host.appendChild(renderDownloadRow(hostileJob(payload, status), {}))));
+  }
+  check("shop downloads panel", payload,
+    probe((host) => host.appendChild(
+      renderDownloads([hostileJob(payload, "downloading")], {}))));
+  check("shop fallback banner", payload,
+    probe((host) => host.appendChild(renderSourceNotice({
+      source: "fallback", notice: payload, error: payload,
+    }))));
+  // A gated repository renders a different branch (no download button, a
+  // licence explanation) and has to be inert on that branch too.
+  check("shop gated model card", payload,
+    probe((host) => host.appendChild(renderModelCard(
+      { ...hostileEntry(payload), gated: true, downloadable: false, gated_mode: "manual" }, {}))));
+  // hearth_shop's fallback listing: entries whose repo_id is null and whose
+  // description and label come from the built-in catalog, rendered by the
+  // same card with a different badge.
+  check("shop reference-catalog card", payload,
+    probe((host) => host.appendChild(renderModelCard(
+      { ...hostileEntry(payload), source: "fallback", repo_id: null,
+        downloadable: false, quants_loaded: false, quants: [], best_quant: null }, {}))));
+}
+
+// The hardware bar is rendered from the sidecar's own hardware probe rather
+// than from the Hub, but it crosses the same JSON boundary, so a string where
+// a number belongs must still be inert rather than trusted.
+check("shop hardware bar", PAYLOADS[0],
+  probe((host) => host.appendChild(renderHardware({
+    gpu_detected: true, gpu_vendor: PAYLOADS[0], vram_bytes: 16 * 1024 ** 3,
+    ram_bytes: 24 * 1024 ** 3, free_disk_bytes: 500 * 1024 ** 3, context_tokens: 8192,
+    vram_approximate: true,
+  }))));
 
 // The live transcript surfaces, rendered into the visible stage so the result
 // can be read by eye as well as asserted.

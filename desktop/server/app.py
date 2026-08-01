@@ -67,6 +67,40 @@ Endpoints:
                   bundled engine contributes nothing, so the list never
                   offers a model the active configuration cannot run. Both
                   halves are best-effort; neither can take the route down.
+  GET  /shop      hearth_shop.search_shop(?q=): live Hugging Face GGUF
+                  results with every quantisation graded against THIS
+                  machine's hardware. ?context= sets the context length the
+                  verdicts are judged at. The response's own "source" field
+                  is "live" or "fallback", and "ok" is True only for live
+                  Hub results -- a caller must not present a fallback
+                  listing as search results, and this route never flattens
+                  that distinction away.
+  GET  /shop/quants  hearth_shop.repo_quants(?repo=): every quantisation of
+                  one repository, for the results search_shop left with
+                  quants_loaded False. Each quantisation is additionally
+                  annotated with what is already on disk for it (see
+                  downloads.quant_local_state), so a UI can say "3.1 GB
+                  already downloaded, resume" instead of offering a fresh
+                  4 GB download over a partial.
+  GET  /downloads     every download this PROCESS knows about, with live byte
+                  counts. Not session-scoped: see downloads.py's module
+                  docstring for why downloads deliberately do not ride on
+                  GET /events.
+  POST /downloads     start one: {"repo_id", "filename"}. filename is the
+                  quantisation's path (a single file) or its logical name (a
+                  split model). Sizes and hashes are NOT accepted from the
+                  caller; downloads.py re-reads them from the Hub, so a page
+                  cannot pick what a download is verified against.
+  GET  /downloads/events  a Server-Sent Events stream carrying the COMPLETE
+                  download list on every change (event: "downloads"), not a
+                  delta log. Accepts ?since=<version>. Every frame is
+                  self-sufficient, so a page reload resumes correctly with no
+                  replay and no gap marker.
+  POST /downloads/cancel   {"id"}: stop a queued or running download. A
+                  running one leaves a resumable .part behind; starting the
+                  same file again continues from it.
+  POST /downloads/dismiss  {"id"}: forget a finished download. Refused for
+                  one still in flight, which must be cancelled instead.
   GET  /checkpoints  the current session's checkpoint history, newest first.
   POST /restore   revert the current session's workspace to a prior
                   checkpoint: {"checkpoint_id"}. The response is whatever
@@ -151,9 +185,11 @@ import os
 import sys
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import auth
+import downloads as downloads_mod
 import engine as engine_mod
 import session as session_mod
 
@@ -177,6 +213,20 @@ IDLE_CACHE_SECONDS = 2.0
 # bounding the allocation a single request can force.
 MAX_BODY_BYTES = 16 * 1024 * 1024
 
+# Bounds on GET /shop. `limit` is how many repositories the Hub is asked
+# for; `detail` is how many of those have their whole file tree fetched and
+# every quantisation graded, which costs one extra Hub request each. The
+# caps exist because both are caller-controlled and each one multiplies the
+# work a single authenticated request can ask this process to do against a
+# third party.
+SHOP_LIMIT_DEFAULT = 12
+SHOP_LIMIT_MAX = 40
+SHOP_DETAIL_DEFAULT = 6
+SHOP_DETAIL_MAX = 12
+# Context length the fit verdicts are judged at. Capped for the same reason:
+# it is a multiplier on the KV-cache arithmetic every verdict does.
+SHOP_CONTEXT_MAX = 1024 * 1024
+
 
 class WorkspaceBusyError(RuntimeError):
     """Raised by SidecarState.create_session when the requested workspace is
@@ -198,7 +248,8 @@ class SidecarState:
     def __init__(self, token, engine_factory=None, port=0, models_fetcher=None,
                  max_sse_connections=None, persist_hook=None,
                  setup_diagnoser=None, idle_prober=None, idle_cache_seconds=None,
-                 local_models_fetcher=None, model_checker=None):
+                 local_models_fetcher=None, model_checker=None,
+                 shop_searcher=None, shop_quanter=None, download_manager=None):
         self.token = token
         self.port = port  # main.py sets this to the real bound port after listen
         self.engine_factory = engine_factory or (lambda: session_mod.NullEngine())
@@ -225,6 +276,18 @@ class SidecarState:
         # get_idle_status(). Injectable for the same reason as
         # models_fetcher and setup_diagnoser.
         self.idle_prober = idle_prober or engine_mod.hearth_idle.is_good_time
+        # GET /shop and GET /shop/quants. Injectable exactly like the fetchers
+        # above, so the self-test exercises the routes (including their
+        # untrusted-text and fallback-labelling behaviour) without reaching
+        # Hugging Face.
+        self.shop_searcher = shop_searcher or engine_mod.hearth_shop.search_shop
+        self.shop_quanter = shop_quanter or engine_mod.hearth_shop.repo_quants
+        # The download queue. One per process, deliberately NOT per session:
+        # see downloads.py's module docstring. Constructed lazily rather than
+        # eagerly so a test that never touches downloads never starts a
+        # worker thread.
+        self._downloads = download_manager
+        self._downloads_lock = threading.Lock()
         self.idle_cache_seconds = (
             IDLE_CACHE_SECONDS if idle_cache_seconds is None else idle_cache_seconds)
         self._idle_lock = threading.Lock()  # separate from self._lock below: probing
@@ -250,6 +313,15 @@ class SidecarState:
     def get_session(self):
         with self._lock:
             return self.session
+
+    def get_downloads(self):
+        """The process-wide DownloadManager, built on first use. Its own
+        lock, not self._lock: a download route must never contend with
+        session creation, and vice versa."""
+        with self._downloads_lock:
+            if self._downloads is None:
+                self._downloads = downloads_mod.DownloadManager()
+            return self._downloads
 
     def _persist_if_current(self, session):
         """The persist_hook every Session this state creates or adopts is
@@ -461,6 +533,12 @@ class SidecarHandler(BaseHTTPRequestHandler):
         return self.path.split("?", 1)[0]
 
     def _query(self):
+        """Percent-decoded query parameters. GET /events' `since` is a plain
+        integer and never needed decoding, but a shop search carries a
+        user-typed string ("qwen 2.5 coder", "phi-3.5"), so the values are
+        unquoted here rather than at one call site. unquote_plus, not
+        unquote: the UI encodes with URLSearchParams, which writes a space
+        as "+"."""
         parts = self.path.split("?", 1)
         if len(parts) < 2:
             return {}
@@ -469,8 +547,18 @@ class SidecarHandler(BaseHTTPRequestHandler):
             if not kv:
                 continue
             k, _, v = kv.partition("=")
-            out[k] = v
+            out[urllib.parse.unquote_plus(k)] = urllib.parse.unquote_plus(v)
         return out
+
+    def _int_param(self, query, name, default, low, high):
+        """A caller-supplied integer, clamped. A missing or unparseable value
+        is the default rather than a 400: these are all display knobs, and
+        failing a search because a stale page sent limit=abc helps nobody."""
+        try:
+            value = int(query.get(name, default))
+        except (TypeError, ValueError):
+            return default
+        return max(low, min(high, value))
 
     # ---- routing ----
 
@@ -500,6 +588,14 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._get_setup()
         elif path == "/idle":
             self._get_idle()
+        elif path == "/shop":
+            self._get_shop()
+        elif path == "/shop/quants":
+            self._get_shop_quants()
+        elif path == "/downloads":
+            self._send_json(200, self.state.get_downloads().snapshot())
+        elif path == "/downloads/events":
+            self._get_download_events()
         else:
             self._send_json(404, {"error": "not_found"})
 
@@ -522,6 +618,10 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._post_cancel()
         elif path == "/restore":
             self._post_restore()
+        elif path == "/downloads":
+            self._post_download()
+        elif path in ("/downloads/cancel", "/downloads/dismiss"):
+            self._post_download_action(path.rsplit("/", 1)[1])
         else:
             self._send_json(404, {"error": "not_found"})
 
@@ -720,6 +820,163 @@ class SidecarHandler(BaseHTTPRequestHandler):
             backend = None
         self._send_json(200, {"installed": installed, "catalog": catalog,
                               "backend": backend})
+
+    # ---- shop ----
+
+    def _shop_kwargs(self, query):
+        ctx = self._int_param(query, "context", 0, 0, SHOP_CONTEXT_MAX)
+        return {"context_tokens": ctx} if ctx else {}
+
+    @staticmethod
+    def _annotate_local(model):
+        """Add downloads.quant_local_state to every quantisation of one shop
+        entry, in place.
+
+        This is what turns "Download 4.1 GB" into "Resume from 3.1 GB" and
+        "Installed". Applied to search results as well as to GET
+        /shop/quants, because the recommended quantisation on a search card
+        is the button most users will actually press, and offering them a
+        fresh 4 GB download over a partial they already have would make the
+        cancel-is-not-loss promise a lie on the one screen that matters.
+
+        Computed here rather than in hearth_shop because it is a fact about
+        this machine's model store, which that module has no business
+        knowing about."""
+        if not isinstance(model, dict):
+            return
+        repo_id = model.get("repo_id")
+        if not repo_id:
+            return  # a fallback catalog entry: nothing downloadable, nothing on disk
+        for quant in model.get("quants") or []:
+            quant["local"] = downloads_mod.quant_local_state(repo_id, quant)
+            for alternate in quant.get("alternate_editions") or []:
+                alternate["local"] = downloads_mod.quant_local_state(repo_id, alternate)
+        best = model.get("best_quant")
+        if isinstance(best, dict):
+            best["local"] = downloads_mod.quant_local_state(repo_id, best)
+
+    def _get_shop(self):
+        """GET /shop: hearth_shop.search_shop, passed through unmodified.
+
+        Unmodified matters. The result's "ok", "source", "notice" and
+        "error_kind" are how a caller tells a live Hub listing from the
+        built-in reference catalog the shop falls back to when the Hub
+        cannot be reached, and hearth_shop is deliberate that ok is True
+        only for live results. Repackaging any of that here -- turning a
+        fallback into a 200 that looks like a search, or a live failure into
+        a 500 -- would be the one way this route could lie. It never raises:
+        search_shop degrades internally, and the try/except only covers a
+        bug in the injected seam.
+        """
+        query = self._query()
+        try:
+            listing = self.state.shop_searcher(
+                query.get("q", ""),
+                limit=self._int_param(query, "limit", SHOP_LIMIT_DEFAULT, 1, SHOP_LIMIT_MAX),
+                detail_limit=self._int_param(query, "detail", SHOP_DETAIL_DEFAULT, 0,
+                                             SHOP_DETAIL_MAX),
+                **self._shop_kwargs(query))
+        except Exception as exc:  # noqa: BLE001 - a searcher bug must not break this route
+            self._send_json(500, {"error": "shop_search_failed: {}".format(exc)})
+            return
+        if isinstance(listing, dict):
+            for model in listing.get("models") or []:
+                self._annotate_local(model)
+        self._send_json(200, listing)
+
+    def _get_shop_quants(self):
+        """GET /shop/quants?repo=<repo_id>: one repository's quantisations,
+        each annotated with what is already on disk for it.
+
+        The annotation is the difference between "download 4.1 GB" and
+        "resume from 3.1 GB", and between offering a download and saying the
+        model is already installed. It is computed here rather than in
+        hearth_shop because it is a fact about this machine's model store,
+        which the shop module has no business knowing about.
+        """
+        query = self._query()
+        repo_id = query.get("repo", "")
+        if not repo_id:
+            self._send_json(400, {"error": "repo is required"})
+            return
+        try:
+            result = self.state.shop_quanter(repo_id, **self._shop_kwargs(query))
+        except Exception as exc:  # noqa: BLE001 - a quanter bug must not break this route
+            self._send_json(500, {"error": "shop_quants_failed: {}".format(exc)})
+            return
+        if isinstance(result, dict):
+            self._annotate_local(result.get("model"))
+        self._send_json(200, result)
+
+    # ---- downloads ----
+
+    def _post_download(self):
+        body = self._read_json()
+        if body is None:
+            self._send_json(400, {"error": "invalid_json"})
+            return
+        try:
+            job = self.state.get_downloads().start(body.get("repo_id"), body.get("filename"))
+        except downloads_mod.DownloadError as exc:
+            # The module's own message and error kind, verbatim: they already
+            # name the repository, the file and the reason, and a gated repo
+            # in particular says why it cannot be fetched at all.
+            self._send_json(exc.http_status, {"error": str(exc), "error_kind": exc.kind})
+            return
+        self._send_json(200, job)
+
+    def _post_download_action(self, action):
+        body = self._read_json()
+        if body is None:
+            self._send_json(400, {"error": "invalid_json"})
+            return
+        job_id = body.get("id")
+        if not isinstance(job_id, str) or not job_id:
+            self._send_json(400, {"error": "id is required"})
+            return
+        manager = self.state.get_downloads()
+        done = manager.cancel(job_id) if action == "cancel" else manager.dismiss(job_id)
+        if not done:
+            self._send_json(404, {"error": "unknown_or_already_settled_download"})
+            return
+        self._send_json(200, {action: True, "downloads": manager.snapshot()})
+
+    def _get_download_events(self):
+        """SSE for downloads. One frame per change, each carrying the WHOLE
+        list -- see downloads.py on why this is a gauge, not a narrative.
+        Shares the same bounded SSE slot pool as GET /events, since it holds
+        a handler thread open in exactly the same way."""
+        q = self._query()
+        try:
+            since = int(q.get("since", 0))
+        except ValueError:
+            since = 0
+        manager = self.state.get_downloads()
+        if not self.state.acquire_sse_slot():
+            self._send_json(429, {"error": "too_many_event_streams"})
+            return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                while True:
+                    snapshot = manager.snapshot_after(since, timeout=15)
+                    if snapshot["version"] == since:
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                        continue
+                    since = snapshot["version"]
+                    chunk = "id: {}\nevent: downloads\ndata: {}\n\n".format(
+                        since, json.dumps(snapshot))
+                    self.wfile.write(chunk.encode("utf-8"))
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
+                return
+        finally:
+            self.state.release_sse_slot()
 
     def _get_checkpoints(self):
         s = self.state.get_session()
@@ -1854,6 +2111,209 @@ def _self_test():
         finally:
             server_real.shutdown()
             server_real.server_close()
+
+        # === the shop and the download queue ================================
+        # === GET /shop, GET /shop/quants, and the four download routes, ====
+        # === with hearth_shop and hearth_hf both stubbed: no Hugging Face ==
+        # === request is made by this self-test. ============================
+
+        shop_calls = []
+
+        def _stub_search(query, limit=None, detail_limit=None, context_tokens=None):
+            shop_calls.append({"query": query, "limit": limit, "detail_limit": detail_limit,
+                               "context_tokens": context_tokens})
+            return {"ok": True, "source": "live", "notice": None, "error": None,
+                    "error_kind": None, "query": query, "model_count": 1,
+                    "hardware": {"vram_bytes": 16 * 1024 ** 3, "ram_bytes": 24 * 1024 ** 3},
+                    "models": [{"repo_id": "acme/Model-GGUF", "label": "Model",
+                                "gated": False, "downloadable": True,
+                                "quants_loaded": True,
+                                "quants": [{"name": "m-Q4_K_M.gguf", "path": "m-Q4_K_M.gguf",
+                                            "parts": [{"path": "m-Q4_K_M.gguf"}],
+                                            "alternate_editions": []}],
+                                "best_quant": {"name": "m-Q4_K_M.gguf", "path": "m-Q4_K_M.gguf",
+                                               "parts": [{"path": "m-Q4_K_M.gguf"}],
+                                               "alternate_editions": []},
+                                "verdict": {"verdict": "great", "message": "Runs fully on the GPU."}}]}
+
+        def _stub_fallback_search(query, **kwargs):  # noqa: ARG001
+            return {"ok": False, "source": "fallback", "notice": "the Hub could not be reached",
+                    "error": "unreachable", "error_kind": "unreachable", "models": []}
+
+        def _stub_quants(repo_id, context_tokens=None):  # noqa: ARG001
+            return {"ok": True, "source": "live", "repo_id": repo_id,
+                    "model": {"repo_id": repo_id, "label": "Model", "quants": [
+                        {"name": "m-Q4_K_M.gguf", "path": "m-Q4_K_M.gguf", "quant": "Q4_K_M",
+                         "size_bytes": 400, "parts": [{"path": "m-Q4_K_M.gguf"}],
+                         "alternate_editions": []}]}}
+
+        def _stub_list(repo_id, **kwargs):  # noqa: ARG001
+            return {"ok": True, "files": [
+                {"name": "m-Q4_K_M.gguf", "path": "m-Q4_K_M.gguf", "quant": "Q4_K_M",
+                 "size_bytes": 400, "sha256": "a" * 64, "complete": True,
+                 "parts": [{"path": "m-Q4_K_M.gguf", "size_bytes": 400,
+                            "sha256": "a" * 64, "index": 1}]}]}
+
+        def _stub_download(repo_id, filename, dest_dir=None, on_progress=None,  # noqa: ARG001
+                           is_cancelled=None, expected_size=None, **kwargs):
+            total = expected_size or 400
+            for done in (total // 2, total):
+                if is_cancelled is not None and is_cancelled():
+                    return {"ok": False, "cancelled": True, "bytes_done": done // 2}
+                if on_progress:
+                    on_progress({"bytes_done": done, "bytes_total": total, "resumed_from": 0,
+                                 "speed_bytes_per_sec": 100.0, "eta_seconds": 1.0})
+                time.sleep(0.01)
+            return {"ok": True, "bytes_done": total, "bytes_total": total, "verified": True,
+                    "verification": "sha256", "path": "/models/" + filename}
+
+        shop_manager = downloads_mod.DownloadManager(
+            list_fn=_stub_list, download_fn=_stub_download, progress_interval=0.0)
+        state_shop = SidecarState("shop-token", shop_searcher=_stub_search,
+                                  shop_quanter=_stub_quants,
+                                  download_manager=shop_manager,
+                                  local_models_fetcher=lambda: [])
+        server_shop = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state_shop))
+        state_shop.port = server_shop.server_address[1]
+        threading.Thread(target=server_shop.serve_forever, kwargs={"poll_interval": 0.05},
+                         daemon=True).start()
+        try:
+            port_s = state_shop.port
+            headers_s = {"Host": "127.0.0.1:{}".format(port_s),
+                         "Authorization": "Bearer shop-token",
+                         "Content-Type": "application/json"}
+
+            # Every new route is behind the same bearer gate as the rest.
+            for method, route in (("GET", "/shop"), ("GET", "/shop/quants?repo=a/b"),
+                                  ("GET", "/downloads"), ("POST", "/downloads"),
+                                  ("POST", "/downloads/cancel"),
+                                  ("POST", "/downloads/dismiss"),
+                                  ("GET", "/downloads/events")):
+                status, _ = _raw_request(port_s, method, route,
+                                         headers={"Host": "127.0.0.1:{}".format(port_s)})
+                assert status == 401, (route, status)
+
+            # -- GET /shop: the search string survives percent-encoding, the -
+            # -- caller's limits are clamped, and the listing is passed -----
+            # -- through unmodified. ----------------------------------------
+            status, data = _raw_request(
+                port_s, "GET", "/shop?q=qwen+2.5%20coder&limit=999&detail=999&context=4096",
+                headers=headers_s)
+            assert status == 200, (status, data)
+            assert shop_calls[-1]["query"] == "qwen 2.5 coder", shop_calls
+            assert shop_calls[-1]["limit"] == SHOP_LIMIT_MAX, shop_calls
+            assert shop_calls[-1]["detail_limit"] == SHOP_DETAIL_MAX, shop_calls
+            assert shop_calls[-1]["context_tokens"] == 4096, shop_calls
+            shop_body = json.loads(data)
+            assert shop_body["ok"] is True and shop_body["source"] == "live", shop_body
+
+            # A fallback listing must reach the UI still labelled a fallback:
+            # it is a 200 (the route worked), but ok False and source
+            # "fallback", never dressed up as a live search result.
+            state_shop.shop_searcher = _stub_fallback_search
+            status, data = _raw_request(port_s, "GET", "/shop?q=x", headers=headers_s)
+            assert status == 200, (status, data)
+            fallback_body = json.loads(data)
+            assert fallback_body["ok"] is False, fallback_body
+            assert fallback_body["source"] == "fallback", fallback_body
+            assert fallback_body["notice"], fallback_body
+            state_shop.shop_searcher = _stub_search
+
+            # -- GET /shop/quants: needs a repo, and annotates each quant ----
+            # -- with what is already on disk for it. -----------------------
+            status, data = _raw_request(port_s, "GET", "/shop/quants", headers=headers_s)
+            assert status == 400, (status, data)
+            status, data = _raw_request(port_s, "GET", "/shop/quants?repo=acme%2FModel-GGUF",
+                                        headers=headers_s)
+            assert status == 200, (status, data)
+            quant_body = json.loads(data)
+            assert quant_body["repo_id"] == "acme/Model-GGUF", quant_body
+            local = quant_body["model"]["quants"][0]["local"]
+            assert set(local) >= {"present", "parts_present", "partial_bytes"}, local
+
+            # The same annotation reaches search results, not only the
+            # per-repository route: the recommended quantisation on a search
+            # card is the button a user actually presses, and it must know
+            # about a partial download rather than offering the whole file
+            # again.
+            status, data = _raw_request(port_s, "GET", "/shop?q=x", headers=headers_s)
+            assert status == 200, (status, data)
+            searched = json.loads(data)["models"][0]
+            assert "local" in searched["best_quant"], searched
+
+            # -- the download lifecycle over HTTP ---------------------------
+            status, data = _raw_request(port_s, "GET", "/downloads", headers=headers_s)
+            assert status == 200 and json.loads(data)["downloads"] == [], data
+
+            status, data = _raw_request(port_s, "POST", "/downloads", headers=headers_s,
+                                        body=json.dumps({"repo_id": "acme/Model-GGUF",
+                                                         "filename": "nope.gguf"}))
+            assert status == 404, (status, data)
+            assert json.loads(data)["error_kind"] == "not_found", data
+
+            status, data = _raw_request(port_s, "POST", "/downloads", headers=headers_s,
+                                        body=json.dumps({"repo_id": "acme/Model-GGUF",
+                                                         "filename": "m-Q4_K_M.gguf"}))
+            assert status == 200, (status, data)
+            job_id = json.loads(data)["id"]
+
+            deadline_dl = time.monotonic() + 10
+            final = None
+            while time.monotonic() < deadline_dl:
+                status, data = _raw_request(port_s, "GET", "/downloads", headers=headers_s)
+                jobs = json.loads(data)["downloads"]
+                final = next((j for j in jobs if j["id"] == job_id), None)
+                if final and final["status"] == downloads_mod.STATUS_DONE:
+                    break
+                time.sleep(0.02)
+            assert final and final["status"] == downloads_mod.STATUS_DONE, final
+            assert final["bytes_done"] == 400 and final["fraction"] == 1.0, final
+
+            # Cancelling a settled download is a 404, not a silent success.
+            status, data = _raw_request(port_s, "POST", "/downloads/cancel", headers=headers_s,
+                                        body=json.dumps({"id": job_id}))
+            assert status == 404, (status, data)
+            status, data = _raw_request(port_s, "POST", "/downloads/dismiss", headers=headers_s,
+                                        body=json.dumps({"id": job_id}))
+            assert status == 200, (status, data)
+            assert json.loads(data)["downloads"]["downloads"] == [], data
+            status, data = _raw_request(port_s, "POST", "/downloads/cancel", headers=headers_s,
+                                        body=json.dumps({}))
+            assert status == 400, (status, data)
+
+            # -- GET /downloads/events streams the WHOLE list per frame, and -
+            # -- works with no session in existence at all, which is the ----
+            # -- entire reason it is not GET /events. -----------------------
+            status, _ = _raw_request(port_s, "GET", "/session", headers=headers_s)
+            assert status == 404, "this server must genuinely have no session"
+
+            req_dl = urllib.request.Request(
+                "http://127.0.0.1:{}/downloads/events?since=0".format(port_s),
+                headers={"Authorization": "Bearer shop-token",
+                         "Host": "127.0.0.1:{}".format(port_s)})
+            resp_dl = urllib.request.urlopen(req_dl, timeout=10)
+            _raw_request(port_s, "POST", "/downloads", headers=headers_s,
+                         body=json.dumps({"repo_id": "acme/Model-GGUF",
+                                          "filename": "m-Q4_K_M.gguf"}))
+            saw_frame = None
+            deadline_sse = time.monotonic() + 10
+            while time.monotonic() < deadline_sse:
+                line = resp_dl.readline().decode("utf-8", "replace")
+                if not line:
+                    break
+                if line.startswith("data: "):
+                    frame = json.loads(line[len("data: "):])
+                    if frame["downloads"]:
+                        saw_frame = frame
+                        break
+            resp_dl.close()
+            assert saw_frame is not None, "GET /downloads/events never delivered a frame"
+            assert "version" in saw_frame and isinstance(saw_frame["downloads"], list), saw_frame
+            assert saw_frame["downloads"][0]["repo_id"] == "acme/Model-GGUF", saw_frame
+        finally:
+            shop_manager.stop()
+            server_shop.shutdown()
+            server_shop.server_close()
 
         # === malformed JSON body is rejected, not a 500 ===
         status, data = _raw_request(port, "POST", "/session", headers=auth_headers, body="{not json")

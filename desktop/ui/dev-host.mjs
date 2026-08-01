@@ -64,6 +64,8 @@ const SERVER_DIR = join(REPO_ROOT, "desktop", "server");
 const SIDECAR_ROUTES = new Set([
   "/healthz", "/session", "/prompt", "/events", "/approve",
   "/cancel", "/models", "/checkpoints", "/restore", "/setup", "/idle",
+  "/shop", "/shop/quants",
+  "/downloads", "/downloads/events", "/downloads/cancel", "/downloads/dismiss",
 ]);
 
 const HOP_BY_HOP = new Set([

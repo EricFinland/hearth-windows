@@ -28,6 +28,8 @@
     <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="2"/><path d="M9.5 3.5v3M14.5 3.5v3M9.5 17.5v3M14.5 17.5v3M3.5 9.5h3M3.5 14.5h3M17.5 9.5h3M17.5 14.5h3"/></symbol>
     <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4.5V10h-5.5"/></symbol>
     <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="12" r="3.5"/><path d="M11.5 12H21M18 12v3M15 12v2.2"/></symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M20.5 12.5c0 3.9-3.8 7-8.5 7-1 0-2-.15-2.9-.42L4 20.5l1.5-3.6C4.2 15.7 3.5 14.2 3.5 12.5c0-3.9 3.8-7 8.5-7s8.5 3.1 8.5 7z"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v10.5M7.5 10.5L12 15l4.5-4.5"/><path d="M4.5 17.5v2h15v-2"/></symbol>
   </defs>
 </svg>
 
@@ -38,6 +40,16 @@
       <span class="brand-mark" aria-hidden="true"></span>
       <span class="brand-word">hearth</span>
     </div>
+
+    <nav class="views" aria-label="view">
+      <button class="view-tab is-active" id="tab-chat" type="button" aria-pressed="true">
+        <svg class="i"><use href="#i-chat"/></svg><span>Chat</span>
+      </button>
+      <button class="view-tab" id="tab-shop" type="button" aria-pressed="false">
+        <svg class="i"><use href="#i-download"/></svg><span>Model shop</span>
+        <span class="tab-badge" id="tab-shop-badge" hidden></span>
+      </button>
+    </nav>
 
     <div class="chips" id="chips">
       <span class="chip" id="chip-workspace" title="workspace"><svg class="i"><use href="#i-folder"/></svg><span class="chip-text">no workspace</span></span>
@@ -140,6 +152,8 @@
         </div>
       </div>
     </main>
+
+    <main class="shop" id="shop" hidden></main>
 
   </div>
 </div>

@@ -29,6 +29,8 @@
 const SIDECAR_ROUTES = new Set([
   "/healthz", "/session", "/prompt", "/events", "/approve",
   "/cancel", "/models", "/checkpoints", "/restore", "/setup", "/idle",
+  "/shop", "/shop/quants",
+  "/downloads", "/downloads/events", "/downloads/cancel", "/downloads/dismiss",
 ]);
 
 export class HttpError extends Error {
@@ -103,6 +105,68 @@ export class Sidecar {
   checkpoints()            { return this.request("GET", "/checkpoints"); }
   restore(checkpointId)    { return this.request("POST", "/restore", { checkpoint_id: checkpointId }); }
 
+  /** Search the shop. The query is a user-typed string and goes in the query
+   *  string, which is fine: it is not a secret. The bearer token never does --
+   *  it only ever travels in an Authorization header (see the note at the top
+   *  of this file). */
+  shop({ q = "", limit, detail, context } = {}) {
+    const params = new URLSearchParams({ q });
+    if (limit) params.set("limit", String(limit));
+    if (detail) params.set("detail", String(detail));
+    if (context) params.set("context", String(context));
+    return this.request("GET", "/shop?" + params.toString());
+  }
+
+  shopQuants(repoId, { context } = {}) {
+    const params = new URLSearchParams({ repo: repoId });
+    if (context) params.set("context", String(context));
+    return this.request("GET", "/shop/quants?" + params.toString());
+  }
+
+  downloads()                     { return this.request("GET", "/downloads"); }
+  startDownload(repoId, filename) { return this.request("POST", "/downloads", { repo_id: repoId, filename }); }
+  cancelDownload(id)              { return this.request("POST", "/downloads/cancel", { id }); }
+  dismissDownload(id)             { return this.request("POST", "/downloads/dismiss", { id }); }
+
+  /** Open GET /downloads/events and call `onSnapshot({version, downloads})`
+   *  for each frame. Unlike /events this is not a delta log: every frame is
+   *  the complete list, so a caller replaces its state rather than folding
+   *  events into it, and a reload needs no replay. */
+  async streamDownloads({ since = 0, onSnapshot, signal }) {
+    const url = `${this.origin}/downloads/events?since=${encodeURIComponent(since)}`;
+    const response = await fetch(url, {
+      headers: this._headers({ Accept: "text/event-stream" }),
+      cache: "no-store",
+      credentials: "omit",
+      redirect: "error",
+      signal,
+    });
+    if (!response.ok) {
+      let body = null;
+      try { body = JSON.parse(await response.text()); } catch { /* body is not JSON */ }
+      throw new HttpError(response.status, body);
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let split;
+        while ((split = buffer.indexOf("\n\n")) !== -1) {
+          const frame = buffer.slice(0, split);
+          buffer = buffer.slice(split + 2);
+          const parsed = parseFrame(frame);
+          if (parsed && parsed.payload && onSnapshot) onSnapshot(parsed.payload);
+        }
+      }
+    } finally {
+      try { reader.cancel().catch(() => {}); } catch { /* already released */ }
+    }
+  }
+
   /** Open GET /events and call `onEvent({id, kind, turn_id, data, ts})` for
    *  each frame until `signal` aborts or the connection ends. Resolves when
    *  the stream closes; rejects only on a transport failure. */
@@ -172,6 +236,10 @@ function parseFrame(frame) {
     turn_id: payload.turn_id,
     data: payload.data || {},
     ts: payload.ts,
+    // The whole decoded object, for streams whose frames are not turn events.
+    // GET /downloads/events sends {version, downloads} rather than the
+    // {kind, turn_id, data} shape GET /events uses.
+    payload,
   };
 }
 

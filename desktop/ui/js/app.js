@@ -9,6 +9,7 @@ import { Sidecar, HttpError, fetchHandshake } from "./api.js";
 import { Transcript } from "./transcript.js";
 import { el, icon, appendAll, clear, $ } from "./dom.js";
 import { blob } from "./safe-text.js";
+import { ShopView } from "./shop.js";
 
 const RECENTS_KEY = "hearth.recentWorkspaces"; // workspace paths only; the bearer token is never stored
 const MAX_RECENTS = 8;
@@ -43,6 +44,11 @@ const ui = {
   modalTitle: $("#modal-title"),
   modalBody: $("#modal-body"),
   modalActions: $("#modal-actions"),
+  chatView: $(".chat"),
+  shopView: $("#shop"),
+  tabChat: $("#tab-chat"),
+  tabShop: $("#tab-shop"),
+  tabShopBadge: $("#tab-shop-badge"),
 };
 
 const state = {
@@ -54,7 +60,27 @@ const state = {
   streamAbort: null,
   checkpoints: [],
   backendHealthy: false,
+  view: "chat",
 };
+
+// ---------------------------------------------------------------------- views
+
+/** Chat and the shop are two panes over one sidebar, not two pages: the
+ *  download stream, the session and the event stream all belong to the page,
+ *  so switching views must never tear any of them down. That is also what
+ *  makes "downloads survive navigating between chat and shop" true by
+ *  construction rather than by bookkeeping. */
+function setView(name) {
+  state.view = name;
+  const shop = name === "shop";
+  ui.chatView.hidden = shop;
+  ui.shopView.hidden = !shop;
+  ui.tabChat.classList.toggle("is-active", !shop);
+  ui.tabShop.classList.toggle("is-active", shop);
+  ui.tabChat.setAttribute("aria-pressed", String(!shop));
+  ui.tabShop.setAttribute("aria-pressed", String(shop));
+  if (shop) shopView?.focus();
+}
 
 // ---------------------------------------------------------------- connection
 
@@ -222,11 +248,102 @@ async function refreshModels() {
   for (const e of entries) ui.model.appendChild(el("option", { value: e.value, text: e.label }));
   if (!entries.length) {
     ui.model.appendChild(el("option", { value: "", text: "no models available on either engine", disabled: true }));
+    ui.sessionNote.className = "panel-note";
+    ui.sessionNote.textContent = "No model is installed yet. Open the model shop to download one.";
   }
   const values = entries.map((e) => e.value);
   if (previous && values.includes(previous)) ui.model.value = previous;
   else if (state.session?.model && values.includes(state.session.model)) ui.model.value = state.session.model;
   else if (values.length) ui.model.value = values[0];
+}
+
+// ---------------------------------------------------------------------- shop
+
+let shopView = null;
+
+/** The titlebar badge, so a download in flight is visible from the chat view
+ *  too. Percent when one thing is downloading, a count when several are. */
+function paintDownloadBadge(jobs) {
+  const active = jobs.filter((j) => j.cancellable);
+  if (!active.length) {
+    ui.tabShopBadge.hidden = true;
+    return;
+  }
+  ui.tabShopBadge.hidden = false;
+  if (active.length === 1 && Number.isFinite(active[0].fraction)) {
+    ui.tabShopBadge.textContent = `${Math.round(active[0].fraction * 100)}%`;
+  } else {
+    ui.tabShopBadge.textContent = String(active.length);
+  }
+}
+
+function normalizePath(p) {
+  return String(p ?? "").replace(/\\/g, "/").toLowerCase().split("/").filter(Boolean);
+}
+
+/** Do these two strings name the same GGUF?
+ *
+ * They cannot simply be compared. A download's path comes back from
+ * hearth_hf, which builds it through hearth_contain.safe_join and therefore
+ * RESOLVES it; GET /models' path comes from the bundled engine walking the
+ * store root, which does not. On an ordinary install those are the same
+ * string. They stop being the same string the moment anything between the
+ * drive and the model store is a junction, a symlink, or a Windows
+ * app-container redirect -- and pointing the store at another drive with a
+ * junction is a normal thing to do when the models are tens of gigabytes.
+ *
+ * Only the PREFIX can differ that way, so the tail is the stable part.
+ * Three segments is the store's own layout (<store>/<repo dir>/<file>, or
+ * <repo dir>/<subdir>/<file> for the repositories that use folders), which
+ * makes it both unique and equal on either side of any redirect. Exact
+ * equality is still tried first, so nothing about the common case changes.
+ */
+function samePath(a, b) {
+  if (!a || !b) return false;
+  const left = normalizePath(a);
+  const right = normalizePath(b);
+  if (left.join("/") === right.join("/")) return true;
+  const depth = Math.min(3, left.length, right.length);
+  if (depth < 2) return false;
+  return left.slice(-depth).join("/") === right.slice(-depth).join("/");
+}
+
+/** A download finished. The bundled engine enumerates the model store on
+ *  every GET /models call, so the new file is selectable immediately; this
+ *  only has to reload the picker, not restart anything. */
+async function onModelReady(job) {
+  await refreshModels();
+  transcript.addNotice("ok", "Model downloaded.",
+    `${job.label} from ${job.repo_id} is ready to use. It is in the model list now.`);
+}
+
+/** Select a just-downloaded model and hand the user back to the chat view.
+ *  Matches on the GGUF path rather than on a display name: GET /models hands
+ *  back a round-trippable "ref" per entry, and guessing which engine owns a
+ *  model from its name is exactly what broke before. */
+async function useDownloadedModel(job) {
+  await refreshModels();
+  let matched = null;
+  for (const option of ui.model.options) {
+    const value = option.value || "";
+    if (value.startsWith("gguf:") && samePath(value.slice("gguf:".length), job.path)) {
+      matched = value;
+      break;
+    }
+  }
+  setView("chat");
+  if (!matched) {
+    ui.sessionNote.className = "panel-note is-error";
+    ui.sessionNote.textContent =
+      "The download finished, but the bundled engine did not list it. Reload the model list, or check that llama-server is installed.";
+    return;
+  }
+  ui.model.value = matched;
+  ui.sessionNote.className = "panel-note";
+  ui.sessionNote.textContent = state.session
+    ? "Model selected. Press Restart session to use it."
+    : "Model selected. Choose a workspace and press Start session.";
+  ui.connect.focus({ preventScroll: true });
 }
 
 // ---------------------------------------------------------------- checkpoints
@@ -394,7 +511,7 @@ async function startSession() {
   }
   if (!model) {
     ui.sessionNote.className = "panel-note is-error";
-    ui.sessionNote.textContent = "Pick a model. If the list is empty, pull one with `ollama pull` first.";
+    ui.sessionNote.textContent = "Pick a model. If the list is empty, download one from the model shop.";
     return;
   }
 
@@ -690,6 +807,8 @@ async function browseForFolder() {
 
 // ------------------------------------------------------------------ bindings
 
+ui.tabChat.addEventListener("click", () => setView("chat"));
+ui.tabShop.addEventListener("click", () => setView("shop"));
 ui.connect.addEventListener("click", startSession);
 ui.browse.addEventListener("click", browseForFolder);
 ui.reloadModels.addEventListener("click", refreshModels);
@@ -744,6 +863,18 @@ async function boot() {
   }
 
   ui.workspace.value = state.handshake.default_workspace || readRecents()[0] || "";
+
+  // The shop is built once and lives for the page. Its download stream starts
+  // immediately, before any session exists, because the first thing a user
+  // with no model at all needs is a download -- which is exactly why
+  // downloads have their own stream rather than riding on GET /events.
+  shopView = new ShopView(ui.shopView, {
+    sidecar,
+    onModelReady,
+    onUseModel: useDownloadedModel,
+    onDownloadsChanged: paintDownloadBadge,
+  });
+  shopView.startDownloadStream();
 
   await Promise.all([refreshSetup(), refreshModels()]);
 
