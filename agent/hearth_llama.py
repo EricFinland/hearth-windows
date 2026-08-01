@@ -74,6 +74,54 @@ BLAS/CPU shape above was observed live; the CUDA and Vulkan tags are read
 from that same registry naming and are classified by prefix, so an
 unrecognised tag degrades to BACKEND_UNKNOWN rather than being guessed at.
 
+## What the Windows build does differently
+
+A second set of measurements, against the binary Hearth actually vendors:
+
+    llama-server --version
+      version: 10105 (e6dd0e29a)
+      built with Clang 20.1.8 for Windows x86_64
+
+from llama-b10105-bin-win-cpu-x64. Three differences from the Linux build
+above, all of which this module had to be taught:
+
+  * `--list-devices` on the Windows CPU build prints the header and NOTHING
+    else -- literally `Available devices:\r\n` on stdout, zero device lines,
+    no BLAS pseudo-device. The Linux CPU build's `BLAS: BLAS (0 MiB, ...)`
+    entry does not exist here. An empty list therefore has to mean
+    "CPU-only build", not "we could not tell"; see _pick_backend, which
+    keys that distinction off the header rather than off the list being
+    empty, so a binary that could not be run at all still reports UNKNOWN.
+  * Startup stderr is COLOURISED, and not optionally so in Hearth's spawn
+    path. llama.cpp's `--log-colors` defaults to `auto`, meaning "on when
+    output is to a terminal". Hearth launches with stdout=DEVNULL, and
+    Windows' CRT reports the NUL device as a character device, so isatty()
+    answers true and `auto` resolves to ON. Every log line then arrives
+    wrapped in SGR escapes:
+
+        \x1b[34m0.00.035.313\x1b[0m \x1b[32mI \x1b[0msrv  llama_server: listening on http://127.0.0.1:65509
+
+    That is a verbatim capture from _spawn_guarded's own pipe, not a
+    reconstruction. It is why LOG_PREFIX_RE, anchored on `^\d`, matched
+    nothing on Windows and _parse_devices silently returned []. Everything
+    read off stderr now goes through _strip_ansi first, and the escapes are
+    additionally suppressed at the source (see _llama_env). Measured, not
+    assumed: `--no-log-prefix`/`--no-log-timestamps` do NOT suppress the
+    colour (they drop the timestamp and level and leave the escapes), and
+    NO_COLOR is not honoured at all; only --log-colors, or its twin
+    LLAMA_ARG_LOG_COLORS=off, actually turns it off.
+  * The port announcement lost a word. Build 9608 said `server is listening
+    on http://...`; build 10105 says `listening on http://...`. PORT_RE
+    survived that change untouched because it anchors on the tail, which is
+    the entire argument for keeping it loose.
+
+The startup device block also gained a log-module prefix in 10105: what was
+`  - BLAS    : BLAS (0 MiB, 0 MiB free)` is now emitted as
+`cmn  common_param:   - CPU     : AMD Ryzen 9 9900X ... (31800 MiB, 13835 MiB free)`,
+so _parse_devices strips an optional `module  function: ` prefix as well as
+the timestamp. The memory suffix stays mandatory, which is what keeps that
+extra tolerance from turning log chatter into imaginary devices.
+
 For Windows specifically the variants that matter are: cpu (works
 everywhere, slow), cuda (NVIDIA, the fast path most Hearth users on a
 gaming machine will get), and vulkan (AMD and Intel, the only broad
@@ -222,7 +270,28 @@ DEFAULT_CHAT_TIMEOUT = 600
 #: Anchored on the "listening on" tail so it survives --no-log-prefix and
 #: any future change to the log module name, and it accepts https:// in case
 #: a build is ever launched with --ssl-cert-file.
+#:
+#: DO NOT tighten this into a full-line anchor. The looseness has already
+#: paid for itself twice against real builds: 9608 wrote `server is
+#: listening on http://...` and 10105 dropped the "server is", and 10105
+#: additionally wraps the whole line in ANSI colour escapes (see
+#: _strip_ansi), so a pattern anchored on the line start would have broken
+#: on both changes. Matching the smallest distinctive tail is the point.
 PORT_RE = re.compile(r"listening on\s+https?://(?P<host>[^\s:/]+):(?P<port>\d+)")
+
+#: SGR/CSI colour escapes, plus the OSC and single-character forms for
+#: completeness. Build 10105 colourises stderr whenever llama.cpp's
+#: `--log-colors auto` decides it is talking to a terminal, which on Windows
+#: it does even when stderr is a pipe, because Hearth's stdout=DEVNULL makes
+#: the CRT's isatty() answer true for the NUL character device. Every
+#: alternative below is written so no quantifier can overlap the token that
+#: follows it (`[0-9;:?]`, `[ -/]` and `[@-~]` are disjoint ranges), which
+#: keeps this linear on hostile input rather than backtracking.
+ANSI_RE = re.compile(
+    r"\x1b\[[0-9;:?]*[ -/]*[@-~]"           # CSI ... final byte (SGR is CSI m)
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"  # OSC ... BEL or ST
+    r"|\x1b[@-Z\\-_]"                       # two-character Fe escapes
+)
 
 #: `version: 9608 (70b54e1)` -- llama.cpp reports a monotonic build number
 #: and a commit, not a semver, so there is nothing to compare with a `>=`.
@@ -247,7 +316,28 @@ DEVICE_RE = re.compile(
 #: same parser works on `--list-devices` output (no prefix) and on the
 #: startup device_info block (prefixed). Suppressible with --no-log-prefix,
 #: hence "strip if present" rather than "require".
+#:
+#: This is anchored on `^\d` and so cannot match a colourised line, which is
+#: exactly how the Windows device-block parsing came to find nothing.
+#: _strip_ansi has to run BEFORE this, never after.
 LOG_PREFIX_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+\s+[A-Z]\s+")
+
+#: The log module and function that build 10105 prints after the timestamp
+#: and level, e.g. `cmn  common_param: ` or `srv    load_model: `. Build 9608
+#: put the startup device block directly after the level, 10105 puts it after
+#: this, so it is stripped too -- if present, and only at the very start of
+#: an already-prefix-stripped line.
+#:
+#: Two words are required, which is what keeps it away from the single-word
+#: `warning: ...` and `load: ...` lines that sit in the same stream and must
+#: not be mistaken for structure.
+LOG_MODULE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*\s+[A-Za-z_][A-Za-z0-9_()<>]*:\s")
+
+#: The header `--list-devices` always prints, even when it goes on to list
+#: nothing at all. Its presence is the difference between "the binary ran and
+#: found no offloadable device" (a CPU-only build) and "we never got an
+#: answer" (genuinely unknown); see _pick_backend.
+DEVICE_HEADER_RE = re.compile(r"^\s*Available devices:", re.MULTILINE)
 
 #: Stderr lines that mean the build cannot offload at all, whatever -ngl said.
 NO_GPU_MARKER = "no usable GPU found"
@@ -277,6 +367,57 @@ class LlamaError(RuntimeError):
 # --------------------------------------------------------------------------
 # Binary discovery
 # --------------------------------------------------------------------------
+
+def _strip_ansi(text):
+    """`text` with terminal colour escapes removed.
+
+    Applied to everything read off llama-server's stderr, for two reasons.
+    The parsers are anchored patterns and an escape sequence at the start of
+    a line defeats every one of them, and the stderr tail is shown to the
+    user inside LlamaError messages, where raw escape bytes are noise at
+    best and mojibake in a GUI text box at worst.
+
+    This is the downstream half of the defence. The escapes are also
+    suppressed at the source (see _llama_env), but that relies on the binary
+    honouring an option, and this module deliberately runs against whatever
+    build it is pointed at, including ones that predate it.
+    """
+    if not text or "\x1b" not in text:
+        return text or ""
+    return ANSI_RE.sub("", text)
+
+
+def _llama_env(extra=None):
+    """The environment to run llama-server in.
+
+    hearth_proc.child_env()'s allow list, plus one pin: colour off.
+
+    llama.cpp's `--log-colors` defaults to `auto`, which its own help text
+    describes as "enables colors when output is to a terminal". Hearth
+    launches with stdout=DEVNULL, and on Windows the CRT reports the NUL
+    device as a character device, so isatty() says terminal and `auto`
+    resolves to ON. Pinning the environment twin settles it instead of
+    depending on how a given build asks that question.
+
+    The environment twin is used rather than an argv flag on purpose. Build
+    10105 spells this `--log-colors [on|off|auto]`, but older builds spell
+    the same option as a bare boolean flag, and passing `--log-colors off` to
+    one of those would leave `off` as an unparseable positional and fail the
+    launch outright. An unrecognised environment variable is ignored
+    instead, and a build whose twin is boolean acts only on "1"/"true", so
+    "off" is inert there and those builds default to colourless anyway.
+
+    Measured against 10105 rather than assumed: `off` is accepted and an
+    invalid value is rejected loudly (exit 1, "unknown value for
+    --log-colors"), which is how "off" was confirmed to be a value this
+    build understands rather than one it silently ignores. Also measured:
+    --no-log-prefix/--no-log-timestamps do NOT suppress the colour, and
+    NO_COLOR is not honoured at all, so neither is used here.
+    """
+    env = hearth_proc.child_env(extra)
+    env["LLAMA_ARG_LOG_COLORS"] = "off"
+    return env
+
 
 def _exe(name):
     """The platform's executable filename for `name`."""
@@ -417,12 +558,19 @@ def _parse_devices(text):
     Lines that are not device lines are skipped; the header
     ("Available devices:", "device_info:") is not a device because it has
     nothing after the colon.
+
+    Each line is peeled in a fixed order before it is matched: colour
+    escapes, then the timestamp/level prefix, then the log module prefix.
+    The order is load-bearing -- LOG_PREFIX_RE is anchored on `^\\d` and a
+    leading escape sequence makes it match nothing, which is precisely how
+    this returned [] for every Windows startup block.
     """
     devices = []
     for raw in (text or "").splitlines():
-        line = LOG_PREFIX_RE.sub("", raw)
+        line = LOG_PREFIX_RE.sub("", _strip_ansi(raw))
         if not line.strip() or line.rstrip().endswith(":"):
             continue
+        line = LOG_MODULE_RE.sub("", line)
         m = DEVICE_RE.match(line)
         if not m:
             continue
@@ -443,13 +591,38 @@ def _pick_backend(devices, text=""):
     """The build's effective backend: the first GPU-capable device if there is
     one, else CPU. An explicit "no usable GPU found" warning in `text` wins
     over any device list, because that warning is the binary telling us
-    directly that -ngl will be ignored."""
+    directly that -ngl will be ignored.
+
+    BACKEND_UNKNOWN is reserved for the one case it should mean: we could not
+    tell. Two situations look superficially like "no GPU" and are kept apart
+    here, because collapsing them is what put "unknown backend" in front of
+    users with a perfectly healthy CPU install:
+
+      * The binary ran and listed devices, and there were none. The Windows
+        CPU build does exactly this -- `Available devices:` and not one line
+        after it, where the Linux CPU build emits a `BLAS: BLAS (0 MiB, ...)`
+        pseudo-device. Nothing to offload to is what a CPU-only build IS, so
+        that is reported as CPU. The header is the evidence that the listing
+        happened at all; without it there is no answer to report.
+      * The binary listed devices and none of their tags are recognised. That
+        stays UNKNOWN. A future ggml backend must never be filed under CPU on
+        the strength of "well, it is not one of the GPUs we know", because
+        the caller would then be told -ngl is pointless when it may not be.
+    """
     if NO_GPU_MARKER in (text or ""):
         return BACKEND_CPU
     for d in devices:
         if d["backend"] in GPU_BACKENDS:
             return d["backend"]
-    return BACKEND_CPU if devices else BACKEND_UNKNOWN
+    if devices:
+        # No GPU among them. Recognising at least one as CPU/BLAS makes this
+        # a CPU build; recognising none of them makes it a build we cannot
+        # describe, whatever else is true.
+        return BACKEND_CPU if any(d["backend"] == BACKEND_CPU for d in devices) \
+            else BACKEND_UNKNOWN
+    if DEVICE_HEADER_RE.search(_strip_ansi(text)):
+        return BACKEND_CPU
+    return BACKEND_UNKNOWN
 
 
 def probe_binary(path=None, timeout=PROBE_TIMEOUT):
@@ -481,11 +654,13 @@ def probe_binary(path=None, timeout=PROBE_TIMEOUT):
         try:
             proc = subprocess.run(
                 [path] + args, capture_output=True, timeout=timeout,
-                encoding="utf-8", errors="replace", env=hearth_proc.child_env(),
+                encoding="utf-8", errors="replace", env=_llama_env(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             return None, str(exc)
-        return (proc.stdout or "") + (proc.stderr or ""), None
+        # Stripped here rather than in each parser: `error` strings built
+        # from this text end up in front of the user too.
+        return _strip_ansi((proc.stdout or "") + (proc.stderr or "")), None
 
     ver_text, err = _run(["--version"])
     if err is not None:
@@ -835,7 +1010,7 @@ def _spawn_guarded(argv, env=None, stderr_sink=None):
         "stdout": subprocess.DEVNULL,
         "stderr": stderr_sink if stderr_sink is not None else subprocess.PIPE,
         "stdin": subprocess.DEVNULL,
-        "env": env or hearth_proc.child_env(),
+        "env": env or _llama_env(),
         "encoding": "utf-8",
         "errors": "replace",
         "bufsize": 1,
@@ -942,12 +1117,19 @@ class Server:
         whole banner to stderr, and a full pipe buffer would block the child
         before it ever finishes loading. The historic version of this bug in
         hearth_proc is the same shape.
+
+        Colour escapes are stripped as the lines arrive, so the ring buffer
+        holds plain text: everything downstream -- PORT_RE here,
+        stderr_tail() and therefore every LlamaError message, and any device
+        parsing over the retained block -- gets text it can actually match
+        and a user can actually read.
         """
         stream = self.proc.stderr
         if stream is None:
             return
         try:
-            for line in stream:
+            for raw in stream:
+                line = _strip_ansi(raw)
                 with self._lock:
                     self._stderr_lines.append(line)
                     self._stderr_bytes += len(line)
@@ -1046,8 +1228,20 @@ class Server:
         terminate() is tried first so llama-server gets to log its
         "cleaning up before exit" and release the GPU in an orderly way.
 
-        Returns the exit code, or None when the process would not confirm
+        Returns the process's exit code, or None when it would not confirm
         death. Safe to call on an already-stopped server.
+
+        Do NOT read that code as success or failure. It is whatever the OS
+        reports for a process we deliberately killed, and on Windows that is
+        always 1, because Popen.terminate() is TerminateProcess(handle, 1)
+        and the exit code is the second argument. Measured against the real
+        binary: a llama-server that started cleanly, served a full stream and
+        shut down with no orphan still returns 1 here. A caller that wants to
+        know whether the server was healthy should ask poll_state() before
+        stopping it; the value returned here is for logging, and None (the
+        tree would not die) is the only outcome that means something went
+        wrong. It is left unnormalised on purpose: reporting the code the
+        kernel actually gave is more useful than inventing a 0.
         """
         proc, self.proc = self.proc, None
         self.state = STATE_STOPPED
@@ -1431,6 +1625,44 @@ FIXTURE_DEVICE_BLOCK = (
     "0.00.032.299 I   - CPU     : Intel(R) Core(TM) i7-10750H CPU @ 2.60GHz (15854 MiB, 15854 MiB free)\n"
 )
 
+# Real output captured from the binary Hearth vendors: build 10105
+# (e6dd0e29a), llama-b10105-bin-win-cpu-x64. Every escape byte below was
+# read off a pipe, not typed in; the colourised ones came out of
+# _spawn_guarded's own stderr handle, which is the exact path Hearth uses.
+
+FIXTURE_WIN_VERSION = (
+    "version: 10105 (e6dd0e29a)\n"
+    "built with Clang 20.1.8 for Windows x86_64\n"
+)
+
+# The whole of `--list-devices` on the Windows CPU build. Not a truncation:
+# the header is all there is, on stdout, and stderr is empty. This is the
+# input that used to produce "backend: unknown".
+FIXTURE_WIN_DEVICES_NONE = "Available devices:\n"
+
+# Startup stderr, colourised. Note the port line lost the "server is" that
+# build 9608 had, and note the stray reset at the start of a line that
+# follows an unterminated colour run -- both are verbatim.
+FIXTURE_WIN_LISTEN_ANSI = (
+    "\x1b[34m0.00.035.307\x1b[0m \x1b[32mI \x1b[0msrv  llama_server: model loaded\n"
+    "\x1b[34m0.00.035.313\x1b[0m \x1b[32mI \x1b[0msrv  llama_server: "
+    "listening on http://127.0.0.1:65509\n"
+)
+
+FIXTURE_WIN_WARN_ANSI = (
+    "\x1b[34m0.00.017.839\x1b[0m \x1b[35mW srv  llama_server: -----------------\n"
+    "\x1b[0m\x1b[34m0.00.017.841\x1b[0m \x1b[35mW srv  llama_server: CORS is set to "
+    "allow all origins ('*') and no API key is set\n"
+)
+
+# The startup device block from the same build, colourised, and carrying the
+# `cmn  common_param: ` log-module prefix that 9608 did not have.
+FIXTURE_WIN_DEVICE_BLOCK_ANSI = (
+    "\x1b[34m0.00.017.035\x1b[0m \x1b[32mI \x1b[0mcmn  common_param: device_info:\n"
+    "\x1b[34m0.00.017.042\x1b[0m \x1b[32mI \x1b[0mcmn  common_param:   - CPU     : "
+    "AMD Ryzen 9 9900X 12-Core Processor             (31800 MiB, 13835 MiB free)\n"
+)
+
 FIXTURE_LOAD_FAILURE = (
     "0.00.018.344 E llama_model_load_from_file_impl: failed to load model\n"
     "0.00.018.345 E common_init_from_params: failed to load model '/tmp/NOPE.gguf'\n"
@@ -1588,6 +1820,9 @@ def _self_test(live=False, model=None):
     assert _parse_version("built with GNU 15.2.0 for Linux x86_64") == (None, None)
     # A build with no commit suffix still yields the build number.
     assert _parse_version("version: 1234")[0] == 1234
+    # The Windows build Hearth actually ships, whose commit hash is 9 hex
+    # characters where 9608's was 7. Nothing may depend on that width.
+    assert _parse_version(FIXTURE_WIN_VERSION) == (10105, "e6dd0e29a"), FIXTURE_WIN_VERSION
 
     # -- port announcement parsing ----------------------------------------
     m = PORT_RE.search(FIXTURE_LISTEN)
@@ -1636,6 +1871,103 @@ def _self_test(live=False, model=None):
     # because that warning is it telling us -ngl will be ignored.
     assert _pick_backend(cuda_devs, cuda_text + NO_GPU_MARKER) == BACKEND_CPU
     assert _pick_backend([], "") == BACKEND_UNKNOWN
+
+    # -- defect 1: the Windows CPU build lists no devices at all -----------
+    # `--list-devices` on llama-b10105-bin-win-cpu-x64 prints the header and
+    # stops. The Linux build's BLAS pseudo-device does not exist there, so an
+    # empty list used to fall through to BACKEND_UNKNOWN and hearth_backend
+    # told the user "unknown backend" about a completely healthy install.
+    assert _parse_devices(FIXTURE_WIN_DEVICES_NONE) == [], FIXTURE_WIN_DEVICES_NONE
+    assert _pick_backend([], FIXTURE_WIN_DEVICES_NONE) == BACKEND_CPU, (
+        "a binary that listed devices and found none is a CPU-only build")
+    # The header is what carries that meaning, and it survives colour.
+    assert _pick_backend([], "\x1b[32mAvailable devices:\x1b[0m\n") == BACKEND_CPU
+    # Without it there is no evidence the listing ever happened, so the
+    # honest answer is still "we could not tell". This is the line between
+    # the two, and it must not be collapsed.
+    assert _pick_backend([], "") == BACKEND_UNKNOWN
+    assert _pick_backend([], "could not run C:\\nope\\llama-server.exe") == BACKEND_UNKNOWN
+    # An unrecognised tag is NOT quietly promoted to CPU just because it is
+    # not a GPU we know: a future ggml backend may well offload fine, and
+    # telling the caller "cpu" would have it skip -ngl for no reason.
+    frob_text = "Available devices:\n  Frobnicator0: Frobnicator (8192 MiB, 8000 MiB free)\n"
+    frob = _parse_devices(frob_text)
+    assert len(frob) == 1 and frob[0]["backend"] == BACKEND_UNKNOWN, frob
+    assert _pick_backend(frob, frob_text) == BACKEND_UNKNOWN, (
+        "an unrecognised device tag must stay unknown, not become cpu")
+    # A recognised CPU device alongside an unrecognised one is still CPU.
+    mixed_text = frob_text + "  CPU: Some CPU (16000 MiB, 8000 MiB free)\n"
+    assert _pick_backend(_parse_devices(mixed_text), mixed_text) == BACKEND_CPU
+
+    # -- defect 2: ANSI colour escapes on Windows stderr -------------------
+    # Build 10105 colourises stderr in Hearth's own spawn path, because
+    # llama.cpp's --log-colors=auto asks isatty() and Hearth passes
+    # stdout=DEVNULL, which Windows' CRT reports as a character device.
+    assert "\x1b" in FIXTURE_WIN_LISTEN_ANSI, "the fixture must carry real escapes"
+    plain = _strip_ansi(FIXTURE_WIN_LISTEN_ANSI)
+    assert "\x1b" not in plain and "[34m" not in plain, repr(plain)
+    assert plain.endswith("srv  llama_server: listening on http://127.0.0.1:65509\n"), repr(plain)
+    # Stripping is exact: nothing but the escapes is removed.
+    assert "0.00.035.313" in plain and "model loaded" in plain, repr(plain)
+    # Text with no escapes is returned untouched, and None/"" do not crash.
+    assert _strip_ansi(FIXTURE_LISTEN) == FIXTURE_LISTEN
+    assert _strip_ansi("") == "" and _strip_ansi(None) == ""
+    # The stray reset that starts a line after an unterminated colour run is
+    # removed too, or the line would still not match an anchored pattern.
+    warn = _strip_ansi(FIXTURE_WIN_WARN_ANSI)
+    assert "\x1b" not in warn, repr(warn)
+    assert warn.splitlines()[1].startswith("0.00.017.841 W srv"), repr(warn.splitlines()[1])
+
+    # LOG_PREFIX_RE is anchored on ^\d and so matches NOTHING on a coloured
+    # line. That is the whole defect, pinned here so the ordering inside
+    # _parse_devices (strip escapes first, always) cannot be reversed.
+    coloured = FIXTURE_WIN_DEVICE_BLOCK_ANSI.splitlines()[1]
+    assert LOG_PREFIX_RE.sub("", coloured) == coloured, \
+        "LOG_PREFIX_RE cannot match a colourised line; _strip_ansi must run first"
+    assert LOG_PREFIX_RE.sub("", _strip_ansi(coloured)) != _strip_ansi(coloured)
+
+    # The real colourised startup device block now parses. Before the fix
+    # this returned [], silently, on every Windows launch.
+    win_block = _parse_devices(FIXTURE_WIN_DEVICE_BLOCK_ANSI)
+    assert len(win_block) == 1, win_block
+    assert win_block[0]["tag"] == "CPU" and win_block[0]["backend"] == BACKEND_CPU, win_block
+    assert win_block[0]["name"] == "AMD Ryzen 9 9900X 12-Core Processor", win_block
+    assert win_block[0]["total_mib"] == 31800 and win_block[0]["free_mib"] == 13835, win_block
+    # The `device_info:` header line is still not a device, colour or not.
+    assert all(d["tag"] != "device_info" for d in win_block), win_block
+    # ... and the extra tolerance for the log-module prefix does not turn
+    # ordinary log chatter into imaginary devices. The memory suffix is what
+    # holds that line; these are real 10105 stderr lines that must parse as
+    # nothing at all.
+    assert _parse_devices(FIXTURE_WIN_LISTEN_ANSI) == [], "log lines are not devices"
+    assert _parse_devices(FIXTURE_WIN_WARN_ANSI) == [], "warnings are not devices"
+    assert _parse_devices(
+        "\x1b[34m0.00.017.665\x1b[0m \x1b[32mI \x1b[0mcmn  common_param: "
+        "common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)\n"
+    ) == [], "a parenthesised tail without MiB is not a device"
+    # The 9608 Linux block, which has no module prefix, still parses exactly
+    # as it did: the new stripping is additive, not a replacement.
+    assert [d["tag"] for d in _parse_devices(FIXTURE_DEVICE_BLOCK)] == ["BLAS", "CPU"]
+
+    # PORT_RE keeps working on a coloured line and across the 9608 -> 10105
+    # wording change, because it anchors on the tail. Both are real captures.
+    mw = PORT_RE.search(FIXTURE_WIN_LISTEN_ANSI)
+    assert mw and int(mw.group("port")) == 65509, FIXTURE_WIN_LISTEN_ANSI
+    assert mw.group("host") == "127.0.0.1", mw.group("host")
+    assert "server is listening" in FIXTURE_LISTEN, "9608 said 'server is listening on'"
+    assert "server is listening" not in FIXTURE_WIN_LISTEN_ANSI, "10105 says just 'listening on'"
+    # And on the stripped form, which is what the reader thread now stores.
+    assert PORT_RE.search(_strip_ansi(FIXTURE_WIN_LISTEN_ANSI)).group("port") == "65509"
+
+    # -- the colour is also suppressed at the source -----------------------
+    # Downstream stripping is the defence; the environment pin is the fix.
+    # Both, because the pin depends on the binary honouring a flag and this
+    # module runs against whatever build it is pointed at.
+    assert _llama_env()["LLAMA_ARG_LOG_COLORS"] == "off", _llama_env()
+    # It really is llama.cpp's own option name, and it does not disturb the
+    # allow list hearth_proc built.
+    assert "PATH" in _llama_env() or "Path" in _llama_env(), _llama_env()
+    assert "HEARTH_DB" not in _llama_env(), "the child env allow list must still hold"
 
     # -- error body extraction --------------------------------------------
     assert _error_message(FIXTURE_ERROR_BODY) == "Expected 'messages' to be an array"
@@ -1950,6 +2282,35 @@ def _self_test(live=False, model=None):
     finally:
         echoer.stop()
 
+    # -- and the same thing over a REAL colourised stream -------------------
+    # A stub that replays the exact bytes build 10105 wrote down Hearth's own
+    # stderr pipe. This proves the reader thread, _strip_ansi and PORT_RE
+    # work together on the live path, which is where the escapes actually
+    # broke things -- the fixture tests above only prove the parsing.
+    ansi_echoer = Server("stub", "m.gguf")
+    ansi_echoer.proc, _ = _spawn_guarded(
+        [sys.executable, "-c",
+         "import sys,time;sys.stderr.write({!r});sys.stderr.flush();time.sleep(20)".format(
+             FIXTURE_WIN_WARN_ANSI + FIXTURE_WIN_LISTEN_ANSI)])
+    ansi_echoer._reader = threading.Thread(target=ansi_echoer._drain_stderr, daemon=True)
+    ansi_echoer._reader.start()
+    try:
+        deadline = time.monotonic() + 20
+        while ansi_echoer.port is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert ansi_echoer.port == 65509, "port was not read back from colourised stderr"
+        tail = ansi_echoer.stderr_tail()
+        # The tail goes into LlamaError messages and therefore in front of a
+        # user, so it must not carry escape bytes.
+        assert "\x1b" not in tail, repr(tail)
+        assert "[34m" not in tail and "[0m" not in tail, repr(tail)
+        # Stripped of colour, not of content.
+        assert "llama_server: model loaded" in tail, tail
+        assert "CORS is set to allow all origins" in tail, tail
+        assert "0.00.035.313" in tail, tail
+    finally:
+        ansi_echoer.stop()
+
     # -- health() against a real HTTP server, with real llama-server bodies -
     # http.server is stdlib, so the 503-then-200 transition that was measured
     # against llama-server can be replayed for real over a socket.
@@ -2104,6 +2465,15 @@ def _live_test(model_path):
     assert isinstance(info["build"], int) and info["build"] > 0, info
     assert info["backend"] in (BACKEND_CPU, BACKEND_CUDA, BACKEND_VULKAN, BACKEND_ROCM,
                                BACKEND_SYCL, BACKEND_METAL, BACKEND_UNKNOWN), info
+    # Defect 1, against whatever real binary is installed: a binary we could
+    # run and get a version out of must be describable. "unknown" here is the
+    # bug -- it is what the Windows CPU build reported, and what
+    # hearth_backend.diagnose() then showed the user.
+    assert info["backend"] != BACKEND_UNKNOWN, (
+        "probe_binary could not classify a binary it successfully ran: {}".format(info))
+    # gpu_offload must agree with the backend rather than being a second,
+    # independently-wrong opinion.
+    assert info["gpu_offload"] == (info["backend"] in GPU_BACKENDS), info
 
     server = start(model_path, server_path=found["path"], ready_timeout=300,
                    alias="hearth-live")
@@ -2113,6 +2483,14 @@ def _live_test(model_path):
         assert server.port and server.port != 8080, server.port
         assert server.host == "127.0.0.1"
         assert health(server.base_url) == STATE_READY
+        # Defect 2, against the real binary: the port was read back off a
+        # stream that build 10105 colourises, and the retained stderr the
+        # user would be shown carries no escape bytes.
+        tail = server.stderr_tail()
+        assert tail, "no stderr was retained from a server that started"
+        assert "\x1b" not in tail, repr(tail[-400:])
+        # The startup banner really was captured, not just emptied.
+        assert "llama_server" in tail, tail[-400:]
         # A real streaming turn, with real usage counts.
         seen = []
         out = server.chat([{"role": "user", "content": "Say hello."}],
@@ -2129,9 +2507,17 @@ def _live_test(model_path):
     finally:
         rc = server.stop()
     assert server.poll_state() == STATE_STOPPED, server.state
-    assert rc is not None or True  # a terminated server has no meaningful code
-    print("hearth-llama live checks OK (build {}, backend {})".format(
-        info["build"], info["backend"]))
+    # stop() must confirm the tree died. The CODE it reports is not a verdict:
+    # on Windows a terminate() is TerminateProcess(handle, 1), so a perfectly
+    # healthy server that served this whole test exits 1. None is the only
+    # value that means trouble, and that is what is asserted here.
+    assert rc is not None, "stop() could not confirm llama-server died"
+    if hearth_paths.is_windows():
+        assert rc == 1, (
+            "expected TerminateProcess's exit code 1 on Windows, got {!r}; if this "
+            "changed, stop()'s docstring needs revisiting".format(rc))
+    print("hearth-llama live checks OK (build {}, backend {}, stop() exit code {})".format(
+        info["build"], info["backend"], rc))
 
 
 if __name__ == "__main__":
