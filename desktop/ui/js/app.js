@@ -207,14 +207,26 @@ async function refreshModels() {
     ui.sessionNote.textContent = "Model list unavailable: " + errorText(err);
     return;
   }
-  const names = installed.map((m) => m.name).filter(Boolean).sort();
-  for (const name of names) ui.model.appendChild(el("option", { value: name, text: name }));
-  if (!names.length) {
-    ui.model.appendChild(el("option", { value: "", text: "no models pulled on this Ollama", disabled: true }));
+  // Every entry names the backend that runs it, and carries the exact "ref"
+  // string POST /session expects. The value sent back is that ref, never a
+  // display name: a bare name has to be guessed at, and guessing which
+  // engine owns a model is what broke before. The label shows the backend so
+  // a picker holding both kinds is readable rather than a mixed list.
+  const entries = installed
+    .filter((m) => m && (m.ref || m.name))
+    .map((m) => ({
+      value: m.ref || m.name,
+      label: m.backend ? `${m.name} (${m.backend})` : m.name,
+    }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+  for (const e of entries) ui.model.appendChild(el("option", { value: e.value, text: e.label }));
+  if (!entries.length) {
+    ui.model.appendChild(el("option", { value: "", text: "no models available on either engine", disabled: true }));
   }
-  if (previous && [...ui.model.options].some((o) => o.value === previous)) ui.model.value = previous;
-  else if (state.session?.model && names.includes(state.session.model)) ui.model.value = state.session.model;
-  else if (names.length) ui.model.value = names[0];
+  const values = entries.map((e) => e.value);
+  if (previous && values.includes(previous)) ui.model.value = previous;
+  else if (state.session?.model && values.includes(state.session.model)) ui.model.value = state.session.model;
+  else if (values.length) ui.model.value = values[0];
 }
 
 // ---------------------------------------------------------------- checkpoints

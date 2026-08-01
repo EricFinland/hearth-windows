@@ -56,9 +56,17 @@ Endpoints:
   POST /approve   resolve a pending approval: {"id", "decision": "allow"|
                   "deny"}.
   POST /cancel    interrupt the running turn, if any.
-  GET  /models    what Ollama has pulled locally (best-effort; [] if Ollama
-                  is unreachable), plus the shop's catalog with fit verdicts
-                  for this machine, so a UI can show what will actually run.
+  GET  /models    every model this machine can actually run right now, plus
+                  the shop's catalog with fit verdicts, so a UI can show
+                  what will really work. "installed" spans BOTH engines --
+                  Ollama's pulled tags and the GGUFs Hearth downloaded for
+                  its own bundled engine -- and every entry carries the
+                  backend that runs it and a "ref" (the exact string to send
+                  back to POST /session). Each source is self-gating: an
+                  unreachable Ollama contributes nothing, and a missing
+                  bundled engine contributes nothing, so the list never
+                  offers a model the active configuration cannot run. Both
+                  halves are best-effort; neither can take the route down.
   GET  /checkpoints  the current session's checkpoint history, newest first.
   POST /restore   revert the current session's workspace to a prior
                   checkpoint: {"checkpoint_id"}. The response is whatever
@@ -189,13 +197,26 @@ class SidecarState:
 
     def __init__(self, token, engine_factory=None, port=0, models_fetcher=None,
                  max_sse_connections=None, persist_hook=None,
-                 setup_diagnoser=None, idle_prober=None, idle_cache_seconds=None):
+                 setup_diagnoser=None, idle_prober=None, idle_cache_seconds=None,
+                 local_models_fetcher=None, model_checker=None):
         self.token = token
         self.port = port  # main.py sets this to the real bound port after listen
         self.engine_factory = engine_factory or (lambda: session_mod.NullEngine())
         # Best-effort GET /models data source. Injectable so tests never need
         # a live Ollama; defaults to the real one for production use.
         self.models_fetcher = models_fetcher or engine_mod.list_installed_models
+        # The other half of GET /models: GGUFs downloaded for Hearth's own
+        # bundled engine. Its own fetcher rather than a branch inside
+        # models_fetcher, so a test can stub either engine's inventory
+        # independently -- including to empty, which is how "an unusable
+        # engine offers nothing" is actually proven.
+        self.local_models_fetcher = local_models_fetcher or engine_mod.list_local_models
+        # POST /session's model gate (hearth_backend.check_model): refuse a
+        # model no engine here can serve, at the moment the user picks it,
+        # rather than mid-turn after a checkpoint has already been taken.
+        # Injectable so tests never need a real engine or a live daemon.
+        self.model_checker = model_checker or (
+            lambda model: engine_mod.hearth_backend.check_model(model))
         # GET /setup data source (hearth_setup.diagnose). Injectable the same
         # way models_fetcher is, so tests never need a real Ollama, a real
         # install, or real hardware.
@@ -533,6 +554,23 @@ class SidecarHandler(BaseHTTPRequestHandler):
         if mode == "bypass":
             self._send_json(400, {"error": "mode 'bypass' cannot be set over HTTP"})
             return
+        # Refuse a model no engine on this machine can serve, HERE, where
+        # the user just picked it -- not mid-turn, several layers down,
+        # after a checkpoint has already been taken. hearth_backend's own
+        # message and remedy are passed through verbatim: they already name
+        # the model, the backend and the reason.
+        try:
+            verdict = self.state.model_checker(model)
+        except Exception:  # noqa: BLE001 - a broken gate must not block session creation
+            verdict = None
+        if isinstance(verdict, dict) and not verdict.get("ok", True):
+            self._send_json(400, {
+                "error": verdict.get("message") or "this model cannot be run as configured",
+                "remedy": verdict.get("remedy"),
+                "backend": verdict.get("backend"),
+                "model_kind": verdict.get("kind"),
+            })
+            return
         try:
             s = self.state.create_session(workspace, model, mode)
         except ValueError as exc:
@@ -640,19 +678,48 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self.state.release_sse_slot()
 
     def _get_models(self):
-        """Best-effort: an unreachable Ollama must not take the whole route
-        down, since the shop's catalog verdicts (computed purely from local
-        hardware, no Ollama involved) are still useful on their own."""
+        """Both engines' inventories, each labelled with the backend that
+        runs it, plus the shop catalog.
+
+        Best-effort on every source independently: an unreachable Ollama, a
+        missing bundled engine, or a fetcher bug must not take the whole
+        route down, since the shop's catalog verdicts (computed purely from
+        local hardware, no engine involved) are still useful on their own.
+        That per-source degradation is also what keeps the list honest --
+        an engine that is not usable contributes no entries, so nothing here
+        offers a model the active configuration cannot run.
+
+        Every entry carries "backend" and "ref". "ref" is the exact string
+        to send back to POST /session, kind prefix included for a GGUF, so
+        a picker never has to re-derive a model's namespace from its name.
+        Guessing that, one layer down, is precisely what broke.
+        """
         try:
-            installed = self.state.models_fetcher()
+            installed = list(self.state.models_fetcher() or [])
         except Exception:  # noqa: BLE001 - a fetcher bug must not break this route
             installed = []
+        # Ollama's fetcher predates model kinds and returns bare tags; label
+        # them here rather than making every caller of that function care.
+        installed = [dict(m, backend=engine_mod.hearth_backend.BACKEND_OLLAMA,
+                          ref=engine_mod.hearth_backend.ModelRef.ollama(
+                              m.get("name") or "?").as_text())
+                     for m in installed if isinstance(m, dict)]
+        try:
+            local = list(self.state.local_models_fetcher() or [])
+        except Exception:  # noqa: BLE001 - same contract as the Ollama half
+            local = []
+        installed.extend(m for m in local if isinstance(m, dict))
         try:
             catalog = engine_mod.hearth_shop.catalog_with_verdicts()
         except Exception as exc:  # noqa: BLE001
             self._send_json(500, {"error": "catalog_failed: {}".format(exc)})
             return
-        self._send_json(200, {"installed": installed, "catalog": catalog})
+        try:
+            backend = engine_mod.hearth_backend.active()
+        except Exception:  # noqa: BLE001 - a selection failure must not break this route
+            backend = None
+        self._send_json(200, {"installed": installed, "catalog": catalog,
+                              "backend": backend})
 
     def _get_checkpoints(self):
         s = self.state.get_session()
@@ -762,8 +829,15 @@ def _self_test():
                 time.sleep(0.02)
             ctx.emit("cancelled", {})
 
-    def _start(token="the-real-token-value", engine_factory=None, models_fetcher=None):
-        state = SidecarState(token, engine_factory=engine_factory, models_fetcher=models_fetcher)
+    def _start(token="the-real-token-value", engine_factory=None, models_fetcher=None,
+               local_models_fetcher=None, model_checker=None):
+        # Both new fetchers default to "this engine has nothing", not to the
+        # real ones: a self-test must never depend on what happens to be
+        # installed on the machine running it, and the whole point of GET
+        # /models' per-source degradation is that an empty source is normal.
+        state = SidecarState(token, engine_factory=engine_factory, models_fetcher=models_fetcher,
+                             local_models_fetcher=local_models_fetcher or (lambda: []),
+                             model_checker=model_checker or (lambda model: {"ok": True}))
         server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
         state.port = server.server_address[1]
         t = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
@@ -1328,14 +1402,22 @@ def _self_test():
             server_sse.shutdown()
             server_sse.server_close()
 
-        # === GET /models: works with an injected fetcher, no live Ollama ===
-        # === required, and the catalog survives a broken fetcher too ======
+        # === GET /models: works with injected fetchers, no live Ollama and =
+        # === no installed engine required; BOTH engines' inventories are ===
+        # === listed, each labelled with the backend that runs it, and the ==
+        # === catalog survives either fetcher being broken. =================
 
         def _fake_models_fetcher():
             return [{"name": "test-model:1b", "size_bytes": 42, "modified_at": "x", "digest": "y"}]
 
+        def _fake_local_fetcher():
+            return [{"name": "stories260K.gguf", "ref": "gguf:/store/stories260K.gguf",
+                     "backend": "llama", "path": "/store/stories260K.gguf",
+                     "size_bytes": 7, "modified_at": None, "digest": None}]
+
         server3, state3 = _start(engine_factory=lambda: _FakeEngine(),
-                                 models_fetcher=_fake_models_fetcher)
+                                 models_fetcher=_fake_models_fetcher,
+                                 local_models_fetcher=_fake_local_fetcher)
         try:
             port3 = state3.port
             headers3 = {"Host": "127.0.0.1:{}".format(port3),
@@ -1343,7 +1425,21 @@ def _self_test():
             status, data = _raw_request(port3, "GET", "/models", headers=headers3)
             assert status == 200, (status, data)
             body = json.loads(data)
-            assert body["installed"] == [_fake_models_fetcher()[0]], body
+            # Both engines, in one list, each entry knowing which engine runs
+            # it. A picker that cannot tell them apart is exactly how an
+            # Ollama tag ended up being handed to the bundled engine.
+            assert [m["backend"] for m in body["installed"]] == ["ollama", "llama"], body
+            ollama_entry, llama_entry = body["installed"]
+            assert ollama_entry["name"] == "test-model:1b", ollama_entry
+            # "ref" round-trips through hearth_backend.ModelRef.parse without
+            # any guessing, which is the property POST /session relies on.
+            assert ollama_entry["ref"] == "ollama:test-model:1b", ollama_entry
+            assert llama_entry["ref"] == "gguf:/store/stories260K.gguf", llama_entry
+            # The Ollama fetcher's own fields survive the labelling pass.
+            assert ollama_entry["size_bytes"] == 42 and ollama_entry["digest"] == "y", ollama_entry
+            # The active selection travels with the list so a UI can say
+            # which engine is in force without a second request.
+            assert body["backend"]["backend"] in ("llama", "ollama"), body["backend"]
             assert isinstance(body["catalog"], list) and len(body["catalog"]) >= 6, body
             assert all("verdict" in e and "id" in e for e in body["catalog"]), body
         finally:
@@ -1353,8 +1449,13 @@ def _self_test():
         def _broken_fetcher():
             raise RuntimeError("ollama unreachable")
 
+        # Each source degrades on its own: a broken (or unreachable) Ollama
+        # must not cost the bundled engine's models their listing, and vice
+        # versa. An engine that reports nothing offers nothing, which is what
+        # keeps this route from advertising models nothing here can run.
         server3b, state3b = _start(engine_factory=lambda: _FakeEngine(),
-                                   models_fetcher=_broken_fetcher)
+                                   models_fetcher=_broken_fetcher,
+                                   local_models_fetcher=_fake_local_fetcher)
         try:
             port3b = state3b.port
             headers3b = {"Host": "127.0.0.1:{}".format(port3b),
@@ -1362,11 +1463,72 @@ def _self_test():
             status, data = _raw_request(port3b, "GET", "/models", headers=headers3b)
             assert status == 200, (status, data)  # a broken fetcher must not take the route down
             body = json.loads(data)
-            assert body["installed"] == [], body
+            assert [m["backend"] for m in body["installed"]] == ["llama"], body
             assert isinstance(body["catalog"], list) and body["catalog"], body
         finally:
             server3b.shutdown()
             server3b.server_close()
+
+        server3c, state3c = _start(engine_factory=lambda: _FakeEngine(),
+                                   models_fetcher=_fake_models_fetcher,
+                                   local_models_fetcher=_broken_fetcher)
+        try:
+            port3c = state3c.port
+            headers3c = {"Host": "127.0.0.1:{}".format(port3c),
+                        "Authorization": "Bearer " + state3c.token}
+            status, data = _raw_request(port3c, "GET", "/models", headers=headers3c)
+            assert status == 200, (status, data)
+            body = json.loads(data)
+            assert [m["backend"] for m in body["installed"]] == ["ollama"], body
+        finally:
+            server3c.shutdown()
+            server3c.server_close()
+
+        # === POST /session refuses a model no engine here can serve, at the
+        # === moment the user picks it -- not mid-turn, after a checkpoint ==
+        # === has already been taken. hearth_backend's own message and ======
+        # === remedy are passed through, not re-worded. =====================
+        _gate_seen = []
+
+        def _model_gate(model):
+            _gate_seen.append(model)
+            if model == "qwen2.5-coder:latest":
+                return {"ok": False, "backend": "ollama", "kind": "ollama",
+                        "message": ("'qwen2.5-coder:latest' is an Ollama model tag, and "
+                                    "Ollama is not reachable at http://127.0.0.1:11434."),
+                        "remedy": "Start Ollama, or pick a downloaded model."}
+            return {"ok": True, "backend": "llama", "kind": None,
+                    "message": None, "remedy": None}
+
+        server3d, state3d = _start(engine_factory=lambda: _FakeEngine(),
+                                   model_checker=_model_gate)
+        try:
+            port3d = state3d.port
+            headers3d = {"Host": "127.0.0.1:{}".format(port3d),
+                         "Authorization": "Bearer " + state3d.token,
+                         "Content-Type": "application/json"}
+            status, data = _raw_request(
+                port3d, "POST", "/session", headers=headers3d,
+                body=json.dumps({"workspace": "/tmp/ws-gate", "model": "qwen2.5-coder:latest"}))
+            assert status == 400, (status, data)
+            body = json.loads(data)
+            assert "not reachable" in body["error"], body
+            assert body["remedy"] == "Start Ollama, or pick a downloaded model.", body
+            assert body["backend"] == "ollama" and body["model_kind"] == "ollama", body
+            # No session was created: a refused model must not leave a
+            # half-built session behind for the next request to find.
+            assert state3d.get_session() is None, "a refused model must not create a session"
+            # ... and a model the gate accepts still creates one normally,
+            # which is what makes the refusal above non-vacuous.
+            status, data = _raw_request(
+                port3d, "POST", "/session", headers=headers3d,
+                body=json.dumps({"workspace": "/tmp/ws-gate", "model": "auto"}))
+            assert status == 200, (status, data)
+            assert state3d.get_session() is not None
+            assert _gate_seen == ["qwen2.5-coder:latest", "auto"], _gate_seen
+        finally:
+            server3d.shutdown()
+            server3d.server_close()
 
         # === GET /checkpoints and POST /restore, end to end over HTTP ======
 

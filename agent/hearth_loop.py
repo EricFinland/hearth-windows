@@ -419,14 +419,33 @@ def chat(base_url, model, messages, tools, timeout=300, options=None, backend=No
     since it asks Ollama's /api/show and there is no Ollama to ask. See
     hearth_backend for the model-identity difference and how a reference of
     the wrong kind is refused rather than coerced.
+
+    WHICH ENGINE RUNS A TURN IS DECIDED FROM `model`, NOT FROM WHAT HAPPENS
+    TO BE INSTALLED. `model` is passed to get_backend so its kind chooses
+    the backend, with availability only breaking the tie for a name whose
+    shape says nothing (see hearth_backend.select). This line is the seam
+    the regression lived in: hearth_backend knew the kind and hearth_loop
+    knew the model, and neither module was wrong on its own -- the model
+    simply never reached the selection call, so a machine with a vendored
+    llama-server handed every Ollama tag to an engine that cannot resolve
+    one.
     """
     if backend is None:
-        backend = hearth_backend.get_backend(ollama_url=base_url)
+        backend = hearth_backend.get_backend(ollama_url=base_url, model=model)
 
     if backend.name != hearth_backend.BACKEND_OLLAMA:
         got = backend.chat(model, messages, tools=tools, timeout=timeout,
                            options=options, on_token=on_token)
         return got["message"], got["tokens_in"], got["tokens_out"]
+
+    # Ollama's /api/chat is spoken directly below rather than through
+    # OllamaBackend.chat, so the ref normalisation that backend would have
+    # done has to happen here. A model string that crossed a UI, config, or
+    # JSON boundary may carry an explicit "ollama:" prefix -- that prefix is
+    # what makes a ref round-trippable without guessing -- and Ollama has
+    # never heard of one. check_ref strips it, and refuses a GGUF path
+    # outright instead of posting it as though it were a registry tag.
+    model = backend.check_ref(model).value
 
     if options is None:
         try:
@@ -1861,6 +1880,93 @@ def _self_test():
             _live_resp["r"].pulled)
     finally:
         urllib.request.urlopen = _real_urlopen
+
+    # -- seam: the MODEL chooses the engine, not what is installed ---------
+    #
+    # A CROSS-MODULE regression test, on purpose. hearth_backend knew every
+    # model's kind and refused the wrong one; hearth_loop knew which model a
+    # turn was for. Both modules were correct and both were fully tested,
+    # and the defect lived entirely in the one line between them: chat()
+    # asked get_backend() which engine to use without telling it what it was
+    # about to run. A unit test on either module alone could not have caught
+    # that, which is why this one injects no backend= and drives real
+    # hearth_loop.chat through real hearth_backend.select, stubbing only the
+    # two probes that reach outside the process.
+    #
+    # The machine it simulates is the one the regression was found on: a
+    # vendored llama-server present AND a reachable Ollama, with the user
+    # naming a model only Ollama can resolve. Before the fix, selection saw
+    # the bundled binary, chose it, and the turn died before any tool call.
+    _real_find_server = hearth_backend.hearth_llama.find_server
+    _real_reachable = hearth_backend.OllamaBackend.reachable
+    _prev_backend_env = os.environ.pop(hearth_backend.ENV_BACKEND, None)
+    _routed = []
+
+    def _bundled_engine_is_installed():
+        return {"found": True, "path": os.path.join("vendor", "llama", "llama-server.exe")}
+
+    def _seam_urlopen(req, timeout=300):
+        _routed.append(req.full_url)
+        return _FakeResp(json.dumps({
+            "message": {"role": "assistant", "content": "routed"},
+            "prompt_eval_count": 3, "eval_count": 4}).encode())
+
+    hearth_backend.hearth_llama.find_server = _bundled_engine_is_installed
+    hearth_backend.OllamaBackend.reachable = lambda self: (True, "0.30.7", None)
+    urllib.request.urlopen = _seam_urlopen
+    hearth_backend.reset()
+    try:
+        # options= is passed only to skip the automatic num_ctx probe, which
+        # would otherwise make a second request through the same stub.
+        _seam_msg, _seam_in, _seam_out = chat(
+            "http://seam:11434", "qwen2.5-coder:latest",
+            [{"role": "user", "content": "hi"}], [], options={"num_ctx": 4096})
+        assert _routed == ["http://seam:11434/api/chat"], (
+            "an Ollama registry tag must reach Ollama even when the bundled "
+            "engine is installed", _routed)
+        assert _seam_msg == {"role": "assistant", "content": "routed"}, _seam_msg
+        assert (_seam_in, _seam_out) == (3, 4), (_seam_in, _seam_out)
+
+        # A round-trippable ref (what GET /models hands a picker) routes the
+        # same way, and the "ollama:" prefix is stripped before it reaches
+        # the wire -- Ollama has never heard of one.
+        _routed.clear()
+        _bodies = []
+
+        def _capture_urlopen(req, timeout=300):
+            _routed.append(req.full_url)
+            _bodies.append(json.loads(req.data.decode()))
+            return _FakeResp(json.dumps({
+                "message": {"role": "assistant", "content": "routed"},
+                "prompt_eval_count": 1, "eval_count": 1}).encode())
+
+        urllib.request.urlopen = _capture_urlopen
+        chat("http://seam:11434", "ollama:qwen2.5-coder:latest",
+             [{"role": "user", "content": "hi"}], [], options={"num_ctx": 4096})
+        assert _routed == ["http://seam:11434/api/chat"], _routed
+        assert _bodies[-1]["model"] == "qwen2.5-coder:latest", _bodies[-1]
+        urllib.request.urlopen = _seam_urlopen
+
+        # The mirror direction, across the same seam and on the same
+        # simulated machine: a GGUF path still reaches the bundled engine
+        # even with Ollama reachable. Proving only the broken half would
+        # leave a "always pick Ollama" fix looking green.
+        assert hearth_backend.get_backend(
+            ollama_url="http://seam:11434",
+            model=os.path.join("models", "a.gguf")).name == hearth_backend.BACKEND_LLAMA
+
+        # And an ambiguous bare name is unchanged: it resolves in whichever
+        # engine is available, which on this machine is the bundled one.
+        assert hearth_backend.get_backend(
+            ollama_url="http://seam:11434",
+            model="auto").name == hearth_backend.BACKEND_LLAMA
+    finally:
+        urllib.request.urlopen = _real_urlopen
+        hearth_backend.hearth_llama.find_server = _real_find_server
+        hearth_backend.OllamaBackend.reachable = _real_reachable
+        hearth_backend.reset()
+        if _prev_backend_env is not None:
+            os.environ[hearth_backend.ENV_BACKEND] = _prev_backend_env
 
     # -- static: every real call site in the repo, bound to this signature -
     import ast  # noqa: PLC0415 - only the guard needs these

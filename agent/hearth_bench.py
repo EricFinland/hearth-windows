@@ -601,7 +601,7 @@ def measure(model, base_url=None, prompt=None, num_predict=DEFAULT_NUM_PREDICT,
     those two are not comparable across engines.
     """
     backend = backend if backend is not None else hearth_backend.get_backend(
-        ollama_url=base_url)
+        ollama_url=base_url, model=model)
     if backend.name == hearth_backend.BACKEND_OLLAMA:
         # Route through the backend's own base_url when the caller did not
         # name one, so an Ollama on a non-default port still gets measured.
@@ -857,7 +857,7 @@ def cached_measure(model, base_url=None, prompt=None, num_predict=DEFAULT_NUM_PR
     shadow a working one on the next call.
     """
     backend = backend if backend is not None else hearth_backend.get_backend(
-        ollama_url=base_url)
+        ollama_url=base_url, model=model)
     hw_sig = hardware_signature()
     cache = _load_cache()
     key = _cache_key(model, hw_sig, backend.name)
@@ -913,8 +913,13 @@ def compare(models, base_url=None, prompt=None, num_predict=DEFAULT_NUM_PREDICT,
     comparison (see the module docstring), and this function does not
     offer a way to ask for one.
     """
+    # One backend for the whole ranking, chosen from the FIRST model so
+    # that a list of registry tags is not measured on an engine that
+    # cannot resolve one. Ranking still compares like with like, which is
+    # this function's actual contract; what it no longer does is pick the
+    # engine from whatever happens to be installed.
     backend = backend if backend is not None else hearth_backend.get_backend(
-        ollama_url=base_url)
+        ollama_url=base_url, model=(models[0] if models else None))
     results = [
         cached_measure(m, base_url=base_url, prompt=prompt, num_predict=num_predict,
                         force=force, timeout=timeout, backend=backend)

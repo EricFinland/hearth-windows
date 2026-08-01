@@ -58,18 +58,42 @@ manage.
 
 ## Selection
 
+THE MODEL DECIDES THE BACKEND. Availability is the tiebreaker, not the
+primary key. That ordering was inverted once and it cost a live regression:
+selection preferred the bundled binary the moment find_server() succeeded,
+so a machine that had both a vendored llama-server and a user who picked
+"qwen2.5-coder:latest" got LlamaBackend handed an Ollama registry tag, which
+it cannot resolve. Every turn died with a generic error before any tool call
+happened. Both modules were individually correct and individually tested; the
+defect lived entirely in the seam, where the model's kind was known and
+simply never consulted.
+
 get_backend() resolves in this order, and active() reports which rung fired
 and why so a setup screen can explain itself:
 
   1. %HEARTH_BACKEND% set to "llama" or "ollama". An explicit override is
      obeyed even when that backend is not currently usable, because a user
      who typed it needs to be told THAT backend is broken, not silently
-     handed the other one.
-  2. The bundled llama-server, if hearth_llama.find_server() finds it.
-  3. Ollama, if it answers on its base URL.
-  4. llama, as the reported default when neither is usable, so the
+     handed the other one. When the model named alongside it belongs to the
+     other namespace, the override still wins and the decision carries a
+     model_error naming both the override and the model's kind -- an
+     override that quietly did something else would be worse than an error.
+  2. The model's own kind, when its shape says which namespace it is in
+     (see model_kind_hint). A GGUF path implies llama.cpp; a registry tag
+     implies Ollama. If that backend is not usable, the decision still names
+     it and carries a model_error saying so, because "this model needs an
+     engine you do not have" is the honest answer and the other engine
+     genuinely cannot run it.
+  3. The bundled llama-server, if hearth_llama.find_server() finds it.
+  4. Ollama, if it answers on its base URL.
+  5. llama, as the reported default when neither is usable, so the
      resulting diagnosis is about the engine Hearth actually ships rather
      than about a dependency Hearth no longer requires.
+
+Rungs 3 to 5 only run for an AMBIGUOUS model -- a bare name with no path
+separator, no .gguf suffix, and no tag colon, or no model at all. Such a
+name resolves in the active backend's own namespace, exactly as it did
+before this existed.
 
 ## Constraints
 
@@ -124,8 +148,16 @@ KIND_GGUF = "gguf"
 KIND_OLLAMA = "ollama"
 KINDS = (KIND_GGUF, KIND_OLLAMA)
 
+#: Which backend serves each model kind. The two are one-to-one by
+#: construction (a backend declares exactly one model_kind), and this is the
+#: mapping selection reads in the direction the backends themselves cannot:
+#: from a model to the engine that can run it.
+BACKEND_FOR_KIND = {KIND_GGUF: BACKEND_LLAMA, KIND_OLLAMA: BACKEND_OLLAMA}
+KIND_FOR_BACKEND = {BACKEND_LLAMA: KIND_GGUF, BACKEND_OLLAMA: KIND_OLLAMA}
+
 #: Why a particular backend was selected. Reported by active().
 WHY_OVERRIDE = "override"
+WHY_MODEL_KIND = "model_kind"
 WHY_BUNDLED = "bundled"
 WHY_OLLAMA_REACHABLE = "ollama_reachable"
 WHY_DEFAULT = "default"
@@ -292,6 +324,52 @@ class ModelRef:
 
     def __repr__(self):
         return "ModelRef({!r}, {!r})".format(self.kind, self.value)
+
+
+def model_kind_hint(model):
+    """Which namespace `model` names, or None when its shape does not say.
+
+    The difference from ModelRef.parse's own inference is the None: parse()
+    must always produce a ref, so it falls back to "registry tag" for
+    anything it cannot place. This function refuses to guess, and that
+    refusal is what the selection rules are built on. A caller can then
+    treat "gguf", "ollama" and "no idea" as three different situations
+    rather than two, which is exactly what separates "route this to the
+    engine that can run it" from "resolve this in whichever engine is
+    already active".
+
+    The evidence, in order:
+
+      An explicit "gguf:" or "ollama:" prefix. Always decisive.
+      A .gguf suffix. Only llama.cpp loads those.
+      A path separator. A registry tag can technically contain one
+        ("hf.co/user/repo:Q4"), so this is the one rule that can be wrong;
+        it matches ModelRef.parse's own long-standing inference, and a tag
+        of that shape is served by writing the "ollama:" prefix, which the
+        rule above honours. Being wrong here fails loudly with a named
+        model rather than silently.
+      A colon. "qwen2.5-coder:latest" -- a registry tag. Checked last so a
+        Windows drive letter ("C:\\models\\x.gguf") has already been claimed
+        by one of the two rules above.
+
+    Anything else -- a bare "llama3.2", the router's "auto" sentinel, an
+    empty value -- is ambiguous and returns None.
+    """
+    if isinstance(model, ModelRef):
+        return model.kind
+    raw = "" if model is None else str(model).strip()
+    if not raw:
+        return None
+    m = _KIND_PREFIX_RE.match(raw)
+    if m:
+        return m.group("kind")
+    if raw.lower().endswith(".gguf"):
+        return KIND_GGUF
+    if "/" in raw or "\\" in raw or os.sep in raw:
+        return KIND_GGUF
+    if ":" in raw:
+        return KIND_OLLAMA
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -543,12 +621,21 @@ class Backend:
         """Return `ref` as a ModelRef, or raise ModelKindError if it names a
         model in the other backend's namespace.
 
-        A bare string is parsed with this backend's own kind as the default,
-        so a caller that has only ever seen one backend keeps working; an
-        explicitly prefixed string of the wrong kind still raises, because
-        that is a caller that knows about both and got them mixed up.
+        SHAPE IS EVIDENCE, not just an explicit prefix. This used to parse a
+        bare string with this backend's own kind as the default, so
+        LlamaBackend.check_ref("qwen2.5-coder:latest") happily produced
+        ModelRef(gguf, "qwen2.5-coder:latest") and the failure surfaced three
+        layers down as llama-server refusing to open a file by that name.
+        model_kind_hint() is consulted first now: a string whose shape names
+        a namespace is held to it, and only a genuinely ambiguous one (a bare
+        "llama3.2", with no separator, suffix or colon) falls back to this
+        backend's own kind, so a caller that has only ever seen one backend
+        keeps working.
         """
-        parsed = ModelRef.parse(ref, default_kind=self.model_kind)
+        if isinstance(ref, ModelRef):
+            parsed = ref
+        else:
+            parsed = ModelRef.parse(ref, default_kind=model_kind_hint(ref) or self.model_kind)
         if parsed.kind != self.model_kind:
             raise ModelKindError(
                 "the {} backend takes a {} model reference, but {!r} is a {} "
@@ -1336,12 +1423,36 @@ def _override(env=None):
         ENV_BACKEND, raw, ", ".join(BACKENDS))
 
 
-def select(env=None, ollama_url=None, find_server_fn=None, ollama_probe_fn=None):
+def _kind_phrase(kind, value):
+    """How to describe a model to a person, in that namespace's own terms."""
+    if kind == KIND_GGUF:
+        return "{!r} is a GGUF model file, which only Hearth's bundled engine can run".format(value)
+    return "{!r} is an Ollama model tag, which only Ollama can resolve".format(value)
+
+
+def select(env=None, ollama_url=None, find_server_fn=None, ollama_probe_fn=None,
+           model=None):
     """Decide which backend to use, and record why. Pure decision, no I/O of
     its own beyond the two probes it is handed.
 
     Returns {"backend", "why", "reason", "override", "override_error",
-    "llama_found", "ollama_reachable"}. Never raises.
+    "llama_found", "ollama_reachable", "model", "model_kind", "model_ok",
+    "model_error", "model_remedy"}. Never raises.
+
+    `model` is the model this decision is for, as a ModelRef or a plain
+    string. Passing one is what makes the answer correct rather than merely
+    plausible: see the module docstring's Selection section for the
+    regression that came of choosing an engine from availability alone.
+    Omitting it (or passing an ambiguous bare name) falls back to the
+    availability order, which is the right answer for "which engine is this
+    install using in general".
+
+    model_ok is False only when the chosen backend genuinely cannot serve
+    the named model -- either an override points at the other namespace, or
+    the engine that owns this model's namespace is not usable here. In that
+    case model_error and model_remedy carry the whole explanation, naming
+    the model, the backend and the reason, so no caller has to reconstruct
+    it from the flags.
 
     `find_server_fn` and `ollama_probe_fn` exist so the self-test can drive
     every branch of this without a binary and without a daemon; both
@@ -1349,38 +1460,96 @@ def select(env=None, ollama_url=None, find_server_fn=None, ollama_probe_fn=None)
     """
     override, override_error = _override(env)
     find_server_fn = find_server_fn or hearth_llama.find_server
+    url = ollama_url or DEFAULT_OLLAMA_URL
     if ollama_probe_fn is None:
-        url = ollama_url or DEFAULT_OLLAMA_URL
-
         def ollama_probe_fn():
             return OllamaBackend(url).reachable()[0]
 
+    kind = model_kind_hint(model)
+    value = model.value if isinstance(model, ModelRef) else (
+        None if model is None else str(model).strip())
+
     out = {"backend": None, "why": None, "reason": None, "override": override,
            "override_error": override_error, "llama_found": None,
-           "ollama_reachable": None}
+           "ollama_reachable": None, "model": value, "model_kind": kind,
+           "model_ok": True, "model_error": None, "model_remedy": None}
 
+    def _probe_llama():
+        try:
+            found = find_server_fn()
+            out["llama_found"] = bool(found and found.get("found"))
+        except Exception:  # noqa: BLE001 - selection must never raise
+            out["llama_found"] = False
+        return out["llama_found"]
+
+    def _probe_ollama():
+        try:
+            out["ollama_reachable"] = bool(ollama_probe_fn())
+        except Exception:  # noqa: BLE001 - selection must never raise
+            out["ollama_reachable"] = False
+        return out["ollama_reachable"]
+
+    # 1. An explicit override wins outright, and is never silently switched.
+    #    A model from the other namespace does not change WHICH backend is
+    #    reported -- it changes what the decision says about it.
     if override:
         out["backend"] = override
         out["why"] = WHY_OVERRIDE
         out["reason"] = "{} is set to {!r}".format(ENV_BACKEND, override)
+        if kind is not None and BACKEND_FOR_KIND[kind] != override:
+            out["model_ok"] = False
+            out["model_error"] = (
+                "{} is set to {!r}, but {}. An explicit backend override is "
+                "obeyed rather than silently switched, so this model cannot "
+                "be run as configured.".format(ENV_BACKEND, override,
+                                               _kind_phrase(kind, value)))
+            out["model_remedy"] = (
+                "Unset {} to let Hearth choose the backend from the model, or "
+                "name a {} model instead.".format(
+                    ENV_BACKEND, KIND_FOR_BACKEND[override]))
         return out
 
-    try:
-        found = find_server_fn()
-        out["llama_found"] = bool(found and found.get("found"))
-    except Exception:  # noqa: BLE001 - selection must never raise
-        out["llama_found"] = False
-    if out["llama_found"]:
+    # 2. The model's own namespace, when its shape names one. This is the
+    #    rung that was missing.
+    if kind == KIND_GGUF:
+        out["backend"] = BACKEND_LLAMA
+        out["why"] = WHY_MODEL_KIND
+        out["reason"] = "{} is a GGUF file, which Hearth's bundled engine runs".format(value)
+        if not _probe_llama():
+            out["model_ok"] = False
+            out["model_error"] = (
+                "{}, and that engine ({}) was not found on this machine.".format(
+                    _kind_phrase(kind, value), hearth_llama.SERVER_BASENAME))
+            out["model_remedy"] = (
+                "Reinstall Hearth, or set {} to the full path of a llama-server "
+                "binary.".format(hearth_llama.ENV_SERVER))
+        return out
+
+    if kind == KIND_OLLAMA:
+        out["backend"] = BACKEND_OLLAMA
+        out["why"] = WHY_MODEL_KIND
+        out["reason"] = "{} is an Ollama model tag, which Ollama resolves".format(value)
+        if not _probe_ollama():
+            out["model_ok"] = False
+            out["model_error"] = (
+                "{}, and Ollama is not reachable at {}. Hearth's bundled engine "
+                "runs GGUF files on disk and cannot resolve a registry tag, so "
+                "it cannot run this model either.".format(
+                    _kind_phrase(kind, value), url))
+            out["model_remedy"] = (
+                "Start Ollama, or pick one of the models Hearth has downloaded "
+                "for its own engine.")
+        return out
+
+    # 3-5. An ambiguous name (or none at all) resolves in whichever engine is
+    #      usable, exactly as it did before model kinds were consulted.
+    if _probe_llama():
         out["backend"] = BACKEND_LLAMA
         out["why"] = WHY_BUNDLED
         out["reason"] = "Hearth's bundled inference engine is present"
         return out
 
-    try:
-        out["ollama_reachable"] = bool(ollama_probe_fn())
-    except Exception:  # noqa: BLE001 - selection must never raise
-        out["ollama_reachable"] = False
-    if out["ollama_reachable"]:
+    if _probe_ollama():
         out["backend"] = BACKEND_OLLAMA
         out["why"] = WHY_OLLAMA_REACHABLE
         out["reason"] = ("Hearth's bundled engine was not found, but Ollama is "
@@ -1395,10 +1564,39 @@ def select(env=None, ollama_url=None, find_server_fn=None, ollama_probe_fn=None)
     return out
 
 
-#: The process-wide backend, built on first use. A single instance matters
-#: for the llama backend specifically: it owns a subprocess holding several
-#: GB of VRAM, and a second instance would start a second server that could
-#: not allocate.
+def check_model(model, ollama_url=None, env=None):
+    """Can `model` be served right now, and by which backend?
+
+    The one call a caller makes when it holds a model name and wants to know
+    whether proceeding is worth attempting -- a session being created, a
+    turn about to start. Returns {"ok", "backend", "kind", "message",
+    "remedy", "why"}, where message and remedy are None when ok is True.
+    Never raises, and never starts an engine: this is select() plus a
+    friendlier shape, so it costs at most one bounded probe.
+    """
+    decision = select(env=env, ollama_url=ollama_url, model=model)
+    return {
+        "ok": decision["model_ok"],
+        "backend": decision["backend"],
+        "kind": decision["model_kind"],
+        "why": decision["why"],
+        "message": decision["model_error"],
+        "remedy": decision["model_remedy"],
+    }
+
+
+#: At most one instance per backend name, built on first use. A single
+#: instance matters for the llama backend specifically: it owns a subprocess
+#: holding several GB of VRAM, and a second instance would start a second
+#: server that could not allocate.
+#:
+#: A dict rather than a single slot because selection is per-model now: one
+#: process can legitimately serve a GGUF on the bundled engine and a registry
+#: tag through Ollama. Each name still has exactly one instance, which is the
+#: invariant that actually mattered.
+_INSTANCES = {}
+#: The instance get_backend() handed out most recently -- "the one answering
+#: chat calls", which is what active() reports on.
 _ACTIVE = None
 _ACTIVE_LOCK = threading.RLock()
 
@@ -1415,35 +1613,50 @@ def build(name, ollama_url=None):
         name, ", ".join(BACKENDS)))
 
 
-def get_backend(ollama_url=None, force=None):
-    """The process-wide backend, selected on first use and reused after.
+def get_backend(ollama_url=None, force=None, model=None):
+    """The backend that should serve `model`, selected per call and cached
+    per backend name.
 
-    `force` names a backend directly and bypasses both the environment and
-    the cache, returning a fresh instance the caller owns and should
-    close(). Everything else shares one instance, because the llama backend
-    owns a GPU-resident subprocess that must not be duplicated.
+    PASS THE MODEL. Selection reads its kind (see select()), and a caller
+    that omits it gets a backend chosen from availability alone -- which is
+    correct for "what is this install using" and wrong for "run this
+    model". hearth_loop.chat passes it; anything else holding a model name
+    should too.
+
+    `force` names a backend directly and bypasses the environment, the
+    model, and the cache, returning a fresh instance the caller owns and
+    should close(). Everything else shares one instance per name, because
+    the llama backend owns a GPU-resident subprocess that must not be
+    duplicated.
     """
     if force:
         return build(force, ollama_url)
     global _ACTIVE
+    name = select(ollama_url=ollama_url, model=model)["backend"]
     with _ACTIVE_LOCK:
-        if _ACTIVE is None:
-            _ACTIVE = build(select(ollama_url=ollama_url)["backend"], ollama_url)
-        return _ACTIVE
+        instance = _INSTANCES.get(name)
+        if instance is None:
+            instance = _INSTANCES[name] = build(name, ollama_url)
+        _ACTIVE = instance
+        return instance
 
 
 def reset():
-    """Drop and close the process-wide backend, so the next get_backend()
-    selects again. For the self-test and for a settings change that
-    switches engines."""
+    """Drop and close every cached backend, so the next get_backend()
+    selects and builds again. For the self-test and for a settings change
+    that switches engines."""
     global _ACTIVE
     with _ACTIVE_LOCK:
-        if _ACTIVE is not None:
-            _ACTIVE.close()
+        for instance in _INSTANCES.values():
+            try:
+                instance.close()
+            except Exception:  # noqa: BLE001 - shutdown must not raise
+                pass
+        _INSTANCES.clear()
         _ACTIVE = None
 
 
-def active(ollama_url=None):
+def active(ollama_url=None, model=None):
     """Which backend is in use and why, without committing to one.
 
     The answer a settings screen or a diagnosis needs: the selection
@@ -1457,8 +1670,12 @@ def active(ollama_url=None):
     mid-run, or a model finished downloading), "stale" carries the backend
     select() would now pick, so a caller can offer a restart instead of
     reporting a choice that is not in force.
+
+    `model` narrows the question to one model, which is the form a settings
+    screen wants when the user has already picked one: the decision then
+    carries model_ok/model_error for that specific choice.
     """
-    decision = select(ollama_url=ollama_url)
+    decision = select(ollama_url=ollama_url, model=model)
     with _ACTIVE_LOCK:
         current = _ACTIVE.name if _ACTIVE is not None else None
     decision["instantiated"] = current is not None
@@ -1486,6 +1703,9 @@ def main(argv=None):
     p.add_argument("--diagnose", action="store_true")
     p.add_argument("--models", action="store_true")
     p.add_argument("--backend", choices=BACKENDS, default=None)
+    p.add_argument("--model", default=None,
+                   help="the model the answer is about; its kind is what "
+                        "chooses the backend")
     p.add_argument("--ollama-url", default=None)
     p.add_argument("--json", action="store_true")
     a = p.parse_args(argv)
@@ -1496,7 +1716,7 @@ def main(argv=None):
         return 0
 
     if a.which:
-        info = active(ollama_url=a.ollama_url)
+        info = active(ollama_url=a.ollama_url, model=a.model)
         if a.json:
             print(json.dumps(info, indent=2, sort_keys=True))
         else:
@@ -1504,9 +1724,12 @@ def main(argv=None):
             print("reason:  {}".format(info["reason"]))
             if info["override_error"]:
                 print("warning: {}".format(info["override_error"]))
-        return 0
+            if not info["model_ok"]:
+                print("problem: {}".format(info["model_error"]))
+                print("  -> {}".format(info["model_remedy"]))
+        return 0 if info["model_ok"] else 1
 
-    backend = get_backend(ollama_url=a.ollama_url, force=a.backend)
+    backend = get_backend(ollama_url=a.ollama_url, force=a.backend, model=a.model)
     try:
         if a.models:
             refs = backend.available_models()
@@ -1576,15 +1799,47 @@ def _self_test(live=False):
     except ValueError:
         pass
 
+    # -- model_kind_hint: three answers, not two ---------------------------
+    assert model_kind_hint("qwen2.5-coder:latest") == KIND_OLLAMA
+    assert model_kind_hint(r"C:\models\qwen.gguf") == KIND_GGUF
+    assert model_kind_hint("/srv/models/a.gguf") == KIND_GGUF
+    assert model_kind_hint("models/qwen") == KIND_GGUF
+    assert model_kind_hint("q4.GGUF") == KIND_GGUF
+    # An explicit prefix beats every shape rule, in both directions.
+    assert model_kind_hint("ollama:hf.co/user/repo:Q4") == KIND_OLLAMA
+    assert model_kind_hint("gguf:weird-name") == KIND_GGUF
+    # A ModelRef answers for itself.
+    assert model_kind_hint(ModelRef.ollama("llama3.2")) == KIND_OLLAMA
+    # Ambiguous is its own answer, and this is the whole reason the function
+    # exists: ModelRef.parse must guess here, selection must not.
+    for ambiguous in ("llama3.2", "auto", "", "   ", None):
+        assert model_kind_hint(ambiguous) is None, ambiguous
+    assert ModelRef.parse("llama3.2").kind == KIND_OLLAMA, (
+        "parse must still guess where hint refuses to")
+
     # -- check_ref: a wrong-namespace ref is refused, not coerced ----------
     lb = LlamaBackend()
     ob = OllamaBackend("http://127.0.0.1:11434")
     # A bare string is read in the backend's own namespace.
     assert lb.check_ref("model.gguf").kind == KIND_GGUF
     assert ob.check_ref("qwen2.5-coder:latest").kind == KIND_OLLAMA
-    # A bare string that LOOKS like the other kind still belongs to this
-    # backend: a caller that has only ever seen one backend keeps working.
-    assert ob.check_ref("weird.gguf").value == "weird.gguf"
+    # A genuinely ambiguous bare name resolves in this backend's namespace,
+    # so a caller that has only ever seen one backend keeps working.
+    assert ob.check_ref("llama3.2").kind == KIND_OLLAMA
+    assert lb.check_ref("llama3.2").kind == KIND_GGUF
+    # A bare string whose SHAPE names the other namespace is refused, not
+    # coerced. This is the check that was missing: LlamaBackend used to
+    # accept "qwen2.5-coder:latest" as a GGUF path and only fail once
+    # llama-server tried to open a file by that name.
+    for backend, wrong_text, wrong_kind in (
+            (lb, "qwen2.5-coder:latest", KIND_OLLAMA),
+            (ob, "weird.gguf", KIND_GGUF),
+            (ob, r"C:\models\qwen.gguf", KIND_GGUF)):
+        try:
+            backend.check_ref(wrong_text)
+            raise AssertionError("{} must refuse {!r}".format(backend.name, wrong_text))
+        except ModelKindError as exc:
+            assert wrong_kind in str(exc) and repr(wrong_text) in str(exc), str(exc)
     # An explicitly tagged ref of the wrong kind raises, and the message
     # names both namespaces rather than just saying "bad model".
     for backend, wrong in ((lb, o), (ob, g)):
@@ -1824,6 +2079,73 @@ def _self_test(live=False):
     s = select(env={}, find_server_fn=no, ollama_probe_fn=_boom)
     assert s["backend"] == BACKEND_LLAMA and s["ollama_reachable"] is False, s
 
+    # -- selection: the model decides, availability only breaks ties -------
+    #
+    # THE REGRESSION THIS EXISTS FOR. A machine with the bundled binary
+    # present and a user who picked an Ollama registry tag used to get
+    # LlamaBackend, which cannot resolve a tag; every turn died with a
+    # generic error before any tool call. Availability is a tiebreaker now.
+    s = select(env={}, model="qwen2.5-coder:latest",
+               find_server_fn=yes, ollama_probe_fn=lambda: True)
+    assert s["backend"] == BACKEND_OLLAMA, ("an Ollama tag must not be routed to "
+                                            "the bundled engine just because it "
+                                            "is installed", s)
+    assert s["why"] == WHY_MODEL_KIND and s["model_ok"] is True, s
+    # The bundled binary is not even probed: the model already answered.
+    assert s["llama_found"] is None, s
+
+    # The mirror image: a GGUF goes to the bundled engine even with Ollama up.
+    s = select(env={}, model=r"C:\models\qwen.gguf",
+               find_server_fn=yes, ollama_probe_fn=lambda: True)
+    assert s["backend"] == BACKEND_LLAMA and s["why"] == WHY_MODEL_KIND, s
+    assert s["model_ok"] is True and s["ollama_reachable"] is None, s
+
+    # An ambiguous bare name resolves in the active backend's namespace,
+    # exactly as it did before any of this existed.
+    for ambiguous in (None, "llama3.2", "auto"):
+        s = select(env={}, model=ambiguous, find_server_fn=yes,
+                   ollama_probe_fn=lambda: True)
+        assert s["why"] == WHY_BUNDLED and s["model_ok"] is True, (ambiguous, s)
+        s = select(env={}, model=ambiguous, find_server_fn=no,
+                   ollama_probe_fn=lambda: True)
+        assert s["why"] == WHY_OLLAMA_REACHABLE, (ambiguous, s)
+
+    # An Ollama tag with no reachable Ollama still reports ollama -- that is
+    # the engine that owns this model -- and says exactly why it cannot run,
+    # naming the model, the URL, and why the other engine is not a fallback.
+    s = select(env={}, model="qwen2.5-coder:latest", ollama_url="http://h:11434",
+               find_server_fn=yes, ollama_probe_fn=lambda: False)
+    assert s["backend"] == BACKEND_OLLAMA and s["model_ok"] is False, s
+    for fragment in ("qwen2.5-coder:latest", "http://h:11434", "GGUF"):
+        assert fragment in s["model_error"], (fragment, s["model_error"])
+    assert s["model_remedy"], s
+
+    # A GGUF with no bundled engine, the mirror image again.
+    s = select(env={}, model="/srv/a.gguf", find_server_fn=no,
+               ollama_probe_fn=lambda: True)
+    assert s["backend"] == BACKEND_LLAMA and s["model_ok"] is False, s
+    assert "/srv/a.gguf" in s["model_error"] and hearth_llama.SERVER_BASENAME in s["model_error"], s
+
+    # An override still wins outright and is never silently switched, but a
+    # model from the other namespace is now an honest, named error rather
+    # than a generic failure three layers down.
+    s = select(env={ENV_BACKEND: "llama"}, model="qwen2.5-coder:latest",
+               find_server_fn=yes, ollama_probe_fn=lambda: True)
+    assert s["backend"] == BACKEND_LLAMA and s["why"] == WHY_OVERRIDE, (
+        "an explicit override must not be overridden by the model", s)
+    assert s["model_ok"] is False, s
+    assert ENV_BACKEND in s["model_error"] and "qwen2.5-coder:latest" in s["model_error"], s
+    assert "llama" in s["model_error"], s
+    # And the matching direction is simply fine.
+    s = select(env={ENV_BACKEND: "ollama"}, model="qwen2.5-coder:latest",
+               find_server_fn=no, ollama_probe_fn=lambda: False)
+    assert s["backend"] == BACKEND_OLLAMA and s["model_ok"] is True, s
+
+    # check_model is select() in the shape a caller with a model wants.
+    _cm = check_model("llama3.2", ollama_url="http://127.0.0.1:1")
+    assert set(_cm) == {"ok", "backend", "kind", "why", "message", "remedy"}, _cm
+    assert _cm["ok"] is True and _cm["message"] is None, _cm
+
     # -- build() / get_backend() / reset() ---------------------------------
     assert isinstance(build(BACKEND_LLAMA), LlamaBackend)
     assert isinstance(build(BACKEND_OLLAMA), OllamaBackend)
@@ -1838,6 +2160,7 @@ def _self_test(live=False):
     assert isinstance(forced, OllamaBackend)
     with _ACTIVE_LOCK:
         assert _ACTIVE is None, "force= must not populate the process-wide backend"
+        assert not _INSTANCES, "force= must not populate the instance cache"
     # The process-wide backend is built once and reused.
     _old_env = os.environ.get(ENV_BACKEND)
     os.environ[ENV_BACKEND] = BACKEND_OLLAMA
@@ -1867,6 +2190,26 @@ def _self_test(live=False):
         reset()
         assert active()["instantiated"] is False
         assert active()["stale"] is None
+
+        # One instance PER NAME, not one instance overall: per-model
+        # selection means a single process can legitimately need both, and
+        # the invariant that actually matters is that the llama backend --
+        # which owns a GPU-resident subprocess -- is never duplicated.
+        os.environ.pop(ENV_BACKEND, None)
+        reset()
+        a1 = get_backend(model=r"C:\models\a.gguf")
+        a2 = get_backend(model="/srv/b.gguf")
+        b1 = get_backend(model="qwen2.5-coder:latest")
+        b2 = get_backend(model="llama3.2:3b")
+        assert a1 is a2 and a1.name == BACKEND_LLAMA, (a1, a2)
+        assert b1 is b2 and b1.name == BACKEND_OLLAMA, (b1, b2)
+        assert a1 is not b1
+        with _ACTIVE_LOCK:
+            assert set(_INSTANCES) == {BACKEND_LLAMA, BACKEND_OLLAMA}, _INSTANCES
+            assert _ACTIVE is b2, "active must be the one handed out most recently"
+        reset()
+        with _ACTIVE_LOCK:
+            assert not _INSTANCES and _ACTIVE is None
     finally:
         if _old_env is None:
             os.environ.pop(ENV_BACKEND, None)

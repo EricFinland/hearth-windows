@@ -144,17 +144,33 @@ calling the right functions in the right order:
   6. A turn that cannot even attempt a chat call fails with a clear reason,
      not hearth_loop.chat's own connection-refused exception three network
      hops later (agent/hearth_setup.py exists for exactly this: "can I even
-     start"). Before checkpointing or making any chat attempt, run() asks
-     self._setup_ready_fn() -- hearth_setup.quick_check(), one bounded HTTP
-     call, never the full diagnose() -- so an ordinary healthy turn pays
-     one cheap check, not a multi-step diagnosis, every single time. Only
-     once that cheap check already says "not ready" does this module pay
-     for hearth_setup.diagnose() (self._setup_diagnose_fn()), to build a
-     single "error" event carrying the diagnosis's own next_action dict
-     ({message, remedy}, not a sentence): its "message" prefixed with
-     "Ollama is not ready: " and its "remedy" passed through untouched, so
-     a user whose Ollama is stopped gets hearth_setup's own wording instead
-     of a stack trace. The only text invented here is the fallback used
+     start"). Two gates, in order, both before the checkpoint.
+
+     First the model-kind gate (_model_problem, hearth_backend.check_model):
+     is there an engine on this machine that can run THIS model at all? A
+     GGUF path needs the bundled engine; a registry tag needs Ollama; and
+     one cannot stand in for the other. When the answer is no, the "error"
+     event carries hearth_backend's own message and remedy verbatim --
+     which model, which backend, and why -- instead of the generic failure
+     a wrongly-chosen engine used to produce several layers down, after a
+     checkpoint had already been taken. It is asked first because it is the
+     more specific question: telling a user their bundled engine has no
+     models downloaded is unhelpful when their model was never going to run
+     there.
+
+     Then the readiness gate: run() asks self._setup_ready_fn(model) --
+     hearth_setup.quick_check() against the backend that model resolves to,
+     one bounded check, never the full diagnose() -- so an ordinary healthy
+     turn pays one cheap check, not a multi-step diagnosis, every single
+     time. Only once that cheap check already says "not ready" does this
+     module pay for hearth_setup.diagnose() (self._setup_diagnose_fn(model)),
+     to build a single "error" event carrying the diagnosis's own
+     next_action dict ({message, remedy}, not a sentence): its "message"
+     prefixed with the diagnosed engine's own name and its "remedy" passed
+     through untouched, so a user whose Ollama is stopped gets
+     hearth_setup's own wording instead of a stack trace. Both fns take the
+     model because which engine is being asked about is decided by the
+     model's kind. The only text invented here is the fallback used
      when the diagnosis itself fails or returns no next_action at all.
      Wired to the real hearth_setup module only when this engine is
      actually going to call real hearth_loop.chat (chat_fn is None); an
@@ -657,6 +673,42 @@ def list_installed_models(ollama_url=None, timeout=3):
     return out
 
 
+def list_local_models(timeout=None):  # noqa: ARG001 - signature parity with list_installed_models
+    """GGUF models Hearth has downloaded for its own bundled engine, in the
+    same entry shape list_installed_models uses for Ollama.
+
+    The other half of GET /models. Listing only Ollama's tags was coherent
+    while Ollama was the only engine; it is not any more, and a picker that
+    offers only tags on a machine whose engine is the bundled one is a
+    picker that cannot offer a single runnable model. Each entry carries the
+    backend that runs it and the exact reference string to send back to
+    POST /session, so the caller never has to re-derive a model's kind from
+    its name (which is what selection got wrong in the first place).
+
+    Returns [] when the bundled engine is not present at all -- there is no
+    point offering models nothing here can run -- and on any failure
+    whatsoever, matching list_installed_models' own "degrade, never raise"
+    contract.
+    """
+    try:
+        if not hearth_backend.hearth_llama.find_server().get("found"):
+            return []
+        refs = hearth_backend.build(hearth_backend.BACKEND_LLAMA).available_models()
+    except Exception:  # noqa: BLE001 - a models listing must never raise
+        return []
+    out = []
+    for ref in refs:
+        try:
+            size = os.path.getsize(ref.value)
+        except OSError:
+            size = None
+        out.append({"name": ref.display, "ref": ref.as_text(),
+                    "backend": hearth_backend.BACKEND_LLAMA,
+                    "path": ref.value, "size_bytes": size,
+                    "modified_at": None, "digest": None})
+    return out
+
+
 def _injection_finding_for_approval(scan_result):
     """Reduce a hearth_injection.scan() result to the small, display-ready
     shape the approval_request event carries: the overall source/severity/
@@ -777,7 +829,8 @@ class RealEngine:
                  checkpoint_fn=None, auto_allow=(), max_iters=None,
                  poll_interval=POLL_INTERVAL, max_messages=None,
                  route_fn=None, available_models_fn=None, hw_fn=None,
-                 setup_ready_fn=None, setup_diagnose_fn=None):
+                 setup_ready_fn=None, setup_diagnose_fn=None,
+                 check_model_fn=None):
         self.ollama_url = ollama_url or hearth_loop.DEFAULT_OLLAMA
         self._chat_fn = chat_fn
         # Whether an injected chat_fn can stream. The real hearth_loop.chat
@@ -796,12 +849,30 @@ class RealEngine:
         # going to call real hearth_loop.chat (chat_fn is None) -- see the
         # module docstring for why that is the right default rather than a
         # magic "test mode" flag.
+        #
+        # Both take the session's model, because "is the engine ready" is
+        # not a question that can be answered without knowing which engine
+        # -- and which engine is decided by the model's kind (see
+        # hearth_backend.select). Asking without it is how a user with an
+        # Ollama tag and no downloaded GGUF got told the BUNDLED engine had
+        # no models, which is true, irrelevant, and unactionable.
         self._setup_ready_fn = setup_ready_fn or (
-            (lambda: hearth_setup.quick_check(self.ollama_url)) if chat_fn is None
-            else (lambda: True))
+            (lambda model=None: hearth_setup.quick_check(
+                self.ollama_url, backend=self._backend_for(model)))
+            if chat_fn is None else (lambda model=None: True))
         self._setup_diagnose_fn = setup_diagnose_fn or (
-            (lambda: hearth_setup.diagnose(self.ollama_url)) if chat_fn is None
-            else (lambda: {"status": hearth_setup.STATUS_READY, "next_action": None}))
+            (lambda model=None: hearth_setup.diagnose(
+                self.ollama_url, backend=self._backend_for(model)))
+            if chat_fn is None
+            else (lambda model=None: {"status": hearth_setup.STATUS_READY,
+                                      "next_action": None}))
+        # Model-kind gate (see _model_problem). Injectable for the same
+        # reason every other outward-facing seam here is: no self-test
+        # scenario should need a real engine on disk or a reachable daemon
+        # just to prove the wiring around it.
+        self._check_model_fn = check_model_fn or (
+            (lambda model: hearth_backend.check_model(model, ollama_url=self.ollama_url))
+            if chat_fn is None else (lambda model: {"ok": True}))
         self.auto_allow = tuple(auto_allow)
         self.max_iters = max_iters or MAX_ITERS
         self.poll_interval = poll_interval
@@ -1026,24 +1097,68 @@ class RealEngine:
             "warning": cp.get("warning"),
         })
 
-    def _setup_not_ready_event_data(self):
+    def _backend_for(self, model):
+        """The hearth_backend instance that would serve `model` -- the
+        engine chosen from the model's own kind, not from whichever engine
+        happens to be installed. Never raises and never starts a server:
+        LlamaBackend spawns its process on the first chat(), not on
+        construction."""
+        try:
+            return hearth_backend.get_backend(ollama_url=self.ollama_url, model=model)
+        except Exception:  # noqa: BLE001 - a selection failure must not block a turn
+            return None
+
+    def _model_problem(self, model):
+        """The 'error' event payload for a model no available engine can
+        serve, or None when the model is fine.
+
+        Runs before the checkpoint and before any chat attempt, because the
+        alternative is what this exists to replace: a checkpoint is taken,
+        a turn starts, and the model call fails several layers down with a
+        message about a file that does not exist. hearth_backend.check_model
+        already names the model, the backend, and the reason, and carries a
+        remedy; all this does is put them on the wire unaltered rather than
+        inventing a sentence of its own.
+        """
+        try:
+            verdict = self._check_model_fn(model)
+        except Exception:  # noqa: BLE001 - a broken gate must never block a turn
+            return None
+        if not isinstance(verdict, dict) or verdict.get("ok", True):
+            return None
+        return {
+            "message": verdict.get("message") or "This model cannot be run as configured.",
+            "remedy": verdict.get("remedy"),
+            "model": model,
+            "backend": verdict.get("backend"),
+            "model_kind": verdict.get("kind"),
+        }
+
+    def _setup_not_ready_event_data(self, model=None):
         """The 'error' event payload for a turn that cannot even attempt a
-        chat call because self._setup_ready_fn() reports Ollama is not
+        chat call because self._setup_ready_fn() reports the engine is not
         ready -- see the module docstring's point 6. Runs the full
         diagnosis only now, once the cheap check has already found a
         problem, and degrades to a generic message if even THAT fails: a
         broken diagnosis must not cost the turn its one honest error
         event."""
         try:
-            diagnosis = self._setup_diagnose_fn()
+            diagnosis = self._setup_diagnose_fn(model)
         except Exception:  # noqa: BLE001 - a broken diagnosis must not crash the turn
             diagnosis = None
         next_action = diagnosis.get("next_action") if isinstance(diagnosis, dict) else None
+        # Name the engine the diagnosis is actually about. Hardcoding
+        # "Ollama" here predated the bundled engine and would now blame the
+        # wrong thing for half of these failures.
+        engine_name = ((diagnosis.get("backend") if isinstance(diagnosis, dict) else None)
+                       or "the inference engine")
         if next_action:
-            message = "Ollama is not ready: {}".format(next_action.get("message") or "").strip()
+            message = "{} is not ready: {}".format(
+                engine_name, next_action.get("message") or "").strip()
             remedy = next_action.get("remedy")
         else:
-            message = "Ollama is not ready, and a full diagnosis could not be completed."
+            message = "{} is not ready, and a full diagnosis could not be completed.".format(
+                engine_name)
             remedy = None
         return {
             "message": message,
@@ -1075,16 +1190,26 @@ class RealEngine:
 
         self._turn_count += 1  # classify()'s turn_index signal -- see _resolve_model
 
+        # Model-kind gate: is there an engine here that can run this model
+        # at all? Asked before the readiness gate because it is the more
+        # specific question -- "your bundled engine has no models" is a
+        # confusing thing to tell a user whose model was never going to run
+        # on the bundled engine. See _model_problem.
+        problem = self._model_problem(ctx.model)
+        if problem is not None:
+            ctx.emit("error", problem)
+            return
+
         # Setup-readiness gate (module docstring's point 6): fail fast and
         # clearly, before checkpointing or attempting a chat call that is
         # certain to fail with an obscure connection error otherwise.
         try:
-            ready = self._setup_ready_fn()
+            ready = self._setup_ready_fn(ctx.model)
         except Exception:  # noqa: BLE001 - a broken readiness check must not block a turn;
             ready = True   # fail OPEN -- the real chat call below will surface a genuine
-                            # failure on its own if Ollama truly is unreachable.
+                            # failure on its own if the engine truly is unusable.
         if not ready:
-            ctx.emit("error", self._setup_not_ready_event_data())
+            ctx.emit("error", self._setup_not_ready_event_data(ctx.model))
             return
 
         self._checkpoint(ctx)
@@ -2431,16 +2556,19 @@ def _self_test():
     # === workspace for a turn that cannot run at all. =======================
     setup_ready_calls = {"n": 0}
 
-    def _setup_not_ready():
+    def _setup_not_ready(model=None):
         setup_ready_calls["n"] += 1
+        setup_ready_calls["model"] = model
         return False
 
     setup_diagnose_calls = {"n": 0}
 
-    def _setup_diagnosis_stub():
+    def _setup_diagnosis_stub(model=None):
         setup_diagnose_calls["n"] += 1
+        setup_diagnose_calls["model"] = model
         return {
             "status": "not_running",
+            "backend": "ollama",
             "next_action": {
                 "message": "Ollama is installed but not reachable at http://127.0.0.1:11434.",
                 "remedy": "Start it: ollama serve",
@@ -2466,6 +2594,11 @@ def _self_test():
     assert setup_ready_calls["n"] == 1, setup_ready_calls
     assert setup_diagnose_calls["n"] == 1, \
         "diagnose() must run exactly once, only after quick_check() already failed"
+    # Both gates are asked ABOUT A MODEL: which engine "ready" even refers
+    # to is decided by the model's kind, so a check that never sees the
+    # model can only answer for whichever engine happens to be installed.
+    assert setup_ready_calls["model"] == "fake-model", setup_ready_calls
+    assert setup_diagnose_calls["model"] == "fake-model", setup_diagnose_calls
     assert checkpoint_calls_p == [], "no point checkpointing a turn that cannot run at all"
     assert "not reachable" in err_event["data"]["message"], err_event
     assert err_event["data"]["remedy"] == "Start it: ollama serve", err_event
@@ -2487,7 +2620,8 @@ def _self_test():
         return ({"role": "assistant", "content": "all good", "tool_calls": []}, 1, 1)
 
     engine_p2 = RealEngine(chat_fn=_chat_ok, execute_tool_fn=fake_execute_tool,
-                           checkpoint_fn=fake_checkpoint, setup_ready_fn=lambda: True,
+                           checkpoint_fn=fake_checkpoint,
+                           setup_ready_fn=lambda model=None: True,
                            setup_diagnose_fn=_setup_diagnosis_stub)
     sess_p2 = session_mod.Session(ws, "fake-model", "edit", engine=engine_p2)
     sess_p2.submit_prompt("do something else")
@@ -2503,10 +2637,85 @@ def _self_test():
     # --- already follows. -----------------------------------------------------
     engine_default_test_mode = RealEngine(chat_fn=fake_chat, execute_tool_fn=fake_execute_tool,
                                           checkpoint_fn=fake_checkpoint)
-    assert engine_default_test_mode._setup_ready_fn() is True, (
+    assert engine_default_test_mode._setup_ready_fn("fake-model") is True, (
         "an engine built with an injected chat_fn must not gate on a real, "
         "unreachable Ollama by default"
     )
+    assert engine_default_test_mode._check_model_fn("fake-model")["ok"] is True, (
+        "the model-kind gate must be permissive by default for an injected chat_fn too"
+    )
+
+    # === P2: the model-kind gate (module docstring's point 6, first half) ==
+    # === -- a model no available engine can serve must fail with a =========
+    # === message naming the model, the backend and the reason, BEFORE ======
+    # === the checkpoint, and must never reach the readiness gate or the ====
+    # === chat call. This is the live regression's user-visible half: a =====
+    # === user with the bundled engine installed who picks an Ollama tag ====
+    # === used to get a bare "error" after a checkpoint had been taken. =====
+    model_gate_calls = {"n": 0}
+
+    def _model_cannot_run(model):
+        model_gate_calls["n"] += 1
+        model_gate_calls["model"] = model
+        return {
+            "ok": False, "backend": "ollama", "kind": "ollama",
+            "message": ("'qwen2.5-coder:latest' is an Ollama model tag, and Ollama is "
+                        "not reachable at http://127.0.0.1:11434."),
+            "remedy": "Start Ollama, or pick one of the models Hearth has downloaded.",
+        }
+
+    def _ready_should_never_run(model=None):
+        raise AssertionError("the readiness gate must not run once the model gate failed")
+
+    engine_p3 = RealEngine(chat_fn=_chat_should_never_run, execute_tool_fn=fake_execute_tool,
+                           checkpoint_fn=_checkpoint_should_never_run,
+                           setup_ready_fn=_ready_should_never_run,
+                           setup_diagnose_fn=_setup_diagnosis_stub,
+                           check_model_fn=_model_cannot_run)
+    sess_p3 = session_mod.Session(ws, "qwen2.5-coder:latest", "edit", engine=engine_p3)
+    sess_p3.submit_prompt("do something")
+    err_p3, _ = _wait_for_kind(sess_p3, "error")
+    _wait_idle(sess_p3)
+    assert model_gate_calls == {"n": 1, "model": "qwen2.5-coder:latest"}, model_gate_calls
+    assert [e["kind"] for e in _all_events(sess_p3)] == ["error"], _all_events(sess_p3)
+    # hearth_backend's own words reach the wire untouched, remedy included --
+    # nothing is re-worded or flattened into a generic sentence here.
+    assert "qwen2.5-coder:latest" in err_p3["data"]["message"], err_p3
+    assert "not reachable" in err_p3["data"]["message"], err_p3
+    assert err_p3["data"]["remedy"].startswith("Start Ollama"), err_p3
+    assert err_p3["data"]["backend"] == "ollama", err_p3
+    assert err_p3["data"]["model"] == "qwen2.5-coder:latest", err_p3
+
+    # --- non-vacuous: the SAME construction with the gate saying ok must ---
+    # --- proceed all the way to the chat call. ------------------------------
+    chat_calls_p4 = {"n": 0}
+
+    def _chat_ok_p4(messages):
+        chat_calls_p4["n"] += 1
+        return ({"role": "assistant", "content": "all good", "tool_calls": []}, 1, 1)
+
+    engine_p4 = RealEngine(chat_fn=_chat_ok_p4, execute_tool_fn=fake_execute_tool,
+                           checkpoint_fn=fake_checkpoint,
+                           setup_ready_fn=lambda model=None: True,
+                           setup_diagnose_fn=_setup_diagnosis_stub,
+                           check_model_fn=lambda model: {"ok": True})
+    sess_p4 = session_mod.Session(ws, "qwen2.5-coder:latest", "edit", engine=engine_p4)
+    sess_p4.submit_prompt("do something else")
+    _wait_for_kind(sess_p4, "done")
+    _wait_idle(sess_p4)
+    assert chat_calls_p4["n"] == 1, "an ok model gate must let the turn reach the chat call"
+
+    # --- a gate that raises must fail OPEN: a broken check is not a reason -
+    # --- to refuse a turn the engine might well be able to run. ------------
+    engine_p5 = RealEngine(chat_fn=_chat_ok_p4, execute_tool_fn=fake_execute_tool,
+                           checkpoint_fn=fake_checkpoint,
+                           setup_ready_fn=lambda model=None: True,
+                           setup_diagnose_fn=_setup_diagnosis_stub,
+                           check_model_fn=lambda model: (_ for _ in ()).throw(RuntimeError("boom")))
+    sess_p5 = session_mod.Session(ws, "m", "edit", engine=engine_p5)
+    sess_p5.submit_prompt("still go")
+    _wait_for_kind(sess_p5, "done")
+    _wait_idle(sess_p5)
 
     # --- production default: no chat_fn injected -> the gate is genuinely --
     # --- wired to the real hearth_setup module, not a permissive stub. -----
@@ -2515,10 +2724,19 @@ def _self_test():
     # --- returns well-shaped data, the same "shape only" discipline --------
     # --- hearth_setup.py's own self-test uses for its unstubbed smoke test.
     engine_prod_default = RealEngine()
-    real_ready = engine_prod_default._setup_ready_fn()
+    real_ready = engine_prod_default._setup_ready_fn("llama3.2")
     assert isinstance(real_ready, bool), real_ready
-    real_diag = engine_prod_default._setup_diagnose_fn()
+    real_diag = engine_prod_default._setup_diagnose_fn("llama3.2")
     assert isinstance(real_diag, dict) and "status" in real_diag, real_diag
+    real_model_check = engine_prod_default._check_model_fn("llama3.2")
+    assert isinstance(real_model_check, dict) and "ok" in real_model_check, real_model_check
+    # And the real gate is genuinely wired: a GGUF path resolves to the
+    # bundled engine, an Ollama tag to Ollama, regardless of which of the
+    # two this machine happens to have.
+    assert engine_prod_default._backend_for(
+        os.path.join("m", "a.gguf")).name == hearth_backend.BACKEND_LLAMA
+    assert engine_prod_default._backend_for(
+        "qwen2.5-coder:latest").name == hearth_backend.BACKEND_OLLAMA
 
     # === Q: Finding 3 -- the secrets scanner must not be dead code in ======
     # === 'auto' mode. permissions.decide returns "allow" (never "gate") ===
