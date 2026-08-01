@@ -226,15 +226,23 @@ async function refreshCheckpoints() {
     ui.cpNote.textContent = "No session yet.";
     return;
   }
+  // GET /checkpoints runs `git log` against the workspace's shadow store, and
+  // this is refreshed the moment a `checkpoint` event arrives, which is exactly
+  // when that store is being written. Losing that race is a transient 500, not
+  // a broken history, so retry once before reporting anything.
   let list;
-  try {
-    const body = await sidecar.checkpoints();
-    list = Array.isArray(body.checkpoints) ? body.checkpoints : [];
-  } catch (err) {
-    clear(ui.cpList);
-    ui.cpNote.className = "panel-note is-error";
-    ui.cpNote.textContent = "Could not read checkpoint history: " + errorText(err);
-    return;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const body = await sidecar.checkpoints();
+      list = Array.isArray(body.checkpoints) ? body.checkpoints : [];
+      break;
+    } catch (err) {
+      if (attempt === 0) { await sleep(700); continue; }
+      clear(ui.cpList);
+      ui.cpNote.className = "panel-note is-error";
+      ui.cpNote.textContent = "Could not read checkpoint history: " + errorText(err);
+      return;
+    }
   }
   state.checkpoints = list;
   clear(ui.cpList);
