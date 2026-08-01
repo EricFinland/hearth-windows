@@ -11,7 +11,7 @@ today; the shop's actual on-screen interface is not built yet. See
 
 ## Fit verdicts, not vibes
 
-Every model in the catalog gets a verdict, computed from your real detected
+Every model the shop lists gets a verdict, computed from your real detected
 hardware against that model's real memory requirements, not a
 one-size-fits-all label. Best to worst:
 
@@ -23,7 +23,7 @@ one-size-fits-all label. Best to worst:
 | `cpu_spillover` | Doesn't fit VRAM at any useful context, but the weights and KV cache fit in system RAM. It will run, just slowly. No speed number is predicted - see below. |
 | `wont_fit` | Doesn't fit VRAM or RAM. The shop's own rule: never recommend this model on this machine. |
 
-When nothing in the catalog earns better than `wont_fit` on a given
+When nothing in the listing earns better than `wont_fit` on a given
 machine, the shop's recommendation function returns nothing rather than
 headline a model that can't actually run. An honest "nothing fits" beats a
 confident wrong answer.
@@ -40,7 +40,7 @@ comfortably in 16GB; the exact same model at a long context can need
 roughly twice the memory of its weights alone once the KV cache is added
 in.
 
-So every catalog entry carries `kv_bytes_per_token`, computed from that
+So every built-in catalog entry carries `kv_bytes_per_token`, computed from that
 model's attention architecture (layer count, KV-head count, head dimension)
 rather than from parameter count alone - the arithmetic itself is never a
 guess. What isn't always known with the same confidence is the architecture
@@ -65,6 +65,54 @@ the KV-cache arithmetic says a 7B Q4 coding model still leaves about 0.80GB
 of headroom there. The same model at 32768 tokens doesn't fit at all on
 that card - the calculation is linear, so the ladder just stops climbing
 once a rung fails to clear a real safety margin.
+
+## Live listings, and a verdict per quantisation
+
+The shop no longer ships a hardcoded list of models. `search_shop()` asks
+Hugging Face for real GGUF repositories and asks each one for its real file
+listing, through `agent/hearth_hf.py`. A search for "qwen coder" returns
+what is actually on the Hub, at the sizes the Hub reports.
+
+That changes the shape of the decision. A repository does not hold "a
+model", it holds five to fifteen quantisations of one set of weights,
+sometimes more than an order of magnitude apart in size. A single verdict
+for the whole repository would be meaningless, so every fit verdict is
+computed per quantisation, against that quantisation's real file size, with
+split models summed across their parts. On a 6GB RTX 2060, one 7B coding
+repository spans every tier in the table above: Q2_K through Q4_K_M are
+`great`, Q5_K_M is `good`, Q6_K is `reduced_context`, Q8_0 is
+`cpu_spillover`, and FP16 is `wont_fit`.
+
+The shop then makes the choice for you: the largest quantisation in the best
+verdict tier the repository offers. Best tier first and size second, because
+a quantisation that runs with room to spare beats a larger one that only
+just fits, and "only just fits" is precisely what a longer prompt breaks.
+When nothing fits in VRAM at all the size preference inverts to the
+smallest, which spills least. Every other quantisation stays in the listing
+with its own verdict, so the choice is visible rather than hidden.
+
+The Hub reports sizes and filenames. It does not report layer counts or KV
+head counts, which is what the KV arithmetic above needs. So the shop
+resolves that figure from a table of known model families first, falling
+back to a size heuristic that assumes plain multi-head attention, and
+finally to one fixed conservative figure. The heuristic deliberately
+over-counts, often several-fold, for any model using grouped-query
+attention: over-counting produces a pessimistic verdict, under-counting
+produces a confident "it fits" that is wrong only after several gigabytes
+have been downloaded. Every entry reports which of the three sources it
+used and how much to trust it, in the same `kv_confidence` vocabulary the
+built-in entries use.
+
+## When Hugging Face can't be reached
+
+The shop degrades to a labelled fallback rather than to an exception or a
+blank screen: the built-in reference catalog, graded against the same
+hardware, so a first run with no network can still answer "what could this
+machine run". It does not pretend to answer "what should I install", because
+nothing can be installed without a network: every fallback entry is marked
+not downloadable, and the listing itself always reports `ok: false` with a
+machine-readable error kind, so a caller that never looks at the `source`
+field still cannot mistake the fallback for live Hub data.
 
 ## Why there's no predicted tokens per second
 
@@ -98,6 +146,13 @@ verdict, it's obligated to also say when the number behind it is a guess.
 
 `hearth_hw.probe()` and `hearth_shop.catalog_with_verdicts()` are real,
 tested, callable functions today: pure detection and pure arithmetic, no
-network calls, no writes. What doesn't exist yet is anything to click:
-there is no shop screen, no download button, no progress bar. See
+network calls, no writes. `hearth_shop.search_shop()`,
+`hearth_shop.repo_quants()` and `hearth_shop.recommend_live()` are real and
+tested too, and they do reach the network, through `hearth_hf`; they never
+raise on a network failure, they return a structured result. `hearth_hf`
+can also download a chosen file, resumably and with its hash verified.
+
+What doesn't exist yet is anything to click: there is no shop screen, no
+download button, no progress bar. The desktop server's `GET /models` route
+still serves the offline reference catalog rather than a live search. See
 [docs/windows.md](windows.md) for the full state of the project.

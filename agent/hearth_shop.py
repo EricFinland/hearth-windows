@@ -1,24 +1,87 @@
 #!/usr/bin/env python3
-r"""hearth model shop: a curated catalog of local models, with an honest verdict
-on whether each one will actually run well on the machine in front of the user.
+r"""hearth model shop: live Hugging Face model listings, with an honest verdict
+on whether each quantisation will actually run well on the machine in front
+of the user.
 
-Most model catalogues show a parameter count and a download size and leave the
+Most model listings show a parameter count and a download size and leave the
 user to guess. That is a bad trade for a desktop app whose whole pitch is "no
 command line, no config files, just click and run." This module is the data
-and logic layer behind the shop: a small, defensible catalog (CATALOG),
-weighted toward coding since Hearth Code is the flagship surface, plus the
-arithmetic that turns "16GB of VRAM" and "a 14B model at 8k context" into a
-verdict a non-technical user can act on.
+and logic layer behind the shop: it asks hearth_hf for real Hugging Face
+search results and for the real GGUF files inside a repository, and it turns
+"6GB of VRAM" and "a 7B model at Q4_K_M and 8k of context" into a verdict a
+non-technical user can act on.
 
 THE KV CACHE IS STILL THE PART PEOPLE GET WRONG. See hearth_hw for the full
 argument: model weights are not the whole story, and the exact same model at
 a longer context can need meaningfully more memory once its KV cache is
-counted in. Every CATALOG entry carries kv_bytes_per_token, derived from that
-model's architecture (layer count, KV head count, head dimension), never
-guessed from parameter count. Where the architecture is not confidently known,
-the entry says so in its "kv_confidence" field and uses a conservative
-(deliberately large) estimate rather than inventing a number - see the
-kv_calc comments on each entry for the arithmetic and its source.
+counted in. Nothing here compares a file size against a VRAM size; every
+verdict goes through hearth_hw.fits(), which adds context_tokens *
+kv_bytes_per_token to the weights before deciding.
+
+## Per quantisation, not per repository
+
+A Hub repository does not hold "a model". It holds five to fifteen
+quantisations of one set of weights, from an IQ1 that fits almost anywhere
+and answers badly to an F16 that needs a datacentre, differing in size by
+more than an order of magnitude. A single per-repository verdict would
+therefore be meaningless. Every fit verdict here is computed per
+quantisation, against that quantisation's real file size as the Hub reports
+it (summed across parts for a split model), and the shop's per-repository
+answer is a *choice among* those quants: the largest one in the best verdict
+tier the repository offers.
+
+Best tier first and size second, in that order, because a quantisation that
+runs with room to spare (great) beats a larger one that only just fits
+(good), and "only just fits" is precisely what a longer prompt or a second
+loaded model breaks. Within one tier the larger file is the more faithful
+one and wins. When nothing fits in VRAM at all the size preference inverts
+to the smallest, which is the one that spills least and gives back the most
+context. See rank_quants() and best_quant().
+
+## Where kv_bytes_per_token comes from now
+
+The Hub's search and tree APIs report sizes, filenames, and hashes. They do
+not report layer counts, KV head counts, or head dimensions, which is what
+the KV arithmetic actually needs. Three sources are used, in this order, and
+every entry reports which one it used in kv_source/kv_confidence:
+
+  1. KV_FAMILIES, a table of known model families keyed by name and
+     parameter count. Each entry carries the same explicit
+     layers/kv_heads/head_dim arithmetic the CATALOG entries carry, and each
+     is labelled with how confident that architecture reading is.
+  2. _kv_heuristic_bytes(), a size heuristic, for an unrecognised family. It
+     assumes a dense transformer with hidden_size = 128 * layers and PLAIN
+     MULTI-HEAD ATTENTION, then multiplies by a safety factor. Most models
+     released since roughly 2023 use grouped-query attention, which needs
+     several times less KV cache than that, so this deliberately over-counts.
+     Over-counting yields a pessimistic verdict; under-counting yields a
+     confident wrong "it fits", so the pessimistic direction is the correct
+     one to be wrong in. The self-test pins the claim that this heuristic
+     never under-counts any multi-head-attention entry in KV_FAMILIES.
+  3. UNKNOWN_KV_BYTES_PER_TOKEN, one fixed conservative figure, when neither
+     a family nor a parameter count could be determined at all.
+     kv_confidence is "unknown" for those and a UI should say so rather than
+     present the verdict flatly.
+
+Parameter counts are read out of the repository or file name where one is
+present ("...-7B-..."), and otherwise estimated from the file size and the
+quantisation's bits per weight (QUANT_BITS_PER_WEIGHT). Both are estimates,
+and params_source says which was used.
+
+## When the Hub is unreachable
+
+search_shop() returns ok False with a machine-readable error_kind, source
+"fallback", and the built-in reference catalog (CATALOG) graded against the
+same hardware, with every entry marked source "fallback" and downloadable
+False. ok is True ONLY for live Hub results, so a caller that ignores
+"source" entirely still cannot mistake the fallback for live data. The
+fallback exists so that a first run with no network can still answer "what
+could this machine run"; it deliberately does not pretend to answer "what
+should I download", because nothing can be downloaded without a network.
+
+CATALOG is also still the tier definition hearth_router buckets against and
+the reference list hearth_setup matches installed models against, so it is
+load-bearing beyond the offline fallback.
 
 Verdict vocabulary (best to worst), see verdict_for():
   great          - fits fully in VRAM at the requested context, with roomy
@@ -58,19 +121,30 @@ Disk space is a separate, independent check (free_disk_bytes / disk_ok):
 a user with 8GB free cannot install a 17GB model, and finding that out at 90%
 through a download is a terrible experience.
 
-Deliberately out of scope, matching hearth_hw's stance: no downloading, no
-network calls of any kind, no tokens-per-second prediction. Throughput
+Deliberately out of scope, matching hearth_hw's stance: no downloading (that
+is hearth_hf.download's job) and no tokens-per-second prediction. Throughput
 prediction from bandwidth and parameter count breaks badly on
 mixture-of-experts models; Hearth measures real throughput on the user's
 machine instead of guessing at it.
 
-Standard library only. Pure and offline: this module computes and returns
-data, it does not write files or touch the network. hw=None on the public
-functions is a convenience that defers to hearth_hw.probe() (itself pure
-local detection, no network); pass an explicit hw dict to stay hermetic.
+Standard library only. This module writes no files. Two halves, split by
+whether they touch the network:
+
+  Offline, no network under any circumstances: verdict_for,
+  catalog_with_verdicts, recommend, rank_quants, best_quant, quant_verdicts,
+  kv_for_model, parse_params_b, free_disk_bytes (a local disk-space call).
+
+  Networked, through hearth_hf, and never raising on a network failure:
+  search_shop, repo_quants, recommend_live.
+
+hw=None on the public functions is a convenience that defers to
+hearth_hw.probe() (pure local detection, no network); pass an explicit hw
+dict to stay hermetic.
 """
 
+import math
 import os
+import re
 import shutil
 import sys
 
@@ -84,6 +158,15 @@ VERDICT_GOOD = "good"
 VERDICT_REDUCED_CONTEXT = "reduced_context"
 VERDICT_CPU_SPILLOVER = "cpu_spillover"
 VERDICT_WONT_FIT = "wont_fit"
+
+# Where a shop entry's facts came from. SOURCE_LIVE means the Hugging Face
+# Hub answered and this entry describes a repository that really exists with
+# the file sizes the Hub reported. SOURCE_FALLBACK means the Hub could not be
+# reached and this entry came from the built-in reference CATALOG below: it
+# is a statement about what this hardware could run, not an offer to download
+# anything.
+SOURCE_LIVE = "live"
+SOURCE_FALLBACK = "fallback"
 
 # Best to worst, used for sorting the catalog listing.
 VERDICT_RANK = {
@@ -138,14 +221,22 @@ DISK_BUFFER_BYTES = 512 * 1024 ** 2
 SHARED_MEMORY_LIKELY_VENDORS = (hearth_hw.VENDOR_INTEL, hearth_hw.VENDOR_UNKNOWN)
 
 
-# -- curated catalog -----------------------------------------------------------
+# -- built-in reference catalog ------------------------------------------------
+#
+# Not the shop's listing any more: search_shop() sources that from Hugging
+# Face. This list has three remaining jobs, all of them real:
+#   1. the offline fallback, when the Hub cannot be reached (search_shop
+#      returns it with ok False and source "fallback", never as live data);
+#   2. the tier definition hearth_router buckets coding models into;
+#   3. the reference list hearth_setup matches already-installed models
+#      against so it can grade them.
 #
 # Roughly six to twelve entries, weighted toward coding since Hearth Code is
 # the flagship surface. download_bytes is an approximate figure matching the
-# model's typical Ollama library listing for that quantisation; the exact
-# blob size drifts a little between quant builds and is not load-bearing here
-# - what matters for the fit calculation is kv_bytes_per_token, which is
-# derived from architecture, not guessed from parameter count.
+# model's typical library listing for that quantisation; the exact blob size
+# drifts a little between quant builds and is not load-bearing here - what
+# matters for the fit calculation is kv_bytes_per_token, which is derived
+# from architecture, not guessed from parameter count.
 #
 # kv_calc records the arithmetic: kv_bytes_per_token = 2 (K and V) *
 # layers * kv_heads * head_dim * bytes_per_element. kv_confidence is one of:
@@ -437,6 +528,14 @@ def _gpu_clause(gpu_detected, platform_name):
 def verdict_for(model, hw, context_tokens=None):
     """The shop's core judgment call: will `model` actually run well on `hw`?
 
+    `model` needs exactly two keys: its resident size, as either
+    "download_bytes" (what a CATALOG entry calls it) or "size_bytes" (what a
+    hearth_hf file entry calls it), and "kv_bytes_per_token". Anything else
+    on the dict is ignored, which is what lets one function grade a CATALOG
+    entry, a live Hub quantisation, and a synthetic test fixture identically.
+    Raises ValueError when neither size key is an integer, rather than
+    computing a verdict from a None.
+
     Returns a dict with at least:
       verdict              - one of the VERDICT_* constants.
       message               - a short human-readable explanation. Hedged
@@ -496,7 +595,18 @@ def verdict_for(model, hw, context_tokens=None):
     # decompression step. It is not exact (loader overhead, mmap alignment),
     # but it is the same approximation every local-model memory estimator
     # makes, and this module does not have a better number to reach for.
-    model_bytes = model["download_bytes"]
+    model_bytes = model.get("download_bytes")
+    if model_bytes is None:
+        # hearth_hf's file entries call the same quantity "size_bytes".
+        # Accepting both means a Hub file entry can be graded directly,
+        # without a caller having to rename a key to talk to this function.
+        model_bytes = model.get("size_bytes")
+    if not isinstance(model_bytes, int):
+        raise ValueError(
+            "verdict_for needs an integer download_bytes (or size_bytes); got {!r}".format(
+                model_bytes,
+            )
+        )
     kv_per_token = model["kv_bytes_per_token"]
     gpu_info = _gpu_vram_bytes(hw)
     vram_bytes = gpu_info["vram_bytes"]
@@ -640,11 +750,16 @@ def verdict_for(model, hw, context_tokens=None):
 
 
 def catalog_with_verdicts(hw=None, context_tokens=None, disk_path=None):
-    """The full CATALOG, each entry merged with its verdict_for() result plus
-    a disk-space check, sorted best-verdict-first (ties broken by the larger
-    model, since among equally-runnable options bigger is the safer proxy for
-    more capable - see recommend() for why that proxy is fine here but not
-    everywhere).
+    """The full built-in reference CATALOG, each entry merged with its
+    verdict_for() result plus a disk-space check, sorted best-verdict-first
+    (ties broken by the larger model, since among equally-runnable options
+    bigger is the safer proxy for more capable - see recommend() for why that
+    proxy is fine here but not everywhere).
+
+    This is the OFFLINE listing. It makes no network calls and it is not the
+    Hugging Face shop: search_shop() is. Every entry carries source
+    SOURCE_FALLBACK to say so, since these entries name models rather than
+    downloadable Hub files.
 
     hw=None defers to hearth_hw.probe() (pure local detection, no network).
     """
@@ -658,15 +773,32 @@ def catalog_with_verdicts(hw=None, context_tokens=None, disk_path=None):
         entry["verdict"] = verdict_for(model, hw, context_tokens=context_tokens)
         entry["free_disk_bytes"] = free_disk
         entry["disk_ok"] = free_disk >= (model["download_bytes"] + DISK_BUFFER_BYTES)
+        entry["source"] = SOURCE_FALLBACK
         results.append(entry)
 
     results.sort(key=lambda e: (VERDICT_RANK[e["verdict"]["verdict"]], -e["params_b"]))
     return results
 
 
-def recommend(hw=None, context_tokens=None):
+def recommend(hw=None, context_tokens=None, listing=None):
     """A short, ranked recommendation for this hardware: the best all-round
     coding model this machine can actually run, plus a lighter fallback.
+
+    Two modes, decided by `listing`:
+
+      listing=None (the default, and what every existing caller passes)
+        Ranks the built-in reference CATALOG, offline, exactly as this
+        function always has, and returns catalog_with_verdicts()-shaped
+        entries. No network, no quantisation choice: a CATALOG entry has
+        exactly one size.
+
+      listing=<a search_shop() result>
+        Ranks the live Hugging Face repositories in that listing instead.
+        Each returned entry is a search_shop() model entry whose best_quant
+        is the quantisation being recommended, with an added "reasoning"
+        string explaining the choice of repository AND of quantisation.
+        recommend_live() is the convenience wrapper that fetches a listing
+        and calls this.
 
     "Best" is chosen from models that fit fully in VRAM at the requested
     context (verdict great or good) - reduced_context, cpu_spillover, and
@@ -694,6 +826,9 @@ def recommend(hw=None, context_tokens=None):
     entry): [best] or [best, fallback], in that order. Also empty if the
     catalog has no coding entries at all, which should never happen.
     """
+    if listing is not None:
+        return _recommend_from_listing(listing)
+
     listed = catalog_with_verdicts(hw, context_tokens=context_tokens)
     coding = [e for e in listed if e["focus"] == "coding"]
     if not coding:
@@ -731,6 +866,1175 @@ def recommend(hw=None, context_tokens=None):
             break
 
     return [best, fallback] if fallback else [best]
+
+
+# ---------------------------------------------------------------------------
+# Live sourcing from Hugging Face
+# ---------------------------------------------------------------------------
+
+# How many repositories a search asks the Hub for, and how many of those get
+# their file listing fetched. Each detailed repository costs one extra HTTP
+# round trip (hearth_hf.list_gguf_files), so detailing all twelve would make
+# the shop's first screen wait on twelve requests. Repositories past
+# detail_limit come back with quants_loaded False and an empty quants list;
+# repo_quants() fills one in on demand, which is what a UI should call when
+# the user opens a row.
+DEFAULT_SEARCH_LIMIT = 12
+DEFAULT_DETAIL_LIMIT = 5
+
+# What recommend_live() searches for when the caller names nothing. Mirrors
+# recommend()'s existing coding-first stance (Hearth Code is the flagship
+# surface). It is a plain Hub search string, not a curated repository list.
+DEFAULT_RECOMMEND_QUERY = "coder"
+
+# Returned in a result's error_kind when hearth_hf itself could not be
+# imported. Every other error_kind these functions return is one of
+# hearth_hf's own ERR_* strings, passed through unchanged, so a UI has a
+# single vocabulary to branch on.
+ERR_HF_UNAVAILABLE = "hf_unavailable"
+
+
+def _hf():
+    """The hearth_hf module, imported at call time rather than at import time.
+
+    hearth_hf imports this module (it uses free_disk_bytes), so a
+    module-level import here would be an import cycle whose resolution
+    depends on which of the two a process happened to import first.
+    Deferring to call time removes that ordering hazard entirely, and keeps
+    every offline function in this module usable on an installation where
+    hearth_hf is missing or broken.
+    """
+    import hearth_hf  # noqa: E402 - deferred deliberately, see above
+    return hearth_hf
+
+
+def _gb(n):
+    """A short human-readable size for a message, or a phrase saying the
+    size is unknown. Never invents a number for None.
+    """
+    if not isinstance(n, int) or n <= 0:
+        return "an unknown size"
+    return "{:.1f} GB".format(n / float(1024 ** 3))
+
+
+# -- parameter counts ---------------------------------------------------------
+
+# "8x7B": a mixture-of-experts count, matched first and read as the PRODUCT.
+# Mixtral-8x7B is 56B of weights sitting in memory even though only about 13B
+# are active per token, and memory is what this module decides about.
+_PARAMS_MOE_RE = re.compile(r"(?<![0-9a-z])(\d{1,2})\s*x\s*(\d+(?:\.\d+)?)\s*b(?![0-9a-z])")
+
+# "7B", "1.5b", "0.5B": a number followed by a b that is not part of a longer
+# word. The lookbehind is what keeps the "3b" of Qwen3-30B-A3B (that model's
+# ACTIVE parameter count, not its size) and the "7b" inside "8x7b" from being
+# read as the whole model's size.
+_PARAMS_RE = re.compile(r"(?<![0-9a-z.])(\d+(?:\.\d+)?)\s*b(?![0-9a-z])")
+
+# Outside this range it is a coincidence in a filename, not a parameter count.
+_PARAMS_MIN_B = 0.01
+_PARAMS_MAX_B = 2000.0
+
+# Approximate bits per weight for each GGUF quantisation, used ONLY to
+# estimate a parameter count from a file size when the name does not state
+# one. These are the commonly published llama.cpp figures for the mixed K and
+# I quants (a "4-bit" K quant is not 4.0 bits per weight: it keeps some
+# tensors at higher precision), rounded to two decimals. They are never used
+# to predict quality, and a few percent of error here only shifts a parameter
+# estimate that is already labelled an estimate.
+QUANT_BITS_PER_WEIGHT = {
+    "F32": 32.0, "FP32": 32.0,
+    "F16": 16.0, "FP16": 16.0, "BF16": 16.0,
+    "Q8_0": 8.5,
+    "Q6_K": 6.56,
+    "Q5_1": 6.0, "Q5_0": 5.5, "Q5_K": 5.67, "Q5_K_M": 5.67, "Q5_K_S": 5.52,
+    "Q4_1": 5.0, "Q4_0": 4.5, "Q4_K": 4.83, "Q4_K_M": 4.83, "Q4_K_S": 4.58,
+    "Q3_K": 3.91, "Q3_K_L": 4.27, "Q3_K_M": 3.91, "Q3_K_S": 3.50,
+    "Q2_K": 3.35, "Q2_K_S": 2.96,
+    "IQ4_NL": 4.50, "IQ4_XS": 4.25,
+    "IQ3_M": 3.66, "IQ3_S": 3.44, "IQ3_XS": 3.30, "IQ3_XXS": 3.06,
+    "IQ2_M": 2.70, "IQ2_S": 2.50, "IQ2_XS": 2.31, "IQ2_XXS": 2.06,
+    "IQ1_M": 1.75, "IQ1_S": 1.56,
+    "TQ2_0": 2.06, "TQ1_0": 1.69,
+    "MXFP4": 4.25, "MXFP4_MOE": 4.25, "NVFP4": 4.25,
+}
+
+
+def _normalize_name(name):
+    """A model name lowered, with underscores turned into hyphens, so one set
+    of patterns matches "Qwen2.5_Coder_7B" and "qwen2.5-coder-7b" alike.
+    """
+    return str(name or "").lower().replace("_", "-")
+
+
+def parse_params_b(name):
+    """The parameter count in billions stated by a repository or file name,
+    or None when the name states none.
+
+    "Qwen2.5-Coder-7B-Instruct-GGUF" gives 7.0, "Llama-3.2-1B" gives 1.0,
+    "Mixtral-8x7B" gives 56.0 (see _PARAMS_MOE_RE for why the product rather
+    than the expert size). When a name states two counts it is stating a
+    total and an active or per-expert count, and the larger is the one that
+    has to fit in memory, so the largest plausible match wins.
+
+    A name is a naming convention, not a config file. This is a parse of the
+    convention: callers label the result params_source "name" so nothing
+    downstream mistakes it for a reading of the model's real architecture.
+    Returns None rather than guessing when nothing matches, which is the
+    signal to fall back to params_from_size().
+    """
+    text = _normalize_name(name)
+    candidates = []
+    for experts, per_expert in _PARAMS_MOE_RE.findall(text):
+        try:
+            candidates.append(float(experts) * float(per_expert))
+        except ValueError:
+            continue
+    for raw in _PARAMS_RE.findall(text):
+        try:
+            candidates.append(float(raw))
+        except ValueError:
+            continue
+    plausible = [c for c in candidates if _PARAMS_MIN_B <= c <= _PARAMS_MAX_B]
+    return max(plausible) if plausible else None
+
+
+def params_from_size(size_bytes, quant):
+    """Estimate a parameter count in billions from a GGUF's size and its
+    quantisation label, or None when the label is not in
+    QUANT_BITS_PER_WEIGHT or the size is unusable.
+
+    The second-choice source for a parameter count, used when the name states
+    none. Callers label it params_source "file_size". It is an estimate on
+    top of an approximate table, and it exists only to feed the conservative
+    KV heuristic.
+    """
+    if not isinstance(size_bytes, int) or size_bytes <= 0:
+        return None
+    bits = QUANT_BITS_PER_WEIGHT.get(str(quant or "").upper())
+    if not bits:
+        return None
+    params = (size_bytes * 8.0) / bits / 1e9
+    if not (_PARAMS_MIN_B <= params <= _PARAMS_MAX_B):
+        return None
+    return params
+
+
+# -- KV cache cost per token ---------------------------------------------------
+
+_ATTENTION_MHA = "mha"   # kv_heads == attention heads, the pre-2023 default
+_ATTENTION_GQA = "gqa"   # kv_heads < attention heads, far cheaper to cache
+
+
+def _kv_entry(params_b, layers, kv_heads, head_dim, attention, confidence,
+              bytes_per_element=2):
+    """One KV_FAMILIES size entry, with the arithmetic kept explicit rather
+    than pre-multiplied, so the self-test can prove the number matches its
+    own stated derivation exactly as it already does for CATALOG.
+    """
+    return {
+        "params_b": params_b,
+        "kv_bytes_per_token": 2 * layers * kv_heads * head_dim * bytes_per_element,
+        "kv_confidence": confidence,
+        "kv_calc": {
+            "layers": layers,
+            "kv_heads": kv_heads,
+            "head_dim": head_dim,
+            "bytes_per_element": bytes_per_element,
+            "attention": attention,
+        },
+    }
+
+
+# Known model families, matched by name and then by nearest declared
+# parameter count. Deliberately short: every entry is a claim about a model's
+# architecture, and a claim that UNDER-counts KV cost produces a confident
+# "it fits" that is wrong on the user's machine. A family that is not listed
+# falls through to _kv_heuristic_bytes, which over-counts and so fails safe.
+# kv_confidence uses the same three words CATALOG uses and introduces none:
+# published_config, recalled_estimate, conservative_overestimate.
+#
+# bytes_per_element is 2 throughout because llama.cpp's default KV cache type
+# is f16. A user who configures a quantised KV cache uses less than this,
+# which is again the safe direction to be wrong in.
+KV_FAMILIES = (
+    {
+        # Qwen2 and Qwen2.5, including the Coder variants, which share the
+        # base architecture at each size. Qwen3 deliberately does NOT match:
+        # its architecture is not confidently known here, so it falls through
+        # to the conservative heuristic rather than borrowing these numbers.
+        "family": "qwen2.5",
+        "pattern": re.compile(r"qwen-?2(?:\.5)?(?![0-9])"),
+        "sizes": [
+            _kv_entry(0.5, 24, 2, 64, _ATTENTION_GQA, "recalled_estimate"),
+            _kv_entry(1.5, 28, 2, 128, _ATTENTION_GQA, "published_config"),
+            _kv_entry(3.0, 36, 2, 128, _ATTENTION_GQA, "recalled_estimate"),
+            _kv_entry(7.0, 28, 4, 128, _ATTENTION_GQA, "published_config"),
+            _kv_entry(14.0, 48, 8, 128, _ATTENTION_GQA, "published_config"),
+            _kv_entry(32.0, 64, 8, 128, _ATTENTION_GQA, "published_config"),
+            _kv_entry(72.0, 80, 8, 128, _ATTENTION_GQA, "recalled_estimate"),
+        ],
+    },
+    {
+        "family": "llama3",
+        "pattern": re.compile(r"llama-?3(?:\.[123])?(?![0-9])"),
+        "sizes": [
+            _kv_entry(1.0, 16, 8, 64, _ATTENTION_GQA, "recalled_estimate"),
+            _kv_entry(3.0, 28, 8, 128, _ATTENTION_GQA, "recalled_estimate"),
+            _kv_entry(8.0, 32, 8, 128, _ATTENTION_GQA, "published_config"),
+            _kv_entry(70.0, 80, 8, 128, _ATTENTION_GQA, "published_config"),
+        ],
+    },
+    {
+        # Llama 2 and Code Llama. The 7B and 13B sizes are plain multi-head
+        # attention (only the 70B in that family uses grouped-query), which
+        # is why their KV cost dwarfs a Llama 3 of the same parameter count,
+        # and exactly why "same size, same memory" reasoning goes wrong.
+        "family": "llama2",
+        "pattern": re.compile(r"code-?llama|llama-?2(?![0-9])"),
+        "sizes": [
+            _kv_entry(7.0, 32, 32, 128, _ATTENTION_MHA, "published_config"),
+            _kv_entry(13.0, 40, 40, 128, _ATTENTION_MHA, "published_config"),
+            _kv_entry(70.0, 80, 8, 128, _ATTENTION_GQA, "published_config"),
+        ],
+    },
+    {
+        "family": "mistral7b",
+        "pattern": re.compile(r"mistral"),
+        "sizes": [
+            _kv_entry(7.0, 32, 8, 128, _ATTENTION_GQA, "published_config"),
+        ],
+    },
+    {
+        "family": "phi3-mini",
+        "pattern": re.compile(r"phi-?3(?:\.5)?"),
+        "sizes": [
+            # Recalled as plain multi-head attention, flagged conservative in
+            # case a grouped-query variant exists, exactly as the matching
+            # CATALOG entry is.
+            _kv_entry(3.8, 32, 32, 96, _ATTENTION_MHA, "conservative_overestimate"),
+        ],
+    },
+    {
+        "family": "deepseek-coder",
+        "pattern": re.compile(r"deepseek-?coder(?!-?v2)"),
+        "sizes": [
+            _kv_entry(6.7, 32, 32, 128, _ATTENTION_MHA, "conservative_overestimate"),
+        ],
+    },
+    {
+        "family": "starcoder2",
+        "pattern": re.compile(r"starcoder-?2"),
+        "sizes": [
+            _kv_entry(15.0, 40, 4, 128, _ATTENTION_GQA, "recalled_estimate"),
+        ],
+    },
+)
+
+# A family entry is used only when the parsed parameter count is within this
+# fraction of that entry's declared count. "Qwen2.5-14B" must not be graded
+# with the 7B entry's KV cost merely because 7 is the nearest number in the
+# table; outside the band the conservative heuristic takes over instead.
+KV_FAMILY_SIZE_TOLERANCE = 0.15
+
+# The geometric shape assumed for an unrecognised dense transformer:
+# hidden_size = 128 * layers, and params ~= 12 * layers * hidden_size**2,
+# which rearranges to params ~= 196608 * layers**3. Checked against shapes
+# this module already knows: it puts a 7B at 32.9 layers (Llama 2 7B has 32)
+# and a 13B at 40.6 (Llama 2 13B has 40).
+_DENSE_PARAM_COEFF = 196608
+_DENSE_ASPECT = 128
+
+# Applied on top of the multi-head-attention estimate. The estimate is
+# already pessimistic for any grouped-query model; this margin covers models
+# whose layer count runs above the geometric fit (Phi-3.5 Mini is one). The
+# self-test pins the resulting claim: the heuristic never under-counts any
+# multi-head-attention entry in KV_FAMILIES.
+_KV_HEURISTIC_SAFETY = 1.25
+
+# Floor, so an implausibly small parameter estimate cannot produce a KV cost
+# so tiny that a broken listing looks like it fits anywhere.
+_KV_HEURISTIC_FLOOR = 8192
+
+# Used when neither a family nor a parameter count could be determined at
+# all. Equal to a 7B model with plain multi-head attention at f16
+# (2 * 32 layers * 32 KV heads * 128 head dim * 2 bytes), the largest KV
+# footprint among the well-known 7B-class architectures. A deliberately large
+# stand-in, not a measurement: entries using it carry kv_confidence "unknown"
+# so a UI can say the fit reading is a guess.
+UNKNOWN_KV_BYTES_PER_TOKEN = 524_288
+
+
+def _kv_heuristic_bytes(params_b):
+    """A conservative KV bytes-per-token estimate for a model of `params_b`
+    billion parameters whose architecture is not known.
+
+    Assumes a dense transformer with hidden_size = 128 * layers and PLAIN
+    MULTI-HEAD ATTENTION, then applies _KV_HEURISTIC_SAFETY. Most models
+    released since roughly 2023 use grouped-query attention and need several
+    times less than this, so the estimate usually over-counts, and that is
+    the intended direction: an over-count produces a pessimistic verdict,
+    while an under-count produces a confident "it fits" that is wrong only
+    after the user has downloaded several gigabytes.
+    """
+    if not params_b or params_b <= 0:
+        return UNKNOWN_KV_BYTES_PER_TOKEN
+    layers = (params_b * 1e9 / _DENSE_PARAM_COEFF) ** (1.0 / 3.0)
+    hidden = _DENSE_ASPECT * layers
+    # Per layer: K and V, each of full hidden width (multi-head attention),
+    # at bytes_per_element = 2.
+    per_token = 2 * layers * hidden * 2
+    return max(_KV_HEURISTIC_FLOOR, int(math.ceil(per_token * _KV_HEURISTIC_SAFETY)))
+
+
+def kv_for_model(name, size_bytes=None, quant=None, params_b=None):
+    """How many bytes of KV cache one token costs for the model `name`, plus
+    a full account of where that number came from.
+
+    Returns a dict with:
+      kv_bytes_per_token - the figure verdict_for() needs.
+      kv_source          - "family", "size_heuristic", or "unknown_default".
+      kv_confidence      - "published_config", "recalled_estimate",
+                           "conservative_overestimate", or "unknown".
+      kv_calc            - the layers/kv_heads/head_dim arithmetic behind a
+                           family hit; None for the heuristic and the
+                           default, which have no architecture to report.
+      kv_family          - the KV_FAMILIES family name, or None.
+      params_b           - the parameter count used, or None.
+      params_source      - "name", "file_size", "caller", "family", or None.
+
+    The KV cost is a property of the WEIGHTS, not of the quantisation: a
+    Q4_K_M and a Q8_0 of the same model cache the same K and V tensors at
+    llama.cpp's f16 default. size_bytes and quant are therefore used only as
+    a second route to a parameter count when the name states none.
+
+    See the module docstring for the three-source order and why the fallback
+    over-counts on purpose.
+    """
+    text = _normalize_name(name)
+    params_source = None
+    if params_b is not None:
+        params_source = "caller"
+    else:
+        params_b = parse_params_b(name)
+        if params_b is not None:
+            params_source = "name"
+        else:
+            params_b = params_from_size(size_bytes, quant)
+            if params_b is not None:
+                params_source = "file_size"
+
+    family_hit = None
+    for family in KV_FAMILIES:
+        if not family["pattern"].search(text):
+            continue
+        if params_b is None:
+            # The family is right but no size is stated anywhere. Take the
+            # family's most expensive size rather than guess a middle one:
+            # within a known family, the largest KV cost is the only figure
+            # that cannot under-count.
+            family_hit = (family, max(family["sizes"], key=lambda s: s["kv_bytes_per_token"]))
+            break
+        near = [
+            size for size in family["sizes"]
+            if abs(size["params_b"] - params_b) <= KV_FAMILY_SIZE_TOLERANCE * size["params_b"]
+        ]
+        if near:
+            family_hit = (family, min(near, key=lambda s: abs(s["params_b"] - params_b)))
+        # First matching family wins, hit or miss on size: a name that looks
+        # like llama2 is not going to be better served by a later family's
+        # numbers, and falling through to the conservative heuristic is the
+        # correct outcome for a size this table does not cover.
+        break
+
+    if family_hit is not None:
+        family, size = family_hit
+        return {
+            "kv_bytes_per_token": size["kv_bytes_per_token"],
+            "kv_source": "family",
+            "kv_confidence": size["kv_confidence"],
+            "kv_calc": dict(size["kv_calc"]),
+            "kv_family": family["family"],
+            "params_b": size["params_b"] if params_b is None else params_b,
+            "params_source": params_source or "family",
+        }
+
+    if params_b is not None:
+        return {
+            "kv_bytes_per_token": _kv_heuristic_bytes(params_b),
+            "kv_source": "size_heuristic",
+            "kv_confidence": "conservative_overestimate",
+            "kv_calc": None,
+            "kv_family": None,
+            "params_b": params_b,
+            "params_source": params_source,
+        }
+
+    return {
+        "kv_bytes_per_token": UNKNOWN_KV_BYTES_PER_TOKEN,
+        "kv_source": "unknown_default",
+        "kv_confidence": "unknown",
+        "kv_calc": None,
+        "kv_family": None,
+        "params_b": None,
+        "params_source": None,
+    }
+
+
+def kv_for_repo(repo_id, files):
+    """kv_for_model() for a whole repository listing.
+
+    The KV cost belongs to the weights, so it is resolved once per repository
+    and applied to every quantisation. The repository name is tried first;
+    when it states no parameter count, the LARGEST quantisation present is
+    used to estimate one, since the largest file carries the smallest
+    relative error against its bits-per-weight figure. Vision projectors are
+    excluded from that estimate: they are a fraction of the model's size and
+    would understate it badly.
+    """
+    sized = [
+        f for f in (files or [])
+        if isinstance(f.get("size_bytes"), int) and not is_projector(f)
+    ]
+    biggest = max(sized, key=lambda f: f["size_bytes"]) if sized else None
+    if parse_params_b(repo_id) is not None or biggest is None:
+        return kv_for_model(repo_id)
+    # Fold the biggest file's own name in: a repository called
+    # "TheBloke/foo-GGUF" can still hold "foo-7B-Q4_K_M.gguf", and that name
+    # is worth reading before falling back to arithmetic on the file size.
+    combined = "{} {}".format(repo_id, biggest.get("name") or "")
+    return kv_for_model(combined, size_bytes=biggest["size_bytes"], quant=biggest.get("quant"))
+
+
+# -- per-quantisation grading --------------------------------------------------
+
+# A name heuristic, nothing more. The Hub has no reliable machine-readable
+# "this is a coding model" signal (pipeline_tag reads "text-generation" for
+# all of them). Used only to order recommend()'s live picks, never to hide a
+# result from a search.
+_CODING_NAME_RE = re.compile(r"cod(?:e|er)|starcoder|devstral|sqlcoder")
+
+
+def guess_focus(name):
+    """"coding" or "general", guessed from a repository or file name.
+
+    A guess, and labelled one everywhere it is used. Hearth Code is the
+    flagship surface so recommend() prefers coding models, but search_shop()
+    never filters on this.
+    """
+    return "coding" if _CODING_NAME_RE.search(_normalize_name(name)) else "general"
+
+
+def _quant_sort_key(quant):
+    """Sort key implementing the shop's per-quantisation preference.
+
+    Three components, in order:
+
+      1. Complete before incomplete. A split model missing a part cannot be
+         loaded at all, so it sorts behind everything regardless of how well
+         it would otherwise have fitted.
+      2. The verdict rank (VERDICT_RANK), best first. This is the point of
+         the whole exercise: choosing between quantisations is a fit
+         decision, not a size decision. A great beats a good even though the
+         good is the larger file, because a good is by definition running
+         with tight headroom and the great is not.
+      3. Size, with the direction FLIPPING on the verdict. Among quants that
+         fit fully in VRAM (great, good), the LARGEST file wins its tier:
+         they all run, so take the most faithful one. Among quants that do
+         not (reduced_context, cpu_spillover, wont_fit), the SMALLEST wins:
+         it gives back the most context and spills the least. Sorting by
+         size in one fixed direction would be wrong at one end or the other.
+    """
+    verdict = quant.get("verdict")
+    name = quant.get("name") or ""
+    incomplete = 0 if quant.get("complete", True) else 1
+    if not verdict:
+        # No size from the Hub means no verdict; those sort last within
+        # their completeness group rather than pretending to a tier.
+        return (incomplete, len(VERDICT_RANK), 0, name)
+    rank = VERDICT_RANK[verdict["verdict"]]
+    size = quant.get("size_bytes") or 0
+    if verdict["verdict"] in (VERDICT_GREAT, VERDICT_GOOD):
+        return (incomplete, rank, -size, name)
+    return (incomplete, rank, size, name)
+
+
+def rank_quants(quants):
+    """The quantisations of one repository, ordered best-choice-first for
+    this machine. Returns a new list; the input is not modified. See
+    _quant_sort_key for the ordering and why the size preference flips.
+    """
+    return sorted(quants or [], key=_quant_sort_key)
+
+
+# A GGUF whose base name starts with this is a multimodal vision projector,
+# not a language model: it is the image encoder that rides ALONGSIDE one.
+# hearth_hf's own filename survey found these among the files that carry no
+# parseable quantisation label. They are listed like any other file, because
+# a user with a vision model does need to download one, but they are never
+# the answer to "which quantisation should I run", and on a small card a
+# 1.4GB projector would otherwise be the first thing to earn a "great".
+_PROJECTOR_PREFIX = "mmproj"
+
+
+def is_projector(quant):
+    """True when this file is a multimodal vision projector rather than a
+    model to run. Matched on the filename prefix, which is the convention
+    llama.cpp's own conversion tooling emits.
+    """
+    base = str(quant.get("name") or "").rsplit("/", 1)[-1].lower()
+    return base.startswith(_PROJECTOR_PREFIX)
+
+
+def _offerable(quant):
+    """True when this entry is a thing a user could actually download and
+    run: complete, not a vision projector, graded, and not wont_fit.
+    """
+    if not quant.get("complete", True) or is_projector(quant):
+        return False
+    verdict = quant.get("verdict")
+    return bool(verdict) and verdict["verdict"] != VERDICT_WONT_FIT
+
+
+def best_quant(quants):
+    """The single quantisation to offer for this repository, or None.
+
+    The first ranked entry that is offerable (see _offerable), with one
+    correction afterwards: when that entry is a SPLIT edition of a
+    quantisation the repository also ships as a single file at the same
+    verdict, the single file is taken instead. Qwen's own GGUF repositories
+    really do publish both editions of each quant, and their sizes differ by
+    a fraction of a percent, so ranking on size alone picks between them
+    essentially at random. The same model in one file is the better download:
+    one request, one hash to verify, nothing to assemble. Both editions stay
+    in the listing, since a user with a filesystem that dislikes very large
+    files may want the split one.
+
+    None when every quantisation in the repository is unusable on this
+    hardware, which is the honest answer and is what keeps a repository
+    nothing can run from being recommended.
+    """
+    ranked = rank_quants(quants)
+    chosen = next((q for q in ranked if _offerable(q)), None)
+    if chosen is None or not chosen.get("multipart") or not chosen.get("quant"):
+        return chosen
+    for quant in ranked:
+        if quant is chosen or quant.get("multipart") or not _offerable(quant):
+            continue
+        if (quant.get("quant") == chosen["quant"]
+                and quant["verdict"]["verdict"] == chosen["verdict"]["verdict"]):
+            return quant
+    return chosen
+
+
+def quant_verdicts(files, hw=None, context_tokens=None, kv=None, free_disk=None):
+    """Grade every quantisation in `files` against `hw`, one verdict each.
+
+    `files` is the "files" list from hearth_hf.list_gguf_files(): one entry
+    per LOGICAL model, so a split model arrives already summed across its
+    parts and is graded on that sum rather than on one part.
+
+    THE VERDICT IS PER QUANTISATION. A repository offers one set of weights
+    at many sizes, an order of magnitude apart end to end, so a single
+    repository-level verdict would be meaningless. Each returned entry is the
+    hearth_hf file entry plus:
+
+      verdict          - the full verdict_for() dict, or None when the Hub
+                         reported no size and there is nothing honest to
+                         compute.
+      disk_ok          - whether there is room on disk, or None when the size
+                         is unknown.
+      free_disk_bytes  - what disk_ok was judged against.
+      kv_bytes_per_token / kv_confidence - the KV figure the verdict used and
+                         how much to trust it.
+
+    `kv` is a kv_for_model()/kv_for_repo() result; when None it is resolved
+    from the files themselves. Every verdict goes through verdict_for(), so
+    the KV cache is counted in exactly as it is for a CATALOG entry: nothing
+    here compares a file size against a VRAM size.
+
+    Returned in rank_quants() order, best choice for this machine first.
+    """
+    if hw is None:
+        hw = hearth_hw.probe()
+    if free_disk is None:
+        free_disk = free_disk_bytes()
+    files = list(files or [])
+    if kv is None:
+        kv = kv_for_repo("", files)
+
+    graded = []
+    for entry in files:
+        quant = dict(entry)
+        size = entry.get("size_bytes")
+        if isinstance(size, int) and size > 0:
+            quant["verdict"] = verdict_for(
+                {"size_bytes": size, "kv_bytes_per_token": kv["kv_bytes_per_token"]},
+                hw, context_tokens=context_tokens,
+            )
+            quant["disk_ok"] = free_disk >= (size + DISK_BUFFER_BYTES)
+        else:
+            quant["verdict"] = None
+            quant["disk_ok"] = None
+        quant["free_disk_bytes"] = free_disk
+        quant["kv_bytes_per_token"] = kv["kv_bytes_per_token"]
+        quant["kv_confidence"] = kv["kv_confidence"]
+        quant["projector"] = is_projector(entry)
+        graded.append(quant)
+    return rank_quants(graded)
+
+
+# -- shop listings -------------------------------------------------------------
+
+def _repo_label(repo_id):
+    """A short display name for a repository: the name half, with the
+    conventional GGUF suffix trimmed, since every result in a filter=gguf
+    search carries it and repeating it adds nothing.
+    """
+    name = str(repo_id or "").rsplit("/", 1)[-1]
+    for suffix in ("-GGUF", "-gguf", ".GGUF", ".gguf"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return name or str(repo_id or "")
+
+
+def _shop_entry_from_search(meta, context_tokens, free_disk):
+    """The parts of a shop entry that come from a search result alone, before
+    (or without) a file listing.
+    """
+    repo_id = meta.get("repo_id")
+    params_b = parse_params_b(repo_id)
+    return {
+        "source": SOURCE_LIVE,
+        "repo_id": repo_id,
+        "label": _repo_label(repo_id),
+        "author": meta.get("author"),
+        "downloads": meta.get("downloads"),
+        "likes": meta.get("likes"),
+        "last_modified": meta.get("last_modified"),
+        "gated": bool(meta.get("gated")),
+        "gated_mode": meta.get("gated_mode"),
+        "private": bool(meta.get("private")),
+        "tags": list(meta.get("tags") or []),
+        "url": meta.get("url"),
+        "focus": guess_focus(repo_id),
+        # A gated repository is listed but cannot be fetched anonymously,
+        # which is exactly what hearth_hf reports too. Saying so up front
+        # beats a 401 after the user clicks download.
+        "downloadable": not bool(meta.get("gated")),
+        "quants": [],
+        "quant_count": 0,
+        "quants_loaded": False,
+        "best_quant": None,
+        "verdict": None,
+        "files_error": None,
+        "files_error_kind": None,
+        "free_disk_bytes": free_disk,
+        "context_tokens": context_tokens,
+        "params_b": params_b,
+        "params_source": "name" if params_b is not None else None,
+        "kv_bytes_per_token": None,
+        "kv_confidence": None,
+        "kv_source": None,
+        "kv_calc": None,
+        "kv_family": None,
+    }
+
+
+def _attach_files(entry, files, hw, context_tokens, free_disk):
+    """Fold a repository's GGUF file listing into a shop entry: resolve the
+    KV cost once, grade every quantisation, and pick the one to offer.
+    """
+    kv = kv_for_repo(entry["repo_id"], files)
+    entry.update({
+        "params_b": kv["params_b"],
+        "params_source": kv["params_source"],
+        "kv_bytes_per_token": kv["kv_bytes_per_token"],
+        "kv_confidence": kv["kv_confidence"],
+        "kv_source": kv["kv_source"],
+        "kv_calc": kv["kv_calc"],
+        "kv_family": kv["kv_family"],
+    })
+    quants = quant_verdicts(files, hw, context_tokens=context_tokens, kv=kv, free_disk=free_disk)
+    chosen = best_quant(quants)
+    for quant in quants:
+        quant["recommended"] = chosen is not None and quant is chosen
+    entry["quants"] = quants
+    entry["quant_count"] = len(quants)
+    entry["quants_loaded"] = True
+    entry["best_quant"] = chosen
+    entry["verdict"] = chosen["verdict"] if chosen else None
+    return entry
+
+
+def _hardware_summary(hw, context_tokens, free_disk):
+    """The hardware every verdict in a listing was judged against, reported
+    once at the top level so a UI can render it without digging a verdict out
+    of an entry. Same fields, and the same caveats, verdict_for() reports.
+    """
+    gpu = _gpu_vram_bytes(hw)
+    return {
+        "platform": hw.get("platform"),
+        "vram_bytes": gpu["vram_bytes"],
+        "vram_approximate": gpu["approximate"],
+        "gpu_detected": gpu["gpu_detected"],
+        "gpu_vendor": gpu["vendor"],
+        "shared_memory_likely": gpu["shared_memory_likely"],
+        "ram_bytes": _ram_budget_bytes(hw),
+        "system_ram_bytes": hw.get("system_ram_bytes", 0) or 0,
+        "free_disk_bytes": free_disk,
+        "context_tokens": context_tokens,
+    }
+
+
+def _fallback_models(hw, context_tokens, free_disk):
+    """The built-in reference CATALOG, graded, in shop-entry shape.
+
+    Every entry is marked source SOURCE_FALLBACK and downloadable False, and
+    carries repo_id None, because these name models rather than Hub files and
+    nothing can be downloaded while the Hub is unreachable anyway. The
+    listing carrying them also has ok False (see search_shop), so a caller
+    cannot mistake them for live data even by ignoring "source".
+    """
+    entries = []
+    for model in catalog_with_verdicts(hw, context_tokens=context_tokens):
+        entries.append({
+            "source": SOURCE_FALLBACK,
+            "repo_id": None,
+            "reference_id": model["id"],
+            "label": model["label"],
+            "author": None,
+            "downloads": None,
+            "likes": None,
+            "last_modified": None,
+            "gated": False,
+            "gated_mode": None,
+            "private": False,
+            "tags": [],
+            "url": None,
+            "focus": model["focus"],
+            "downloadable": False,
+            "description": model["description"],
+            "license": model["license"],
+            "params_b": model["params_b"],
+            "params_source": "reference_catalog",
+            "kv_bytes_per_token": model["kv_bytes_per_token"],
+            "kv_confidence": model["kv_confidence"],
+            "kv_source": "reference_catalog",
+            "kv_calc": model.get("kv_calc"),
+            "kv_family": None,
+            "quants": [],
+            "quant_count": 0,
+            "quants_loaded": False,
+            "best_quant": None,
+            "verdict": model["verdict"],
+            "files_error": None,
+            "files_error_kind": None,
+            "free_disk_bytes": free_disk,
+            "disk_ok": model["disk_ok"],
+            "context_tokens": context_tokens,
+        })
+    return entries
+
+
+_FALLBACK_NOTICE = (
+    "These are Hearth's built-in reference models, not live Hugging Face "
+    "results: the Hub could not be reached, so the shop cannot show what is "
+    "actually available or download anything. The fit verdicts below are "
+    "still real - they were computed against this machine's hardware - but "
+    "they answer \"what could this machine run\", not \"what should I "
+    "install right now\"."
+)
+
+
+def _shop_entry_sort_key(entry):
+    """Graded repositories first (best verdict first), then repositories
+    whose quantisations have not been fetched yet, then repositories where
+    nothing at all fits. Python's sort is stable, so within each group the
+    Hub's own most-downloaded-first order survives untouched.
+
+    Repositories that cannot run here sort LAST rather than being dropped: a
+    user searching for a specific model deserves to see it and be told why it
+    will not work, not to have it silently vanish from the results.
+    """
+    verdict = entry.get("verdict")
+    if verdict:
+        return (0, VERDICT_RANK[verdict["verdict"]])
+    if not entry.get("quants_loaded"):
+        return (1, 0)
+    return (2, 0)
+
+
+def _call_hf(fn, *args, **kwargs):
+    """Call one of hearth_hf's result-returning functions and normalise a
+    raised exception into the same result shape.
+
+    hearth_hf documents that it never raises on a network failure, and it
+    does not. This exists for the injected search_fn/list_fn seam and for a
+    genuine bug, so that neither can turn a shop search into a traceback in
+    front of a user.
+    """
+    try:
+        out = fn(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - classified, never propagated
+        return {
+            "ok": False,
+            "error": "{} failed unexpectedly: {}: {}".format(
+                getattr(fn, "__name__", "the Hugging Face client"), type(exc).__name__, exc,
+            ),
+            "error_kind": ERR_HF_UNAVAILABLE,
+        }
+    return out if isinstance(out, dict) else {
+        "ok": False,
+        "error": "The Hugging Face client returned a {}, not a result dict.".format(
+            type(out).__name__,
+        ),
+        "error_kind": ERR_HF_UNAVAILABLE,
+    }
+
+
+def search_shop(query="", hw=None, context_tokens=None, limit=DEFAULT_SEARCH_LIMIT,
+                detail_limit=DEFAULT_DETAIL_LIMIT, timeout=None, disk_path=None,
+                search_fn=None, list_fn=None):
+    """Search Hugging Face for GGUF models and grade every quantisation of
+    the first `detail_limit` results against this machine.
+
+    This is the shop's listing. Always returns a dict, never raises:
+
+      ok             - True ONLY for live Hub results. A fallback listing is
+                       always ok False, so a caller that never looks at
+                       "source" still cannot mistake it for live data.
+      error, error_kind - None on success. On failure, error_kind is one of
+                       hearth_hf's ERR_* strings (unreachable, rate_limited,
+                       auth_required, ...) or ERR_HF_UNAVAILABLE.
+      source         - SOURCE_LIVE or SOURCE_FALLBACK.
+      notice         - a sentence explaining a fallback listing, else None.
+      query, context_tokens - what was asked for.
+      hardware       - the machine every verdict was judged against.
+      models         - the shop entries, best-fitting first (see
+                       _shop_entry_sort_key). On a fallback listing, the
+                       built-in reference catalog in the same shape.
+      model_count, rate_limit, url.
+
+    Each entry carries repo_id, label, author, downloads, likes,
+    last_modified, gated/gated_mode, tags, url, focus, downloadable, the
+    resolved params_b/params_source and kv_* fields, and:
+
+      quants        - every quantisation in the repository, each the
+                      hearth_hf file entry plus its own verdict, ordered
+                      best-choice-first. Empty when quants_loaded is False.
+      quants_loaded - False for results past detail_limit, which were not
+                      fetched. Call repo_quants() to fill one in.
+      best_quant    - the quantisation to offer, or None when nothing in the
+                      repository runs here.
+      verdict       - best_quant's verdict, or None. THE REPOSITORY HAS NO
+                      VERDICT OF ITS OWN: this is the verdict of the one
+                      quantisation the shop would pick.
+      files_error / files_error_kind - set when that repository's file
+                      listing failed while the search itself succeeded (a
+                      gated repository does this), so one bad repository
+                      degrades to one explained row rather than an empty
+                      screen.
+
+    search_fn and list_fn default to hearth_hf.search_models and
+    hearth_hf.list_gguf_files. They are an injection seam: the self-test
+    passes captured fixtures through them so the whole listing path is
+    exercised with no network, and a caller with cached results can reuse
+    this grading without refetching.
+    """
+    if hw is None:
+        hw = hearth_hw.probe()
+    ctx = DEFAULT_CONTEXT_TOKENS if context_tokens is None else context_tokens
+    free_disk = free_disk_bytes(disk_path)
+    result = {
+        "ok": False,
+        "error": None,
+        "error_kind": None,
+        "source": SOURCE_FALLBACK,
+        "notice": None,
+        "query": query,
+        "context_tokens": ctx,
+        "hardware": _hardware_summary(hw, ctx, free_disk),
+        "models": [],
+        "model_count": 0,
+        "rate_limit": None,
+        "url": None,
+    }
+
+    def degrade(error, error_kind):
+        result["error"] = error
+        result["error_kind"] = error_kind
+        result["notice"] = _FALLBACK_NOTICE
+        result["models"] = _fallback_models(hw, ctx, free_disk)
+        result["model_count"] = len(result["models"])
+        return result
+
+    if search_fn is None or list_fn is None:
+        try:
+            hf = _hf()
+        except Exception as exc:  # noqa: BLE001 - a broken install, not a bug here
+            return degrade(
+                "Hearth's Hugging Face client could not be loaded ({}: {}), so the shop "
+                "cannot search.".format(type(exc).__name__, exc),
+                ERR_HF_UNAVAILABLE,
+            )
+        search_fn = search_fn or hf.search_models
+        list_fn = list_fn or hf.list_gguf_files
+
+    search_kwargs = {"limit": limit}
+    if timeout is not None:
+        search_kwargs["timeout"] = timeout
+    found = _call_hf(search_fn, query or "", **search_kwargs)
+    result["rate_limit"] = found.get("rate_limit")
+    result["url"] = found.get("url")
+    if not found.get("ok"):
+        return degrade(
+            found.get("error") or "The Hugging Face search failed for an unstated reason.",
+            found.get("error_kind") or ERR_HF_UNAVAILABLE,
+        )
+
+    list_kwargs = {} if timeout is None else {"timeout": timeout}
+    entries = []
+    for index, meta in enumerate(found.get("models") or []):
+        entry = _shop_entry_from_search(meta, ctx, free_disk)
+        if entry["repo_id"] and index < max(0, detail_limit):
+            listing = _call_hf(list_fn, entry["repo_id"], **list_kwargs)
+            if listing.get("ok"):
+                _attach_files(entry, listing.get("files") or [], hw, ctx, free_disk)
+            else:
+                entry["files_error"] = listing.get("error")
+                entry["files_error_kind"] = listing.get("error_kind")
+        entries.append(entry)
+
+    entries.sort(key=_shop_entry_sort_key)
+    result["ok"] = True
+    result["source"] = SOURCE_LIVE
+    result["models"] = entries
+    result["model_count"] = len(entries)
+    return result
+
+
+def repo_quants(repo_id, hw=None, context_tokens=None, disk_path=None, timeout=None,
+                list_fn=None, meta=None):
+    """Every quantisation in one Hugging Face repository, graded against this
+    machine. Always returns a dict, never raises.
+
+    What a UI calls when the user opens a search result that search_shop()
+    left with quants_loaded False, and what a caller pointing straight at a
+    known repository calls without searching first.
+
+      ok, error, error_kind, source - as search_shop().
+      repo_id, hardware, context_tokens.
+      model - one shop entry, exactly as search_shop() produces, with
+              quants_loaded True on success. None when the listing failed.
+
+    `meta` is an optional search entry for the same repository (downloads,
+    likes, gated, and so on); without it those fields are None, since this
+    function asks the Hub for a file tree, not for repository metadata.
+    """
+    if hw is None:
+        hw = hearth_hw.probe()
+    ctx = DEFAULT_CONTEXT_TOKENS if context_tokens is None else context_tokens
+    free_disk = free_disk_bytes(disk_path)
+    result = {
+        "ok": False,
+        "error": None,
+        "error_kind": None,
+        "source": SOURCE_LIVE,
+        "repo_id": repo_id,
+        "context_tokens": ctx,
+        "hardware": _hardware_summary(hw, ctx, free_disk),
+        "model": None,
+    }
+
+    if list_fn is None:
+        try:
+            list_fn = _hf().list_gguf_files
+        except Exception as exc:  # noqa: BLE001
+            result["error_kind"] = ERR_HF_UNAVAILABLE
+            result["error"] = (
+                "Hearth's Hugging Face client could not be loaded ({}: {}), so the "
+                "quantisations of {} cannot be listed.".format(
+                    type(exc).__name__, exc, repo_id,
+                )
+            )
+            return result
+
+    listing = _call_hf(list_fn, repo_id, **({} if timeout is None else {"timeout": timeout}))
+    base = dict(meta or {})
+    base.setdefault("repo_id", repo_id)
+    entry = _shop_entry_from_search(base, ctx, free_disk)
+    if not listing.get("ok"):
+        result["error"] = listing.get("error") or "Listing {} failed.".format(repo_id)
+        result["error_kind"] = listing.get("error_kind") or ERR_HF_UNAVAILABLE
+        entry["files_error"] = result["error"]
+        entry["files_error_kind"] = result["error_kind"]
+        result["model"] = entry
+        return result
+
+    _attach_files(entry, listing.get("files") or [], hw, ctx, free_disk)
+    result["ok"] = True
+    result["model"] = entry
+    return result
+
+
+def _capability(entry):
+    """The capability proxy recommend() ranks live entries by: the parameter
+    count, or 0 when the name did not state one and it could not be
+    estimated. Sorting an unknown as 0 means a repository whose size could
+    not be read is never the headline pick while a known one is available,
+    which is the honest ordering: the shop should not claim a model is the
+    biggest thing that fits when it does not know how big it is.
+    """
+    return entry.get("params_b") or 0.0
+
+
+def _recommendation_reasoning(entry, role, listing):
+    """The honest account of why this repository and this quantisation were
+    picked: the choice, the competition it beat, the verdict's own message,
+    and how much to trust the parameter and KV figures behind it.
+    """
+    verdict = entry["verdict"]
+    ctx = verdict.get("requested_context_tokens")
+    lead = ("Best pick for this machine" if role == "best"
+            else "Lighter fallback if the best pick feels slow")
+    name = entry.get("label") or entry.get("repo_id") or "this model"
+    sentences = []
+
+    quant = entry.get("best_quant")
+    if quant is not None:
+        graded = [q for q in entry.get("quants") or [] if q.get("verdict")]
+        if verdict["verdict"] in (VERDICT_GREAT, VERDICT_GOOD):
+            why = (
+                "the largest of the {} graded quantisation(s) in this repository in the "
+                "best verdict tier available at {} tokens of context".format(len(graded), ctx)
+            )
+        else:
+            why = (
+                "the smallest of the {} graded quantisation(s) in this repository, since "
+                "none of them fit fully in VRAM at {} tokens of context".format(len(graded), ctx)
+            )
+        sentences.append("{}: {} at {} ({}), chosen as {}.".format(
+            lead, name, quant.get("quant") or quant.get("name"),
+            _gb(quant.get("size_bytes")), why,
+        ))
+    else:
+        sentences.append(
+            "{}: {}, from Hearth's built-in reference list rather than Hugging Face, "
+            "because the Hub could not be reached. It cannot be downloaded until it "
+            "can.".format(lead, name)
+        )
+
+    sentences.append(verdict["message"])
+
+    if entry.get("params_b"):
+        sentences.append("Parameter count taken as {:g}B, from {}.".format(
+            entry["params_b"], (entry.get("params_source") or "an unstated source"),
+        ))
+    else:
+        sentences.append(
+            "The parameter count could not be read from the name or estimated from the "
+            "file size, so the KV cache figure below is a conservative stand-in."
+        )
+
+    sentences.append(
+        "KV cache figured at {} bytes per token ({}, confidence {}).".format(
+            entry.get("kv_bytes_per_token"),
+            (entry.get("kv_source") or "unknown source"),
+            (entry.get("kv_confidence") or "unknown"),
+        )
+    )
+
+    if entry.get("kv_source") == "size_heuristic":
+        sentences.append(
+            "That figure assumes plain multi-head attention because this model family is "
+            "not in Hearth's table, which over-counts for any grouped-query model, so the "
+            "verdict here is pessimistic rather than optimistic."
+        )
+    if listing and listing.get("source") == SOURCE_FALLBACK:
+        sentences.append(_FALLBACK_NOTICE)
+    return " ".join(s for s in sentences if s)
+
+
+def _recommend_from_listing(listing):
+    """recommend()'s live half: pick a headline repository and a lighter
+    fallback out of a search_shop() listing.
+
+    Mirrors the offline half's rules exactly, one level up. Among entries
+    that fit fully in VRAM the largest by parameter count wins; when none do,
+    the smallest reduced_context entry is preferred over the smallest
+    cpu_spillover one, matching VERDICT_RANK. Coding models are preferred, by
+    the guess_focus() name heuristic, but if the listing holds none, the
+    general ones are ranked instead rather than returning nothing.
+
+    An entry that cannot run is never picked, and the tier walk below is what
+    guarantees it: wont_fit is not one of the tiers considered, at either the
+    headline or the fallback step, exactly as in the offline half. An entry
+    with no runnable quantisation carries verdict None and is dropped before
+    the walk, since there is nothing to rank it by.
+    """
+    models = [m for m in (listing or {}).get("models") or [] if m.get("verdict")]
+    if not models:
+        return []
+    coding = [m for m in models if m.get("focus") == "coding"]
+    pool = coding or models
+
+    runs_on_gpu = [m for m in pool if m["verdict"]["verdict"] in (VERDICT_GREAT, VERDICT_GOOD)]
+    if runs_on_gpu:
+        best = max(runs_on_gpu, key=_capability)
+    else:
+        reduced = [m for m in pool if m["verdict"]["verdict"] == VERDICT_REDUCED_CONTEXT]
+        spill = [m for m in pool if m["verdict"]["verdict"] == VERDICT_CPU_SPILLOVER]
+        if reduced:
+            best = min(reduced, key=_capability)
+        elif spill:
+            best = min(spill, key=_capability)
+        else:
+            return []
+
+    second = None
+    for tier in (VERDICT_GREAT, VERDICT_GOOD, VERDICT_REDUCED_CONTEXT, VERDICT_CPU_SPILLOVER):
+        candidates = [
+            m for m in pool
+            if m is not best and m["verdict"]["verdict"] == tier
+        ]
+        if candidates:
+            second = min(candidates, key=_capability)
+            break
+
+    picks = []
+    for role, entry in (("best", best), ("fallback", second)):
+        if entry is None:
+            continue
+        out = dict(entry)
+        out["recommended_role"] = role
+        out["reasoning"] = _recommendation_reasoning(entry, role, listing)
+        picks.append(out)
+    return picks
+
+
+def recommend_live(query=None, hw=None, context_tokens=None, limit=DEFAULT_SEARCH_LIMIT,
+                   detail_limit=DEFAULT_DETAIL_LIMIT, timeout=None, disk_path=None,
+                   search_fn=None, list_fn=None):
+    """"What should I run on this machine", answered over live Hugging Face
+    results. Always returns a dict, never raises.
+
+    A search_shop() listing with one extra key, "picks": the 0 to 2 entries
+    recommend() chose out of it, each with a "reasoning" string and a
+    "recommended_role" of "best" or "fallback".
+
+    query=None searches DEFAULT_RECOMMEND_QUERY. When the Hub is unreachable
+    the listing degrades exactly as search_shop() does (ok False, source
+    fallback, notice set) and the picks come from the built-in reference
+    catalog, each one saying so in its reasoning.
+    """
+    listing = search_shop(
+        DEFAULT_RECOMMEND_QUERY if query is None else query,
+        hw=hw, context_tokens=context_tokens, limit=limit, detail_limit=detail_limit,
+        timeout=timeout, disk_path=disk_path, search_fn=search_fn, list_fn=list_fn,
+    )
+    listing["picks"] = recommend(listing=listing)
+    return listing
 
 
 def _self_test():
@@ -1095,10 +2399,766 @@ def _self_test():
         "the catalog can run, an empty list is the honest answer", rec_nothing,
     )
 
+    _self_test_hf(_hw)
+
     print("hearth-shop self-test OK")
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Self-test fixtures for the Hugging Face half. Raw Hub tree entries, fed
+# through hearth_hf.group_gguf_files so the shop is tested against that
+# function's REAL output shape rather than against a hand-written guess at
+# it. No network: search and listing both arrive through the search_fn /
+# list_fn seam.
+# ---------------------------------------------------------------------------
+
+def _fixture_tree(entries):
+    """[(path, size), ...] into the raw Hub tree shape, every file LFS-backed
+    with a plausible 64-hex sha256, which is what a real GGUF over a few
+    hundred kilobytes always is.
+    """
+    out = []
+    for index, (path, size) in enumerate(entries):
+        oid = "{:064x}".format(index + 1)
+        out.append({"type": "file", "oid": "git" + str(index), "size": size,
+                    "lfs": {"oid": oid, "size": size, "pointerSize": 136},
+                    "path": path})
+    return out
+
+
+# Sizes are the real orders of magnitude for these quantisations of these
+# models. The 7B repo is the calibration case: on a 6GB card at 8192 tokens
+# it spans every verdict tier from great to wont_fit, which is what makes it
+# able to catch a broken fit calculation.
+_FIXTURE_REPO_FILES = {
+    "bartowski/Qwen2.5-Coder-7B-Instruct-GGUF": _fixture_tree([
+        ("Qwen2.5-Coder-7B-Instruct-Q2_K.gguf", 3_180_000_000),
+        ("Qwen2.5-Coder-7B-Instruct-Q3_K_M.gguf", 3_808_000_000),
+        ("Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf", 4_683_073_344),
+        # Qwen's official repositories really do publish the SAME quant both
+        # as one file and as a split, a fraction of a percent apart in size.
+        # The split is listed a hair larger here so that ranking on size
+        # alone would pick it, which is the wrong download of the two.
+        ("Qwen2.5-Coder-7B-Instruct-Q4_K_M-00001-of-00002.gguf", 2_342_000_000),
+        ("Qwen2.5-Coder-7B-Instruct-Q4_K_M-00002-of-00002.gguf", 2_342_000_000),
+        ("Qwen2.5-Coder-7B-Instruct-Q5_K_M.gguf", 5_444_831_104),
+        ("Qwen2.5-Coder-7B-Instruct-Q6_K.gguf", 6_254_199_264),
+        ("Qwen2.5-Coder-7B-Instruct-Q8_0.gguf", 8_098_525_184),
+        ("Qwen2.5-Coder-7B-Instruct-f16.gguf", 15_237_852_672),
+        # A vision projector: a real .gguf with no parseable quant label and
+        # no business being offered as a model to run.
+        ("mmproj-Qwen2.5-Coder-7B.gguf", 1_400_000_000),
+    ]),
+    "bartowski/Qwen2.5-Coder-32B-Instruct-GGUF": _fixture_tree([
+        ("Qwen2.5-Coder-32B-Instruct-IQ2_M.gguf", 11_264_441_312),
+        ("Qwen2.5-Coder-32B-Instruct-Q2_K.gguf", 12_313_099_000),
+        ("Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf", 19_851_336_704),
+        # A complete two-part split, which must be offered as ONE 34GB
+        # choice rather than two 17GB ones.
+        ("Qwen2.5-Coder-32B-Instruct-Q8_0-00001-of-00002.gguf", 17_000_000_000),
+        ("Qwen2.5-Coder-32B-Instruct-Q8_0-00002-of-00002.gguf", 17_800_000_000),
+        # An INCOMPLETE split: part 2 of 2 never made it into the repo. Sized
+        # deliberately so that, judged on its one present part alone, it
+        # would look like the best choice on a 6GB card. It cannot be loaded,
+        # so it must never be picked.
+        ("Qwen2.5-Coder-32B-Instruct-Q3_K_S-00001-of-00002.gguf", 6_000_000_000),
+    ]),
+    "TheBloke/CodeLlama-13B-Instruct-GGUF": _fixture_tree([
+        ("codellama-13b-instruct.Q3_K_M.gguf", 6_337_769_472),
+        ("codellama-13b-instruct.Q4_K_M.gguf", 7_866_070_016),
+    ]),
+    "nebula/Nebula-Mix-9B-GGUF": _fixture_tree([
+        ("Nebula-Mix-9B-Q4_K_M.gguf", 5_500_000_000),
+    ]),
+    "mystery/Mystery-Model-GGUF": _fixture_tree([
+        ("Mystery-Model-Q4_K_M.gguf", 4_683_073_344),
+    ]),
+}
+
+_FIXTURE_SEARCH_MODELS = [
+    {"repo_id": "bartowski/Qwen2.5-Coder-7B-Instruct-GGUF", "author": "bartowski",
+     "downloads": 214637, "likes": 219, "last_modified": "2024-11-09T12:45:18.000Z",
+     "gated": False, "gated_mode": None, "private": False,
+     "tags": ["transformers", "gguf", "code"],
+     "url": "https://huggingface.co/bartowski/Qwen2.5-Coder-7B-Instruct-GGUF"},
+    {"repo_id": "bartowski/Qwen2.5-Coder-32B-Instruct-GGUF", "author": "bartowski",
+     "downloads": 190000, "likes": 400, "last_modified": "2024-11-12T09:00:00.000Z",
+     "gated": False, "gated_mode": None, "private": False,
+     "tags": ["gguf", "code"],
+     "url": "https://huggingface.co/bartowski/Qwen2.5-Coder-32B-Instruct-GGUF"},
+    {"repo_id": "TheBloke/CodeLlama-13B-Instruct-GGUF", "author": "TheBloke",
+     "downloads": 90000, "likes": 180, "last_modified": "2023-09-01T00:00:00.000Z",
+     "gated": False, "gated_mode": None, "private": False, "tags": ["gguf"],
+     "url": "https://huggingface.co/TheBloke/CodeLlama-13B-Instruct-GGUF"},
+    # Gated: listed by search, refused by the tree endpoint for an anonymous
+    # client, exactly as the live Hub behaves.
+    {"repo_id": "meta-llama/Llama-3.1-70B-Instruct-GGUF", "author": "meta-llama",
+     "downloads": 7948428, "likes": 4000, "last_modified": "2024-08-03T22:11:58.000Z",
+     "gated": True, "gated_mode": "manual", "private": False, "tags": ["gguf"],
+     "url": "https://huggingface.co/meta-llama/Llama-3.1-70B-Instruct-GGUF"},
+    {"repo_id": "nebula/Nebula-Mix-9B-GGUF", "author": "nebula",
+     "downloads": 120, "likes": 2, "last_modified": "2025-01-01T00:00:00.000Z",
+     "gated": False, "gated_mode": None, "private": False, "tags": ["gguf"],
+     "url": "https://huggingface.co/nebula/Nebula-Mix-9B-GGUF"},
+    {"repo_id": "mystery/Mystery-Model-GGUF", "author": "mystery",
+     "downloads": 30, "likes": 0, "last_modified": "2025-02-01T00:00:00.000Z",
+     "gated": False, "gated_mode": None, "private": False, "tags": ["gguf"],
+     "url": "https://huggingface.co/mystery/Mystery-Model-GGUF"},
+]
+
+
+def _fixture_search_fn(query, limit=DEFAULT_SEARCH_LIMIT, timeout=None):
+    return {
+        "ok": True, "error": None, "error_kind": None, "query": query,
+        "models": _FIXTURE_SEARCH_MODELS[:limit],
+        "rate_limit": {"remaining": 499, "reset_seconds": 121},
+        "url": "https://huggingface.co/api/models?search=" + str(query),
+    }
+
+
+def _fixture_list_fn(repo_id, timeout=None):
+    hf = _hf()
+    if repo_id not in _FIXTURE_REPO_FILES:
+        return {
+            "ok": False,
+            "error": "{} is gated on Hugging Face.".format(repo_id),
+            "error_kind": hf.ERR_GATED,
+            "repo_id": repo_id, "files": [], "file_count": 0,
+        }
+    files = hf.group_gguf_files(_FIXTURE_REPO_FILES[repo_id])
+    return {
+        "ok": True, "error": None, "error_kind": None, "repo_id": repo_id,
+        "revision": "main", "files": files, "file_count": len(files),
+        "rate_limit": None, "url": hf.tree_url(repo_id),
+    }
+
+
+def _self_test_hf(_hw):
+    """The Hugging Face half of the self-test. Offline throughout: every Hub
+    call goes through the search_fn/list_fn seam onto the fixtures above.
+    """
+    # -- parameter counts out of names ---------------------------------------
+    assert parse_params_b("bartowski/Qwen2.5-Coder-7B-Instruct-GGUF") == 7.0
+    assert parse_params_b("Qwen2.5-Coder-1.5B-Instruct-Q4_K_M.gguf") == 1.5
+    assert parse_params_b("Llama-3.2-1B-Instruct") == 1.0
+    assert parse_params_b("Meta-Llama-3-70B-Instruct.Q8_0.00001-of-00002.gguf") == 70.0
+    # Mixture of experts: 8x7B is 56B of weights to hold in memory, which is
+    # the number this module has to decide against, not the 7B expert size.
+    assert parse_params_b("mistralai/Mixtral-8x7B-Instruct-v0.1-GGUF") == 56.0
+    # "A3B" is Qwen3-30B-A3B's ACTIVE parameter count. Reading it as the
+    # model's size would understate a 30B model by a factor of ten.
+    assert parse_params_b("Qwen3-30B-A3B-Instruct") == 30.0
+    # Names that state no parameter count must say so, not produce a number.
+    assert parse_params_b("tinyllamas/stories260K.gguf") is None
+    assert parse_params_b("mystery/Mystery-Model-GGUF") is None
+    assert parse_params_b("Qwen2.5-Coder-7B-Instruct-BF16.gguf") == 7.0, (
+        "BF16 must not be misread as a parameter count"
+    )
+    assert parse_params_b("") is None and parse_params_b(None) is None
+
+    # -- parameter counts out of a file size ---------------------------------
+    # 4.68GB of Q4_K_M at 4.83 bits per weight is a 7B-class model.
+    est = params_from_size(4_683_073_344, "Q4_K_M")
+    assert est is not None and 7.0 <= est <= 8.5, est
+    assert params_from_size(4_683_073_344, "q4_k_m") == est, "quant label is case-insensitive"
+    assert params_from_size(4_683_073_344, "APEX-Compact") is None, (
+        "an unrecognised quant label must produce no estimate, not a default one"
+    )
+    assert params_from_size(None, "Q4_K_M") is None
+    assert params_from_size(0, "Q4_K_M") is None
+
+    # -- KV_FAMILIES: the arithmetic must reproduce its own stated numbers ---
+    seen_families = set()
+    for family in KV_FAMILIES:
+        assert family["family"] not in seen_families, family["family"]
+        seen_families.add(family["family"])
+        assert family["sizes"], family["family"]
+        for size in family["sizes"]:
+            calc = size["kv_calc"]
+            computed = (2 * calc["layers"] * calc["kv_heads"] * calc["head_dim"]
+                        * calc["bytes_per_element"])
+            assert computed == size["kv_bytes_per_token"], (family["family"], size)
+            assert calc["attention"] in (_ATTENTION_MHA, _ATTENTION_GQA), size
+            assert size["kv_confidence"] in (
+                "published_config", "recalled_estimate", "conservative_overestimate",
+            ), size
+
+    # THE CLAIM THE HEURISTIC MAKES: it never under-counts a plain
+    # multi-head-attention model. Under-counting is the one failure mode that
+    # produces a confident "it fits" that is wrong on the user's machine, so
+    # this is pinned against every MHA architecture the table knows.
+    for family in KV_FAMILIES:
+        for size in family["sizes"]:
+            if size["kv_calc"]["attention"] != _ATTENTION_MHA:
+                continue
+            assert _kv_heuristic_bytes(size["params_b"]) >= size["kv_bytes_per_token"], (
+                "the size heuristic must never under-count a multi-head-attention "
+                "model; that is the failure mode that produces a wrong 'it fits'",
+                family["family"], size,
+            )
+
+    # -- every CATALOG entry must resolve through KV_FAMILIES to its own -----
+    # -- vetted KV number. Two tables of architecture facts that disagree ----
+    # -- would mean the same model is graded differently depending on whether
+    # -- it arrived from the Hub or from the built-in list.
+    for model in CATALOG:
+        kv = kv_for_model(model["id"])
+        assert kv["kv_source"] == "family", (model["id"], kv)
+        assert kv["kv_bytes_per_token"] == model["kv_bytes_per_token"], (
+            "KV_FAMILIES and CATALOG must agree about the same model",
+            model["id"], kv["kv_bytes_per_token"], model["kv_bytes_per_token"],
+        )
+        assert abs(kv["params_b"] - model["params_b"]) < 0.001, (model["id"], kv)
+
+    # A real Hub repo name for a cataloged model must resolve the same way.
+    kv = kv_for_model("bartowski/Qwen2.5-Coder-7B-Instruct-GGUF")
+    assert kv["kv_source"] == "family" and kv["kv_family"] == "qwen2.5", kv
+    assert kv["kv_bytes_per_token"] == 57_344, kv
+
+    # A size the family table does not cover falls through to the heuristic
+    # rather than borrowing the nearest listed size's numbers.
+    kv = kv_for_model("Qwen2.5-Coder-20B-Instruct-GGUF")
+    assert kv["kv_source"] == "size_heuristic", kv
+    assert kv["kv_family"] is None, kv
+
+    # An unknown family with a stated size: heuristic, flagged conservative.
+    kv = kv_for_model("nebula/Nebula-Mix-9B-GGUF")
+    assert kv["kv_source"] == "size_heuristic", kv
+    assert kv["kv_confidence"] == "conservative_overestimate", kv
+    assert kv["params_source"] == "name", kv
+
+    # Nothing at all: the fixed conservative stand-in, and it must SAY it is
+    # a guess rather than present itself as a reading.
+    kv = kv_for_model("mystery/Mystery-Model-GGUF")
+    assert kv["kv_source"] == "unknown_default", kv
+    assert kv["kv_confidence"] == "unknown", kv
+    assert kv["kv_bytes_per_token"] == UNKNOWN_KV_BYTES_PER_TOKEN, kv
+
+    # Same repo, but now with a file to estimate from: the size route fires.
+    hf = _hf()
+    mystery_files = hf.group_gguf_files(_FIXTURE_REPO_FILES["mystery/Mystery-Model-GGUF"])
+    kv = kv_for_repo("mystery/Mystery-Model-GGUF", mystery_files)
+    assert kv["params_source"] == "file_size", kv
+    assert kv["kv_source"] == "size_heuristic", kv
+
+    # -- the calibration machines --------------------------------------------
+    # RTX 2060, 6GB, the project's Linux host. Every number below was worked
+    # out by hand against these fixtures; see the comments for the arithmetic.
+    hw_2060 = _hw(6_442_450_944, 16 * 1024 ** 3)
+    hw_5080 = _hw(17_094_934_528, 33 * 1024 ** 3)
+
+    listing = search_shop(
+        "qwen coder", hw=hw_2060, context_tokens=8192, detail_limit=10,
+        search_fn=_fixture_search_fn, list_fn=_fixture_list_fn,
+    )
+    assert listing["ok"] is True, listing
+    assert listing["source"] == SOURCE_LIVE, listing
+    assert listing["notice"] is None, listing
+    assert listing["model_count"] == len(_FIXTURE_SEARCH_MODELS), listing["model_count"]
+    by_repo = {m["repo_id"]: m for m in listing["models"]}
+
+    # -- CRITICAL: the fit verdict is PER QUANTISATION -----------------------
+    # One repository, seven graded quantisations, and on a 6GB card they land
+    # in four different verdict tiers. A repository-level verdict cannot say
+    # anything true here, which is the whole reason this module grades quants.
+    qwen7 = by_repo["bartowski/Qwen2.5-Coder-7B-Instruct-GGUF"]
+    assert qwen7["quants_loaded"] is True, qwen7
+    assert qwen7["kv_bytes_per_token"] == 57_344, qwen7
+    tiers = {q["quant"]: q["verdict"]["verdict"] for q in qwen7["quants"] if q["verdict"]}
+    # KV cache at 8192 tokens is 57344 * 8192 = 469,762,048 bytes.
+    #   Q2_K   3.18GB + 0.47GB = 3.65GB, 2.79GB spare of 6.00GB -> great
+    #   Q4_K_M 4.68GB + 0.47GB = 5.15GB, 1.29GB spare           -> great
+    #   Q5_K_M 5.44GB + 0.47GB = 5.91GB, 0.53GB spare (8%)      -> good
+    #   Q6_K   6.25GB weights alone fit, but not with the cache  -> reduced
+    #   Q8_0   8.10GB weights alone exceed the card, fits RAM    -> spillover
+    #   f16   15.24GB + 0.47GB exceeds the RAM budget too        -> wont_fit
+    assert tiers["Q2_K"] == VERDICT_GREAT, tiers
+    assert tiers["Q5_K_M"] == VERDICT_GOOD, tiers
+    assert tiers["Q6_K"] == VERDICT_REDUCED_CONTEXT, tiers
+    assert tiers["Q8_0"] == VERDICT_CPU_SPILLOVER, tiers
+    assert tiers["F16"] == VERDICT_WONT_FIT, tiers
+    assert len(set(tiers.values())) >= 4, (
+        "one repository's quantisations must be able to land in different "
+        "verdict tiers; if they all agree, the per-quant grading is not "
+        "actually doing anything", tiers,
+    )
+
+    # The KV cache is what separates Q6_K from a naive size comparison: its
+    # weights alone DO fit the card, and it still does not fit at 8192
+    # tokens. This is the exact mistake a file-size-against-VRAM check makes.
+    q6 = next(q for q in qwen7["quants"] if q["quant"] == "Q6_K")
+    assert q6["size_bytes"] < hw_2060["gpus"][0]["vram_bytes"], (
+        "fixture is wrong: Q6_K's weights must fit the card on size alone, "
+        "or this test proves nothing about the KV cache", q6["size_bytes"],
+    )
+    assert q6["verdict"]["verdict"] == VERDICT_REDUCED_CONTEXT, q6["verdict"]
+    assert q6["verdict"]["required_bytes"] == q6["size_bytes"] + 57_344 * q6["verdict"][
+        "max_context_tokens"], q6["verdict"]
+
+    # -- CRITICAL: which quantisation the shop offers ------------------------
+    # The largest one that still fits fully in VRAM at the requested context.
+    # Not the first listed, not the smallest, not the biggest in the repo.
+    best = qwen7["best_quant"]
+    assert best is not None, qwen7
+    assert best["quant"] == "Q4_K_M", (
+        "the shop must offer the largest quantisation in the BEST VERDICT "
+        "TIER: Q5_K_M is the larger file but only earns 'good' (0.53GB "
+        "spare), while Q4_K_M earns 'great' (1.29GB spare)",
+        best["quant"], tiers,
+    )
+    # Both halves of that rule, pinned separately so neither can rot alone.
+    great = [q for q in qwen7["quants"]
+             if q["verdict"] and q["verdict"]["verdict"] == VERDICT_GREAT
+             and not q["projector"]]
+    single_great = [q for q in great if not q["multipart"]]
+    assert best["size_bytes"] == max(q["size_bytes"] for q in single_great), (
+        "within the winning tier, the largest file wins (a split edition of "
+        "a quantisation the repository also ships whole is a separate rule, "
+        "see best_quant)", best["quant"],
+    )
+    bigger_that_also_runs = [
+        q for q in qwen7["quants"]
+        if q["verdict"] and q["verdict"]["verdict"] == VERDICT_GOOD
+        and q["size_bytes"] > best["size_bytes"]
+    ]
+    assert bigger_that_also_runs, (
+        "fixture is wrong: there must be a LARGER quantisation that still "
+        "fits, or this proves nothing about tier beating size",
+    )
+    # The winning quant must be the SINGLE-FILE Q4_K_M, not the split
+    # edition of the same quant that this repository also ships a hair
+    # larger. Ranking on size alone would take the split one.
+    assert best["multipart"] is False, (
+        "when a repository ships the same quantisation as one file and as a "
+        "split, the single file is the better download", best["name"],
+    )
+    split_twin = next(q for q in qwen7["quants"]
+                      if q["quant"] == "Q4_K_M" and q["multipart"])
+    assert split_twin["size_bytes"] > best["size_bytes"], (
+        "fixture must make the split edition rank first on size, or this "
+        "proves nothing", split_twin["size_bytes"], best["size_bytes"],
+    )
+    assert split_twin["verdict"]["verdict"] == best["verdict"]["verdict"], split_twin
+    assert split_twin in qwen7["quants"], (
+        "the split edition stays in the listing; it is just not the default "
+        "offer, since someone may want it"
+    )
+
+    # Preferring the single-file edition must never cost a verdict tier. A
+    # repository can ship a split that lands in "great" and a single file of
+    # the same quantisation, a little larger, that only lands in "good";
+    # swapping to the single file there would be a downgrade dressed up as a
+    # convenience.
+    def _edition(name, size, multipart):
+        return {"name": name, "quant": "Q4_K_M", "size_bytes": size,
+                "multipart": multipart, "complete": True,
+                "verdict": verdict_for(
+                    {"size_bytes": size, "kv_bytes_per_token": 57_344},
+                    hw_2060, context_tokens=8192)}
+
+    split_great = _edition("split-edition", 4_600_000_000, True)
+    single_good = _edition("single-edition.gguf", 5_200_000_000, False)
+    assert split_great["verdict"]["verdict"] == VERDICT_GREAT, split_great["verdict"]
+    assert single_good["verdict"]["verdict"] == VERDICT_GOOD, single_good["verdict"]
+    assert best_quant([split_great, single_good])["name"] == "split-edition", (
+        "the single-file preference only applies at an equal verdict; it "
+        "must never trade a great down to a good",
+        best_quant([split_great, single_good])["name"],
+    )
+
+    # rank_quants() and best_quant() are public and must do their own
+    # ordering: the Hub returns files in its own order, and a caller can hand
+    # them an unsorted list. Feeding them a deliberately reversed list must
+    # not change either answer. (Without this, best_quant() passing its input
+    # straight through goes unnoticed, because quant_verdicts() happens to
+    # hand it an already-ranked list.)
+    shuffled = list(reversed(qwen7["quants"]))
+    assert [q["name"] for q in rank_quants(shuffled)] == [q["name"] for q in qwen7["quants"]], (
+        "rank_quants must impose its own order, not preserve the input's",
+    )
+    assert best_quant(shuffled)["quant"] == best["quant"], (
+        "best_quant must rank its input rather than trust the order it "
+        "arrived in", best_quant(shuffled)["quant"], best["quant"],
+    )
+
+    assert qwen7["verdict"] is best["verdict"], (
+        "a repository's headline verdict is its chosen quantisation's "
+        "verdict, not a verdict of its own", qwen7["verdict"],
+    )
+    assert sum(1 for q in qwen7["quants"] if q.get("recommended")) == 1, qwen7["quants"]
+
+    # At a longer context the same repository must offer a SMALLER
+    # quantisation, because the KV cache grows and pushes Q5_K_M out. A shop
+    # that ignored context would answer identically at both lengths.
+    listing_32k = search_shop(
+        "qwen coder", hw=hw_2060, context_tokens=32768, detail_limit=1,
+        search_fn=_fixture_search_fn, list_fn=_fixture_list_fn,
+    )
+    best_32k = listing_32k["models"][0]["best_quant"]
+    assert best_32k is not None, listing_32k["models"][0]
+    assert best_32k["size_bytes"] < best["size_bytes"], (
+        "a longer context must force a smaller quantisation; if it does not, "
+        "the KV cache is not being counted",
+        best_32k["quant"], best["quant"],
+    )
+
+    # A stronger card must be offered at least as large a quantisation as a
+    # weaker one for the same repository. Backwards would be absurd.
+    listing_5080 = search_shop(
+        "qwen coder", hw=hw_5080, context_tokens=8192, detail_limit=1,
+        search_fn=_fixture_search_fn, list_fn=_fixture_list_fn,
+    )
+    best_5080 = listing_5080["models"][0]["best_quant"]
+    assert best_5080["size_bytes"] >= best["size_bytes"], (best_5080["quant"], best["quant"])
+
+    # -- the quant with no parseable label is still listed, honestly ---------
+    mmproj = next(q for q in qwen7["quants"] if q["name"].startswith("mmproj"))
+    assert mmproj["quant"] is None, mmproj
+    assert mmproj["projector"] is True, mmproj
+    assert mmproj["verdict"]["verdict"] == VERDICT_GREAT, (
+        "fixture must make the projector look attractive, or the guard below "
+        "proves nothing", mmproj["verdict"],
+    )
+    assert mmproj is not best, "a vision projector must not be offered as the model to run"
+    assert best_quant([mmproj]) is None, (
+        "a vision projector is the image encoder that rides alongside a "
+        "model, not a model. It must not be offered even when it is the only "
+        "thing on the machine that fits.", best_quant([mmproj]),
+    )
+
+    # -- multi-part models are one choice, summed ----------------------------
+    qwen32 = by_repo["bartowski/Qwen2.5-Coder-32B-Instruct-GGUF"]
+    split = next(q for q in qwen32["quants"] if q["multipart"])
+    assert split["part_count"] == 2 and split["complete"] is True, split
+    assert split["size_bytes"] == 17_000_000_000 + 17_800_000_000, split
+    assert split["verdict"]["verdict"] == VERDICT_WONT_FIT, split["verdict"]
+    # Graded on the SUM, not on one part. Grading a split on a single part
+    # would make a 34GB model look like a 17GB one, which is the worst
+    # possible direction for this module to be wrong in.
+    assert split["verdict"]["required_bytes"] == (
+        split["size_bytes"] + qwen32["kv_bytes_per_token"] * 8192
+    ), (split["verdict"]["required_bytes"], split["size_bytes"])
+
+    # Nothing in the 32B repo fits a 6GB card in VRAM, so the preference
+    # flips: the SMALLEST option wins, not the largest.
+    best32 = qwen32["best_quant"]
+    assert best32["quant"] == "IQ2_M", (
+        "when nothing fits in VRAM the shop must offer the smallest option, "
+        "which spills least", best32["quant"],
+    )
+    assert best32["verdict"]["verdict"] == VERDICT_CPU_SPILLOVER, best32["verdict"]
+
+    # An incomplete split cannot be loaded at all, so it is never the answer,
+    # however well its present bytes would have fitted. The fixture is sized
+    # so it WOULD have won on fit alone, which is what makes this a test.
+    broken = next(q for q in qwen32["quants"] if not q["complete"])
+    assert broken["multipart"] is True and broken["missing_parts"] == [2], broken
+    assert broken["size_bytes"] < best32["size_bytes"], (
+        "fixture must make the incomplete split look like the better choice",
+        broken["size_bytes"], best32["size_bytes"],
+    )
+    assert broken["verdict"]["verdict"] == VERDICT_CPU_SPILLOVER, broken["verdict"]
+    assert best_quant([broken]) is None, (
+        "a split model missing a part is not downloadable into a working "
+        "model and must never be offered", best_quant([broken]),
+    )
+
+    # -- a 13B multi-head-attention model on a 6GB card ----------------------
+    # Its KV cache alone (819200 * 8192 = 6.7GB) is larger than the whole
+    # card. A shop reasoning about file sizes would call Q3_K_M (6.34GB) a
+    # fit; it is not one.
+    codellama = by_repo["TheBloke/CodeLlama-13B-Instruct-GGUF"]
+    assert codellama["kv_bytes_per_token"] == 819_200, codellama
+    q3 = next(q for q in codellama["quants"] if q["quant"] == "Q3_K_M")
+    assert q3["size_bytes"] < hw_2060["gpus"][0]["vram_bytes"], q3["size_bytes"]
+    assert q3["verdict"]["verdict"] == VERDICT_CPU_SPILLOVER, q3["verdict"]
+
+    # -- disk space is an independent check on live quantisations too -------
+    # A user with 1KB free cannot install a 5GB model however comfortably it
+    # would have fitted in VRAM, and finding that out at 90% of a download is
+    # the experience this check exists to prevent.
+    old_free = globals()["free_disk_bytes"]
+    try:
+        globals()["free_disk_bytes"] = lambda path=None: 1024
+        starved = search_shop("qwen coder", hw=hw_2060, context_tokens=8192, detail_limit=1,
+                              search_fn=_fixture_search_fn, list_fn=_fixture_list_fn)
+        starved_quants = [q for q in starved["models"][0]["quants"] if q["verdict"]]
+        assert starved_quants, starved["models"][0]
+        assert all(q["disk_ok"] is False for q in starved_quants), starved_quants
+        # The fit verdict must be untouched by the disk reading: they are two
+        # independent facts, and collapsing them would hide one of them.
+        assert starved["models"][0]["best_quant"]["quant"] == best["quant"], (
+            "a full disk must not change which quantisation fits",
+            starved["models"][0]["best_quant"]["quant"],
+        )
+        globals()["free_disk_bytes"] = lambda path=None: 10 ** 15
+        roomy = search_shop("qwen coder", hw=hw_2060, context_tokens=8192, detail_limit=1,
+                            search_fn=_fixture_search_fn, list_fn=_fixture_list_fn)
+        roomy_quants = [q for q in roomy["models"][0]["quants"] if q["verdict"]]
+        assert all(q["disk_ok"] is True for q in roomy_quants), roomy_quants
+    finally:
+        globals()["free_disk_bytes"] = old_free
+
+    # -- one bad repository degrades to one explained row --------------------
+    gated = by_repo["meta-llama/Llama-3.1-70B-Instruct-GGUF"]
+    assert gated["gated"] is True and gated["gated_mode"] == "manual", gated
+    assert gated["downloadable"] is False, gated
+    assert gated["files_error_kind"] == hf.ERR_GATED, gated
+    assert gated["quants_loaded"] is False and gated["quants"] == [], gated
+    assert gated["verdict"] is None, (
+        "a repository whose files could not be listed has no verdict; "
+        "inventing one would be a claim with nothing behind it", gated,
+    )
+    assert listing["ok"] is True, "one gated repository must not fail the whole search"
+
+    # -- ordering: runnable first, unrunnable last but still present ---------
+    ranks = []
+    for entry in listing["models"]:
+        ranks.append(_shop_entry_sort_key(entry))
+    assert ranks == sorted(ranks), [m["repo_id"] for m in listing["models"]]
+    assert listing["models"][0]["repo_id"] == "bartowski/Qwen2.5-Coder-7B-Instruct-GGUF", (
+        "on a 6GB card the 7B repo is the only one with a great-or-good "
+        "quantisation, so it must lead", [m["repo_id"] for m in listing["models"]],
+    )
+
+    # -- detail_limit: unfetched repositories say so rather than look empty --
+    partial = search_shop(
+        "qwen coder", hw=hw_2060, context_tokens=8192, detail_limit=2,
+        search_fn=_fixture_search_fn, list_fn=_fixture_list_fn,
+    )
+    loaded = [m for m in partial["models"] if m["quants_loaded"]]
+    assert len(loaded) == 2, [m["repo_id"] for m in loaded]
+    for entry in partial["models"]:
+        if entry["quants_loaded"]:
+            continue
+        assert entry["verdict"] is None and entry["files_error"] is None, entry
+
+    # repo_quants() fills one of those in on demand, with the same shape.
+    filled = repo_quants(
+        "TheBloke/CodeLlama-13B-Instruct-GGUF", hw=hw_2060, context_tokens=8192,
+        list_fn=_fixture_list_fn,
+    )
+    assert filled["ok"] is True, filled
+    assert filled["model"]["quants_loaded"] is True, filled
+    assert filled["model"]["kv_bytes_per_token"] == codellama["kv_bytes_per_token"], filled
+
+    failed = repo_quants("meta-llama/Llama-3.1-70B-Instruct-GGUF", hw=hw_2060,
+                         context_tokens=8192, list_fn=_fixture_list_fn)
+    assert failed["ok"] is False and failed["error_kind"] == hf.ERR_GATED, failed
+    assert failed["model"]["files_error"], failed
+
+    # -- offline: a clear structured error, never an exception or a blank ----
+    def dead_search(query, limit=None, timeout=None):
+        return {"ok": False, "error": "Could not reach Hugging Face: URLError: [Errno 11001]",
+                "error_kind": hf.ERR_UNREACHABLE, "models": [], "rate_limit": None,
+                "url": "https://huggingface.co/api/models"}
+
+    offline = search_shop("qwen coder", hw=hw_2060, context_tokens=8192,
+                          search_fn=dead_search, list_fn=_fixture_list_fn)
+    assert offline["ok"] is False, (
+        "a fallback listing must never report ok True; that flag is the "
+        "guarantee a caller ignoring 'source' still cannot mistake the "
+        "built-in list for live Hub results", offline["ok"],
+    )
+    assert offline["source"] == SOURCE_FALLBACK, offline["source"]
+    assert offline["error_kind"] == hf.ERR_UNREACHABLE, offline["error_kind"]
+    assert offline["error"], offline
+    assert offline["notice"] and "not live hugging face" in offline["notice"].lower(), offline
+    assert offline["models"], (
+        "offline must not be a blank screen: the built-in reference list, "
+        "clearly labelled, is more useful than nothing", offline,
+    )
+    for entry in offline["models"]:
+        assert entry["source"] == SOURCE_FALLBACK, entry
+        assert entry["downloadable"] is False, (
+            "nothing is downloadable while the Hub is unreachable, and the "
+            "entry must say so rather than offer a button that cannot work", entry,
+        )
+        assert entry["repo_id"] is None, entry
+        assert entry["verdict"], "a fallback entry still carries a real hardware verdict"
+    # The verdicts in a fallback listing are the same real verdicts the
+    # offline catalog produces; only their provenance is different.
+    assert len(offline["models"]) == len(CATALOG), offline["model_count"]
+
+    # An exception out of the seam is classified, not propagated: a shop that
+    # raises in front of a user is the failure this whole path exists to
+    # avoid.
+    def exploding_search(query, limit=None, timeout=None):
+        raise RuntimeError("socket exploded")
+
+    boom = search_shop("qwen coder", hw=hw_2060, context_tokens=8192,
+                       search_fn=exploding_search, list_fn=_fixture_list_fn)
+    assert boom["ok"] is False and boom["error_kind"] == ERR_HF_UNAVAILABLE, boom
+    assert "socket exploded" in boom["error"], boom
+    assert boom["models"], boom
+
+    # A search that succeeds but returns nothing is a real answer, not an
+    # error, and must not be dressed up as a fallback.
+    def empty_search(query, limit=None, timeout=None):
+        return {"ok": True, "error": None, "error_kind": None, "models": [],
+                "rate_limit": None, "url": "https://huggingface.co/api/models"}
+
+    empty = search_shop("zzzz no such model", hw=hw_2060, context_tokens=8192,
+                        search_fn=empty_search, list_fn=_fixture_list_fn)
+    assert empty["ok"] is True and empty["source"] == SOURCE_LIVE, empty
+    assert empty["models"] == [] and empty["notice"] is None, empty
+
+    # -- recommend() over live results ---------------------------------------
+    picks = recommend(listing=listing)
+    assert 1 <= len(picks) <= 2, picks
+    head = picks[0]
+    assert head["recommended_role"] == "best", head
+    assert head["repo_id"] == "bartowski/Qwen2.5-Coder-7B-Instruct-GGUF", head["repo_id"]
+    assert head["best_quant"]["quant"] == "Q4_K_M", head["best_quant"]["quant"]
+    assert head["verdict"]["verdict"] in (VERDICT_GREAT, VERDICT_GOOD), head["verdict"]
+    # The reasoning must be honest about the actual choice, not boilerplate:
+    # it has to name the quantisation, the context it was judged at, and how
+    # much to trust the KV figure behind the verdict.
+    reasoning = head["reasoning"]
+    assert "Q4_K_M" in reasoning, reasoning
+    assert "8192" in reasoning, reasoning
+    assert "KV cache" in reasoning, reasoning
+    assert head["kv_confidence"] in reasoning, reasoning
+    for pick in picks:
+        assert pick["verdict"]["verdict"] != VERDICT_WONT_FIT, pick
+
+    # recommend() must never headline something nothing can run.
+    hw_nothing = _hw(0, 512 * 1024 ** 2)
+    listing_nothing = search_shop(
+        "qwen coder", hw=hw_nothing, context_tokens=8192, detail_limit=10,
+        search_fn=_fixture_search_fn, list_fn=_fixture_list_fn,
+    )
+    for entry in listing_nothing["models"]:
+        if entry["quants_loaded"]:
+            assert entry["best_quant"] is None, (
+                "no quantisation of any of these repositories fits a machine "
+                "with no GPU and no RAM budget", entry["repo_id"], entry["best_quant"],
+            )
+    assert recommend(listing=listing_nothing) == [], recommend(listing=listing_nothing)
+
+    # recommend(listing=...) takes any listing a caller hands it, not only
+    # one search_shop() built, so its own wont_fit guard has to hold on its
+    # own. best_quant() already refuses to select a wont_fit quantisation, so
+    # a search_shop() listing can never contain one; a hand-built listing
+    # can, and the answer must still be "nothing here runs".
+    hand_built = {
+        "source": SOURCE_LIVE,
+        "models": [{
+            "repo_id": "someone/Too-Big-70B-GGUF",
+            "label": "Too Big 70B",
+            "focus": "coding",
+            "params_b": 70.0,
+            "params_source": "name",
+            "kv_bytes_per_token": 327_680,
+            "kv_confidence": "published_config",
+            "kv_source": "family",
+            "quants": [],
+            "best_quant": None,
+            "verdict": verdict_for(
+                {"size_bytes": 74_975_000_000, "kv_bytes_per_token": 327_680},
+                hw_2060, context_tokens=8192,
+            ),
+        }],
+    }
+    assert hand_built["models"][0]["verdict"]["verdict"] == VERDICT_WONT_FIT, hand_built
+    assert recommend(listing=hand_built) == [], (
+        "recommend() must never headline a model that cannot run, whatever "
+        "listing it is handed", recommend(listing=hand_built),
+    )
+
+    # -- the live and offline halves agree on the same catalog ---------------
+    # recommend() over a fallback listing must reach the same conclusion as
+    # recommend() over the same catalog offline; the two paths share the
+    # ranking rules, and a divergence would mean one of them is wrong.
+    offline_picks = recommend(listing=offline)
+    catalog_picks = recommend(hw_2060, context_tokens=8192)
+    assert [p["label"] for p in offline_picks] == [p["label"] for p in catalog_picks], (
+        [p["label"] for p in offline_picks], [p["label"] for p in catalog_picks],
+    )
+    assert offline_picks[0]["reasoning"], offline_picks[0]
+    assert "could not be reached" in offline_picks[0]["reasoning"], offline_picks[0]["reasoning"]
+
+    # recommend(listing=None) must still be the untouched offline function
+    # every existing caller relies on.
+    assert recommend(hw_2060, context_tokens=8192)[0]["id"] == "qwen2.5-coder:7b-instruct-q4_K_M"
+
+    # -- recommend_live(): a listing plus picks, offline-safe ----------------
+    live = recommend_live(hw=hw_2060, context_tokens=8192, detail_limit=10,
+                          search_fn=_fixture_search_fn, list_fn=_fixture_list_fn)
+    assert live["ok"] is True and live["source"] == SOURCE_LIVE, live
+    assert live["picks"] and live["picks"][0]["recommended_role"] == "best", live["picks"]
+    live_offline = recommend_live(hw=hw_2060, context_tokens=8192,
+                                  search_fn=dead_search, list_fn=_fixture_list_fn)
+    assert live_offline["ok"] is False and live_offline["source"] == SOURCE_FALLBACK, live_offline
+    assert live_offline["picks"], "even offline, recommend_live must say something useful"
+
+    # -- the intuition check: a 7B Q4_K_M fits a 6GB card, a 70B Q8_0 does not
+    seven_b_q4 = verdict_for(
+        {"size_bytes": 4_683_073_344, "kv_bytes_per_token": 57_344}, hw_2060,
+        context_tokens=8192,
+    )
+    assert seven_b_q4["verdict"] in (VERDICT_GREAT, VERDICT_GOOD), seven_b_q4
+    seventy_b_q8 = verdict_for(
+        {"size_bytes": 74_975_000_000, "kv_bytes_per_token": 327_680}, hw_2060,
+        context_tokens=8192,
+    )
+    assert seventy_b_q8["verdict"] == VERDICT_WONT_FIT, seventy_b_q8
+
+    # -- verdict_for accepts either size key, and refuses neither ------------
+    a = verdict_for({"download_bytes": 4_000_000_000, "kv_bytes_per_token": 57_344},
+                    hw_2060, context_tokens=8192)
+    b = verdict_for({"size_bytes": 4_000_000_000, "kv_bytes_per_token": 57_344},
+                    hw_2060, context_tokens=8192)
+    assert a == b, (a, b)
+    try:
+        verdict_for({"kv_bytes_per_token": 57_344}, hw_2060, context_tokens=8192)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("verdict_for must refuse a model dict with no size")
+
+    # -- guess_focus is a name heuristic and is labelled as one --------------
+    assert guess_focus("bartowski/Qwen2.5-Coder-7B-Instruct-GGUF") == "coding"
+    assert guess_focus("TheBloke/CodeLlama-13B-Instruct-GGUF") == "coding"
+    assert guess_focus("meta-llama/Llama-3.1-8B-Instruct-GGUF") == "general"
+
+
+def _live_check():
+    """A real, networked search against Hugging Face. Not part of --self-test:
+    it needs the internet, and a self-test that fails when the Wi-Fi drops is
+    a self-test nobody trusts.
+    """
+    listing = search_shop("qwen coder", detail_limit=3)
+    print("source={} ok={} error_kind={}".format(
+        listing["source"], listing["ok"], listing["error_kind"]))
+    if listing["error"]:
+        print("error: {}".format(listing["error"]))
+    hardware = listing["hardware"]
+    print("vram={} approximate={} vendor={} context={}".format(
+        hardware["vram_bytes"], hardware["vram_approximate"], hardware["gpu_vendor"],
+        hardware["context_tokens"]))
+    for entry in listing["models"]:
+        best = entry["best_quant"]
+        if best:
+            outcome = "{} {}".format(best["quant"], best["verdict"]["verdict"])
+        elif entry["files_error_kind"]:
+            outcome = entry["files_error_kind"]
+        elif not entry["quants_loaded"]:
+            outcome = "not fetched (past detail_limit)"
+        else:
+            outcome = "no runnable quantisation"
+        print("  {} params={} kv={}/tok ({}) -> {}".format(
+            entry["repo_id"], entry["params_b"], entry["kv_bytes_per_token"],
+            entry["kv_source"], outcome,
+        ))
+    for pick in recommend(listing=listing):
+        print("{}: {}".format(pick["recommended_role"], pick["reasoning"]))
+    return 0 if listing["ok"] else 1
+
+
 if __name__ == "__main__":
+    if "--live" in sys.argv:
+        sys.exit(_live_check())
     if "--self-test" in sys.argv or len(sys.argv) == 1:
         sys.exit(_self_test())

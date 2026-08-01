@@ -43,7 +43,8 @@ everything else on this page.
   (`agent/hearth_proc.py`).
 - Hardware detection: GPU, VRAM, and system RAM, plus the KV-cache fit
   calculator the model shop's verdicts are built on (`agent/hearth_hw.py`).
-- The model shop's catalog and fit logic (`agent/hearth_shop.py`) - the
+- The model shop's live Hugging Face listings and per-quantisation fit
+  logic (`agent/hearth_shop.py`, sourcing from `agent/hearth_hf.py`) - the
   data and arithmetic, not a UI yet.
 - Git-backed checkpoint and undo (`agent/hearth_checkpoint.py`).
 - The permission engine: `plan`, `edit`, `auto`, `bypass`, plus a
