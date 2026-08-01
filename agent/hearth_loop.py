@@ -2063,7 +2063,7 @@ def _self_test():
     _files_with_calls = {w.split(":")[0].replace("\\", "/") for w in _checked}
     for _expected in ("agent/hearth_evolve.py", "agent/hearth_grow.py",
                       "agent/hearth_marathon.py", "desktop/server/engine.py",
-                      "agent/hearth_loop.py"):
+                      "agent/hearth_loop.py", "agent/hearth_workloop.py"):
         assert _expected in _files_with_calls, (
             "the chat() arity guard found no call site in {}; it has moved or "
             "been renamed, and the guard is no longer guarding it. Found: "

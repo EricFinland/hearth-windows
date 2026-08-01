@@ -313,6 +313,26 @@ class Session:
         except Exception:  # noqa: BLE001 - persistence must never break a live session
             pass
 
+    def persist_now(self):
+        """Ask, from an engine, for this session's state to be made durable
+        right now.
+
+        The moments this class persists on its own -- a turn starting, an
+        approval being raised, a turn ending -- assume a turn is a short
+        thing. An engine whose single turn is long-lived breaks that
+        assumption badly: a work loop (see loop_engine.py) runs for hours
+        inside ONE turn, so "turn start" and "turn end" can be a whole night
+        apart, and a crash in between loses the entire transcript tail
+        because nothing in between ever asked for a write.
+
+        Such an engine calls this at its own natural boundaries instead
+        (loop_engine calls it once per loop turn). Best-effort and never
+        raises, exactly like every other persist here: see _persist. It is
+        deliberately a request, not a guarantee -- the hook app.py installs
+        still refuses to write on behalf of a session that has since been
+        replaced."""
+        self._persist()
+
     def recent_events(self, n=50):
         """The most recent `n` events, oldest first -- a bounded tail for
         session_state.py to persist, so a UI reconnecting after a restart
@@ -1083,6 +1103,46 @@ def _self_test():
         time.sleep(0.005)
     assert len(persist_calls) >= 3, "persist_hook never fired at turn end"
     assert persist_calls[-1]["status"] == STATUS_IDLE, persist_calls[-1]
+
+    # persist_now(): an engine whose ONE turn runs for hours (a work loop --
+    # see loop_engine.py) asks for a durable write at its own boundaries,
+    # because turn start and turn end are far too far apart to be the only
+    # two. Without it a hard kill mid-loop restores a session whose event log
+    # is empty; measured on a real sidecar, 1 event instead of the full tail.
+    now_calls = []
+
+    class LongTurnEngine:
+        def run(self, ctx):
+            for i in range(3):
+                ctx.emit("delta", {"text": "chunk {}".format(i)})
+                ctx.session.persist_now()
+            ctx.emit("done", {})
+
+    s_now = Session("/tmp/ws-persist-now", "m", "auto", engine=LongTurnEngine(),
+                    persist_hook=lambda sess: now_calls.append(len(sess.recent_events(50))))
+    s_now.submit_prompt("go")
+    deadline = time.monotonic() + 5
+    while s_now.to_dict()["status"] != STATUS_IDLE and time.monotonic() < deadline:
+        time.sleep(0.005)
+    # turn start + three explicit asks + turn end
+    assert len(now_calls) >= 5, ("persist_now must reach the hook every time it is "
+                                 "called, not be coalesced away", now_calls)
+    assert max(now_calls) > now_calls[0], \
+        "a later persist must carry more of the transcript than the turn-start one"
+
+    # ...and it is best-effort like every other persist: a hook that raises
+    # must not propagate out of persist_now into the engine's own turn.
+    s_now_broken = Session("/tmp/ws-persist-now-broken", "m", "auto",
+                           engine=LongTurnEngine(),
+                           persist_hook=lambda sess: (_ for _ in ()).throw(
+                               OSError("disk full")))
+    s_now_broken.submit_prompt("go")
+    deadline = time.monotonic() + 5
+    while s_now_broken.to_dict()["status"] != STATUS_IDLE and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert s_now_broken.to_dict()["status"] == STATUS_IDLE
+    assert any(e["kind"] == "done" for e in s_now_broken.recent_events(50)), \
+        "a failing persist_now must not stop the turn from completing"
 
     # A persist_hook that raises must never take the session down with it.
     def broken_hook(sess):

@@ -106,6 +106,54 @@ Also worth reading before you trust it with anything real:
 - **[docs/security/windows-threat-model.md](docs/security/windows-threat-model.md)**:
   the full threat model this was distilled from.
 
+### The work loop
+
+`agent/hearth_workloop.py` takes one goal and works at it across many turns,
+unattended, until it finishes or can tell you exactly why it stopped.
+
+```
+python agent/hearth_workloop.py "fix the failing tests in stats.py" \
+  --workspace ./project --done-command "python -m pytest -q" \
+  --max-turns 40 --max-seconds 7200
+```
+
+It stops for exactly one of six reasons, and says which: it finished (proved
+by `--done-command` exiting 0, or by the files named with `--artifact`
+actually existing), it hit a ceiling (turns, wall clock, tokens, unattended
+writes, tool calls), it stopped making progress, you stopped it, it needed a
+permission nobody was there to give, or it errored.
+
+The interesting one is **stopped making progress**. Four detectors run over
+the whole run rather than a recent window: the workspace not reaching any
+state it has not already been in, thrashing back and forth between states it
+has seen, repeating an identical tool call, and hitting the same error over
+and over. The account names which one fired, quotes the error, and shows the
+turn-by-turn history:
+
+```
+stopped making progress: the same error recurred in the last 5 turns
+  [repeat_error] ... FAILED test_type: f(1) must be both an int and a str
+  what the completion check said:
+    FAILED test_sign: f(1) must be both positive and negative, got -1
+    3 failed
+```
+
+What it cannot see is documented on `ProgressLedger` itself and repeated in
+every report: it measures **change, not correctness**. Work that happens
+outside the workspace is invisible to it, and steady progress toward a wrong
+answer never trips a single detector.
+
+A loop runs in `auto` or `plan`, never `edit` (which would gate its own first
+write) and never `bypass` (refused at construction and again on restore). It
+gets a capability manifest that `permissions.decide` enforces as a hard cap,
+a budget of unattended writes, and a deny-by-default policy for anything
+dangerous. Pre-authorise specific commands with `--allow-command git`.
+
+Every turn takes a checkpoint, so any point is recoverable with the same undo
+the desktop app uses. Every turn is journalled, so a machine that loses power
+mid-run comes back knowing which turn was interrupted and refusing to resume
+it: `--resume` continues from the last turn that actually completed.
+
 ## The NixOS system
 
 Most people run local agents with full system privileges and no record of
