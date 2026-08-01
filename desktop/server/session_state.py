@@ -223,9 +223,37 @@ def snapshot(session):
         # eviction docstring) still-pending approval, never its args -- see
         # the module docstring's "what is NOT persisted" section.
         "pending_approval_tool": pending[0] if pending else None,
+        # WHICH KIND of engine this session ran, and how it was configured.
+        # Top level rather than inside engine_state, because whoever rebuilds
+        # the session needs it BEFORE the engine exists -- engine_state is
+        # handed to load_state() on an engine that has already been
+        # constructed, which is too late to decide what to construct.
+        #
+        # Both are read back with exactly the suspicion `mode` is: this file
+        # is writable by the agent's own write_file, so it may say what a
+        # session WAS, and it may never say what a session is ALLOWED to be.
+        # desktop/server/main.py re-validates engine_config through
+        # loop_engine.parse_loop_config on the way in and falls back to the
+        # defaults if it does not pass, so a hand-edited state file cannot
+        # hand its successor a run with ceilings of its own choosing.
+        "engine_kind": getattr(session.engine, "ENGINE_KIND", "chat"),
+        "engine_config": _engine_config(session.engine),
         "engine_state": engine_state,
         "recent_events": session.recent_events(RECENT_EVENTS_LIMIT),
     }
+
+
+def _engine_config(engine):
+    """The engine's own restore_config(), or None. Never raises, for the same
+    reason snapshot() guards get_state(): a broken engine must cost the
+    conversation, not the whole snapshot."""
+    getter = getattr(engine, "restore_config", None)
+    if not callable(getter):
+        return None
+    try:
+        return getter()
+    except Exception:  # noqa: BLE001 - a broken engine must not break persistence
+        return None
 
 
 def save(state):

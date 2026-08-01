@@ -32,6 +32,7 @@ const SIDECAR_ROUTES = new Set([
   "/shop", "/shop/quants",
   "/downloads", "/downloads/events", "/downloads/cancel", "/downloads/dismiss",
   "/engine", "/engine/events",
+  "/loop", "/loop/events",
 ]);
 
 export class HttpError extends Error {
@@ -136,6 +137,22 @@ export class Sidecar {
   startDownload(repoId, filename) { return this.request("POST", "/downloads", { repo_id: repoId, filename }); }
   cancelDownload(id)              { return this.request("POST", "/downloads/cancel", { id }); }
   dismissDownload(id)             { return this.request("POST", "/downloads/dismiss", { id }); }
+
+  /** The work loop's run state: which turn, what it has spent against each
+   *  ceiling, what it may do, whether a stop is pending, how many abandoned
+   *  tool calls are still live, and the account once it ends. A versioned
+   *  whole snapshot, not a delta log.
+   *
+   *  There is deliberately no stopLoop(): a loop is stopped with cancel(),
+   *  the same call that stops a chat turn, because two things that mean
+   *  "stop" are two things that can disagree. */
+  loop()               { return this.request("GET", "/loop"); }
+
+  /** Open GET /loop/events and call `onSnapshot(snapshot)` per frame. Same
+   *  contract as streamDownloads: every frame is the whole state. */
+  async streamLoop({ since = 0, onSnapshot, signal }) {
+    return this._streamSnapshots("/loop/events", { since, onSnapshot, signal });
+  }
 
   engine()             { return this.request("GET", "/engine"); }
   /** Start (or, with force, retry) the GPU engine fetch. Returns at once:

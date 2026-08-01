@@ -241,6 +241,19 @@ export class Transcript {
     return node;
   }
 
+  /** Put an already-built node at the end of the transcript, with the same
+   *  autoscroll behaviour every other entry gets.
+   *
+   *  The one thing this file does not build itself is the work loop's
+   *  account (loop.js): it is a page of structured evidence rather than a
+   *  chat entry, and duplicating its layout here would mean two places that
+   *  decide what an account looks like. The node still comes out of dom.js,
+   *  so its text is neutralized exactly like everything else here. */
+  append(node) {
+    this.clearPlaceholder();
+    return this._append(node);
+  }
+
   _autoscroll() {
     if (!this.pinned) return;
     this.root.scrollTop = this.root.scrollHeight;

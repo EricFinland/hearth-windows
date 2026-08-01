@@ -215,9 +215,11 @@ class TurnContext:
     def emit(self, kind, data=None):
         self.session._emit(self.turn_id, kind, data or {})
 
-    def request_approval(self, tool, args=None, injection_finding=None, secrets_finding=None):
+    def request_approval(self, tool, args=None, injection_finding=None, secrets_finding=None,
+                         timeout=None):
         return self.session._request_approval(self.turn_id, tool, args or {},
-                                               injection_finding, secrets_finding)
+                                               injection_finding, secrets_finding,
+                                               timeout=timeout)
 
     def cancelled(self):
         return self.session._is_cancelled(self.turn_id)
@@ -588,7 +590,34 @@ class Session:
             if self._approvals[appr_id].decision is not None:
                 del self._approvals[appr_id]
 
-    def _request_approval(self, turn_id, tool, args, injection_finding=None, secrets_finding=None):
+    def _request_approval(self, turn_id, tool, args, injection_finding=None, secrets_finding=None,
+                          timeout=None):
+        """Raise an approval card and block until it is answered.
+
+        `timeout` (seconds, or None for the interactive default of "wait
+        forever") exists for exactly one caller: an UNATTENDED engine. A work
+        loop running overnight can reach a gated tool at 03:00 with nobody
+        awake, and an unbounded wait there is not caution, it is a hang that
+        looks like work -- the run holds its turn open, burns no ceiling
+        (wall clock is only measured at turn boundaries), and reports
+        nothing. The bounded wait turns that into a decision the run can act
+        on and the report can explain.
+
+        A timed-out approval is resolved as an explicit "deny", not merely
+        abandoned: the same treatment cancel() gives a pending card. That
+        keeps the one invariant _evict_approvals_locked depends on (a card is
+        either pending or resolved, never a third thing) and it keeps the UI
+        honest, because a card left pending forever is a card the user can
+        still click long after the run stopped caring about the answer.
+        Denying is also the safe direction: the tool does not run.
+
+        The RETURN VALUE for that case is "timeout", not "deny", so a caller
+        can tell "a person refused this" from "nobody was there". Every
+        existing caller tests `decision != "allow"` and so treats it exactly
+        as a denial, which is correct; and "timeout" is unreachable unless
+        the caller asked for a timeout in the first place, so no interactive
+        path can start seeing a value it was not written for.
+        """
         # secrets.token_urlsafe rather than a sequential counter: an approval
         # id must not be guessable from a previous one (defense in depth --
         # nothing today lets an unauthenticated party race an approval, but
@@ -620,9 +649,24 @@ class Session:
         # approval a restarted process has no thread left to resolve. See
         # the module docstring and record_restart_interruption.
         self._persist()
-        appr.event.wait()  # released by resolve_approval() or by cancel()
+        # released by resolve_approval(), by cancel(), or by the timeout below
+        answered = appr.event.wait(timeout)
         with self._lock:
+            if not answered and appr.decision is None:
+                appr.decision = "deny"
+                self._evict_approvals_locked()
+                timed_out = True
+            else:
+                timed_out = False
             decision = appr.decision
+        if timed_out:
+            appr.event.set()  # so a late resolve_approval() sees it resolved
+            self._emit(turn_id, "approval_timeout", {
+                "id": appr_id, "tool": tool, "seconds": timeout,
+                "reason": "No one answered within {:g}s, so it was refused and "
+                          "the tool did not run.".format(timeout),
+            })
+            return "timeout"
         return decision or "deny"  # cancelled with no explicit decision: deny
 
     def resolve_approval(self, approval_id, allow):
@@ -712,6 +756,74 @@ def _self_test():
     assert kinds == ["delta", "approval_request", "tool_call", "done"], kinds
     tool_call_event = next(e for e in all_events if e["kind"] == "tool_call")
     assert tool_call_event["data"]["decision"] == "allow"
+
+    # --- a BOUNDED approval: an unattended engine must not hang on a card ---
+    # An overnight work loop that reaches a gated tool with nobody awake used
+    # to have exactly one option here, waiting forever, which holds the turn
+    # open without spending any ceiling and reports nothing. A timeout turns
+    # that into a decision. It must deny (the safe direction), it must leave
+    # the card RESOLVED rather than pending (so the UI cannot offer a button
+    # for an answer nothing is listening for, and so eviction can reclaim it),
+    # and it must say out loud that it happened.
+    class UnattendedEngine:
+        def run(self, ctx):
+            decision = ctx.request_approval("run_command", {"cmd": "rm -rf /"},
+                                            timeout=0.2)
+            ctx.emit("gate_outcome", {"decision": decision})
+            ctx.emit("done", {})
+
+    s_to = Session("/tmp/ws-timeout", "m", "auto", engine=UnattendedEngine())
+    t_to = time.monotonic()
+    s_to.submit_prompt("go")
+    deadline = time.monotonic() + 5
+    while s_to.to_dict()["status"] != STATUS_IDLE and time.monotonic() < deadline:
+        time.sleep(0.01)
+    elapsed_to = time.monotonic() - t_to
+    assert s_to.to_dict()["status"] == STATUS_IDLE, (
+        "a timed approval must release the turn; an unbounded wait here is a "
+        "hang that looks like work")
+    assert elapsed_to < 3.0, ("the wait must be bounded by the timeout, took "
+                              "{:.2f}s".format(elapsed_to))
+    to_events = s_to.events_after(0, timeout=1)
+    to_kinds = [e["kind"] for e in to_events]
+    assert "approval_request" in to_kinds and "approval_timeout" in to_kinds, to_kinds
+    outcome = next(e for e in to_events if e["kind"] == "gate_outcome")
+    assert outcome["data"]["decision"] == "timeout", (
+        "a caller that asked for a timeout must be able to tell 'a person "
+        "refused this' from 'nobody was there'", outcome["data"])
+    assert outcome["data"]["decision"] != "allow", (
+        "an unanswered approval must never allow", outcome["data"])
+    assert s_to.pending_approvals() == [], (
+        "a timed-out card must be RESOLVED, not left pending for a user to "
+        "click long after the run stopped caring")
+    timed = next(e for e in to_events if e["kind"] == "approval_timeout")
+    assert timed["data"]["tool"] == "run_command", timed["data"]
+    assert "refused" in timed["data"]["reason"], timed["data"]
+    assert timed["data"]["reason"][0].isupper(), (
+        "this string is rendered after a sentence in the UI", timed["data"])
+    # a resolve arriving after the timeout is a no-op, not a second answer
+    stale_id = next(e["data"]["id"] for e in to_events if e["kind"] == "approval_request")
+    assert s_to.resolve_approval(stale_id, True) is False
+
+    # timeout=None (every interactive caller) still waits indefinitely: the
+    # bounded wait must be opt-in, never a new deadline on a chat turn.
+    class PatientEngine:
+        def run(self, ctx):
+            ctx.emit("gate_outcome", {"decision": ctx.request_approval("write_file", {})})
+
+    s_pat = Session("/tmp/ws-patient", "m", "edit", engine=PatientEngine())
+    s_pat.submit_prompt("go")
+    deadline = time.monotonic() + 5
+    pat_id = None
+    while time.monotonic() < deadline and pat_id is None:
+        for e in s_pat.events_after(0, timeout=1) or []:
+            if e["kind"] == "approval_request":
+                pat_id = e["data"]["id"]
+    assert pat_id, "approval_request never arrived"
+    time.sleep(0.5)
+    assert s_pat.pending_approvals() == [pat_id], (
+        "an interactive approval must still wait indefinitely")
+    assert s_pat.resolve_approval(pat_id, True) is True
 
     # --- injection_finding and secrets_finding, when the engine passes ---
     # --- one, ride on the approval_request event verbatim under their ---

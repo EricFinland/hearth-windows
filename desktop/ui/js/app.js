@@ -10,6 +10,7 @@ import { Transcript } from "./transcript.js";
 import { el, icon, appendAll, clear, setText, neutralize, $ } from "./dom.js";
 import { blob } from "./safe-text.js";
 import { ShopView } from "./shop.js";
+import { LoopConfigPanel, LoopRunBar, account as loopAccount } from "./loop.js";
 
 const RECENTS_KEY = "hearth.recentWorkspaces"; // workspace paths only; the bearer token is never stored
 const MAX_RECENTS = 8;
@@ -29,6 +30,10 @@ const ui = {
   model: $("#in-model"),
   reloadModels: $("#btn-models"),
   mode: $("#in-mode"),
+  engine: $("#in-engine"),
+  loopPanel: $("#loop-panel"),
+  loopConfig: $("#loop-config"),
+  loopRunBar: $("#loop-runbar"),
   connect: $("#btn-connect"),
   sessionNote: $("#session-note"),
   setupBody: $("#setup-body"),
@@ -65,7 +70,20 @@ const state = {
   // How many models GET /models listed. null means the list could not be
   // read at all, which is not the same as zero: only zero is a first run.
   modelCount: null,
+  // The last GET /loop snapshot. The work loop's run state is a gauge on its
+  // own versioned stream, not folded out of the transcript -- see loop.js and
+  // loop_engine.py's "TWO SHAPES". Held whole and replaced whole, which is
+  // what makes a reconnect an hour into a run immediately correct.
+  loop: null,
+  loopStream: null,
+  loopGeneration: 0,
+  // True once the account for the CURRENT run has been put in the transcript,
+  // so a reconnect that replays the terminal event does not print it twice.
+  accountShownFor: null,
 };
+
+const loopConfigPanel = new LoopConfigPanel(ui.loopConfig);
+const loopRunBar = new LoopRunBar(ui.loopRunBar);
 
 // ---------------------------------------------------------------------- views
 
@@ -610,6 +628,90 @@ async function doRestore(cp) {
   await refreshCheckpoints();
 }
 
+// ----------------------------------------------------------------- work loop
+
+/** True when the live session runs a work loop rather than a chat. Read off
+ *  GET /session's own answer (which app.py derives from the live engine
+ *  object), never from what this page last asked for: a session restored
+ *  after a restart, or replaced by another window, is still the truth. */
+function isLoopSession() {
+  return state.session ? state.session.engine === "loop" : ui.engine.value === "loop";
+}
+
+/** Show or hide the bounds form. The form is only meaningful before a run,
+ *  so it is shown whenever the engine selector says "loop" -- including
+ *  while a session is live, because a person reading the numbers back is
+ *  exactly as important as one typing them in. */
+function updateLoopPanel() {
+  const wanted = ui.engine.value === "loop" || isLoopSession();
+  ui.loopPanel.hidden = !wanted;
+  loopConfigPanel.setMode(ui.mode.value);
+}
+
+function applyLoopSnapshot(snapshot) {
+  state.loop = snapshot;
+  loopConfigPanel.render(snapshot.defaults, snapshot.blind_spots);
+  // A live loop session's OWN bounds win over the defaults the form was
+  // built from. Otherwise a reloaded page (or a restarted sidecar) shows the
+  // default ceilings beside a run that is bounded by different ones.
+  loopConfigPanel.applyConfig(snapshot.config);
+  updateLoopPanel();
+  loopRunBar.render(isLoopSession() || snapshot.run || snapshot.pending ? snapshot : null);
+
+  // The account is the product. Put it in the transcript exactly once per
+  // run, driven by the gauge rather than by the terminal event, so it also
+  // appears for a page that connected after the run had already ended.
+  const run = snapshot.run;
+  if (run && run.state === "stopped" && snapshot.report
+      && state.accountShownFor !== run.run_id) {
+    state.accountShownFor = run.run_id;
+    transcript.clearPlaceholder();
+    transcript.closeAgent();
+    transcript.append(loopAccount(snapshot.report, snapshot.account,
+                                  snapshot.blind_spots));
+  }
+  if (run && run.state !== "stopped") state.accountShownFor = null;
+}
+
+function stopLoopStream() {
+  state.loopGeneration += 1;
+  if (state.loopStream) {
+    state.loopStream.abort();
+    state.loopStream = null;
+  }
+}
+
+/** Watch GET /loop/events. Runs for the life of the page, not the life of a
+ *  run: an inherited unfinished run has to be visible before anything is
+ *  started, and the account of the last run has to stay readable after. */
+function startLoopStream() {
+  const generation = ++state.loopGeneration;
+  (async () => {
+    let backoff = 400;
+    while (generation === state.loopGeneration) {
+      const controller = new AbortController();
+      state.loopStream = controller;
+      try {
+        await sidecar.streamLoop({
+          since: state.loop ? state.loop.version : 0,
+          signal: controller.signal,
+          onSnapshot: (snapshot) => {
+            if (generation !== state.loopGeneration) return;
+            backoff = 400;
+            applyLoopSnapshot(snapshot);
+          },
+        });
+        if (generation !== state.loopGeneration) return;
+        await sleep(150);
+      } catch (err) {
+        if (controller.signal.aborted || generation !== state.loopGeneration) return;
+        await sleep(backoff);
+        backoff = Math.min(backoff * 2, 5000);
+      }
+    }
+  })();
+}
+
 // ------------------------------------------------------------------- session
 
 async function loadSession({ quiet = false } = {}) {
@@ -642,6 +744,8 @@ function applySession(session) {
 
   if (!ui.workspace.value) ui.workspace.value = session.workspace;
   if (session.mode) ui.mode.value = session.mode;
+  if (session.engine) ui.engine.value = session.engine;
+  updateLoopPanel();
 
   setText(ui.connect, "Restart session");
   ui.sessionNote.className = "panel-note";
@@ -655,6 +759,21 @@ async function startSession() {
   const workspace = ui.workspace.value.trim();
   const model = ui.model.value;
   const mode = ui.mode.value;
+  const engine = ui.engine.value;
+
+  // A loop has nobody awake to answer its approval cards, so 'edit' (which
+  // gates every single write) would deny its own first write and grind to a
+  // stall by turn four. Say so here, where it can still be changed, rather
+  // than letting the sidecar refuse the session with the same sentence.
+  if (engine === "loop" && !["auto", "plan"].includes(mode)) {
+    ui.sessionNote.className = "panel-note is-error";
+    setText(ui.sessionNote,
+      "A work loop needs 'auto' (it may read and write unattended; anything "
+      + "dangerous is gated) or 'plan' (read only). 'edit' gates every write "
+      + "and nobody is awake to approve them.");
+    ui.mode.focus();
+    return;
+  }
 
   if (!workspace) {
     ui.sessionNote.className = "panel-note is-error";
@@ -677,10 +796,21 @@ async function startSession() {
   setText(ui.sessionNote, "Starting...");
   try {
     stopEventStream();
-    const session = await sidecar.createSession({ workspace, model, mode });
+    const body = { workspace, model, mode, engine };
+    // Read off the live form at the moment the button is pressed, so what is
+    // sent is exactly what the operator has on screen.
+    if (engine === "loop") body.loop = loopConfigPanel.read();
+    const session = await sidecar.createSession(body);
     state.lastEventId = 0;
+    state.accountShownFor = null;
     transcript.reset();
-    transcript.showPlaceholder("Session ready", `${session.mode} mode in ${session.workspace}`);
+    transcript.showPlaceholder(
+      session.engine === "loop" ? "Work loop ready" : "Session ready",
+      session.engine === "loop"
+        ? `Give it one goal. It will keep working until it is done, hits a `
+          + `ceiling, stops making progress, or you stop it. ${session.mode} mode `
+          + `in ${session.workspace}.`
+        : `${session.mode} mode in ${session.workspace}`);
     applySession(session);
     rememberWorkspace(session.workspace);
     startEventStream();
@@ -710,11 +840,19 @@ function updateTurnUi() {
     setConn(state.backendHealthy ? "ok" : "warn", state.backendHealthy ? "ready" : "backend not ready");
     return;
   }
+  const loop = isLoopSession();
   if (state.running) {
-    setComposerEnabled(false, "Working. Press Esc or the stop button to interrupt.");
-    setConn("busy", "running");
+    setComposerEnabled(false, loop
+      ? "The work loop is running. Press Esc or Stop to end it."
+      : "Working. Press Esc or the stop button to interrupt.");
+    setConn("busy", loop ? "work loop running" : "running");
   } else {
-    setComposerEnabled(true, "Ready.");
+    const pending = state.loop && state.loop.pending;
+    setComposerEnabled(true, loop
+      ? (pending && pending.resumable
+          ? "Send a goal to start a run, or \"resume\" to continue the inherited one."
+          : "Send one goal. It will work until it is done, bounded, stalled, or stopped.")
+      : "Ready.");
     setConn("ok", "connected");
   }
 }
@@ -896,6 +1034,64 @@ function handleEvent(event) {
         "The session's event buffer wrapped while this window was disconnected.");
       break;
 
+    // ---- work loop -------------------------------------------------------
+    // The transcript carries the loop's NARRATIVE. Its running totals live on
+    // GET /loop instead (see loop.js), so nothing here tries to keep a
+    // counter: a number folded out of a log that drops its oldest 500 entries
+    // would quietly go wrong on a long run.
+    case "loop_start":
+      transcript.addNotice("quiet", "Work loop started.",
+        `${data.mode} mode · ${(data.allowed_tools || []).length} tools available`);
+      break;
+
+    case "turn_start":
+      transcript.closeAgent();
+      transcript.addNotice("quiet", `Turn ${data.turn}`, null);
+      break;
+
+    case "progress": {
+      const spend = data.spend || {};
+      transcript.addNotice(data.new_state ? "quiet" : "warn",
+        data.new_state ? "The workspace changed." : "Nothing new changed.",
+        [`turn ${data.turn}`,
+         `${data.changed ?? 0} file(s)`,
+         data.errors ? `${data.errors} error(s)` : null,
+         spend.writes !== undefined ? `${spend.writes} unattended write(s) so far` : null,
+        ].filter(Boolean).join(" · "));
+      break;
+    }
+
+    case "notice":
+      transcript.addNotice("warn", "Work loop note.", data.detail || "");
+      break;
+
+    case "loop_resuming":
+      transcript.addNotice("warn", "Resuming the run that was interrupted.",
+        `${data.completed_turns ?? 0} turn(s) already completed. Turn `
+        + `${data.interrupted_turn} was interrupted and will NOT be resumed: there `
+        + "is no way to know whether its last tool call reached the workspace.");
+      break;
+
+    case "loop_abandoned":
+      transcript.addNotice("warn", "An unfinished run was left alone.",
+        data.reason || "");
+      break;
+
+    case "approval_timeout":
+      transcript.resolveApproval(data.id, "deny", "Nobody answered in time.");
+      transcript.addNotice("warn", `Nobody approved ${data.tool}.`,
+        data.reason || "It was refused and the run continued.");
+      break;
+
+    case "loop_report":
+      // The account itself is rendered from GET /loop, so it appears for a
+      // page that connected after the run ended too. Nothing to draw here.
+      refreshCheckpoints();
+      break;
+
+    case "loop_stop":
+      break;
+
     case "done":
       transcript.closeAgent();
       state.running = false;
@@ -913,8 +1109,14 @@ function handleEvent(event) {
       state.running = false;
       updateTurnUi();
       transcript.resolveAllPending("deny", "The turn was cancelled.");
-      transcript.addNotice("warn", "Turn cancelled.",
-        "A tool call already in flight may still finish in the background.");
+      // Never claim a clean stop. Cancellation abandons an in-flight tool
+      // call; it cannot kill one. When the sidecar tells us how many are
+      // still live, say the number rather than the vague warning.
+      transcript.addNotice("warn", "Stopped.",
+        data.live_workers > 0
+          ? `${data.live_workers} tool call(s) are still running against this `
+            + "workspace and cannot be killed. Watch the counter above."
+          : "A tool call already in flight may still finish in the background.");
       break;
 
     case "error":
@@ -964,6 +1166,30 @@ ui.reloadSetup.addEventListener("click", refreshSetup);
 ui.reloadCheckpoints.addEventListener("click", refreshCheckpoints);
 ui.send.addEventListener("click", send);
 ui.stop.addEventListener("click", cancel);
+
+// The bounds form appears the moment "work loop" is chosen, not after a
+// session exists: a person deciding whether to run one unattended needs to
+// see what would bound it while they are still deciding.
+ui.engine.addEventListener("change", () => {
+  if (ui.engine.value === "loop" && ui.mode.value === "edit") {
+    // 'edit' gates every write and a loop has nobody to answer those gates.
+    // Move to the mode that actually works, visibly, rather than failing at
+    // the moment the button is pressed. BEFORE the repaint below, so the tool
+    // list describes the mode the session will actually use -- painting it
+    // from the old mode would show every tool as unavailable, which is both
+    // wrong and exactly the kind of quiet inaccuracy this panel exists to
+    // avoid.
+    ui.mode.value = "auto";
+    ui.sessionNote.className = "panel-note";
+    setText(ui.sessionNote,
+      "Switched to 'auto': a work loop cannot use 'edit', which gates every "
+      + "write with nobody awake to approve them. Check what 'auto' allows "
+      + "below before starting.");
+  }
+  updateLoopPanel();
+  updateTurnUi();
+});
+ui.mode.addEventListener("change", () => updateLoopPanel());
 
 ui.composer.addEventListener("input", () => {
   autosize();
@@ -1031,6 +1257,19 @@ async function boot() {
   // whole point is that nothing waits for it. watchEngine paints the panel
   // from the first snapshot and keeps repainting it from the stream.
   watchEngine();
+
+  // The work loop gauge, likewise started before any session exists. Two
+  // things depend on that: an unfinished run inherited from a restart has to
+  // be on screen BEFORE the user types anything (starting something else is
+  // what forfeits the chance to resume it), and the bounds form is built from
+  // this snapshot's `defaults`, which a person needs while deciding whether
+  // to run one at all.
+  try {
+    applyLoopSnapshot(await sidecar.loop());
+  } catch (err) {
+    void err;  // the stream below retries; a first-read failure is not fatal
+  }
+  startLoopStream();
 
   await Promise.all([refreshSetup(), refreshModels()]);
 

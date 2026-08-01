@@ -91,11 +91,48 @@ if _HERE not in sys.path:
 
 import app as app_mod  # noqa: E402
 import engine as engine_mod
+import loop_engine as loop_mod
 import session_state
 
 
 def _default_persist_hook(session):
     session_state.save(session_state.snapshot(session))
+
+
+def restore_engine_factory(persisted, default_factory, state):
+    """The engine factory session_state.restore_session should use for THIS
+    persisted session.
+
+    A session that was running a work loop has to come back as one. Restoring
+    it with the process-wide chat factory would not merely lose a setting: a
+    chat engine has no pending_run(), so the loop's journal would sit on disk
+    with nothing in the application able to see it, and the user would be
+    told nothing at all about the run that was in flight when the machine
+    went down.
+
+    The persisted config is re-validated through parse_loop_config, and a
+    config that does not pass is replaced by the defaults rather than
+    honoured or refused. That is the same suspicion RESTORABLE_MODES applies
+    to the persisted mode, for the same reason: this file lives in the data
+    directory the agent's own write_file can reach, so it may say what a
+    session WAS and never what a session is allowed to be. Falling back to
+    the defaults (rather than dropping the session) keeps the run visible,
+    which is the point, while denying the file any say in its bounds.
+    """
+    if not isinstance(persisted, dict) or persisted.get("engine_kind") != "loop":
+        return default_factory
+    if persisted.get("mode") not in loop_mod.LOOP_MODES:
+        # A loop cannot run in this mode, so do not rebuild one that would
+        # refuse its own first prompt. The chat engine restores normally.
+        return default_factory
+    try:
+        config = loop_mod.parse_loop_config(persisted.get("engine_config"))
+    except loop_mod.ConfigError as exc:
+        print("[hearth-main] persisted work loop config is not acceptable ({}); "
+              "restoring the run with default ceilings instead".format(exc),
+              file=sys.stderr)
+        config = loop_mod.parse_loop_config({})
+    return lambda: loop_mod.build_loop_engine(config, status=state.get_loop_status())
 
 
 def start_engine_acquisition(state, stream=None):
@@ -170,13 +207,26 @@ def make_server(engine_factory=None, host="127.0.0.1", port=0, token=None,
                   "starting with no session".format(type(exc).__name__, exc), file=sys.stderr)
         if persisted:
             try:
-                restored = session_state.restore_session(persisted, engine_factory)
+                restored = session_state.restore_session(
+                    persisted, restore_engine_factory(persisted, engine_factory, state))
             except Exception as exc:  # noqa: BLE001 - a broken restore must not crash startup
                 restored = None
                 print("[hearth-main] failed to restore persisted session state: {}: {}; "
                       "starting with no session".format(type(exc).__name__, exc), file=sys.stderr)
             if restored is not None:
                 state.set_restored_session(restored)
+                # Put any inherited unfinished run on the gauge NOW, so the
+                # first GET /loop a restarted app makes already carries it.
+                # Without this the run is only discovered when the user
+                # happens to submit something, which is exactly the moment
+                # they would already have destroyed the chance to resume it.
+                publish = getattr(restored.engine, "publish_pending", None)
+                if callable(publish):
+                    try:
+                        publish()
+                    except Exception as exc:  # noqa: BLE001 - never crash startup
+                        print("[hearth-main] could not read the work loop journal: "
+                              "{}: {}".format(type(exc).__name__, exc), file=sys.stderr)
 
     return server, state
 

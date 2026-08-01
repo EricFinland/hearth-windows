@@ -39,6 +39,7 @@ import {
   renderModelCard, renderQuantRow, renderDownloadRow, renderDownloads,
   renderSourceNotice, renderHardware, renderVerdict,
 } from "./shop.js";
+import { account as loopAccount, LoopRunBar, blindSpots } from "./loop.js";
 
 // Any payload that manages to execute sets this. It must stay false.
 window.__xssFired = false;
@@ -247,6 +248,110 @@ check("shop hardware bar", PAYLOADS[0],
     ram_bytes: 24 * 1024 ** 3, free_disk_bytes: 500 * 1024 ** 3, context_tokens: 8192,
     vram_approximate: true,
   }))));
+
+// ---------------------------------------------------------------------------
+// The work loop.
+//
+// Every string a loop surface renders is written by something that is not the
+// user: the GOAL is echoed back from a run that may have been resumed out of a
+// journal on disk, the stop detail and the recurring-error list are built from
+// tool output and from the completion command's stdout, the file lists are
+// paths the model chose, and the notices are the loop's own prose about what
+// it found. The `pending` card is the worst of them -- its goal, its refusal
+// text and its turn counts are read off a JSONL file in the user's data
+// directory that the agent's own write_file can reach.
+//
+// As with the shop, the payload is planted in every field at once, so one
+// missed `text:` fails rather than being masked by its neighbours.
+// ---------------------------------------------------------------------------
+
+function hostileReport(payload) {
+  return {
+    run_id: payload, goal: payload, model: payload, workspace: payload,
+    mode: "auto", stop_reason: "stalled", stop_detail: payload,
+    turns: 6, elapsed: 91.5, tokens_in: 10, tokens_out: 20, tokens: 30,
+    writes: 4, tool_calls: 9, gates_denied: 2,
+    denied_tools: { [payload]: 2 },
+    checkpoints: [payload], checkpoint_error: payload,
+    ceilings: { max_turns: 40, max_seconds: 7200, max_tokens: 1000000,
+                max_writes: 200, max_tool_calls: 400 },
+    stall_policy: { window: 6, repeat_actions: 4, repeat_errors: 5,
+                    oscillations: 3, min_turns: 3 },
+    verdict: { stalled: true, reason: payload,
+               detectors: [{ name: payload, detail: payload }] },
+    recurring_errors: [[4, payload], [2, payload]],
+    last_error: payload,
+    completion: { done: false, available: true, detail: payload, output: payload },
+    created: [payload], modified: [payload], deleted: [payload],
+    turn_log: [{ turn: 1, new_state: false, summary: payload, errors: [payload] }],
+    notices: [payload], live_workers: 2,
+  };
+}
+
+function hostileRun(payload, state) {
+  return {
+    run_id: payload, goal: payload, model: payload, workspace: payload,
+    mode: "auto", state, resumed: true, started_at: Date.now() / 1000,
+    elapsed: 12, turn: 3,
+    spend: { turns: 3, elapsed: 12, tokens: 40, writes: 2, tool_calls: 5 },
+    ceilings: { max_turns: 40, max_seconds: 7200, max_tokens: 1000000,
+                max_writes: 200, max_tool_calls: 400 },
+    stall: { window: 6, repeat_actions: 4, repeat_errors: 5,
+             oscillations: 3, min_turns: 3 },
+    gate_policy: "ask", gate_timeout: 300, allowed_tools: [payload],
+    done_command: payload, required_artifacts: [payload], verified: true,
+    gates_allowed: 1, gates_denied: 1, gates_timed_out: 1, checkpoints: 3,
+    last_progress: { turn: 3, new_state: false, changed: 0, errors: 1 },
+    last_tool: payload, stop_requested: state === "stopping",
+    stop_reason: state === "stopped" ? "stalled" : undefined,
+    stop_detail: state === "stopped" ? payload : undefined,
+    live_workers: 2,
+  };
+}
+
+function hostilePending(payload, resumable) {
+  return {
+    run_id: payload, goal: payload, completed_turns: 4, interrupted_turn: 5,
+    resumable, refusal: payload, journal_goal_differs: true,
+  };
+}
+
+const HOSTILE_BLIND = [{ headline: PAYLOADS[0], means: PAYLOADS[1], remedy: PAYLOADS[2] }];
+
+for (const payload of PAYLOADS) {
+  check("work loop account", payload,
+    probe((host) => host.appendChild(
+      loopAccount(hostileReport(payload), payload, HOSTILE_BLIND))));
+  for (const state of ["running", "stopping", "stopped"]) {
+    check(`work loop run bar (${state})`, payload,
+      probe((host) => new LoopRunBar(host).render({
+        run: hostileRun(payload, state), pending: null,
+        blind_spots: HOSTILE_BLIND,
+      })));
+  }
+  // The inherited-run card, both branches: one that offers to resume and one
+  // that refuses with a reason lifted straight out of the journal header.
+  for (const resumable of [true, false]) {
+    check(`work loop pending card (resumable=${resumable})`, payload,
+      probe((host) => new LoopRunBar(host).render({
+        run: null, pending: hostilePending(payload, resumable),
+        blind_spots: HOSTILE_BLIND,
+      })));
+  }
+  check("work loop blind spots", payload,
+    probe((host) => host.appendChild(blindSpots(
+      [{ headline: payload, means: payload, remedy: payload }]))));
+}
+
+// A completed run takes a different headline branch, and an unverified
+// completion adds a sentence -- both must be inert too.
+for (const payload of [PAYLOADS[0], PAYLOADS[5]]) {
+  check("work loop account (completed, unverified)", payload,
+    probe((host) => host.appendChild(loopAccount({
+      ...hostileReport(payload), stop_reason: "completed",
+      completion: { done: true, verified: false, detail: payload },
+    }, payload, HOSTILE_BLIND))));
+}
 
 // The live transcript surfaces, rendered into the visible stage so the result
 // can be read by eye as well as asserted.
@@ -498,7 +603,74 @@ const BIDI_SURFACES = [
   { label: "shop hardware bar", selector: ".hw-v",
     build: (host, text) => host.appendChild(renderHardware({
       gpu_detected: true, gpu_vendor: text, context_tokens: 8192 })) },
+  // The work loop. The account is what a person reads to decide whether to
+  // trust hours of unsupervised work, and the run bar's goal line is echoed
+  // back from a run that may have been resumed out of a file on disk. A stop
+  // detail whose glyphs are reordered would misreport why a run ended;
+  // a reordered goal would misreport what it was doing at all.
+  { label: "loop account stop detail", selector: ".lac-detail",
+    build: (host, text) => host.appendChild(loopAccount(
+      { ...bidiReport(text) }, "", [])) },
+  { label: "loop account detector detail", selector: ".lac-detectors li span",
+    build: (host, text) => host.appendChild(loopAccount(bidiReport(text), "", [])) },
+  { label: "loop account recurring error", selector: ".lac-recurring li .mono",
+    build: (host, text) => host.appendChild(loopAccount(bidiReport(text), "", [])) },
+  { label: "loop account last error", selector: ".lac pre.blob",
+    build: (host, text) => host.appendChild(loopAccount(bidiReport(text), "", [])) },
+  { label: "loop account created files", selector: ".lac-files .mono",
+    build: (host, text) => host.appendChild(loopAccount(bidiReport(text), "", [])) },
+  { label: "loop account notice", selector: ".lac-note",
+    build: (host, text) => host.appendChild(loopAccount(bidiReport(text), "", [])) },
+  { label: "loop account full text", selector: ".lac-full pre.blob",
+    build: (host, text) => host.appendChild(loopAccount(bidiReport(text), text, [])) },
+  { label: "loop run bar goal", selector: ".lrb-goal",
+    build: (host, text) => new LoopRunBar(host).render(
+      { run: bidiRun(text), pending: null }) },
+  { label: "loop run bar stop detail", selector: ".lrb-detail",
+    build: (host, text) => new LoopRunBar(host).render(
+      { run: bidiRun(text), pending: null }) },
+  { label: "loop pending goal (read off a journal on disk)", selector: ".lrb-goal",
+    build: (host, text) => new LoopRunBar(host).render(
+      { run: null, pending: bidiPending(text) }) },
+  { label: "loop pending refusal", selector: ".lrb-pending .lrb-warn",
+    build: (host, text) => new LoopRunBar(host).render(
+      { run: null, pending: bidiPending(text) }) },
+  { label: "loop blind spot headline", selector: ".lbs-item strong",
+    build: (host, text) => host.appendChild(blindSpots(
+      [{ headline: text, means: text, remedy: text }])) },
 ];
+
+function bidiReport(text) {
+  return {
+    run_id: "r", goal: text, model: "m", workspace: "w", mode: "auto",
+    stop_reason: "stalled", stop_detail: text, turns: 3, elapsed: 10,
+    tokens: 5, writes: 1, tool_calls: 2,
+    ceilings: { max_turns: 40, max_seconds: 7200, max_tokens: 1000,
+                max_writes: 200, max_tool_calls: 400 },
+    verdict: { detectors: [{ name: "repeat_action", detail: text }] },
+    recurring_errors: [[3, text]], last_error: text,
+    completion: {}, created: [text], modified: [], deleted: [],
+    notices: [text], live_workers: 0,
+  };
+}
+
+function bidiRun(text) {
+  return {
+    run_id: "r", goal: text, mode: "auto", state: "stopped",
+    stop_reason: "stalled", stop_detail: text, turn: 3,
+    spend: { turns: 3, elapsed: 10, tokens: 5, writes: 1, tool_calls: 2 },
+    ceilings: { max_turns: 40, max_seconds: 7200, max_tokens: 1000,
+                max_writes: 200, max_tool_calls: 400 },
+    allowed_tools: [], verified: false, live_workers: 0, checkpoints: 0,
+  };
+}
+
+function bidiPending(text) {
+  return {
+    run_id: "r", goal: text, completed_turns: 2, interrupted_turn: 3,
+    resumable: false, refusal: text, journal_goal_differs: false,
+  };
+}
 
 function bidiHost(label) {
   const host = el("div", { class: "bidi-probe" }, [el("div", { class: "bidi-label", text: label })]);

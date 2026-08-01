@@ -57,6 +57,7 @@ const SIDECAR_ROUTES = new Set([
   "/shop", "/shop/quants",
   "/downloads", "/downloads/events", "/downloads/cancel", "/downloads/dismiss",
   "/engine", "/engine/events",
+  "/loop", "/loop/events",
 ]);
 
 const HOP_BY_HOP = new Set([

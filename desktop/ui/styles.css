@@ -322,7 +322,9 @@ select.input option { background: var(--panel-2); color: var(--fg); }
 
 /* ---------- chat column ---------- */
 
-.chat { display: grid; grid-template-rows: minmax(0, 1fr) auto; min-width: 0; }
+/* Three rows: the work-loop run bar (auto, and `hidden` collapses it to
+ * nothing when there is no run), the transcript, the composer. */
+.chat { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; min-width: 0; }
 
 .transcript {
   overflow-y: auto;
@@ -888,6 +890,210 @@ kbd {
 .dl-detail { margin: 0; font-size: 12px; color: var(--fg-dim); line-height: 1.55; overflow-wrap: anywhere; }
 .dl-error .dl-detail { color: var(--danger); }
 .dl-actions { display: flex; gap: 7px; margin-top: 9px; }
+
+/* ---------- work loop ----------
+ *
+ * Three surfaces, in the order a person meets them: the bounds form in the
+ * sidebar (before), the run bar above the transcript (during), and the
+ * account inside the transcript (after). See desktop/ui/js/loop.js.
+ *
+ * The recurring visual rule: the unattended-write budget is the scary one, so
+ * it is the only meter with its own colour, and it keeps that colour whether
+ * it is being configured, watched, or read back afterwards.
+ */
+
+.loop-fields { display: grid; gap: 10px; }
+.loop-field { margin-bottom: 0; }
+.loop-field .field-label { display: flex; align-items: baseline; gap: 6px; }
+.loop-unit {
+  margin-left: auto;
+  font-size: 10px; font-weight: 500; letter-spacing: .04em;
+  color: var(--fg-faint); text-transform: none;
+}
+.loop-hint {
+  display: block; margin: 4px 0 0;
+  font-size: 11px; line-height: 1.5; color: var(--fg-faint);
+}
+.loop-field.is-scary .field-label > span:first-child { color: var(--warn); }
+.loop-field.is-scary .input { border-color: rgba(226,178,74,.34); }
+
+.loop-details {
+  margin-top: 14px; padding-top: 12px;
+  border-top: 1px solid var(--line-soft);
+}
+.loop-details > summary {
+  cursor: pointer; list-style: none;
+  font-size: 11px; font-weight: 600; letter-spacing: .06em;
+  text-transform: uppercase; color: var(--fg-dim);
+  padding: 2px 0;
+}
+.loop-details > summary::-webkit-details-marker { display: none; }
+.loop-details > summary::before { content: "\25B8 "; color: var(--fg-faint); }
+.loop-details[open] > summary::before { content: "\25BE "; }
+.loop-details > summary:hover { color: var(--fg); }
+.loop-details > .field, .loop-details > .loop-fields { margin-top: 10px; }
+
+.loop-tools { display: grid; gap: 2px; margin-top: 8px; }
+.loop-tool {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 6px; border-radius: var(--radius-sm);
+  cursor: pointer; font-size: 12px;
+}
+.loop-tool:hover { background: var(--panel-2); }
+.loop-tool-box { accent-color: var(--accent); flex: none; }
+.loop-tool-box:disabled { opacity: .35; }
+.loop-tool-name { flex: 1 1 auto; min-width: 0; color: var(--fg-dim); font-size: 11.5px; }
+.loop-tool-eff { font-size: 10.5px; color: var(--fg-faint); white-space: nowrap; }
+.loop-tool-eff.is-allow { color: var(--fg-faint); }
+.loop-tool-eff.is-gate { color: var(--gate); }
+.loop-tool-eff.is-deny { color: var(--fg-faint); opacity: .6; }
+.loop-tool:has(.loop-tool-box:checked) .loop-tool-name { color: var(--fg); }
+.panel-note.is-warn { color: var(--warn); }
+
+/* the limits of progress detection. Never dismissable, never a tooltip. */
+.lbs {
+  margin-top: 16px; padding: 11px 12px;
+  background: rgba(226,178,74,.06);
+  border: 1px solid rgba(226,178,74,.22);
+  border-radius: var(--radius-sm);
+}
+.lbs-title {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 11px; font-weight: 600; letter-spacing: .05em;
+  text-transform: uppercase; color: var(--warn);
+}
+.lbs-title .i { width: 14px; height: 14px; }
+.lbs-list { margin: 9px 0 0; padding: 0; list-style: none; display: grid; gap: 9px; }
+.lbs-item { display: grid; gap: 2px; font-size: 11.5px; line-height: 1.5; }
+.lbs-item strong { color: var(--fg); font-weight: 600; }
+.lbs-means { color: var(--fg-dim); }
+.lbs-remedy { color: var(--fg-faint); font-style: italic; }
+
+/* ---------- the run bar ---------- */
+
+.loop-runbar { border-bottom: 1px solid var(--line); background: var(--bg-raise); }
+.lrb-card {
+  max-width: 860px; margin: 0 auto;
+  padding: 13px 28px 15px;
+  display: grid; gap: 8px;
+}
+.lrb-card + .lrb-card { border-top: 1px solid var(--line-soft); }
+.lrb-pending { background: rgba(183,149,255,.05); }
+.lrb-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+.lrb-title .i { width: 15px; height: 15px; color: var(--accent); flex: none; }
+.lrb-card[data-state="stopping"] .lrb-title .i { color: var(--warn); }
+/* Green is reserved for a run that actually finished the goal. Anything else
+ * that stopped gets the warning colour, so the glance-level read of the bar
+ * can never be more encouraging than the sentence next to it. */
+.lrb-card[data-state="stopped"] .lrb-title .i { color: var(--warn); }
+.lrb-card[data-reason="completed"] .lrb-title .i { color: var(--ok); }
+.lrb-tag {
+  padding: 1px 7px; border-radius: 999px;
+  background: var(--panel-2); border: 1px solid var(--line);
+  font-size: 10.5px; color: var(--fg-dim);
+}
+.lrb-tag.is-ok { color: var(--ok); border-color: rgba(111,207,127,.35); }
+.lrb-tag.is-warn { color: var(--warn); border-color: rgba(226,178,74,.35); }
+.lrb-goal { font-size: 12.5px; color: var(--fg-dim); overflow-wrap: anywhere; }
+.lrb-sub { font-size: 11.5px; color: var(--fg-faint); overflow-wrap: anywhere; }
+.lrb-sub.is-ok { color: var(--ok); }
+.lrb-detail { font-size: 12px; overflow-wrap: anywhere; }
+.lrb-detail.is-ok { color: var(--ok); }
+.lrb-detail.is-warn { color: var(--warn); }
+.lrb-detail.is-error { color: var(--danger); }
+.lrb-warn {
+  font-size: 11.5px; line-height: 1.55; color: var(--danger);
+  padding: 8px 10px; border-radius: var(--radius-sm);
+  background: rgba(239,118,118,.08); border: 1px solid rgba(239,118,118,.28);
+  overflow-wrap: anywhere;
+}
+.lrb-meters {
+  display: grid; gap: 8px 20px;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  margin-top: 2px;
+}
+
+/* ---------- a meter ---------- */
+
+.lm { display: grid; gap: 4px; min-width: 0; }
+.lm-head { display: flex; align-items: baseline; gap: 8px; font-size: 11px; }
+.lm-label { color: var(--fg-faint); white-space: nowrap; }
+.lm-value { margin-left: auto; color: var(--fg-dim); font-variant-numeric: tabular-nums; }
+.lm-track {
+  height: 3px; border-radius: 999px; overflow: hidden;
+  background: var(--line);
+}
+.lm-fill {
+  display: block; height: 100%; border-radius: 999px;
+  background: var(--accent);
+  transition: width .3s linear;
+}
+@media (prefers-reduced-motion: reduce) { .lm-fill { transition: none; } }
+.lm.is-scary .lm-fill { background: var(--warn); }
+.lm.is-scary .lm-label { color: var(--warn); }
+.lm.is-near .lm-fill { background: var(--danger); }
+.lm.is-near .lm-value { color: var(--danger); }
+
+/* ---------- the account ---------- */
+
+.lac {
+  max-width: 860px; margin: 18px auto 6px; padding: 16px 18px;
+  background: var(--panel);
+  border: 1px solid var(--line); border-left: 3px solid var(--fg-faint);
+  border-radius: var(--radius);
+  display: grid; gap: 10px;
+}
+.lac-ok    { border-left-color: var(--ok); }
+.lac-warn  { border-left-color: var(--warn); }
+.lac-error { border-left-color: var(--danger); }
+.lac-head { display: flex; align-items: center; gap: 9px; font-size: 14px; }
+.lac-head .i { width: 17px; height: 17px; flex: none; color: var(--fg-dim); }
+.lac-ok .lac-head .i { color: var(--ok); }
+.lac-warn .lac-head .i { color: var(--warn); }
+.lac-error .lac-head .i { color: var(--danger); }
+.lac-detail { font-size: 12.5px; color: var(--fg-dim); overflow-wrap: anywhere; }
+.lac-sub {
+  font-size: 11px; font-weight: 600; letter-spacing: .05em;
+  text-transform: uppercase; color: var(--fg-faint); margin-top: 4px;
+}
+.lac-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 5px; }
+.lac-list li {
+  font-size: 12px; color: var(--fg-dim); line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.lac-list code { color: var(--gate); font-size: 11.5px; }
+.lac-count {
+  display: inline-block; min-width: 30px;
+  color: var(--danger); font-variant-numeric: tabular-nums;
+}
+.lac-spend {
+  display: grid; gap: 8px 20px;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  padding: 10px 0; margin: 2px 0;
+  border-top: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft);
+}
+.lac-files { font-size: 11.5px; color: var(--fg-dim); overflow-wrap: anywhere; }
+.lac-files-label {
+  display: inline-block; min-width: 66px;
+  color: var(--fg-faint); text-transform: uppercase;
+  font-size: 10px; letter-spacing: .05em;
+}
+.lac-note { font-size: 11.5px; color: var(--fg-faint); line-height: 1.55; overflow-wrap: anywhere; }
+.lac-warn {
+  font-size: 12px; line-height: 1.55; color: var(--danger);
+  padding: 9px 11px; border-radius: var(--radius-sm);
+  background: rgba(239,118,118,.08); border: 1px solid rgba(239,118,118,.28);
+}
+.lac-full > summary {
+  cursor: pointer; list-style: none;
+  font-size: 11px; letter-spacing: .05em; text-transform: uppercase;
+  color: var(--fg-faint);
+}
+.lac-full > summary::-webkit-details-marker { display: none; }
+.lac-full > summary::before { content: "\25B8 "; }
+.lac-full[open] > summary::before { content: "\25BE "; }
+.lac-full > summary:hover { color: var(--fg-dim); }
+.lac .lbs { margin-top: 4px; }
 
 /* ---------- scrollbars ---------- */
 

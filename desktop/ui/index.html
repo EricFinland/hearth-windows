@@ -93,6 +93,14 @@
         </label>
 
         <label class="field">
+          <span class="field-label">What a turn does</span>
+          <select class="input" id="in-engine">
+            <option value="chat" selected>Chat &middot; one reply per message</option>
+            <option value="loop">Work loop &middot; keeps going until done or stopped</option>
+          </select>
+        </label>
+
+        <label class="field">
           <span class="field-label">Permission mode</span>
           <select class="input" id="in-mode">
             <option value="plan">plan &middot; read only, no writes</option>
@@ -103,6 +111,11 @@
 
         <button class="btn btn-primary btn-wide" id="btn-connect" type="button">Start session</button>
         <p class="panel-note" id="session-note"></p>
+      </section>
+
+      <section class="panel" id="loop-panel" aria-labelledby="p-loop" hidden>
+        <h2 class="panel-title" id="p-loop">Work loop bounds</h2>
+        <div id="loop-config"></div>
       </section>
 
       <section class="panel" aria-labelledby="p-env">
@@ -132,6 +145,7 @@
     </aside>
 
     <main class="chat">
+      <div class="loop-runbar" id="loop-runbar" role="status" aria-live="polite" hidden></div>
       <div class="transcript" id="transcript" role="log" aria-live="polite" aria-relevant="additions text"></div>
 
       <div class="composer">

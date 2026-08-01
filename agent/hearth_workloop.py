@@ -234,6 +234,43 @@ DEFAULT_ALLOWED_TOOLS = frozenset({
 
 GATE_POLICIES = ("deny", "stop", "ask")
 
+# What progress detection genuinely cannot see. This is the same list
+# ProgressLedger's docstring carries, lifted into data for one reason: the
+# person who most needs it is the one starting an unattended run from a GUI,
+# and they will never read a Python docstring. A user who believes "it did not
+# stall" means "it worked" has been misled by this module, so the account
+# (LoopReport.render) and any UI in front of it render this verbatim rather
+# than paraphrasing it into reassurance. Each entry is
+# (headline, what_it_means, what_to_do_about_it).
+PROGRESS_BLIND_SPOTS = (
+    ("Steady progress toward a wrong answer trips nothing.",
+     "Every detector here measures CHANGE, not correctness. A model writing a "
+     "confident, fluent, completely incorrect solution leaves a new workspace "
+     "state every single turn and will never look stalled.",
+     "Set a completion check: a command whose exit status decides, or files "
+     "that must exist. Without one, 'finished' is the model's own opinion."),
+    ("Work outside the workspace reads as a stall.",
+     "Progress is measured by fingerprinting the workspace directory. A run "
+     "whose real effect lands on a database, a remote service, or any path "
+     "outside it looks like it changed nothing, and will be stopped for it.",
+     "Widen the workspace, or give the run a completion check that can "
+     "observe the real effect."),
+    ("Growth is not value.",
+     "A model appending one more junk line to a file each turn changes the "
+     "fingerprint each turn and reads as progress for as long as its ceilings "
+     "allow.",
+     "Read the turn-by-turn list and the diff before trusting the result."),
+    ("Some changes are below the resolution.",
+     "Files inside ignored directories (.git, node_modules, build caches) do "
+     "not register at all, and very large files are fingerprinted by size and "
+     "modification time rather than by content.",
+     "Expect a run that only touches those to look idle."),
+    ("A slow start is never called a stall.",
+     "No verdict at all is reached before the run's min_turns threshold, so "
+     "the first few turns are unjudged by design.",
+     "Ceilings, not stall detection, are what bound those turns."),
+)
+
 # Directories never walked when fingerprinting the workspace. Version control
 # internals, caches and virtualenvs churn constantly for reasons that have
 # nothing to do with whether the agent is making progress, and including them
@@ -269,11 +306,17 @@ class CancelToken:
     also cannot silently disarm the internal flag, which is checked first.
     """
 
-    def __init__(self, is_cancelled_fn=None, reason="stopped"):
+    def __init__(self, is_cancelled_fn=None, reason="stopped",
+                 external_reason="stopped by the host"):
         self._event = threading.Event()
         self._lock = threading.Lock()
         self._reason = ""
         self._default_reason = reason
+        # What the report says when the EXTERNAL flag is what fired. "the
+        # host" is accurate and useless to a person: in the desktop app the
+        # host is that person's own Stop button, and this string is what they
+        # read in the account. So the host names itself.
+        self._external_reason = external_reason
         self._external = is_cancelled_fn
 
     def cancel(self, reason=None):
@@ -290,7 +333,7 @@ class CancelToken:
         if self._external is not None:
             try:
                 if self._external():
-                    self.cancel("stopped by the host")
+                    self.cancel(self._external_reason)
                     return True
             except Exception:  # noqa: BLE001 - a broken host must not wedge the run
                 return False
@@ -450,7 +493,7 @@ class Ceilings:
     def exceeded(self, stats):
         """The first ceiling `stats` has reached, as (name, limit, value), or
         None. Order is fixed so the reported ceiling is deterministic when a
-        turn crosses two at once."""
+        turn crosses two at once. `stats` is what _spend() returns."""
         checks = (
             ("turns", self.max_turns, stats.get("turns", 0)),
             ("wall clock", self.max_seconds, stats.get("elapsed", 0.0)),
@@ -462,6 +505,19 @@ class Ceilings:
             if limit is not None and limit >= 0 and value >= limit:
                 return name, limit, value
         return None
+
+
+def _spend(report, elapsed):
+    """Everything a run has spent so far, in the shape Ceilings.exceeded
+    reads.
+
+    One function with two callers on purpose: the turn loop feeds it to the
+    ceiling check, and the per-turn `progress` event carries it to whoever is
+    watching. A budget meter drawn from one tally while enforcement reads
+    another is a meter that is eventually wrong, and it is the one the user
+    can see -- so they are the same tally, by construction."""
+    return {"turns": report.turns, "elapsed": elapsed, "tokens": report.tokens,
+            "writes": report.writes, "tool_calls": report.tool_calls}
 
 
 # --------------------------------------------------------------------------
@@ -1153,10 +1209,19 @@ class LoopReport:
                      "kill a call already in flight.".format(self.live_workers))
             L.append("")
 
-        if self.stop_reason != STOP_COMPLETED:
-            L.append("Progress detection reports CHANGE, not correctness: a run that "
-                     "did not stall was not necessarily useful. See ProgressLedger's "
-                     "documented blind spots.")
+        # ALWAYS, including on a completed run. "It finished" is exactly the
+        # verdict a reader is most likely to over-trust, and if no completion
+        # check ran then "finished" was the model's own opinion about its own
+        # work. Printing the limits only on failure would put the caveat
+        # everywhere except the one place it changes what someone believes.
+        L.append("what this account cannot tell you")
+        if self.completion.get("done") and self.completion.get("verified") is False:
+            L.append("  NOTHING VERIFIED THIS. No completion check was configured, so "
+                     "'finished' here is the model's own claim about its own work.")
+        for headline, means, todo in PROGRESS_BLIND_SPOTS:
+            L.append("  * {}".format(headline))
+            L.append("      {}".format(means))
+            L.append("      {}".format(todo))
         return "\n".join(L)
 
 
@@ -1275,7 +1340,7 @@ def run_workloop(goal, model, workspace, *,
                  run_id=None, journal=None, resume=False,
                  chat_fn=None, execute_tool_fn=None, checkpoint_fn=None,
                  scan_fn=None, done_runner=None, clock=None,
-                 checkpoint_every_turn=True):
+                 checkpoint_every_turn=True, workers=None):
     """Work at `goal` until it is done, a ceiling is hit, progress stops, or
     the run is cancelled. Always returns a LoopReport; never raises for an
     expected outcome.
@@ -1284,11 +1349,21 @@ def run_workloop(goal, model, workspace, *,
     checkpoint_fn, scan_fn, done_runner, clock) so the self-test can drive
     the whole machine deterministically without an engine, a git store, or a
     real clock. The DEFAULTS are the real thing.
+
+    `workers` is the abandoned-call counter (see _Workers). It is injectable
+    for one reason: a caller that already owns such a counter for the same
+    workspace must be able to hand it ITS counter rather than have this run
+    keep a second, private tally. desktop/server/loop_engine.py does exactly
+    that, so a `run_command` this loop abandoned keeps
+    Session.is_workspace_busy() true -- which is what stops POST /restore and
+    a replacement session from acting on a directory a live worker is still
+    writing to. Two counters would mean the one being consulted is not the
+    one being incremented.
     """
     clock = clock or time.monotonic
     token = token or CancelToken()
     emit = emit or (lambda ev: None)
-    workers = _Workers()
+    workers = workers if workers is not None else _Workers()
     started = clock()
 
     if mode not in ALLOWED_MODES:
@@ -1438,9 +1513,7 @@ def run_workloop(goal, model, workspace, *,
             if token.cancelled():
                 return _finish(STOP_CANCELLED, token.reason)
 
-            stats = {"turns": report.turns, "elapsed": clock() - started,
-                     "tokens": report.tokens, "writes": report.writes,
-                     "tool_calls": report.tool_calls}
+            stats = _spend(report, clock() - started)
             hit = ceilings.exceeded(stats)
             if hit is not None:
                 name, limit, value = hit
@@ -1623,8 +1696,15 @@ def run_workloop(goal, model, workspace, *,
                        "deleted": delta["deleted"][:10],
                        "seconds": round(clock() - t_turn, 2)}
             report.turn_log.append(log_row)
+            # `spend` is built by the same expression the ceiling check is fed
+            # at the top of the next turn, deliberately: a watcher that draws
+            # a budget meter from this and an enforcement that reads a
+            # different tally would eventually disagree, and the one the user
+            # can see is the one they would believe. One expression, one
+            # meaning. See _spend().
             emit({"type": "progress", "turn": turn, "new_state": rec["new_state"],
-                  "changed": changed, "errors": len(uniq_errors)})
+                  "changed": changed, "errors": len(uniq_errors),
+                  "spend": _spend(report, clock() - started)})
 
             journal.append({
                 "t": "turn_end", "turn": turn, "ts": time.time(),
@@ -2198,6 +2278,32 @@ def _self_test():  # noqa: PLR0915 - one function on purpose, per house style
               chat_fn=scripted([("t", [("read_file", {"path": "a"})])] * 9))
     assert r.stop_reason == STOP_CEILING and "tool calls" in r.stop_detail, r.stop_detail
 
+    # (2b) A WATCHER CAN SEE THE SPEND, AND IT IS THE ENFORCED SPEND.
+    # A UI showing "18 of 200 writes" from a tally other than the one the
+    # ceiling check reads would eventually be wrong, and it is the visible one
+    # the user would believe. The per-turn `progress` event therefore carries
+    # exactly what Ceilings.exceeded is fed, and the last one before a ceiling
+    # trip must already show the number that trips it.
+    spends = []
+    r = run_workloop(
+        "watched", "m", ws("spend"), journal=jr("spend"),
+        chat_fn=scripted([("w", [("write_file", {"path": "f.txt", "content": "c"})])] * 9),
+        execute_tool_fn=tool_ok, checkpoint_fn=None,
+        ceilings=Ceilings(max_turns=999, max_writes=3),
+        stall=StallPolicy(window=0, repeat_actions=0, repeat_errors=0, oscillations=0),
+        emit=lambda ev: spends.append(ev["spend"]) if ev.get("type") == "progress" else None)
+    assert r.stop_reason == STOP_CEILING and "unattended writes" in r.stop_detail
+    assert spends, "a watcher gets no progress events at all"
+    for s in spends:
+        assert set(s) == {"turns", "elapsed", "tokens", "writes", "tool_calls"}, s
+    assert [s["writes"] for s in spends] == [1, 2, 3], (
+        "the visible write tally must be the enforced one", spends)
+    assert Ceilings(max_writes=3).exceeded(spends[-1]) is not None, (
+        "the last spend a watcher saw must already be the one that trips the "
+        "ceiling; a meter that reads under the limit while the run stops on it "
+        "is a meter that lies", spends[-1])
+    assert spends[-1]["turns"] == r.turns and spends[-1]["tokens"] == r.tokens
+
     # (3) STALLS on a task it cannot complete, with a legible account. This is
     # the hearth-grow failure mode, and the whole point of the module.
     d3 = ws("stall")
@@ -2227,6 +2333,31 @@ def _self_test():  # noqa: PLR0915 - one function on purpose, per house style
     assert "no_new_state" in text and "repeat_action" in text, text
     assert "python -m pytest" in text, "the account must name the repeated action"
     assert "stopped making progress" in text
+
+    # (3a) THE DETECTORS' HONEST LIMITS REACH THE READER, ON EVERY ACCOUNT.
+    # The person who most needs to know that "did not stall" is not "worked"
+    # is someone starting an unattended run from a GUI, and they will never
+    # read a docstring. Every rendered account carries the list -- including a
+    # COMPLETED one, which is the verdict most likely to be over-trusted.
+    for headline, _means, _todo in PROGRESS_BLIND_SPOTS:
+        assert headline in text, ("a stalled account must carry the limits", headline)
+    assert "wrong answer" in text, (
+        "the single most important blind spot -- confident, fluent, wrong -- must "
+        "be named in words, not left as a reference to a docstring")
+
+    ok_rep = run_workloop(
+        "trivial", "m", ws("blind-ok"), journal=jr("blind-ok"),
+        chat_fn=scripted([(DONE_SENTINEL, [])]), execute_tool_fn=tool_ok,
+        checkpoint_fn=None)
+    assert ok_rep.stop_reason == STOP_COMPLETED, ok_rep.stop_reason
+    ok_text = ok_rep.render()
+    for headline, _means, _todo in PROGRESS_BLIND_SPOTS:
+        assert headline in ok_text, (
+            "a COMPLETED account must carry the limits too: 'it finished' is the "
+            "verdict a reader is most likely to over-trust", headline)
+    assert "NOTHING VERIFIED THIS" in ok_text, (
+        "a completion nobody checked must say so in the account, not only in the "
+        "stop_detail", ok_text)
 
     # the ledger's own numbers back the sentence up
     assert rep.verdict["signals"]["distinct_states"] == 1, rep.verdict["signals"]
@@ -2321,6 +2452,41 @@ def _self_test():  # noqa: PLR0915 - one function on purpose, per house style
                                    "still running", rep.live_workers)
     assert "abandoned tool call" in rep.render()
     gate.set()
+
+    # (5b) The abandoned-worker counter is injectable, and an injected one is
+    # the ONLY one used. A caller that owns a counter for this workspace
+    # (desktop/server/loop_engine.py hands in one wired to its Session, so
+    # POST /restore and a replacement session can see a live worker) must not
+    # end up consulting a counter this function kept privately instead.
+    d5c = ws("cancel-tool-shared")
+    ct5c = CancelToken()
+    gate_c = threading.Event()
+    shared = _Workers()
+    peak = {"n": 0}
+
+    def slow_tool_c(name, args, workspace):
+        peak["n"] = max(peak["n"], shared.live())
+        gate_c.wait(10)
+        return "finally"
+    threading.Timer(0.15, lambda: ct5c.cancel("stopped by user")).start()
+    rep = run_workloop("x", "m", d5c, journal=jr("r5c"), token=ct5c, workers=shared,
+                       chat_fn=scripted([("go", [("read_file", {"path": "a"})])]),
+                       execute_tool_fn=slow_tool_c, checkpoint_fn=None)
+    assert rep.stop_reason == STOP_CANCELLED, rep.stop_reason
+    assert peak["n"] >= 1, ("the INJECTED counter must be the one the run "
+                            "increments, not a private second one", peak["n"])
+    assert shared.live() >= 1, ("the injected counter must still show the "
+                                "abandoned worker after the run returned",
+                                shared.live())
+    assert rep.live_workers >= 1, rep.live_workers
+    gate_c.set()
+    for _ in range(500):
+        if shared.live() == 0:
+            break
+        time.sleep(0.01)
+    assert shared.live() == 0, ("the injected counter must fall back to zero "
+                                "once the abandoned worker unwinds, so a caller "
+                                "can tell 'stopped' from 'still writing'")
 
     # a token cancelled before the first turn stops without calling the model
     never = {"called": False}

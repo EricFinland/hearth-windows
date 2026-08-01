@@ -7,8 +7,25 @@ Endpoints:
                   route reachable by any local process or web page without a
                   bearer token, so its response must stay boring on purpose.
   POST /session   create or replace the live session: {"workspace", "model",
-                  "mode"?}. Replacing drops the previous session's event log
-                  and any turn in flight for it.
+                  "mode"?, "engine"?, "loop"?}. Replacing drops the previous
+                  session's event log and any turn in flight for it.
+
+                  "engine" chooses what a turn IS: "chat" (the default, the
+                  interactive engine) or "loop" (a self-running work loop --
+                  see loop_engine.py). This field is the whole reachability
+                  surface for the work loop: it worked from the CLI and from
+                  a sidecar constructed with a loop engine factory, and from
+                  nowhere a user could get to.
+
+                  "loop" configures that run: ceilings, stall thresholds,
+                  gate policy, capability manifest, completion check.
+                  loop_engine.parse_loop_config validates it and a bad value
+                  is a 400 naming the field, never a clamp -- an unattended
+                  run must not quietly get bounds other than the ones its
+                  operator read on screen. Two of those rules are refusals
+                  rather than clamps and are stated there: no ceiling can be
+                  removed over this transport, and the capability manifest
+                  can only be narrowed.
 
                   SECURITY: "mode" accepts "plan", "edit", or "auto" only.
                   "bypass" is rejected with 400 -- permissions.decide still
@@ -116,6 +133,39 @@ Endpoints:
   GET  /engine/events  the same snapshot over SSE (event: "engine"), one
                   frame per change, ?since=<version>. Same bounded slot
                   pool as GET /events.
+  GET  /loop      the work loop's RUN STATE: which turn it is on, what it has
+                  spent against each ceiling, what it is allowed to do, how
+                  much of the write budget is gone, whether a stop has been
+                  requested, how many abandoned tool calls are still live,
+                  and -- once it ends -- the report and the rendered account.
+                  A versioned whole snapshot, the same shape GET /downloads
+                  and GET /engine use.
+
+                  Deliberately NOT on GET /events, and the split is the
+                  point: the transcript is a LOG (order is the meaning, a
+                  missed entry matters, hence ids and a gap marker) and this
+                  is a GAUGE (only the latest value is ever wanted). Making a
+                  client fold forty turns of token deltas to draw a progress
+                  bar is the failure downloads.py's docstring names. See
+                  loop_engine.py's "TWO SHAPES" section.
+
+                  Also carries `pending`: an unfinished run inherited from a
+                  previous process. A restart never resumes on its own, and
+                  never drops the run silently either; `pending.resumable`
+                  and `pending.refusal` say whether its journal can be
+                  believed. And `blind_spots`: what progress detection
+                  genuinely cannot see, shipped as data so a UI cannot
+                  quietly leave it out.
+  GET  /loop/events  the same snapshot over SSE (event: "loop"), one frame
+                  per change, ?since=<version>. Same bounded slot pool as
+                  GET /events. Token deltas deliberately do not bump the
+                  version: this stream is a gauge, not a second copy of the
+                  token stream.
+
+                  There is no POST /loop/stop and there must not be. The work
+                  loop's CancelToken is driven by POST /cancel, through
+                  Session's existing per-turn cancel flag, so the Stop button
+                  is one bit rather than two that can disagree.
   GET  /checkpoints  the current session's checkpoint history, newest first.
   POST /restore   revert the current session's workspace to a prior
                   checkpoint: {"checkpoint_id"}. The response is whatever
@@ -206,6 +256,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import auth
 import downloads as downloads_mod
 import engine as engine_mod
+import loop_engine as loop_mod
 import session as session_mod
 
 
@@ -265,7 +316,7 @@ class SidecarState:
                  setup_diagnoser=None, idle_prober=None, idle_cache_seconds=None,
                  local_models_fetcher=None, model_checker=None,
                  shop_searcher=None, shop_quanter=None, download_manager=None,
-                 engine_acquirer=None):
+                 engine_acquirer=None, loop_builder=None):
         self.token = token
         self.port = port  # main.py sets this to the real bound port after listen
         self.engine_factory = engine_factory or (lambda: session_mod.NullEngine())
@@ -310,6 +361,23 @@ class SidecarState:
         # that never touches /engine never reads the user's data directory.
         self._engine_acquirer = engine_acquirer
         self._engine_lock = threading.Lock()
+        # The work loop's gauge (GET /loop). Process-wide, like the download
+        # queue and the engine acquirer, and for the same reason plus one
+        # more: GET /loop/events must not have to chase a session being
+        # replaced underneath it while it is blocked in snapshot_after. There
+        # is only ever one session anyway, and a new run's begin() resets
+        # every field, so a stale watcher sees the new run rather than a
+        # merge of two. It deliberately OUTLIVES the session that produced it
+        # -- the account of the last run stays readable after that run's
+        # session has been replaced, which is the whole point of an account.
+        self._loop_status = loop_mod.LoopStatus()
+        # How POST /session builds a work loop engine. Injectable for the
+        # same reason models_fetcher is: the self-test drives real ceiling
+        # enforcement and a real cancellation through this HTTP surface
+        # without an inference engine, by handing the REAL run_workloop a
+        # scripted chat_fn. What is under test stays the production code
+        # path; only the model is a stand-in.
+        self.loop_builder = loop_builder or loop_mod.build_loop_engine
         self.idle_cache_seconds = (
             IDLE_CACHE_SECONDS if idle_cache_seconds is None else idle_cache_seconds)
         self._idle_lock = threading.Lock()  # separate from self._lock below: probing
@@ -351,6 +419,43 @@ class SidecarState:
             if self._engine_acquirer is None:
                 self._engine_acquirer = engine_mod.hearth_engine.Acquirer()
             return self._engine_acquirer
+
+    def get_loop_status(self):
+        """The process-wide work-loop gauge."""
+        return self._loop_status
+
+    def loop_snapshot(self, since=None, timeout=None):
+        """GET /loop's body: the gauge, plus the two facts only this layer
+        knows.
+
+        `engine` says whether the CURRENT session is a loop at all, and
+        `config` is that engine's own manifest -- read off the same objects
+        its run() passes to run_workloop, so the ceilings a page displays
+        cannot describe a different run than the one that would start. Both
+        are merged on top of the snapshot rather than stored inside it,
+        because they belong to the session and the gauge outlives sessions.
+
+        create_session touches the gauge, so a session swap bumps the version
+        too and a watcher blocked on `since` wakes for it -- otherwise these
+        two merged fields could change without the stream ever saying so.
+        """
+        status = self._loop_status
+        snap = (status.snapshot() if since is None
+                else status.snapshot_after(since, timeout=timeout))
+        session = self.get_session()
+        engine = getattr(session, "engine", None) if session is not None else None
+        is_loop = isinstance(engine, loop_mod.LoopEngine)
+        snap["engine"] = "loop" if is_loop else ("chat" if session is not None else None)
+        snap["config"] = engine.manifest() if is_loop else None
+        # The form's raw material: defaults, hard bounds, and what each tool
+        # would actually be allowed to do in each mode. Static, so it costs a
+        # kilobyte per frame; shipped anyway rather than fetched separately,
+        # because "every frame is the whole state" is the property that makes
+        # a client which connects at any moment immediately correct, and a
+        # second endpoint that could be stale relative to this one is exactly
+        # the drift this shape exists to prevent.
+        snap["defaults"] = loop_mod.config_defaults()
+        return snap
 
     def _persist_if_current(self, session):
         """The persist_hook every Session this state creates or adopts is
@@ -425,7 +530,7 @@ class SidecarState:
         with self._lock:
             self._sse_count = max(0, self._sse_count - 1)
 
-    def create_session(self, workspace, model, mode):
+    def create_session(self, workspace, model, mode, engine_factory=None):
         """Build a fresh Session and make it the live one. If a turn is still
         running on the session being replaced, cancel it first -- otherwise
         its background thread would keep running with nothing left able to
@@ -454,7 +559,12 @@ class SidecarState:
         sequence makes concurrent callers fully serialize instead: the
         second caller only ever sees the first caller's already-completed
         outcome (either the first call's new session as its own `old`, or
-        the pre-existing session untouched if the first call raised)."""
+        the pre-existing session untouched if the first call raised).
+
+        `engine_factory` overrides self.engine_factory for THIS session only.
+        POST /session passes one when {"engine": "loop"} was asked for; the
+        process-wide default (a chat engine) is untouched, so a loop session
+        does not turn every later session into a loop."""
         with self._lock:
             old = self.session
             if old is not None:
@@ -468,10 +578,16 @@ class SidecarState:
                         "work in progress; wait for it to finish and try again")
                 old.cancel()
             hook = self._persist_if_current if self._raw_persist_hook is not None else None
-            s = session_mod.Session(workspace, model, mode, engine=self.engine_factory(),
+            factory = engine_factory or self.engine_factory
+            s = session_mod.Session(workspace, model, mode, engine=factory(),
                                     persist_hook=hook)
             self.session = s
-            return s
+        # Outside the lock: the gauge has its own, and holding two at once in
+        # a fixed order is a rule someone eventually breaks. `engine` and
+        # `config` in loop_snapshot() just changed, so a watcher blocked on
+        # GET /loop/events must wake for it.
+        self._loop_status.touch()
+        return s
 
 
 class SidecarHandler(BaseHTTPRequestHandler):
@@ -629,6 +745,10 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._send_json(200, self.state.get_engine().snapshot())
         elif path == "/engine/events":
             self._get_engine_events()
+        elif path == "/loop":
+            self._send_json(200, self.state.loop_snapshot())
+        elif path == "/loop/events":
+            self._get_loop_events()
         else:
             self._send_json(404, {"error": "not_found"})
 
@@ -667,7 +787,15 @@ class SidecarHandler(BaseHTTPRequestHandler):
         if s is None:
             self._send_json(404, {"error": "no_session"})
             return
-        self._send_json(200, s.to_dict())
+        out = s.to_dict()
+        # Which engine this session runs, so a page reloaded (or restarted)
+        # into a live loop shows the loop controls instead of a chat box.
+        # Read off the live object, not off a remembered request field.
+        is_loop = isinstance(s.engine, loop_mod.LoopEngine)
+        out["engine"] = "loop" if is_loop else "chat"
+        if is_loop:
+            out["loop"] = s.engine.manifest()
+        self._send_json(200, out)
 
     def _post_session(self):
         body = self._read_json()
@@ -706,15 +834,51 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 "model_kind": verdict.get("kind"),
             })
             return
+        # What a turn IS. "chat" keeps the process-wide interactive engine;
+        # "loop" builds a work loop engine for THIS session from the
+        # validated `loop` config. This is the field that makes the work loop
+        # reachable from the application at all.
+        engine_kind = body.get("engine") or "chat"
+        if engine_kind not in ("chat", "loop"):
+            self._send_json(400, {"error": "engine must be 'chat' or 'loop'"})
+            return
+        engine_factory = None
+        loop_config = None
+        if engine_kind == "loop":
+            if mode not in loop_mod.LOOP_MODES:
+                self._send_json(400, {
+                    "error": "a work loop cannot run in {!r} mode".format(mode),
+                    "remedy": ("Choose 'auto' (it may read and write files "
+                               "unattended; anything dangerous is gated) or 'plan' "
+                               "(read only). 'edit' gates every write and nobody is "
+                               "awake to approve them."),
+                    "modes": list(loop_mod.LOOP_MODES),
+                })
+                return
+            try:
+                loop_config = loop_mod.parse_loop_config(body.get("loop"))
+            except loop_mod.ConfigError as exc:
+                # Named, never clamped: an unattended run must not quietly get
+                # bounds other than the ones its operator read on screen.
+                self._send_json(400, {"error": str(exc)})
+                return
+            status = self.state.get_loop_status()
+            build = self.state.loop_builder
+            engine_factory = (lambda cfg=loop_config, st=status: build(cfg, status=st))
         try:
-            s = self.state.create_session(workspace, model, mode)
+            s = self.state.create_session(workspace, model, mode,
+                                          engine_factory=engine_factory)
         except ValueError as exc:
             self._send_json(400, {"error": str(exc)})
             return
         except WorkspaceBusyError as exc:
             self._send_json(409, {"error": str(exc)})
             return
-        self._send_json(200, s.to_dict())
+        out = s.to_dict()
+        out["engine"] = engine_kind
+        if loop_config is not None:
+            out["loop"] = s.engine.manifest()
+        self._send_json(200, out)
 
     def _post_prompt(self):
         s = self.state.get_session()
@@ -757,11 +921,23 @@ class SidecarHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"resolved": True})
 
     def _post_cancel(self):
+        """The one kill switch. A work loop's CancelToken is driven from the
+        very same Session.cancel() flag a chat turn uses -- there is no
+        POST /loop/stop, deliberately, because two bits that mean "stop" are
+        two bits that can disagree.
+
+        The extra touch() is not a second piece of state: `stop_requested` on
+        the gauge is DERIVED from this same flag when a snapshot is taken.
+        It only wakes watchers blocked in snapshot_after, whose value would
+        otherwise be correct but arrive up to a keep-alive late -- which, for
+        the button a user presses when they want something to stop, is the
+        one place a 15-second lag is unacceptable."""
         s = self.state.get_session()
         if s is None:
             self._send_json(400, {"error": "no_session"})
             return
         cancelled = s.cancel()
+        self.state.get_loop_status().touch()
         self._send_json(200, {"cancelled": cancelled})
 
     def _get_events(self):
@@ -1029,6 +1205,43 @@ class SidecarHandler(BaseHTTPRequestHandler):
         acquirer = self.state.get_engine()
         self._send_json(200, acquirer.start(force=bool(body.get("force"))))
 
+    def _get_loop_events(self):
+        """SSE for the work loop's run state. One frame per change, each
+        carrying the WHOLE snapshot, exactly like GET /downloads/events and
+        GET /engine/events -- and for the reason loop_engine.py's "TWO
+        SHAPES" section gives: this is a gauge, and only its latest value is
+        ever wanted. Shares the same bounded SSE slot pool."""
+        q = self._query()
+        try:
+            since = int(q.get("since", 0))
+        except ValueError:
+            since = 0
+        if not self.state.acquire_sse_slot():
+            self._send_json(429, {"error": "too_many_event_streams"})
+            return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                while True:
+                    snapshot = self.state.loop_snapshot(since=since, timeout=15)
+                    if snapshot["version"] == since:
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                        continue
+                    since = snapshot["version"]
+                    chunk = "id: {}\nevent: loop\ndata: {}\n\n".format(
+                        since, json.dumps(snapshot))
+                    self.wfile.write(chunk.encode("utf-8"))
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
+                return
+        finally:
+            self.state.release_sse_slot()
+
     def _get_engine_events(self):
         """SSE for the engine fetch. One frame per change, each carrying the
         WHOLE snapshot, exactly like GET /downloads/events and for the same
@@ -1151,9 +1364,13 @@ def make_handler(state):
 
 def _self_test():
     import http.client
+    import shutil
     import socket
+    import tempfile
     import time
     import urllib.request
+
+    import session_state as session_state_mod
 
     class _FakeEngine:
         """Drives one scripted turn: a delta, a gated tool call, then done.
@@ -1175,14 +1392,15 @@ def _self_test():
             ctx.emit("cancelled", {})
 
     def _start(token="the-real-token-value", engine_factory=None, models_fetcher=None,
-               local_models_fetcher=None, model_checker=None):
+               local_models_fetcher=None, model_checker=None, loop_builder=None):
         # Both new fetchers default to "this engine has nothing", not to the
         # real ones: a self-test must never depend on what happens to be
         # installed on the machine running it, and the whole point of GET
         # /models' per-source degradation is that an empty source is normal.
         state = SidecarState(token, engine_factory=engine_factory, models_fetcher=models_fetcher,
                              local_models_fetcher=local_models_fetcher or (lambda: []),
-                             model_checker=model_checker or (lambda model: {"ok": True}))
+                             model_checker=model_checker or (lambda model: {"ok": True}),
+                             loop_builder=loop_builder)
         server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
         state.port = server.server_address[1]
         t = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
@@ -1389,7 +1607,7 @@ def _self_test():
         assert status == 200, (status, data)
         created = json.loads(data)
         assert created == {"workspace": "/tmp/ws", "model": "qwen2.5-coder", "mode": "edit",
-                           "status": "idle", "turn_id": None}, created
+                           "status": "idle", "turn_id": None, "engine": "chat"}, created
 
         status, data = _raw_request(port, "GET", "/session", headers=auth_headers)
         assert status == 200
@@ -2499,6 +2717,414 @@ def _self_test():
         finally:
             server_eng.shutdown()
             server_eng.server_close()
+
+        # ==============================================================
+        # === the work loop is reachable from the application ==========
+        # ==============================================================
+        # The loop worked from the CLI and from a sidecar constructed with a
+        # loop engine factory, and from nowhere a user could get to. These
+        # tests are about the transport that closes that gap, so they drive
+        # the REAL hearth_workloop through the REAL routes; only the model is
+        # a stand-in.
+        hearth_workloop = loop_mod.hearth_workloop
+        loop_tmp = tempfile.mkdtemp(prefix="app-loop-")
+        loop_ws = os.path.join(loop_tmp, "ws")
+        os.makedirs(loop_ws, exist_ok=True)
+
+        def _scripted_chat(script):
+            """A chat_fn that plays a fixed script and then repeats its last
+            line forever, so a run can be ended by a ceiling rather than by
+            running out of script."""
+            box = {"n": 0}
+
+            def chat(messages, tools, on_token):  # noqa: ARG001
+                step = script[min(box["n"], len(script) - 1)]
+                box["n"] += 1
+                on_token("thinking ")
+                text, calls = step
+                msg = {"role": "assistant", "content": text}
+                if calls:
+                    msg["tool_calls"] = [
+                        {"function": {"name": n, "arguments": a}} for n, a in calls]
+                return msg, 10, 20
+            return chat
+
+        def _loop_builder_for(script, tool_fn=None, hold=None):
+            """Wrap the production builder, replacing ONLY the model.
+
+            run_workloop itself -- its ceiling checks, its cancellation
+            token, its journal, its report -- is the real thing, which is the
+            point: a ceiling that is enforced by a test double proves
+            nothing about the ceiling a user sets on screen."""
+            def build(cfg, status=None):
+                eng = loop_mod.build_loop_engine(
+                    cfg, status=status,
+                    journal_factory=lambda rid: hearth_workloop.Journal(
+                        os.path.join(loop_tmp, rid + ".jsonl"), fsync=False))
+                real = eng._run_fn
+
+                def run_fn(*a, **kw):
+                    kw.setdefault("chat_fn", _scripted_chat(script))
+                    kw.setdefault("execute_tool_fn",
+                                  tool_fn or (lambda n, ar, w: "ok"))
+                    # No git store: what is under test here is the transport
+                    # and the ceilings, and hearth_checkpoint has its own
+                    # self-test for its own job.
+                    kw.setdefault("checkpoint_every_turn", False)
+                    return real(*a, **kw)
+                eng._run_fn = run_fn
+                return eng
+            return build
+
+        def _await_loop(port, headers, predicate, timeout=25):
+            end = time.monotonic() + timeout
+            snap = None
+            while time.monotonic() < end:
+                st, body = _raw_request(port, "GET", "/loop", headers=headers)
+                assert st == 200, (st, body)
+                snap = json.loads(body)
+                if predicate(snap):
+                    return snap
+                time.sleep(0.02)
+            raise AssertionError("GET /loop never satisfied the predicate: {}".format(snap))
+
+        # ---- 1. POST /session's `engine` field is the whole gap ----------
+        server_l, state_l = _start(
+            token="loop-token", engine_factory=lambda: _FakeEngine(),
+            loop_builder=_loop_builder_for([("working on it", [])]))
+        try:
+            port_l = state_l.port
+            headers_l = {"Host": "127.0.0.1:{}".format(port_l),
+                         "Authorization": "Bearer loop-token",
+                         "Content-Type": "application/json"}
+
+            # the new routes are behind the same bearer gate as every other
+            for method, route in (("GET", "/loop"), ("GET", "/loop/events")):
+                st, _ = _raw_request(port_l, method, route,
+                                     headers={"Host": "127.0.0.1:{}".format(port_l)})
+                assert st == 401, (route, st)
+
+            # with no session, GET /loop is still answerable: it reports no
+            # run rather than 404ing, because the account of a PREVIOUS run
+            # has to stay readable and the blind spots have to be readable
+            # before one starts.
+            st, body = _raw_request(port_l, "GET", "/loop", headers=headers_l)
+            assert st == 200, (st, body)
+            empty = json.loads(body)
+            assert empty["run"] is None and empty["engine"] is None, empty
+            assert empty["blind_spots"], "the honest limits must be readable up front"
+
+            # the default engine is chat, and a chat session is not a loop
+            st, body = _raw_request(port_l, "POST", "/session", headers=headers_l,
+                                    body=json.dumps({"workspace": loop_ws,
+                                                     "model": "m", "mode": "auto"}))
+            assert st == 200, (st, body)
+            assert json.loads(body)["engine"] == "chat", body
+            st, body = _raw_request(port_l, "GET", "/loop", headers=headers_l)
+            assert json.loads(body)["engine"] == "chat", body
+
+            # and THIS is the field that makes the loop reachable at all
+            st, body = _raw_request(port_l, "POST", "/session", headers=headers_l,
+                                    body=json.dumps({
+                                        "workspace": loop_ws, "model": "m",
+                                        "mode": "auto", "engine": "loop",
+                                        "loop": {"ceilings": {"max_turns": 3},
+                                                 "allowed_tools": ["read_file",
+                                                                   "write_file"]}}))
+            assert st == 200, (st, body)
+            made = json.loads(body)
+            assert made["engine"] == "loop", made
+            # the response describes the run that would actually start, read
+            # off the engine object rather than echoed back from the request
+            assert made["loop"]["ceilings"]["max_turns"] == 3, made
+            assert made["loop"]["allowed_tools"] == ["read_file", "write_file"], made
+            assert "bypass" not in made["loop"]["modes"], made
+
+            # GET /session says so too, so a reloaded page shows loop controls
+            st, body = _raw_request(port_l, "GET", "/session", headers=headers_l)
+            assert json.loads(body)["engine"] == "loop", body
+
+            # ---- 2. A CEILING SET OVER HTTP IS THE CEILING ENFORCED -----
+            # named: "a ceiling set over HTTP is the ceiling enforced"
+            st, body = _raw_request(port_l, "POST", "/prompt", headers=headers_l,
+                                    body=json.dumps({"message": "go forever"}))
+            assert st == 200, (st, body)
+            snap = _await_loop(port_l, headers_l,
+                               lambda s: s["run"] and s["run"]["state"] == "stopped")
+            run = snap["run"]
+            assert run["stop_reason"] == "ceiling", (
+                "the run must end on the ceiling the HTTP body set, not on "
+                "anything else", run)
+            assert "turns ceiling" in run["stop_detail"], run
+            assert "3 of 3" in run["stop_detail"], (
+                "and it must be the NUMBER that was sent, not a default", run)
+            assert run["ceilings"]["max_turns"] == 3, run
+            assert run["spend"]["turns"] == 3, run
+            assert snap["report"]["turns"] == 3, snap["report"]
+            assert snap["account"] and "hearth work loop" in snap["account"], snap
+            assert "turns ceiling reached (3 of 3)" in snap["account"], snap["account"]
+
+            # the account carries the detectors' honest limits to the reader
+            assert "wrong answer" in snap["account"], (
+                "a user who believes an unstalled run is a working run has been "
+                "misled by this product", snap["account"])
+
+            # the capability manifest the run actually had is visible
+            assert run["allowed_tools"] == ["read_file", "write_file"], run
+            assert run["verified"] is False, (
+                "no completion check was configured, and the gauge must say so "
+                "rather than let 'completed' look verified", run)
+
+            # ---- 3. GET /loop/events streams whole snapshots ------------
+            frames = []
+
+            def _read_loop_stream():
+                conn = http.client.HTTPConnection("127.0.0.1", port_l, timeout=20)
+                conn.request("GET", "/loop/events?since=0", headers=dict(
+                    headers_l, Accept="text/event-stream"))
+                resp = conn.getresponse()
+                assert resp.status == 200, resp.status
+                buf = ""
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline and len(frames) < 3:
+                    chunk = resp.read(1)
+                    if not chunk:
+                        break
+                    buf += chunk.decode("utf-8", "replace")
+                    while "\n\n" in buf:
+                        frame, buf = buf.split("\n\n", 1)
+                        for line in frame.split("\n"):
+                            if line.startswith("data: "):
+                                frames.append(json.loads(line[6:]))
+                conn.close()
+
+            reader = threading.Thread(target=_read_loop_stream, daemon=True)
+            reader.start()
+            time.sleep(0.3)
+            _raw_request(port_l, "POST", "/prompt", headers=headers_l,
+                         body=json.dumps({"message": "go again"}))
+            reader.join(20)
+            assert len(frames) >= 2, ("the loop stream produced no frames", len(frames))
+            for f in frames:
+                # EVERY frame is the whole state, not a delta: that is what
+                # makes a page that connects an hour in immediately correct.
+                assert "version" in f and "blind_spots" in f, f
+                assert "run" in f and "account" in f and "pending" in f, f
+            assert frames[-1]["version"] > frames[0]["version"], frames
+
+            # ---- 4. bad configs are refused BY NAME, never clamped ------
+            for bad, needle in (
+                    ({"ceilings": {"max_turns": 0}}, "max_turns"),
+                    ({"ceilings": {"max_turns": -1}}, "max_turns"),
+                    ({"ceilings": {"max_turns": None}}, "max_turns"),
+                    ({"ceilings": {"max_vibes": 4}}, "max_vibes"),
+                    ({"gate_policy": "always"}, "gate_policy"),
+                    ({"allowed_tools": ["read_file", "exfiltrate"]}, "exfiltrate"),
+                    ({"allowed_tools": []}, "allowed_tools"),
+                    ({"required_artifacts": ["../escape"]}, "escape"),
+                    ({"gate_timeout_seconds": 1}, "gate_timeout_seconds")):
+                st, body = _raw_request(port_l, "POST", "/session", headers=headers_l,
+                                        body=json.dumps({
+                                            "workspace": loop_ws, "model": "m",
+                                            "mode": "auto", "engine": "loop",
+                                            "loop": bad}))
+                assert st == 400, (bad, st, body)
+                assert needle in json.loads(body)["error"], (bad, body)
+
+            # an unattended run cannot be given a mode nobody can supervise,
+            # and bypass is refused before the loop branch is even reached
+            for mode, expect in (("edit", "cannot run in"), ("bypass", "bypass")):
+                st, body = _raw_request(port_l, "POST", "/session", headers=headers_l,
+                                        body=json.dumps({
+                                            "workspace": loop_ws, "model": "m",
+                                            "mode": mode, "engine": "loop"}))
+                assert st == 400, (mode, st, body)
+                assert expect in json.loads(body)["error"], (mode, body)
+
+            st, body = _raw_request(port_l, "POST", "/session", headers=headers_l,
+                                    body=json.dumps({"workspace": loop_ws, "model": "m",
+                                                     "engine": "telepathy"}))
+            assert st == 400 and "engine" in json.loads(body)["error"], body
+        finally:
+            server_l.shutdown()
+            server_l.server_close()
+
+        # ---- 5. POST /cancel IS the work loop's kill switch --------------
+        # named: "POST /cancel stops a work loop"
+        # There is no POST /loop/stop and there must not be. This proves the
+        # existing route reaches the loop's own CancelToken, from HTTP, with
+        # a real run_workloop in between -- and that the snapshot does not
+        # claim a clean stop while an abandoned tool call is still running.
+        held = threading.Event()
+        in_tool = threading.Event()
+
+        def _slow_tool(name, args, workspace):  # noqa: ARG001
+            in_tool.set()
+            held.wait(20)
+            return "eventually"
+
+        server_c, state_c = _start(
+            token="cancel-token", engine_factory=lambda: _FakeEngine(),
+            loop_builder=_loop_builder_for(
+                [("running it", [("read_file", {"path": "a"})])],
+                tool_fn=_slow_tool))
+        try:
+            port_c = state_c.port
+            headers_c = {"Host": "127.0.0.1:{}".format(port_c),
+                         "Authorization": "Bearer cancel-token",
+                         "Content-Type": "application/json"}
+            st, body = _raw_request(port_c, "POST", "/session", headers=headers_c,
+                                    body=json.dumps({
+                                        "workspace": loop_ws, "model": "m",
+                                        "mode": "auto", "engine": "loop",
+                                        "loop": {"ceilings": {"max_seconds": 600}}}))
+            assert st == 200, (st, body)
+            st, _ = _raw_request(port_c, "POST", "/prompt", headers=headers_c,
+                                 body=json.dumps({"message": "start something slow"}))
+            assert st == 200
+            assert in_tool.wait(20), "the loop never reached its tool call"
+
+            snap = _await_loop(port_c, headers_c,
+                               lambda s: s["run"] and s["run"]["live_workers"] == 1)
+            assert snap["run"]["state"] == "running", snap["run"]
+            assert snap["run"]["stop_requested"] is False, snap["run"]
+
+            t0 = time.monotonic()
+            st, body = _raw_request(port_c, "POST", "/cancel", headers=headers_c)
+            assert st == 200 and json.loads(body)["cancelled"] is True, body
+            snap = _await_loop(port_c, headers_c,
+                               lambda s: s["run"]["state"] == "stopped", timeout=15)
+            dt = time.monotonic() - t0
+            assert dt < 8.0, (
+                "POST /cancel must reach the loop's CancelToken promptly; if it "
+                "does not, the Stop button and the loop are two different "
+                "mechanisms. Took {:.2f}s".format(dt))
+            assert snap["run"]["stop_reason"] == "cancelled", snap["run"]
+            assert snap["run"]["stop_requested"] is True, snap["run"]
+
+            # AND IT MUST NOT CLAIM A CLEAN STOP. The tool call is still
+            # running: Python cannot kill a thread, so cancellation abandons
+            # rather than kills, and a UI told "stopped" while a shell command
+            # is still writing to the workspace is lying at the worst moment.
+            assert snap["run"]["live_workers"] == 1, (
+                "the snapshot must admit an abandoned tool call is still live",
+                snap["run"])
+            assert snap["report"]["live_workers"] == 1, snap["report"]
+            assert "abandoned tool call" in snap["account"], snap["account"]
+
+            # the same live worker keeps the workspace busy, so POST /restore
+            # refuses to act on a directory something is still writing to
+            st, body = _raw_request(port_c, "POST", "/restore", headers=headers_c,
+                                    body=json.dumps({"checkpoint_id": "whatever"}))
+            assert st == 409, (st, body)
+
+            held.set()
+            snap = _await_loop(port_c, headers_c,
+                               lambda s: s["run"]["live_workers"] == 0, timeout=20)
+            assert snap["run"]["state"] == "stopped", snap["run"]
+        finally:
+            held.set()
+            server_c.shutdown()
+            server_c.server_close()
+
+        # ---- 6. a restart neither resumes silently nor loses the run -----
+        # named: "a restarted sidecar reports the unfinished run as pending"
+        restart_state = {}
+
+        def _fake_load():
+            return restart_state.get("saved")
+
+        prev_data_dir = os.environ.get("HEARTH_DATA_DIR")
+        os.environ["HEARTH_DATA_DIR"] = os.path.join(loop_tmp, "data")
+        real_journal_path = hearth_workloop.journal_path
+        hearth_workloop.journal_path = lambda rid: os.path.join(loop_tmp, rid + ".jsonl")
+        try:
+            import main as main_mod  # noqa: PLC0415
+
+            # A state file describing a loop session that was mid-run.
+            run_id = "loop-restarted"
+            j = hearth_workloop.Journal(hearth_workloop.journal_path(run_id), fsync=False)
+            j.append({"t": "run", "version": hearth_workloop.JOURNAL_VERSION,
+                      "run_id": run_id, "goal": "tidy the workspace", "mode": "auto",
+                      "gate_policy": "deny",
+                      "allowed_tools": sorted(hearth_workloop.DEFAULT_ALLOWED_TOOLS)})
+            j.append({"t": "turn_end", "turn": 1, "digest": "d1"})
+            j.append({"t": "turn_start", "turn": 2})  # the process died here
+            restart_state["saved"] = {
+                "version": session_state_mod.STATE_VERSION,
+                "saved_at": time.time(), "workspace": loop_ws, "model": "m",
+                "mode": "auto", "status_at_save": "running", "turn_id_at_save": "t1",
+                "pending_approval_tool": None,
+                "engine_kind": "loop",
+                "engine_config": {"ceilings": {"max_turns": 11}},
+                "engine_state": {
+                    "messages": [{"role": "system",
+                                  "content": hearth_workloop.LOOP_SYSTEM}],
+                    "run_id": run_id, "goal": "tidy the workspace",
+                    "finished": False, "last_report": None},
+                "recent_events": [],
+            }
+            server_r, state_r = main_mod.make_server(
+                engine_factory=lambda: _FakeEngine(), token="restart-token",
+                state_loader=_fake_load, persist_hook=False)
+            # persist_hook=False disables restore, so drive the same code path
+            # main.py's production branch takes, directly.
+            server_r.server_close()
+            server_r, state_r = main_mod.make_server(
+                engine_factory=lambda: _FakeEngine(), token="restart-token",
+                state_loader=_fake_load,
+                persist_hook=lambda session: None)
+            threading.Thread(target=server_r.serve_forever,
+                             kwargs={"poll_interval": 0.05}, daemon=True).start()
+            try:
+                port_r = state_r.port
+                headers_r = {"Host": "127.0.0.1:{}".format(port_r),
+                             "Authorization": "Bearer restart-token",
+                             "Content-Type": "application/json"}
+                st, body = _raw_request(port_r, "GET", "/session", headers=headers_r)
+                assert st == 200, (st, body)
+                assert json.loads(body)["engine"] == "loop", (
+                    "a restart must rebuild a LOOP session; coming back as a chat "
+                    "would strand the journal where nothing can see it", body)
+                assert json.loads(body)["loop"]["ceilings"]["max_turns"] == 11, body
+
+                st, body = _raw_request(port_r, "GET", "/loop", headers=headers_r)
+                assert st == 200, (st, body)
+                snap = json.loads(body)
+                assert snap["run"] is None, (
+                    "a restart must not look like it silently picked the work "
+                    "back up", snap)
+                pend = snap["pending"]
+                assert pend is not None, (
+                    "and it must not silently lose the run either", snap)
+                assert pend["run_id"] == run_id, pend
+                assert pend["goal"] == "tidy the workspace", pend
+                assert pend["completed_turns"] == 1, pend
+                assert pend["interrupted_turn"] == 2, (
+                    "the turn that started and never ended must be named", pend)
+                assert pend["resumable"] is True and pend["refusal"] is None, pend
+
+                # A JOURNAL IS A FILE THE AGENT CAN WRITE. It may say what a
+                # run WAS; it may never say what a run is allowed to be.
+                hostile = hearth_workloop.Journal(
+                    hearth_workloop.journal_path("loop-hostile"), fsync=False)
+                hostile.append({"t": "run", "version": hearth_workloop.JOURNAL_VERSION,
+                                "run_id": "loop-hostile", "goal": "g",
+                                "mode": "bypass", "gate_policy": "deny",
+                                "allowed_tools": []})
+                verdict = loop_mod.inspect_journal("loop-hostile")
+                assert verdict["resumable"] is False, verdict
+                assert "may not run in" in verdict["refusal"], verdict
+            finally:
+                server_r.shutdown()
+                server_r.server_close()
+        finally:
+            hearth_workloop.journal_path = real_journal_path
+            if prev_data_dir is None:
+                os.environ.pop("HEARTH_DATA_DIR", None)
+            else:
+                os.environ["HEARTH_DATA_DIR"] = prev_data_dir
+            shutil.rmtree(loop_tmp, ignore_errors=True)
 
         # === the four route allowlists agree ==========================
         # This router's table is duplicated, by necessity, in three
