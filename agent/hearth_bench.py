@@ -12,10 +12,37 @@ docs/model-shop.md, "Why there's no predicted tokens per second", for the
 full argument. That decision is not revisited here.
 
 The honest alternative is to MEASURE. This module runs one short,
-deterministic generation against the user's own Ollama server on their own
-hardware, reads back what the server itself reports actually happened, and
-shows that number. If a measurement cannot be taken, the module says so
-plainly instead of guessing.
+deterministic generation on the user's own hardware, reads back what
+actually happened, and shows that number. If a measurement cannot be taken,
+the module says so plainly instead of guessing.
+
+## Two engines, and why the numbers are not the same kind of number
+
+Hearth runs models on its own bundled llama-server by default, and on
+Ollama when the user already has one (see agent/hearth_backend.py). Both
+are measured, but not identically, and the difference is recorded in every
+result rather than smoothed over:
+
+  Ollama reports its own load_duration / prompt_eval_duration /
+  eval_duration, measured inside the process doing the arithmetic. So
+  tokens_per_second there is eval_count / eval_duration, with
+  tokens_per_second_source "server_eval_duration", and the HTTP round trip
+  is excluded. All of the reasoning below about which of those fields to
+  trust applies to that path, and only to it.
+
+  llama-server also keeps a timings block, but hearth_llama's stream
+  consumer folds only the usage counts out of a response and discards it,
+  so there is no server-reported rate to read. The bundled path therefore
+  measures wall clock and says tokens_per_second_source "wall_clock". That
+  is a slightly pessimistic number, since it includes request overhead,
+  and comparing it against a server_eval_duration figure is not apples to
+  apples. tokens_per_second_source is in every result so a caller can tell
+  which it has; the "backend" field says which engine produced it.
+
+Because those two numbers are not interchangeable, the measurement cache
+is keyed by the backend-qualified model reference (ModelRef.as_text(), so
+"ollama:qwen2.5-coder:latest" and "gguf:C:\models\qwen.gguf" can never
+collide) alongside the hardware signature.
 
 The target user runs local models around the clock, often on modest
 hardware shared with everything else the machine does. For them, real
@@ -159,6 +186,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import hearth_backend  # noqa: E402
 import hearth_paths  # noqa: E402
 import hearth_hw  # noqa: E402
 
@@ -549,22 +577,72 @@ def _attribute_energy(samples, t0_perf, load_seconds, prompt_eval_seconds,
 # Core measurement
 # --------------------------------------------------------------------------
 
-def measure(base_url, model, prompt=None, num_predict=DEFAULT_NUM_PREDICT, timeout=GENERATE_TIMEOUT):
+def measure(model, base_url=None, prompt=None, num_predict=DEFAULT_NUM_PREDICT,
+            timeout=GENERATE_TIMEOUT, backend=None):
+    """Measure throughput on whichever engine is active.
+
+    `model` may be a ModelRef or a string; a bare string is read in the
+    active backend's own namespace (a GGUF path for the bundled engine, a
+    registry tag for Ollama), and an explicitly prefixed string of the
+    wrong kind is refused rather than coerced. See hearth_backend.ModelRef.
+
+    `base_url` names the Ollama server and is used only when the Ollama
+    backend is in use. The bundled engine is a process Hearth starts
+    itself on an ephemeral loopback port it chooses, so there is no URL for
+    a caller to supply and this argument is ignored on that path.
+
+    `backend` overrides the active-backend lookup, which is what the
+    self-test uses to exercise one engine's path deterministically on a
+    machine that has neither installed.
+
+    Always returns a dict, never raises. Every result carries "backend" and
+    "tokens_per_second_source" so a caller can tell which engine produced
+    the number and how it was derived; see the module docstring for why
+    those two are not comparable across engines.
+    """
+    backend = backend if backend is not None else hearth_backend.get_backend(
+        ollama_url=base_url)
+    if backend.name == hearth_backend.BACKEND_OLLAMA:
+        # Route through the backend's own base_url when the caller did not
+        # name one, so an Ollama on a non-default port still gets measured.
+        return measure_ollama(base_url or backend.base_url, model, prompt=prompt,
+                              num_predict=num_predict, timeout=timeout)
+    return backend.measure(model, prompt=prompt, num_predict=num_predict,
+                           timeout=timeout)
+
+
+def measure_ollama(base_url, model, prompt=None, num_predict=DEFAULT_NUM_PREDICT,
+                   timeout=GENERATE_TIMEOUT):
     """Run one short, deterministic generation against Ollama and report
     what actually happened. See the module docstring for which timing
     fields are trusted and why, how residency is attached, and the
     conditions under which energy_wh_per_1k_tokens appears.
 
+    The Ollama-specific implementation, called by measure() when that
+    backend is active and by hearth_backend.OllamaBackend.measure. `model`
+    is an Ollama registry tag; a ModelRef of that kind is accepted and
+    unwrapped, and a GGUF ref is refused.
+
     Always returns a dict, never raises: connection refused, model not
     pulled, a timeout, or a malformed response all come back as
     ok: False with error explaining what went wrong.
     """
+    if isinstance(model, hearth_backend.ModelRef):
+        if model.kind != hearth_backend.KIND_OLLAMA:
+            return {"ok": False, "backend": hearth_backend.BACKEND_OLLAMA,
+                    "model": model.value, "tokens_per_second": None,
+                    "tokens_per_second_source": None, "wall_seconds": None,
+                    "tokens_generated": 0,
+                    "error": "measure_ollama needs an ollama model reference, "
+                             "not a {} one".format(model.kind)}
+        model = model.value
     prompt = DEFAULT_PROMPT if prompt is None else prompt
     base_url = (base_url or "").rstrip("/")
 
     result = {
         "ok": False,
         "error": None,
+        "backend": hearth_backend.BACKEND_OLLAMA,
         "model": model,
         "base_url": base_url,
         "timestamp": _now_iso(),
@@ -744,31 +822,53 @@ def _save_cache(data):
         pass
 
 
-def _cache_key(model, hw_sig):
-    return "{}::{}".format(hw_sig, model)
+def _cache_key(model, hw_sig, backend_name=None):
+    """The cache key for one measurement.
+
+    The model part is the backend-qualified ModelRef text, not the bare
+    name, so a GGUF file and an Ollama tag can never share an entry. That
+    matters because the two engines produce a tokens_per_second derived a
+    different way (see the module docstring), and serving one from the
+    other's cache entry would silently mix them.
+    """
+    if isinstance(model, hearth_backend.ModelRef):
+        name = model.as_text()
+    elif backend_name is not None:
+        name = hearth_backend.ModelRef.parse(
+            model,
+            default_kind=(hearth_backend.KIND_OLLAMA
+                          if backend_name == hearth_backend.BACKEND_OLLAMA
+                          else hearth_backend.KIND_GGUF),
+        ).as_text()
+    else:
+        name = str(model)
+    return "{}::{}".format(hw_sig, name)
 
 
-def cached_measure(base_url, model, prompt=None, num_predict=DEFAULT_NUM_PREDICT,
-                    force=False, timeout=GENERATE_TIMEOUT):
-    """measure(), but only once per (model, hardware_signature()).
+def cached_measure(model, base_url=None, prompt=None, num_predict=DEFAULT_NUM_PREDICT,
+                    force=False, timeout=GENERATE_TIMEOUT, backend=None):
+    """measure(), but only once per (model, backend, hardware_signature()).
 
     A hit returns the stored result with from_cache: True added. A miss
     (including "hardware changed since the last measurement") runs
     measure() and, if it succeeded, stores the result before returning it.
     A failed measurement (ok: False) is never cached, so a transient
-    problem (Ollama briefly down) does not stick around and shadow a
-    working server on the next call.
+    problem (the engine briefly unavailable) does not stick around and
+    shadow a working one on the next call.
     """
+    backend = backend if backend is not None else hearth_backend.get_backend(
+        ollama_url=base_url)
     hw_sig = hardware_signature()
     cache = _load_cache()
-    key = _cache_key(model, hw_sig)
+    key = _cache_key(model, hw_sig, backend.name)
     entry = cache.get(key)
     if entry and not force and entry.get("ok"):
         hit = dict(entry)
         hit["from_cache"] = True
         return hit
 
-    result = measure(base_url, model, prompt=prompt, num_predict=num_predict, timeout=timeout)
+    result = measure(model, base_url=base_url, prompt=prompt, num_predict=num_predict,
+                     timeout=timeout, backend=backend)
     result["hardware_signature"] = hw_sig
     result["from_cache"] = False
     if result.get("ok"):
@@ -799,17 +899,25 @@ def _rank_key(result):
     return (0 if ok else 1, -tps)
 
 
-def compare(base_url, models, prompt=None, num_predict=DEFAULT_NUM_PREDICT,
-            force=False, timeout=GENERATE_TIMEOUT):
+def compare(models, base_url=None, prompt=None, num_predict=DEFAULT_NUM_PREDICT,
+            force=False, timeout=GENERATE_TIMEOUT, backend=None):
     """Measure several models (via cached_measure) and return them ranked
     fastest first. A model that could not be measured sorts to the bottom,
     regardless of any partial numbers it produced, and keeps ok: False so
     a caller can tell "slow" from "unmeasurable" apart. Each entry gets a
     1-based rank field.
+
+    Every model is measured on the SAME backend, so the ranking compares
+    like with like. Ranking a wall-clock figure from the bundled engine
+    against a server-reported one from Ollama would not be a fair
+    comparison (see the module docstring), and this function does not
+    offer a way to ask for one.
     """
+    backend = backend if backend is not None else hearth_backend.get_backend(
+        ollama_url=base_url)
     results = [
-        cached_measure(base_url, m, prompt=prompt, num_predict=num_predict,
-                        force=force, timeout=timeout)
+        cached_measure(m, base_url=base_url, prompt=prompt, num_predict=num_predict,
+                        force=force, timeout=timeout, backend=backend)
         for m in models
     ]
     ranked = sorted(results, key=_rank_key)
@@ -825,10 +933,13 @@ def compare(base_url, models, prompt=None, num_predict=DEFAULT_NUM_PREDICT,
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="hearth-bench",
-        description="Measure real Ollama throughput on this machine. Never predicts it.",
+        description="Measure real throughput on this machine. Never predicts it.",
     )
     parser.add_argument("--self-test", action="store_true")
-    parser.add_argument("--base-url", default=DEFAULT_OLLAMA)
+    parser.add_argument("--base-url", default=DEFAULT_OLLAMA,
+                        help="Ollama base URL; ignored when the bundled engine is in use")
+    parser.add_argument("--backend", choices=hearth_backend.BACKENDS, default=None,
+                        help="force an engine instead of using the active one")
     sub = parser.add_subparsers(dest="command")
 
     p_measure = sub.add_parser("measure", help="measure one model")
@@ -849,20 +960,30 @@ def main(argv=None):
     if args.self_test:
         return _self_test()
 
+    backend = (hearth_backend.build(args.backend, args.base_url) if args.backend
+               else hearth_backend.get_backend(ollama_url=args.base_url))
+
     if args.command == "measure":
         if args.no_cache:
-            result = measure(args.base_url, args.model, num_predict=args.num_predict)
+            result = measure(args.model, base_url=args.base_url,
+                             num_predict=args.num_predict, backend=backend)
         else:
-            result = cached_measure(args.base_url, args.model, num_predict=args.num_predict, force=args.force)
+            result = cached_measure(args.model, base_url=args.base_url,
+                                    num_predict=args.num_predict, force=args.force,
+                                    backend=backend)
         print(json.dumps(result, indent=2))
         return 0 if result.get("ok") else 1
 
     if args.command == "residency":
-        print(json.dumps(residency(args.base_url, args.model), indent=2))
+        if backend.name == hearth_backend.BACKEND_OLLAMA:
+            print(json.dumps(residency(args.base_url, args.model), indent=2))
+        else:
+            print(json.dumps(backend.residency(backend.check_ref(args.model)), indent=2))
         return 0
 
     if args.command == "compare":
-        ranked = compare(args.base_url, args.models, force=args.force)
+        ranked = compare(args.models, base_url=args.base_url, force=args.force,
+                         backend=backend)
         print(json.dumps(ranked, indent=2))
         return 0 if all(r.get("ok") for r in ranked) else 1
 
@@ -949,9 +1070,15 @@ def _run_live_http_self_test():
     thread.start()
     try:
         base_url = "http://127.0.0.1:{}".format(port)
+        # An explicit Ollama backend: the point of this test is the real
+        # urllib path against a real socket, not backend selection, and the
+        # machine running it may have no engine installed at all.
+        live_backend = hearth_backend.OllamaBackend(base_url)
 
-        r = measure(base_url, "fixture-model:latest", num_predict=40)
+        r = measure("fixture-model:latest", base_url=base_url, num_predict=40,
+                    backend=live_backend)
         assert r["ok"] is True, r
+        assert r["backend"] == hearth_backend.BACKEND_OLLAMA, r
         assert r["tokens_generated"] == 40, r
         assert r["tokens_per_second"] == 20.0, r
         assert r["tokens_per_second_source"] == "server_eval_duration", r
@@ -959,13 +1086,26 @@ def _run_live_http_self_test():
         assert r["residency"]["loaded"] is True, r
         assert r["residency"]["fully_resident"] is True, r
 
-        missing = measure(base_url, "missing-model", num_predict=40)
+        missing = measure("missing-model", base_url=base_url, num_predict=40,
+                          backend=live_backend)
         assert missing["ok"] is False, missing
         assert "missing-model" in (missing["error"] or ""), missing
 
         res = residency(base_url, "fixture-model")
         assert res["loaded"] is True, res
         assert res["vram_fraction"] == 1.0, res
+
+        # The same request through OllamaBackend.measure, which is what
+        # hearth_backend hands callers: it must reach this same real socket
+        # and produce the same number, so the delegation is proved rather
+        # than assumed.
+        via = live_backend.measure("fixture-model:latest", num_predict=40)
+        assert via["ok"] is True and via["tokens_per_second"] == 20.0, via
+        assert via["backend"] == hearth_backend.BACKEND_OLLAMA, via
+        # A GGUF reference must be refused here too, not sent to Ollama as
+        # if a file path were a registry tag.
+        bad = live_backend.measure(hearth_backend.ModelRef.gguf("/m/a.gguf"))
+        assert bad["ok"] is False and bad["error"], bad
     finally:
         server.shutdown()
         server.server_close()
@@ -982,6 +1122,12 @@ def _self_test():
     orig_gpu_count = _detect_gpu_count
     orig_probe = hearth_hw.probe
     orig_monotonic = time.monotonic
+
+    # An explicit Ollama backend for every test that exercises the Ollama
+    # measurement path. Passed rather than selected, so these tests measure
+    # what they say they measure on a machine with neither engine installed
+    # (this one), instead of quietly routing to whatever select() picks.
+    _ob = hearth_backend.OllamaBackend("http://x:11434")
 
     try:
         # -- _attribute_energy(): THE regression pin. These are the exact ----
@@ -1148,7 +1294,7 @@ def _self_test():
         # never actually reached in real elapsed time. Per the "omit rather
         # than guess" rule, energy must be absent here: this is exactly the
         # case a fudged before/after reading would have papered over.
-        r = measure("http://x:11434", "m", num_predict=100)
+        r = measure_ollama("http://x:11434", "m", num_predict=100)
         assert r["ok"] is True, r
         assert r["error"] is None, r
         assert r["tokens_generated"] == 100, r
@@ -1165,7 +1311,7 @@ def _self_test():
 
         # -- measure(): missing power reading omits energy, does not fabricate
         _gpu_power_watts = lambda: None  # noqa: E731
-        r_no_power = measure("http://x:11434", "m", num_predict=100)
+        r_no_power = measure_ollama("http://x:11434", "m", num_predict=100)
         assert r_no_power["ok"] is True, r_no_power
         assert "energy_wh_per_1k_tokens" not in r_no_power, r_no_power
         assert "energy_note" not in r_no_power, r_no_power
@@ -1201,12 +1347,12 @@ def _self_test():
 
         # short load/prompt: 20ms load + 20ms prompt + 200ms eval, sleep covers it
         _http_post = make_realtime_post(20_000_000, 20_000_000, 200_000_000, 0.30)
-        r_short_load = measure("http://x:11434", "m", num_predict=20)
+        r_short_load = measure_ollama("http://x:11434", "m", num_predict=20)
         assert r_short_load["ok"] is True, r_short_load
 
         # long load/prompt: 500ms load + 100ms prompt + the SAME 200ms eval
         _http_post = make_realtime_post(500_000_000, 100_000_000, 200_000_000, 0.90)
-        r_long_load = measure("http://x:11434", "m", num_predict=20)
+        r_long_load = measure_ollama("http://x:11434", "m", num_predict=20)
         assert r_long_load["ok"] is True, r_long_load
 
         # Both must have actually measured energy (proves the sampler landed
@@ -1228,7 +1374,7 @@ def _self_test():
         # -- measure(): multi-GPU disclosure - the figure is still reported --
         # -- but with a plain caveat and the GPU count, never silently summed
         _detect_gpu_count = lambda: 3  # noqa: E731
-        r_multi_gpu = measure("http://x:11434", "m", num_predict=20)
+        r_multi_gpu = measure_ollama("http://x:11434", "m", num_predict=20)
         assert r_multi_gpu["ok"] is True, r_multi_gpu
         assert "energy_wh_per_1k_tokens" in r_multi_gpu, r_multi_gpu
         assert r_multi_gpu.get("energy_gpu_count") == 3, r_multi_gpu
@@ -1237,7 +1383,7 @@ def _self_test():
 
         # -- measure(): single GPU carries the count but no caveat -----------
         _detect_gpu_count = lambda: 1  # noqa: E731
-        r_single_gpu = measure("http://x:11434", "m", num_predict=20)
+        r_single_gpu = measure_ollama("http://x:11434", "m", num_predict=20)
         assert r_single_gpu.get("energy_gpu_count") == 1, r_single_gpu
         assert "energy_note" not in r_single_gpu, r_single_gpu
 
@@ -1260,7 +1406,7 @@ def _self_test():
         fake_times = iter([1000.0, 1002.0])  # wall_seconds == 2.0, exactly
         time.monotonic = lambda: next(fake_times)  # noqa: E731
         try:
-            r_wall = measure("http://x:11434", "m", num_predict=50)
+            r_wall = measure_ollama("http://x:11434", "m", num_predict=50)
         finally:
             time.monotonic = orig_monotonic
         assert r_wall["ok"] is True, r_wall
@@ -1273,7 +1419,7 @@ def _self_test():
 
         # -- measure(): eval_count == 0 is a failure, not a silent zero ------
         _http_post = lambda url, payload, timeout: {"eval_count": 0, "error": "context deadline exceeded"}  # noqa: E731
-        r_zero = measure("http://x:11434", "m")
+        r_zero = measure_ollama("http://x:11434", "m")
         assert r_zero["ok"] is False, r_zero
         assert r_zero["error"] == "context deadline exceeded", r_zero
 
@@ -1282,7 +1428,7 @@ def _self_test():
             raise urllib.error.URLError("Connection refused")
 
         _http_post = post_refused
-        r_refused = measure("http://x:11434", "m")
+        r_refused = measure_ollama("http://x:11434", "m")
         assert r_refused["ok"] is False, r_refused
         assert "Connection refused" in r_refused["error"], r_refused
 
@@ -1292,7 +1438,7 @@ def _self_test():
             raise urllib.error.HTTPError(url=url, code=404, msg="Not Found", hdrs=None, fp=io.BytesIO(body))
 
         _http_post = post_404
-        r_404 = measure("http://x:11434", "ghost")
+        r_404 = measure_ollama("http://x:11434", "ghost")
         assert r_404["ok"] is False, r_404
         assert "404" in r_404["error"] and "ghost" in r_404["error"], r_404
 
@@ -1301,13 +1447,13 @@ def _self_test():
             raise ValueError("Expecting value: line 1 column 1 (char 0)")
 
         _http_post = post_bad_json
-        r_bad_json = measure("http://x:11434", "m")
+        r_bad_json = measure_ollama("http://x:11434", "m")
         assert r_bad_json["ok"] is False, r_bad_json
         assert "invalid JSON" in r_bad_json["error"], r_bad_json
 
         # -- measure(): empty base_url / empty model never raise -------------
-        assert measure("", "m")["error"] == "empty base_url"
-        assert measure("http://x:11434", "")["error"] == "empty model"
+        assert measure_ollama("", "m")["error"] == "empty base_url"
+        assert measure_ollama("http://x:11434", "")["error"] == "empty model"
 
         # -- residency(): exact match, tag-stripped match, partial residency -
         _http_get = lambda url, timeout: {  # noqa: E731
@@ -1393,24 +1539,28 @@ def _self_test():
             _http_get = lambda url, timeout: {"models": []}  # noqa: E731
 
             hearth_hw.probe = lambda: rtx2060
-            first = cached_measure("http://x:11434", "cache-model", num_predict=100)
+            first = cached_measure("cache-model", base_url="http://x:11434", num_predict=100,
+                                    backend=_ob)
             assert first["ok"] is True, first
             assert first["from_cache"] is False, first
             assert call_count["n"] == 1, call_count
             assert first["tokens_per_second"] == 20.0, first
 
-            second = cached_measure("http://x:11434", "cache-model", num_predict=100)
+            second = cached_measure("cache-model", base_url="http://x:11434", num_predict=100,
+                                    backend=_ob)
             assert second["from_cache"] is True, second
             assert call_count["n"] == 1, call_count  # no second HTTP call: served from cache
             assert second["tokens_per_second"] == 20.0, second
 
-            forced = cached_measure("http://x:11434", "cache-model", num_predict=100, force=True)
+            forced = cached_measure("cache-model", base_url="http://x:11434", num_predict=100,
+                                     force=True, backend=_ob)
             assert forced["from_cache"] is False, forced
             assert call_count["n"] == 2, call_count
 
             # hardware change invalidates the cache for the same model
             hearth_hw.probe = lambda: rtx5080
-            third = cached_measure("http://x:11434", "cache-model", num_predict=100)
+            third = cached_measure("cache-model", base_url="http://x:11434", num_predict=100,
+                                    backend=_ob)
             assert third["from_cache"] is False, third
             assert call_count["n"] == 3, call_count
 
@@ -1425,11 +1575,12 @@ def _self_test():
             # a failed measurement is never cached
             hearth_hw.probe = lambda: rtx2060
             _http_post = lambda url, payload, timeout: (_ for _ in ()).throw(urllib.error.URLError("down"))  # noqa: E731
-            failed = cached_measure("http://x:11434", "flaky-model", num_predict=100)
+            failed = cached_measure("flaky-model", base_url="http://x:11434", num_predict=100,
+                                     backend=_ob)
             assert failed["ok"] is False, failed
             assert failed["from_cache"] is False, failed
             cache_after_failure = _load_cache()
-            assert not any(k.endswith("::flaky-model") for k in cache_after_failure), cache_after_failure
+            assert not any(k.endswith("::ollama:flaky-model") for k in cache_after_failure), cache_after_failure
         finally:
             if old_data_dir_env is None:
                 os.environ.pop("HEARTH_DATA_DIR", None)
@@ -1467,7 +1618,8 @@ def _self_test():
             _http_post = post_compare
             _http_get = lambda url, timeout: {"models": []}  # noqa: E731
 
-            ranked = compare("http://x:11434", ["cmp-slow", "cmp-fast", "cmp-broken"])
+            ranked = compare(["cmp-slow", "cmp-fast", "cmp-broken"],
+                              base_url="http://x:11434", backend=_ob)
             assert [r["model"] for r in ranked] == ["cmp-fast", "cmp-slow", "cmp-broken"], ranked
             assert [r["rank"] for r in ranked] == [1, 2, 3], ranked
             assert ranked[0]["tokens_per_second"] == 50.0, ranked
@@ -1528,7 +1680,8 @@ def _self_test():
         _http_get = lambda url, timeout: {"models": []}  # noqa: E731
         _gpu_power_watts = lambda: None  # noqa: E731
         hearth_hw.probe = lambda: rtx2060
-        recovered = cached_measure("http://x:11434", "recovery-model", num_predict=10)
+        recovered = cached_measure("recovery-model", base_url="http://x:11434", num_predict=10,
+                                    backend=_ob)
         assert recovered["ok"] is True, recovered
         assert recovered["from_cache"] is False, recovered
     finally:
@@ -1540,6 +1693,81 @@ def _self_test():
             os.environ.pop("HEARTH_DATA_DIR", None)
         else:
             os.environ["HEARTH_DATA_DIR"] = old_data_dir_env3
+
+    # -- Backend dispatch: measure() routes to the ACTIVE engine ------------
+    #
+    # The point of the cutover. Neither engine is installed on the machine
+    # running this test, so both paths are driven with explicit stand-in
+    # backends rather than by whatever select() would pick here.
+    class _StubBackend:
+        name = hearth_backend.BACKEND_LLAMA
+
+        def __init__(self):
+            self.calls = []
+
+        def measure(self, model, prompt=None, num_predict=None, timeout=None):
+            self.calls.append((model, num_predict))
+            return {"ok": True, "backend": self.name, "model": str(model),
+                    "tokens_generated": 12, "wall_seconds": 1.0,
+                    "tokens_per_second": 12.0,
+                    "tokens_per_second_source": "wall_clock"}
+
+    stub = _StubBackend()
+    r = measure("C:\\models\\a.gguf", backend=stub, num_predict=32)
+    assert r["backend"] == hearth_backend.BACKEND_LLAMA, r
+    # The llama path is wall-clock, and says so. A caller comparing this
+    # against an Ollama figure needs that field to know they are not the
+    # same kind of number.
+    assert r["tokens_per_second_source"] == "wall_clock", r
+    assert stub.calls == [("C:\\models\\a.gguf", 32)], stub.calls
+    # base_url is meaningless to the bundled engine and must not reach it.
+    r = measure("C:\\models\\a.gguf", base_url="http://x:11434", backend=stub)
+    assert r["ok"] is True, r
+
+    # The Ollama backend routes to measure_ollama, with its server-reported
+    # rate, against the same stubbed transport used above.
+    _http_post = lambda url, payload, timeout: {  # noqa: E731
+        "eval_count": 10, "eval_duration": 1_000_000_000}
+    _http_get = lambda url, timeout: {"models": []}  # noqa: E731
+    _gpu_power_watts = lambda: None  # noqa: E731
+    try:
+        r = measure("m:latest", base_url="http://x:11434", backend=_ob)
+        assert r["backend"] == hearth_backend.BACKEND_OLLAMA, r
+        assert r["tokens_per_second"] == 10.0, r
+        assert r["tokens_per_second_source"] == "server_eval_duration", r
+        # An Ollama backend with no explicit base_url falls back to its own,
+        # so a non-default port is still measured rather than silently
+        # replaced by the module default.
+        r = measure("m:latest", backend=hearth_backend.OllamaBackend("http://other:9999"))
+        assert r["base_url"] == "http://other:9999", r
+    finally:
+        _http_post = orig_http_post
+        _http_get = orig_http_get
+        _gpu_power_watts = orig_power
+
+    # measure_ollama refuses a GGUF reference rather than sending a file
+    # path to Ollama as if it were a registry tag.
+    r = measure_ollama("http://x:11434", hearth_backend.ModelRef.gguf("/m/a.gguf"))
+    assert r["ok"] is False and "ollama model reference" in r["error"], r
+    # ...and unwraps a correctly-typed one.
+    assert measure_ollama("", hearth_backend.ModelRef.ollama("m"))["error"] == "empty base_url"
+
+    # -- Cache keys are backend-qualified ----------------------------------
+    #
+    # A GGUF path and an Ollama tag must never share a cache entry: the two
+    # engines derive tokens_per_second differently, so serving one from the
+    # other's entry would silently mix a wall-clock number with a
+    # server-reported one.
+    k_ol = _cache_key("qwen2.5-coder", "HWSIG", hearth_backend.BACKEND_OLLAMA)
+    k_gg = _cache_key("qwen2.5-coder", "HWSIG", hearth_backend.BACKEND_LLAMA)
+    assert k_ol != k_gg, (k_ol, k_gg)
+    assert k_ol == "HWSIG::ollama:qwen2.5-coder", k_ol
+    assert k_gg == "HWSIG::gguf:qwen2.5-coder", k_gg
+    # An explicit ModelRef keys off its own kind, whatever backend is named.
+    assert _cache_key(hearth_backend.ModelRef.gguf("/m/a.gguf"), "HWSIG",
+                      hearth_backend.BACKEND_OLLAMA) == "HWSIG::gguf:/m/a.gguf"
+    # Same hardware, same model, same backend is a stable key.
+    assert k_ol == _cache_key("qwen2.5-coder", "HWSIG", hearth_backend.BACKEND_OLLAMA)
 
     _run_live_http_self_test()
 

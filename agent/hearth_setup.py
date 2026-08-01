@@ -1,14 +1,38 @@
 #!/usr/bin/env python3
 r"""hearth first-run setup diagnosis: why a new user cannot just start working.
 
-Hearth's promise is download, open, start working with a local model. Today
-the engine assumes Ollama is installed, running, and has a model pulled. If
-any of that is false the user gets an obscure connection error from deep
-inside hearth_loop, not a sentence they can act on. This module is the
-difference between "something went wrong" and "Ollama is installed but not
-running; start it and I will continue."
+Hearth's promise is download, open, start working with a local model. When
+that fails, the user gets an obscure connection error from deep inside
+hearth_loop, not a sentence they can act on. This module is the difference
+between "something went wrong" and a specific thing to go and do.
 
-## Check order
+## Two engines, two genuinely different diagnoses
+
+Hearth runs models on its own bundled llama-server by default, and on
+Ollama when the user already has one (agent/hearth_backend.py). What can be
+wrong is not the same in the two cases, and this module does NOT ask one
+set of questions and relabel the answers:
+
+  For OLLAMA the failure is usually operational. It is somebody else's
+  daemon: it can be missing, installed but stopped, too old, or running
+  with nothing pulled. Those are four distinct states with four distinct
+  remedies, and telling them apart is most of the value. The check order
+  below describes that path.
+
+  For the BUNDLED ENGINE there is no daemon and nothing for the user to
+  start. Hearth ships the binary and launches it per request, so "not
+  running" is not a diagnosis, it is the normal resting state. The real
+  questions are whether the binary Hearth shipped is present, whether it
+  actually executes on this machine, and whether a model has been
+  downloaded. A missing binary there is a broken install, not something
+  the user should go and start, and saying "start it" would send them
+  looking for a service that does not exist. See _diagnose_llama.
+
+Which path runs is decided by the active backend, so a user who has neither
+engine is diagnosed against the one Hearth actually ships rather than
+against a dependency Hearth no longer requires.
+
+## Check order (Ollama path)
 
 Checks run in dependency order, and diagnose() stops at the first one that
 is actually wrong, rather than piling up a wall of downstream failures a
@@ -78,7 +102,9 @@ import urllib.request
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import hearth_backend  # noqa: E402
 import hearth_hw  # noqa: E402
+import hearth_llama  # noqa: E402
 import hearth_pull  # noqa: E402
 import hearth_shop  # noqa: E402
 
@@ -110,6 +136,15 @@ STATUS_VERSION_TOO_OLD = "version_too_old"
 STATUS_NO_MODELS = "no_models"
 STATUS_MODEL_UNSUITABLE = "model_unsuitable"
 STATUS_UNKNOWN = "unknown"
+
+# Bundled-engine states. Deliberately NOT folded into STATUS_NOT_INSTALLED
+# and STATUS_NOT_RUNNING: those two mean "go and install/start Ollama",
+# which is advice a user of the bundled engine cannot act on. A missing
+# llama-server is a broken Hearth install, and a present-but-unrunnable one
+# is a different problem again (usually a missing system library), so they
+# get their own states and their own remedies.
+STATUS_ENGINE_MISSING = "engine_missing"
+STATUS_ENGINE_BROKEN = "engine_broken"
 
 # -- per-finding states -------------------------------------------------------
 
@@ -422,11 +457,16 @@ def _finding(check, status, message, remedy=None, detail=None):
     return {"check": check, "status": status, "message": message, "remedy": remedy, "detail": detail}
 
 
-def _result(status, findings, base_url):
+def _result(status, findings, base_url, backend=hearth_backend.BACKEND_OLLAMA):
     """Assemble diagnose()'s return value. next_action is derived from the
     findings list itself (the last "problem" finding, if any) rather than
     threaded through separately, so it can never drift out of sync with
     what findings actually says.
+
+    base_url is None on the bundled-engine path: that engine has no URL a
+    user could point at, because Hearth starts it on an ephemeral loopback
+    port it picks itself. Reporting the Ollama default there would be a
+    lie a UI could go on to display.
     """
     next_action = None
     for f in reversed(findings):
@@ -437,6 +477,7 @@ def _result(status, findings, base_url):
         "status": status,
         "healthy": status == STATUS_READY and next_action is None,
         "platform": platform.system(),
+        "backend": backend,
         "base_url": base_url,
         "timestamp": _now_iso(),
         "findings": findings,
@@ -445,18 +486,167 @@ def _result(status, findings, base_url):
 
 
 # --------------------------------------------------------------------------
+# The bundled engine's diagnosis
+# --------------------------------------------------------------------------
+
+def _reinstall_remedy():
+    return ("This Hearth install is incomplete: reinstall Hearth. If you are "
+            "running from a source checkout, set {} to the full path of a "
+            "llama-server binary.".format(hearth_llama.ENV_SERVER))
+
+
+def _diagnose_llama(hw=None, backend=None):
+    """Diagnose Hearth's own bundled engine, in dependency order.
+
+      1. present   - is the llama-server binary where it should be? Hearth
+                     ships it, so absence is a broken install rather than
+                     something the user forgot to do.
+      2. runnable  - does it actually execute here? A binary that is
+                     present but cannot load its backend libraries reports
+                     no version, and that is a different problem with a
+                     different remedy.
+      3. models    - has anything been downloaded into Hearth's model
+                     store? An engine with no GGUF to load is the direct
+                     analogue of a running Ollama with nothing pulled.
+      4. fit       - will the best available model actually sit on this
+                     GPU? Answered with hearth_llama.choose_gpu_layers,
+                     the same arithmetic a real launch uses, so the
+                     diagnosis cannot disagree with what happens next.
+
+    There is deliberately no "running" check. The bundled engine is not a
+    service: Hearth starts it when a turn needs it and stops it after, so
+    "not running" is its normal resting state and reporting it as a fault
+    would send the user hunting for something to start.
+    """
+    backend = backend or hearth_backend.LlamaBackend()
+    findings = []
+
+    found = hearth_llama.find_server()
+    if not found["found"]:
+        findings.append(_finding(
+            "engine_present", FINDING_PROBLEM,
+            "Hearth's inference engine ({}) is missing.".format(
+                hearth_llama.SERVER_BASENAME),
+            _reinstall_remedy(), detail=found,
+        ))
+        return _result(STATUS_ENGINE_MISSING, findings, None,
+                       hearth_backend.BACKEND_LLAMA)
+    findings.append(_finding(
+        "engine_present", FINDING_OK,
+        "Hearth's inference engine is present at {}.".format(found["path"]),
+        detail=found,
+    ))
+
+    info = hearth_llama.probe_binary(found["path"])
+    if not info["ok"]:
+        findings.append(_finding(
+            "engine_runnable", FINDING_PROBLEM,
+            "Hearth's inference engine is present but did not run: {}".format(
+                info.get("error") or "it reported no version"),
+            _reinstall_remedy(), detail=info,
+        ))
+        return _result(STATUS_ENGINE_BROKEN, findings, None,
+                       hearth_backend.BACKEND_LLAMA)
+    engine_msg = "Inference engine works: llama.cpp build {}, {} backend.".format(
+        info["build"], info["backend"])
+    if not info["gpu_offload"]:
+        # Not a "problem": the app runs, just slowly. Saying so here is the
+        # whole point, since the alternative is a user waiting five minutes
+        # for a first generation and concluding Hearth is broken.
+        findings.append(_finding(
+            "engine_runnable", FINDING_UNKNOWN,
+            engine_msg + " This build cannot use a GPU, so generation will run "
+                         "on the CPU and be slow.",
+            detail=info,
+        ))
+    else:
+        findings.append(_finding("engine_runnable", FINDING_OK, engine_msg, detail=info))
+
+    models = backend.available_models()
+    if not models:
+        disk = {
+            "free_bytes": hearth_pull.free_space_for_models(),
+            "store_dir": hearth_backend._model_store_dir(),
+        }
+        findings.append(_finding(
+            "models_downloaded", FINDING_PROBLEM,
+            "No model has been downloaded yet.",
+            "Pick a model in Hearth and let it download ({} free).".format(
+                _human_bytes(disk["free_bytes"])),
+            detail={"disk": disk},
+        ))
+        return _result(STATUS_NO_MODELS, findings, None, hearth_backend.BACKEND_LLAMA)
+    findings.append(_finding(
+        "models_downloaded", FINDING_OK,
+        "{} model(s) downloaded.".format(len(models)),
+        detail={"models": [m.display for m in models]},
+    ))
+
+    # 4. fit: the same offload arithmetic a real launch performs, so this
+    #    cannot promise something start() would then refuse to do.
+    hw = hw if hw is not None else hearth_hw.probe()
+    vram = max((g.get("vram_bytes") or 0) for g in hw.get("gpus") or []) or 0
+    best = None
+    for ref in models:
+        layers, reason = hearth_llama.choose_gpu_layers(
+            ref.value, backend=info["backend"], vram_bytes=vram or None)
+        fits_fully = layers == "all"
+        # The best model here is the one that fits fully; failing that, any
+        # of them, since a partial offload still runs.
+        if best is None or (fits_fully and not best[1]):
+            best = (ref, fits_fully, layers, reason)
+        if fits_fully:
+            break
+
+    ref, fits_fully, layers, reason = best
+    detail = {"model": ref.display, "n_gpu_layers": layers, "reason": reason,
+              "vram_bytes": vram}
+    if fits_fully:
+        findings.append(_finding(
+            "model_fit", FINDING_OK,
+            "{} fits entirely in GPU memory ({}).".format(ref.display, reason),
+            detail=detail,
+        ))
+        return _result(STATUS_READY, findings, None, hearth_backend.BACKEND_LLAMA)
+    if layers == 0:
+        # Runs, but every layer is on the CPU. Honest, actionable, and not
+        # a hard failure: a slow answer still beats no answer.
+        findings.append(_finding(
+            "model_fit", FINDING_PROBLEM,
+            "{} will run entirely on the CPU and be very slow ({}).".format(
+                ref.display, reason),
+            "Download a smaller model, or use a machine with more GPU memory.",
+            detail=detail,
+        ))
+        return _result(STATUS_MODEL_UNSUITABLE, findings, None,
+                       hearth_backend.BACKEND_LLAMA)
+    findings.append(_finding(
+        "model_fit", FINDING_UNKNOWN,
+        "{} only partly fits in GPU memory, so part of it runs on the CPU and "
+        "generation will be slower ({}).".format(ref.display, reason),
+        "A smaller model would fit entirely in GPU memory and run faster.",
+        detail=detail,
+    ))
+    return _result(STATUS_READY, findings, None, hearth_backend.BACKEND_LLAMA)
+
+
+# --------------------------------------------------------------------------
 # Public entry points
 # --------------------------------------------------------------------------
 
-def diagnose(base_url=None, hw=None):
-    """Diagnose the local environment's readiness to run Hearth's local
-    model, in dependency order, stopping at the first real problem (see
-    the module docstring's "Check order" section).
+def diagnose(base_url=None, hw=None, backend=None):
+    """Diagnose the local environment's readiness to run a local model, in
+    dependency order, stopping at the first real problem.
+
+    Which set of checks runs depends on the active engine, because the two
+    fail in genuinely different ways: see the module docstring's "Two
+    engines" section, and _diagnose_llama for the bundled path. `backend`
+    forces one instead of using the active one.
 
     hw=None defers to hearth_hw.probe() (pure local detection, no
     network), and is only invoked at all if execution reaches the fit
-    check (step 5) - the earlier steps never touch hardware detection.
-    Pass an explicit hw dict to stay hermetic in a test or to reuse an
+    check - the earlier steps never touch hardware detection. Pass an
+    explicit hw dict to stay hermetic in a test or to reuse an
     already-probed reading.
 
     Always returns a dict, never raises:
@@ -464,7 +654,9 @@ def diagnose(base_url=None, hw=None):
       healthy      - True only when status is STATUS_READY and no finding
                      carries a "problem".
       platform     - platform.system().
-      base_url     - the Ollama URL this diagnosis was run against.
+      backend      - which engine was diagnosed.
+      base_url     - the Ollama URL this diagnosis was run against, or
+                     None on the bundled path, which has no URL.
       timestamp    - ISO 8601 UTC.
       findings     - ordered list of {check, status, message, remedy,
                      detail} dicts, in the order each check actually ran.
@@ -476,7 +668,12 @@ def diagnose(base_url=None, hw=None):
       next_action  - {message, remedy} for the single most important
                      thing to do next, or None when nothing needs doing.
     """
-    base_url = base_url or DEFAULT_OLLAMA
+    if backend is None:
+        backend = hearth_backend.get_backend(ollama_url=base_url)
+    if backend.name == hearth_backend.BACKEND_LLAMA:
+        return _diagnose_llama(hw=hw, backend=backend)
+
+    base_url = base_url or getattr(backend, "base_url", None) or DEFAULT_OLLAMA
     findings = []
 
     # 1. installed?
@@ -597,18 +794,32 @@ def diagnose(base_url=None, hw=None):
     return _result(STATUS_READY, findings, base_url)
 
 
-def quick_check(base_url=None):
-    """A cheap "can I proceed" gate: is Ollama reachable and does it have
-    at least one model pulled? One bounded HTTP call, no hardware probing,
-    no filesystem checks. Never raises; any failure reads as False.
+def quick_check(base_url=None, backend=None):
+    """A cheap "can I proceed" gate: is there an engine and a model to run?
 
-    Deliberately coarser than diagnose(): this does not distinguish "not
-    installed" from "not running" from "installed, running, no models" -
-    it only answers the one question a caller needs before attempting a
-    chat turn. Call diagnose() for the reason why, when quick_check()
-    returns False.
+    For Ollama that is one bounded HTTP call: is it reachable and does it
+    have at least one model pulled. For the bundled engine it is a
+    filesystem question instead: is the binary present and has a model been
+    downloaded. Neither probes hardware, and neither starts a server.
+
+    Never raises; any failure reads as False.
+
+    Deliberately coarser than diagnose(): this does not distinguish the
+    several ways an engine can be unusable, it only answers the one
+    question a caller needs before attempting a chat turn. Call diagnose()
+    for the reason why, when quick_check() returns False.
     """
-    models = _list_models(base_url or DEFAULT_OLLAMA, timeout=QUICK_TIMEOUT_SECONDS)
+    if backend is None:
+        backend = hearth_backend.get_backend(ollama_url=base_url)
+    if backend.name == hearth_backend.BACKEND_LLAMA:
+        try:
+            if not hearth_llama.find_server()["found"]:
+                return False
+            return bool(backend.available_models())
+        except Exception:  # noqa: BLE001 - a gate must never raise
+            return False
+    models = _list_models(base_url or getattr(backend, "base_url", None) or DEFAULT_OLLAMA,
+                          timeout=QUICK_TIMEOUT_SECONDS)
     return bool(models)
 
 
@@ -617,7 +828,8 @@ def quick_check(base_url=None):
 # --------------------------------------------------------------------------
 
 def format_report(result):
-    lines = ["hearth setup diagnosis ({})".format(result["platform"])]
+    lines = ["hearth setup diagnosis ({}, {} engine)".format(
+        result["platform"], result.get("backend") or "unknown")]
     symbol = {FINDING_OK: "OK  ", FINDING_PROBLEM: "FAIL", FINDING_UNKNOWN: "?   "}
     for f in result["findings"]:
         lines.append("  [{}] {}: {}".format(symbol.get(f["status"], "?"), f["check"], f["message"]))
@@ -635,23 +847,29 @@ def main(argv=None):
         description="Diagnose whether this machine can run Hearth's local model, and what to do about it.",
     )
     parser.add_argument("--self-test", action="store_true")
-    parser.add_argument("--base-url", default=DEFAULT_OLLAMA)
+    parser.add_argument("--base-url", default=DEFAULT_OLLAMA,
+                        help="Ollama base URL; ignored when the bundled engine is in use")
+    parser.add_argument("--backend", choices=hearth_backend.BACKENDS, default=None,
+                        help="diagnose a specific engine instead of the active one")
     parser.add_argument("--json", action="store_true", help="print machine-readable JSON instead of a report")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("diagnose", help="full diagnosis (default)")
-    sub.add_parser("quick", help="cheap reachable+has-models check only")
+    sub.add_parser("quick", help="cheap engine-and-model check only")
 
     args = parser.parse_args(argv)
 
     if args.self_test:
         return _self_test()
 
+    backend = (hearth_backend.build(args.backend, args.base_url) if args.backend
+               else hearth_backend.get_backend(ollama_url=args.base_url))
+
     if args.command == "quick":
-        ok = quick_check(args.base_url)
+        ok = quick_check(args.base_url, backend=backend)
         print("yes" if ok else "no")
         return 0 if ok else 1
 
-    result = diagnose(args.base_url)
+    result = diagnose(args.base_url, backend=backend)
     if args.json:
         print(json.dumps(result, indent=2))
     else:
@@ -670,6 +888,12 @@ def _self_test():
     orig_which = _which
     orig_isfile = _isfile
     orig_get_json = _http_get_json
+
+    # An explicit Ollama backend for every test of the Ollama diagnosis
+    # path. Passed rather than selected, because on a machine with neither
+    # engine installed (this one) the active backend is the bundled engine,
+    # and these tests would otherwise silently exercise the wrong path.
+    _ob = hearth_backend.OllamaBackend("http://x:11434")
 
     try:
         # -- _version_tuple / _version_at_least ------------------------------
@@ -790,7 +1014,7 @@ def _self_test():
 
         # -- A: not installed -> stops at check 1, exactly one finding -------
         detect_installed = lambda: {"installed": False, "path": None, "source": None}
-        r = diagnose("http://x:11434", hw=hw_strong)
+        r = diagnose("http://x:11434", hw=hw_strong, backend=_ob)
         assert r["status"] == STATUS_NOT_INSTALLED, r
         assert r["healthy"] is False, r
         assert len(r["findings"]) == 1, r
@@ -818,7 +1042,7 @@ def _self_test():
             raise AssertionError("unexpected URL: " + url)
 
         _http_get_json = fake_all_good
-        r = diagnose("http://x:11434", hw=hw_strong)
+        r = diagnose("http://x:11434", hw=hw_strong, backend=_ob)
         assert r["status"] == STATUS_NOT_INSTALLED, (
             "a machine with no Ollama binary must be reported as not_installed, "
             "never masked by a downstream check that happens to look fine", r,
@@ -836,7 +1060,7 @@ def _self_test():
         def refused(url, timeout):
             raise ConnectionRefusedError("nobody home")
         _http_get_json = refused
-        r = diagnose("http://x:11434", hw=hw_strong)
+        r = diagnose("http://x:11434", hw=hw_strong, backend=_ob)
         assert r["status"] == STATUS_NOT_RUNNING, r
         assert len(r["findings"]) == 2, r
         assert [f["check"] for f in r["findings"]] == ["installed", "running"], r
@@ -851,7 +1075,7 @@ def _self_test():
             assert url.endswith("/api/version"), url
             return {"version": "0.1.5"}
         _http_get_json = old_version
-        r = diagnose("http://x:11434", hw=hw_strong)
+        r = diagnose("http://x:11434", hw=hw_strong, backend=_ob)
         assert r["status"] == STATUS_VERSION_TOO_OLD, r
         assert len(r["findings"]) == 3, r
         assert [f["check"] for f in r["findings"]] == ["installed", "running", "version"], r
@@ -872,7 +1096,7 @@ def _self_test():
         try:
             hearth_pull.free_space_for_models = lambda: 200 * 1024 ** 3
             hearth_pull.model_store_dir = lambda: "/home/test/.ollama/models"
-            r = diagnose("http://x:11434", hw=hw_strong)
+            r = diagnose("http://x:11434", hw=hw_strong, backend=_ob)
             assert r["status"] == STATUS_NO_MODELS, r
             assert len(r["findings"]) == 4, r
             assert [f["check"] for f in r["findings"]] == ["installed", "running", "version", "models_pulled"], r
@@ -882,13 +1106,13 @@ def _self_test():
             # Same scenario, but disk is too small: the remedy must say so
             # rather than cheerfully suggesting a pull that will fail.
             hearth_pull.free_space_for_models = lambda: 10 * 1024 * 1024  # 10MB
-            r_tight = diagnose("http://x:11434", hw=hw_strong)
+            r_tight = diagnose("http://x:11434", hw=hw_strong, backend=_ob)
             assert r_tight["status"] == STATUS_NO_MODELS, r_tight
             assert "not enough" in r_tight["next_action"]["remedy"], r_tight
 
             # Disk itself unknown: honest about that too, never a fabricated figure.
             hearth_pull.free_space_for_models = lambda: None
-            r_unk_disk = diagnose("http://x:11434", hw=hw_strong)
+            r_unk_disk = diagnose("http://x:11434", hw=hw_strong, backend=_ob)
             assert "could not be determined" in r_unk_disk["next_action"]["remedy"], r_unk_disk
         finally:
             hearth_pull.free_space_for_models = old_free
@@ -903,7 +1127,7 @@ def _self_test():
                 return {"models": [{"name": "some-custom-finetune:latest"}]}
             raise AssertionError(url)
         _http_get_json = unknown_model
-        r = diagnose("http://x:11434", hw=hw_strong)
+        r = diagnose("http://x:11434", hw=hw_strong, backend=_ob)
         assert r["status"] == STATUS_READY, r
         assert len(r["findings"]) == 5, r
         assert r["findings"][4]["check"] == "model_fit", r
@@ -922,7 +1146,7 @@ def _self_test():
                 return {"models": [{"name": "qwen2.5-coder:32b-instruct-q4_K_M"}]}
             raise AssertionError(url)
         _http_get_json = wont_fit_model
-        r = diagnose("http://x:11434", hw=hw_small_gpu)
+        r = diagnose("http://x:11434", hw=hw_small_gpu, backend=_ob)
         assert r["status"] == STATUS_MODEL_UNSUITABLE, r
         assert len(r["findings"]) == 5, r
         assert r["findings"][4]["status"] == FINDING_PROBLEM, r
@@ -931,7 +1155,7 @@ def _self_test():
         # Same too-big-a-model scenario, but on hardware so weak nothing in
         # the catalog fits at all: the remedy must say so honestly rather
         # than suggest a pull that would also fail.
-        r_nothing_fits = diagnose("http://x:11434", hw=hw_weak)
+        r_nothing_fits = diagnose("http://x:11434", hw=hw_weak, backend=_ob)
         assert r_nothing_fits["status"] == STATUS_MODEL_UNSUITABLE, r_nothing_fits
         assert "ollama pull" not in r_nothing_fits["next_action"]["remedy"], r_nothing_fits
         assert "nothing in hearth" in r_nothing_fits["next_action"]["remedy"].lower(), r_nothing_fits
@@ -945,7 +1169,7 @@ def _self_test():
                 return {"models": [{"name": "qwen2.5-coder:7b-instruct-q4_K_M"}]}
             raise AssertionError(url)
         _http_get_json = all_good
-        r = diagnose("http://x:11434", hw=hw_strong)
+        r = diagnose("http://x:11434", hw=hw_strong, backend=_ob)
         assert r["status"] == STATUS_READY, r
         assert r["healthy"] is True, r
         assert r["next_action"] is None, r
@@ -959,7 +1183,7 @@ def _self_test():
                 return {"version": "0.5.0"}
             raise TimeoutError("server busy")
         _http_get_json = flaky_tags
-        r = diagnose("http://x:11434", hw=hw_strong)
+        r = diagnose("http://x:11434", hw=hw_strong, backend=_ob)
         assert r["status"] == STATUS_UNKNOWN, r
         assert len(r["findings"]) == 4, r
         assert r["findings"][3]["check"] == "models_pulled", r
@@ -970,21 +1194,21 @@ def _self_test():
 
         # -- quick_check(): stubbed --------------------------------------------
         _http_get_json = lambda url, timeout: {"models": [{"name": "a"}]}
-        assert quick_check("http://x:11434") is True
+        assert quick_check("http://x:11434", backend=_ob) is True
 
         _http_get_json = lambda url, timeout: {"models": []}
-        assert quick_check("http://x:11434") is False
+        assert quick_check("http://x:11434", backend=_ob) is False
 
         def refused2(url, timeout):
             raise ConnectionRefusedError("nobody home")
         _http_get_json = refused2
-        assert quick_check("http://x:11434") is False
+        assert quick_check("http://x:11434", backend=_ob) is False
         _http_get_json = orig_get_json
 
         # -- format_report(): shape sanity, not a golden-text pin -------------
         _http_get_json = all_good
         detect_installed = lambda: {"installed": True, "path": "/usr/bin/ollama", "source": "path"}
-        rep = format_report(diagnose("http://x:11434", hw=hw_strong))
+        rep = format_report(diagnose("http://x:11434", hw=hw_strong, backend=_ob))
         assert "status: READY" in rep, rep
         detect_installed = orig_detect_installed
         _http_get_json = orig_get_json
@@ -999,7 +1223,7 @@ def _self_test():
         # asserts it, and asserts that the one in-module renderer really does
         # index into it rather than interpolating the whole object.
         detect_installed = lambda: {"installed": False, "path": None, "source": None}
-        r_na = diagnose("http://x:11434", hw=hw_strong)
+        r_na = diagnose("http://x:11434", hw=hw_strong, backend=_ob)
         detect_installed = orig_detect_installed
         assert isinstance(r_na["next_action"], dict), (
             "next_action must be a dict, not a rendered sentence: {!r}".format(r_na["next_action"]))
@@ -1027,12 +1251,135 @@ def _self_test():
         real_diag = diagnose()
         assert real_diag["status"] in (
             STATUS_READY, STATUS_NOT_INSTALLED, STATUS_NOT_RUNNING,
-            STATUS_VERSION_TOO_OLD, STATUS_NO_MODELS, STATUS_MODEL_UNSUITABLE, STATUS_UNKNOWN,
+            STATUS_VERSION_TOO_OLD, STATUS_NO_MODELS, STATUS_MODEL_UNSUITABLE,
+            STATUS_UNKNOWN, STATUS_ENGINE_MISSING, STATUS_ENGINE_BROKEN,
         ), real_diag
         assert isinstance(real_diag["findings"], list) and len(real_diag["findings"]) >= 1, real_diag
         # Must be trivially JSON-serialisable, since a UI consumes this over IPC.
         encoded = json.dumps(real_diag)
         assert json.loads(encoded)["status"] == real_diag["status"]
+
+        # ==================================================================
+        # The bundled engine's diagnosis. Different questions, different
+        # remedies -- see the module docstring's "Two engines" section.
+        # ==================================================================
+        _lb = hearth_backend.LlamaBackend()
+        orig_find = hearth_llama.find_server
+        orig_probe_bin = hearth_llama.probe_binary
+        orig_avail = hearth_backend.LlamaBackend.available_models
+        hw_6gb = {"platform": "Windows", "cpu_count": 8,
+                  "system_ram_bytes": 32 * 1024 ** 3,
+                  "gpus": [{"name": "RTX 2060", "vram_bytes": 6 * 1024 ** 3,
+                            "vendor": "nvidia"}]}
+        try:
+            # 1. Binary missing -> a BROKEN INSTALL, never "go start a
+            #    daemon". This is the whole point of a separate path: a
+            #    bundled-engine user has nothing to start, and telling them
+            #    to would send them hunting for a service that never
+            #    existed.
+            hearth_llama.find_server = lambda env=None: {
+                "found": False, "path": None, "source": "missing", "searched": ["/a"],
+                "reason": "no llama-server executable found"}
+            r = diagnose(backend=_lb, hw=hw_6gb)
+            assert r["status"] == STATUS_ENGINE_MISSING, r
+            assert r["backend"] == hearth_backend.BACKEND_LLAMA, r
+            # No URL is reported, because the bundled engine has none: it
+            # binds an ephemeral port Hearth picks per launch.
+            assert r["base_url"] is None, r
+            blob = json.dumps(r).lower()
+            assert "ollama" not in blob, ("the bundled path must never mention "
+                                          "Ollama", r)
+            for daemon_word in ("not running", "ollama serve", "systemctl", "start it"):
+                assert daemon_word not in blob, (daemon_word, r)
+            assert "reinstall" in r["next_action"]["remedy"].lower(), r
+            assert quick_check(backend=_lb) is False, "no binary must fail the gate"
+
+            hearth_llama.find_server = lambda env=None: {
+                "found": True, "path": "/opt/hearth/llama/llama-server",
+                "source": "bundled", "searched": [], "reason": "bundled"}
+
+            # 2. Present but will not execute: a DIFFERENT problem from
+            #    missing, and it must not be collapsed into it.
+            hearth_llama.probe_binary = lambda path=None, timeout=None: {
+                "ok": False, "path": path, "build": None, "commit": None,
+                "backend": "unknown", "gpu_offload": False, "devices": [],
+                "error": "libcuda.so.1: cannot open shared object file"}
+            r = diagnose(backend=_lb, hw=hw_6gb)
+            assert r["status"] == STATUS_ENGINE_BROKEN, r
+            assert "libcuda" in r["next_action"]["message"], r
+            assert r["status"] != STATUS_ENGINE_MISSING, r
+
+            hearth_llama.probe_binary = lambda path=None, timeout=None: {
+                "ok": True, "path": path, "build": 9608, "commit": "70b54e1",
+                "backend": "cuda", "gpu_offload": True, "devices": [], "error": None}
+
+            # 3. Engine fine, nothing downloaded. The direct analogue of a
+            #    running Ollama with nothing pulled, and it reports free
+            #    disk in the remedy just as that path does.
+            hearth_backend.LlamaBackend.available_models = lambda self: []
+            r = diagnose(backend=_lb, hw=hw_6gb)
+            assert r["status"] == STATUS_NO_MODELS, r
+            assert "download" in r["next_action"]["remedy"].lower(), r
+            assert quick_check(backend=_lb) is False, "no models must fail the gate"
+
+            # 4. A model that fits entirely in VRAM -> ready. Uses a real
+            #    temp file, because the fit arithmetic stats the GGUF.
+            import tempfile
+            with tempfile.TemporaryDirectory() as td:
+                small = os.path.join(td, "small.gguf")
+                with open(small, "wb") as fh:
+                    fh.write(b"\0" * (2 * 1024 * 1024))  # tiny: fits anywhere
+                hearth_backend.LlamaBackend.available_models = (
+                    lambda self, _p=small: [hearth_backend.ModelRef.gguf(_p)])
+                r = diagnose(backend=_lb, hw=hw_6gb)
+                assert r["status"] == STATUS_READY and r["healthy"] is True, r
+                fit = [f for f in r["findings"] if f["check"] == "model_fit"][0]
+                assert fit["status"] == FINDING_OK, fit
+                assert fit["detail"]["n_gpu_layers"] == "all", fit
+                assert quick_check(backend=_lb) is True, "engine + model must pass the gate"
+
+                # 5. A model far too big for the card: it still RUNS, on the
+                #    CPU, so this is reported as unsuitable with an
+                #    actionable remedy rather than as a hard failure. The
+                #    size is stubbed rather than written, because a real
+                #    400GB file is not something a self-test may create.
+                orig_model_bytes = hearth_llama._model_bytes
+                try:
+                    hearth_llama._model_bytes = lambda p: 400 * 1024 ** 3
+                    r = diagnose(backend=_lb, hw=hw_6gb)
+                    assert r["status"] == STATUS_MODEL_UNSUITABLE, r
+                    assert "smaller model" in r["next_action"]["remedy"], r
+                finally:
+                    hearth_llama._model_bytes = orig_model_bytes
+
+                # 6. A CPU-only build is reported honestly but is NOT a
+                #    problem finding: a slow answer still beats no answer,
+                #    and the user needs telling before they wait five
+                #    minutes and conclude Hearth is broken.
+                hearth_llama.probe_binary = lambda path=None, timeout=None: {
+                    "ok": True, "path": path, "build": 9608, "commit": "70b54e1",
+                    "backend": "cpu", "gpu_offload": False, "devices": [],
+                    "error": None}
+                hearth_backend.LlamaBackend.available_models = (
+                    lambda self, _p=small: [hearth_backend.ModelRef.gguf(_p)])
+                r = diagnose(backend=_lb, hw=hw_6gb)
+                runnable = [f for f in r["findings"] if f["check"] == "engine_runnable"][0]
+                assert runnable["status"] == FINDING_UNKNOWN, runnable
+                assert "slow" in runnable["message"], runnable
+                assert r["status"] == STATUS_MODEL_UNSUITABLE, (
+                    "a CPU-only build offloads nothing, which is the "
+                    "unsuitable-fit case", r)
+
+            # Every bundled-path result stays JSON-serialisable for the UI.
+            assert json.loads(json.dumps(r))["backend"] == hearth_backend.BACKEND_LLAMA
+
+            # format_report names the engine, so a support log says which
+            # one the diagnosis was even about.
+            assert "llama engine" in format_report(r), format_report(r)
+        finally:
+            hearth_llama.find_server = orig_find
+            hearth_llama.probe_binary = orig_probe_bin
+            hearth_backend.LlamaBackend.available_models = orig_avail
 
         print("hearth-setup self-test OK")
         return 0

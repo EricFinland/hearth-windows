@@ -57,21 +57,41 @@ SIGNALS, AND WHICH ONES ARE HONEST.
      disables itself the first time it is actually used (observed on a
      real host: Ollama holding a model resident, 76% of VRAM, nothing
      generating, and the module answering "busy" anyway). OWNERSHIP is
-     resolved by asking Ollama directly: GET {ollama_base_url}/api/ps
-     reports size_vram per currently-loaded model - the same field
-     agent/hearth_bench.py's residency() already reads - and the sum of
-     that is treated as "ours". Only nvidia-smi's total memory used minus
-     that sum ("other") ever counts toward the memory threshold. A model
-     resident but idle is exactly the state a caller wants to run in, so
-     it must read as idle; a model actively generating is genuinely
-     contention for compute cycles regardless of who asked for the
-     generation, which utilization already catches without needing to
-     know who "who" is. If Ollama's own residency cannot be determined
-     (unreachable, not running), this falls back to treating the full
-     reading as "other" - the conservative direction, since getting
-     ownership wrong should widen what looks like contention, not narrow
-     it - and the raised memory threshold from fix 1 keeps that fallback
-     from tripping on ordinary desktop baseline anyway.
+     resolved by asking Hearth's own inference backend how much VRAM it
+     holds (agent/hearth_backend.py, Backend.own_vram_bytes), and only
+     nvidia-smi's total memory used MINUS that ever counts toward the
+     memory threshold. A model resident but idle is exactly the state a
+     caller wants to run in, so it must read as idle; a model actively
+     generating is genuinely contention for compute cycles regardless of
+     who asked for the generation, which utilization already catches
+     without needing to know who "who" is.
+
+     Both engines answer that question, differently, and the difference is
+     the whole reason it is asked through the backend rather than inline:
+
+       Ollama answers over HTTP. GET {ollama_base_url}/api/ps reports
+       size_vram per currently-loaded model, which is Ollama's own
+       accounting rather than a guess from process names.
+
+       llama.cpp has no residency endpoint, but its server is Hearth's own
+       child process, so the answer comes from nvidia-smi's per-process
+       query, matched on our PID (exact, and the case that matters, since
+       the sidecar that holds the model is the process that asks this) and
+       secondarily on the resolved path of the llama-server binary Hearth
+       ships, which covers a second Hearth process holding the model. It
+       is matched on PATH and never on process NAME because Ollama's
+       embedded runner is also called "llama-server" - verified live - so
+       a name match would credit an unrelated Ollama workload to Hearth
+       and invert this answer. The path half is best effort: nvidia-smi
+       cannot always report a path (it returns "[No data]" for a sandboxed
+       service), and an unidentifiable process is then left counted as
+       somebody else's, which is the conservative direction.
+
+     If ownership cannot be determined at all, this falls back to treating
+     the full reading as "other" - the conservative direction, since
+     getting ownership wrong should widen what looks like contention, not
+     narrow it - and the raised memory threshold from fix 1 keeps that
+     fallback from tripping on ordinary desktop baseline anyway.
 
   Full-screen foreground state (Windows only). GetForegroundWindow plus
   GetWindowRect compared against GetSystemMetrics(SM_CXSCREEN/CYSCREEN) is
@@ -152,6 +172,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import hearth_backend  # noqa: E402
+
 STATE_IDLE = "idle"
 STATE_BUSY = "busy"
 STATE_UNKNOWN = "unknown"
@@ -179,7 +202,13 @@ class IdlePolicy:
     gpu_busy_util_percent: float = 15.0  # primary, decisive: real compute happening
     gpu_busy_mem_percent: float = 40.0   # secondary corroboration only; see module docstring
     cpu_busy_frac: float = 0.90  # corroboration only, never decisive alone
-    ollama_base_url: str = DEFAULT_OLLAMA  # where to ask what Hearth's own inference stack owns
+    # Where to ask what Hearth's own inference stack owns. ollama_base_url
+    # is used only when the Ollama backend is active; the bundled engine
+    # has no URL (Hearth starts it on an ephemeral port it chooses) and
+    # answers from its own process instead. backend=None means "whichever
+    # engine is active"; the self-test passes one explicitly.
+    ollama_base_url: str = DEFAULT_OLLAMA
+    backend: object = None
 
 
 DEFAULT_POLICY = IdlePolicy()
@@ -423,59 +452,59 @@ def _run_bounded(cmd, timeout=GPU_SUBPROCESS_TIMEOUT):
     return proc.stdout
 
 
-def _ollama_resident_vram_bytes(base_url=None):
-    """Total bytes of VRAM Ollama itself currently reports resident, summed
-    across every model GET {base_url}/api/ps lists. This is "ours": the
-    same size_vram field agent/hearth_bench.py's residency() already reads
-    off the identical endpoint, so this reuses Ollama's own accounting
-    rather than guessing at process names via nvidia-smi.
+def _own_resident_vram_bytes(policy=None):
+    """Total bytes of VRAM Hearth's OWN inference stack currently holds.
 
-    Returns (bytes, True) on a clean read, (None, False) on any failure at
-    all - unreachable server, non-2xx response, malformed JSON, unexpected
-    shape - never raises. A caller must treat False as "ownership unknown",
-    not as "Ollama owns nothing": see _gpu_contention for how the two are
-    handled differently.
+    Delegates to the active backend's own_vram_bytes() (see
+    agent/hearth_backend.py), because the two engines answer this question
+    in genuinely different ways and neither answer belongs inline here:
+    Ollama reports its own size_vram over /api/ps, while llama.cpp is
+    answered from nvidia-smi's per-process query against a process Hearth
+    started. The module docstring's GPU contention section has the full
+    reasoning, including why the llama.cpp match is on the binary's path
+    and never on its name.
+
+    Returns (bytes, True) on a clean read, (None, False) when ownership
+    could not be determined at all. Never raises: a backend that throws is
+    reported as unknown, not propagated, since this is polled and must
+    never be the thing that breaks the caller. A caller must treat False as
+    "ownership unknown", not as "Hearth owns nothing": see _gpu_contention
+    for how the two are handled differently.
     """
-    base_url = (base_url or DEFAULT_OLLAMA or "").rstrip("/")
-    if not base_url:
+    policy = policy or DEFAULT_POLICY
+    try:
+        backend = policy.backend or hearth_backend.get_backend(
+            ollama_url=policy.ollama_base_url)
+        got = backend.own_vram_bytes()
+    except Exception:  # noqa: BLE001 - a polled probe must never raise
         return None, False
     try:
-        req = urllib.request.Request(base_url + "/api/ps", method="GET")
-        with urllib.request.urlopen(req, timeout=OLLAMA_PS_TIMEOUT) as resp:
-            raw = resp.read()
-        data = json.loads(raw)
-    except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+        total, known = got
+    except (TypeError, ValueError):
         return None, False
-    if not isinstance(data, dict):
+    if not known or total is None:
         return None, False
-    models = data.get("models")
-    if not isinstance(models, list):
-        return None, False
-    total = 0
-    for entry in models:
-        if not isinstance(entry, dict):
-            continue
-        size_vram = entry.get("size_vram")
-        if isinstance(size_vram, (int, float)) and size_vram > 0:
-            total += size_vram
     return int(total), True
 
 
 def _gpu_contention(policy):
     """(busy, util_percent, other_mem_percent, available) from nvidia-smi,
-    with Ollama's own resident VRAM subtracted out before the memory
+    with Hearth's own resident VRAM subtracted out before the memory
     threshold is ever checked. See the module docstring's GPU contention
     section for the full reasoning; summary:
 
       - busy is driven primarily by utilization (real compute happening,
         regardless of whose request caused it).
       - other_mem_percent is memory used that is NOT accounted for by
-        Ollama's own /api/ps residency - i.e. memory some other process is
+        Hearth's own inference stack - i.e. memory some other process is
         holding - and only trips the (deliberately high) memory threshold
         as corroboration, never as the sole reason.
-      - a model Hearth's own Ollama has loaded and left resident, but is
+      - a model Hearth's own engine has loaded and left resident, but is
         not generating with, must read as idle - that is the state a
-        caller wants to run heavy work in, not a reason to refuse.
+        caller wants to run heavy work in, not a reason to refuse. This
+        holds for both engines: Hearth's bundled llama-server sitting on
+        5GB between turns is no more contention than an Ollama model
+        Hearth loaded and left warm.
 
     Reports the busiest GPU's utilization and the aggregate memory picture
     across every GPU nvidia-smi lists: one contended card is enough reason
@@ -516,12 +545,12 @@ def _gpu_contention(policy):
     if not saw_a_line or best_util is None:
         return None, None, None, False
 
-    own_vram_bytes, own_available = _ollama_resident_vram_bytes(policy.ollama_base_url)
+    own_vram_bytes, own_available = _own_resident_vram_bytes(policy)
     if own_available and own_vram_bytes is not None:
         other_mem_bytes = max(0.0, total_mem_used_bytes - own_vram_bytes)
     else:
-        # Ollama's own residency could not be determined (not running,
-        # unreachable, bad response). Falling back to the unsubtracted
+        # Hearth's own residency could not be determined (engine not
+        # running, unreachable, bad response). Falling back to the unsubtracted
         # total is the conservative direction: an unknown ownership split
         # should widen what counts as possible contention, not quietly
         # ignore memory altogether. The raised gpu_busy_mem_percent default
@@ -843,13 +872,13 @@ def _self_test():
 
     # -- _gpu_contention: ownership-aware, regression fixtures for both real -
     # -- bugs a coordinator review found by testing against real machines ---
-    # Both _run_bounded (the nvidia-smi call) and _ollama_resident_vram_bytes
-    # (the /api/ps call) are swapped for canned fixtures, exactly like
-    # hearth_hw.py's self-test does for its Windows WMI/CIM parsers - this
-    # never touches a real GPU or a real Ollama server, so it is
-    # deterministic on a machine with neither.
+    # Both _run_bounded (the nvidia-smi call) and _own_resident_vram_bytes
+    # (the backend ownership question) are swapped for canned fixtures,
+    # exactly like hearth_hw.py's self-test does for its Windows WMI/CIM
+    # parsers - this never touches a real GPU or a real inference engine,
+    # so it is deterministic on a machine with neither.
     old_run_bounded = globals()["_run_bounded"]
-    old_ollama_resident = globals()["_ollama_resident_vram_bytes"]
+    old_own_resident = globals()["_own_resident_vram_bytes"]
     try:
         # Regression fixture for finding 1: a genuinely idle Windows
         # desktop - 0% utilization, ~10% VRAM resident from the compositor's
@@ -859,7 +888,7 @@ def _self_test():
         def _fixture_idle_desktop(cmd, timeout=GPU_SUBPROCESS_TIMEOUT):
             return "0, 1024, 10240\n"  # util%, mem.used MiB, mem.total MiB -> 10% used
         globals()["_run_bounded"] = _fixture_idle_desktop
-        globals()["_ollama_resident_vram_bytes"] = lambda base_url=None: (None, False)
+        globals()["_own_resident_vram_bytes"] = lambda policy=None: (None, False)
         busy, util, other_pct, avail = _gpu_contention(DEFAULT_POLICY)
         assert avail is True, (busy, util, other_pct, avail)
         assert util == 0.0 and abs(other_pct - 10.0) < 0.01, (util, other_pct)
@@ -878,7 +907,7 @@ def _self_test():
             return "0, 18240, 24000\n"  # 76% used, 0% util: resident, not generating
         globals()["_run_bounded"] = _fixture_ollama_loaded_idle
         own_bytes = int(18240 * 1024 * 1024 * 0.995)  # nearly all of the resident memory is ours
-        globals()["_ollama_resident_vram_bytes"] = lambda base_url=None: (own_bytes, True)
+        globals()["_own_resident_vram_bytes"] = lambda policy=None: (own_bytes, True)
         busy, util, other_pct, avail = _gpu_contention(DEFAULT_POLICY)
         assert busy is False, (
             "Hearth's own resident-but-idle model must not make the module "
@@ -895,7 +924,7 @@ def _self_test():
         def _fixture_other_app_heavy_vram(cmd, timeout=GPU_SUBPROCESS_TIMEOUT):
             return "5, 14400, 24000\n"  # 60% used, only 5% util
         globals()["_run_bounded"] = _fixture_other_app_heavy_vram
-        globals()["_ollama_resident_vram_bytes"] = lambda base_url=None: (None, False)
+        globals()["_own_resident_vram_bytes"] = lambda policy=None: (None, False)
         busy, util, other_pct, avail = _gpu_contention(DEFAULT_POLICY)
         assert busy is True, (
             "60% of VRAM held by something that is not Ollama, with Ollama "
@@ -910,16 +939,88 @@ def _self_test():
         def _fixture_ollama_generating(cmd, timeout=GPU_SUBPROCESS_TIMEOUT):
             return "70, 18240, 24000\n"
         globals()["_run_bounded"] = _fixture_ollama_generating
-        globals()["_ollama_resident_vram_bytes"] = lambda base_url=None: (own_bytes, True)
+        globals()["_own_resident_vram_bytes"] = lambda policy=None: (own_bytes, True)
         busy, util, other_pct, avail = _gpu_contention(DEFAULT_POLICY)
         assert busy is True, (
             "sustained high utilization must read as busy even when all of "
             "the resident memory is ours: got busy={} util={} other_mem_pct={}"
             .format(busy, util, other_pct)
         )
+
+        # The llama.cpp analogue, driven through the REAL backend wiring
+        # rather than a stubbed ownership function. The fixtures above pin
+        # the arithmetic; this pins that a live LlamaBackend actually
+        # reaches it, which is the part that was dead on arrival last time.
+        globals()["_own_resident_vram_bytes"] = old_own_resident
+        _llama = hearth_backend.LlamaBackend(server_path="/opt/hearth/llama/llama-server")
+
+        class _Proc:
+            pid = 4242
+
+            def poll(self):
+                return None
+
+        class _Srv:
+            proc = _Proc()
+
+        _llama._server = _Srv()
+        _real_apps = hearth_backend._compute_apps
+        try:
+            # Hearth's own llama-server holding 76% of the card, generating
+            # nothing. Must read idle: this is the state a caller WANTS to
+            # start heavy work in.
+            hearth_backend._compute_apps = lambda: [
+                {"pid": 4242, "name": "/opt/hearth/llama/llama-server",
+                 "bytes": int(18240 * 1024 * 1024 * 0.995)}]
+            globals()["_run_bounded"] = _fixture_ollama_loaded_idle
+            busy, util, other_pct, avail = _gpu_contention(
+                dataclasses.replace(DEFAULT_POLICY, backend=_llama))
+            assert avail is True, (busy, util, other_pct, avail)
+            assert busy is False, (
+                "Hearth's own bundled llama-server, resident and idle, must not "
+                "read as contention: got busy={} util={} other_mem_pct={}"
+                .format(busy, util, other_pct))
+
+            # THE TRAP: the same VRAM held by OLLAMA's embedded runner,
+            # which is also named llama-server but lives at a different
+            # path. That is somebody else's workload, so it must read as
+            # contention. A name-based ownership match would pass the
+            # assertion above and fail this one.
+            hearth_backend._compute_apps = lambda: [
+                {"pid": 777, "name": "/nix/store/x-ollama/lib/ollama/llama-server",
+                 "bytes": int(18240 * 1024 * 1024 * 0.995)}]
+            _other = hearth_backend.LlamaBackend(
+                server_path="/opt/hearth/llama/llama-server")
+            busy, util, other_pct, avail = _gpu_contention(
+                dataclasses.replace(DEFAULT_POLICY, backend=_other))
+            assert busy is True, (
+                "an unrelated Ollama runner holding 76% of VRAM must read as "
+                "contention, not as Hearth's own resting model: got busy={} "
+                "util={} other_mem_pct={}".format(busy, util, other_pct))
+        finally:
+            hearth_backend._compute_apps = _real_apps
+
+        # A backend whose ownership probe raises must degrade to "unknown",
+        # never propagate: this is polled, and an exception here would take
+        # down every caller asking whether now is a good time.
+        class _AngryBackend:
+            def own_vram_bytes(self):
+                raise RuntimeError("nvidia-smi exploded")
+
+        assert _own_resident_vram_bytes(
+            dataclasses.replace(DEFAULT_POLICY, backend=_AngryBackend())) == (None, False)
+
+        # A backend returning a shape this module does not understand is
+        # unknown too, rather than an unpacking error.
+        class _WeirdBackend:
+            def own_vram_bytes(self):
+                return "not a pair"
+
+        assert _own_resident_vram_bytes(
+            dataclasses.replace(DEFAULT_POLICY, backend=_WeirdBackend())) == (None, False)
     finally:
         globals()["_run_bounded"] = old_run_bounded
-        globals()["_ollama_resident_vram_bytes"] = old_ollama_resident
+        globals()["_own_resident_vram_bytes"] = old_own_resident
 
     # -- IdleTracker: fake clock, synthetic raw samples only -----------------
     clock = {"t": 0.0}

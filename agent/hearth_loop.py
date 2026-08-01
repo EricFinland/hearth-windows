@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """hearth agent loop: give the model a goal and tools; it thinks, calls tools,
-reads results, and repeats until done (or hits the iteration cap). Uses Ollama's
-chat tool-calling. Emits runtime state per step (for the live map) and records
-the run. A daily token budget (hearth_budget, HEARTH_DAILY_TOKEN_CAP) pauses
-runs at the cap, and operator alerts fan out through hearth_notify (budget,
-tripwire, error, and opt-in done via HEARTH_NOTIFY_DONE=on). Standard library
-only.
+reads results, and repeats until done (or hits the iteration cap). Emits
+runtime state per step (for the live map) and records the run. A daily token
+budget (hearth_budget, HEARTH_DAILY_TOKEN_CAP) pauses runs at the cap, and
+operator alerts fan out through hearth_notify (budget, tripwire, error, and
+opt-in done via HEARTH_NOTIFY_DONE=on). Standard library only.
+
+The model call itself goes through agent/hearth_backend.py, so the loop runs
+on Hearth's own bundled llama.cpp server by default and on Ollama when the
+user already has one. Tool calls are still described in Ollama's schema
+shape (hearth_tools.ollama_tool_specs) and assistant messages still arrive
+in Ollama's shape, because llama-server's OpenAI-shaped tool calls are
+translated into it by the backend rather than by a second parser here.
 
 Usage:
   hearth-loop --model qwen2.5-coder --agent-name builder --workspace DIR "GOAL"
-  hearth-loop --self-test    # runs the loop against a mock model, no Ollama
+  hearth-loop --self-test    # runs the loop against a mock model, no engine
 """
 
 import argparse
@@ -24,6 +30,7 @@ import uuid
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import hearth_backend  # noqa: E402
 import hearth_budget  # noqa: E402
 import hearth_hw  # noqa: E402
 import hearth_notify  # noqa: E402
@@ -360,11 +367,42 @@ def _resolve_num_ctx(base_url, model):
     return ctx
 
 
-def chat(base_url, model, messages, tools, timeout=300, options=None):
-    """One Ollama chat call with tools. options is Ollama's request-level
-    'options' dict (e.g. {"num_ctx": ...}); when omitted, a hardware-aware
-    num_ctx is chosen automatically (see _resolve_num_ctx), overridable
-    process-wide via HEARTH_NUM_CTX. Returns (message, tokens_in, tokens_out)."""
+def chat(base_url, model, messages, tools, timeout=300, options=None, backend=None):
+    """One chat turn with tools, on whichever engine is active.
+
+    RETURNS A 3-TUPLE: (message, tokens_in, tokens_out). That arity is load
+    bearing. hearth_evolve, hearth_grow, hearth_marathon and
+    desktop/server/engine.py all call this directly and unpack three
+    values, and a previous change to it broke every one of them while every
+    self-test still passed, because they all inject a mock chat_fn and mocks
+    cannot catch an arity break at a real call site. _self_test therefore
+    walks the repository's own syntax tree and checks each real call site
+    against this signature; see the "arity" section there before changing
+    anything about this line.
+
+    `base_url` and `options` are Ollama's, and are used as-is when that
+    backend is active: options is the request-level dict (e.g.
+    {"num_ctx": ...}), and when omitted a hardware-aware num_ctx is chosen
+    automatically (see _resolve_num_ctx), overridable process-wide via
+    HEARTH_NUM_CTX.
+
+    On the bundled llama.cpp engine `base_url` is ignored (Hearth starts
+    that server itself on an ephemeral port), `model` is a GGUF path rather
+    than a registry tag, and num_ctx is NOT sent: llama.cpp fixes the
+    context length at spawn time with -c, so a per-request value would be
+    silently discarded. The automatic num_ctx probe is skipped there too,
+    since it asks Ollama's /api/show and there is no Ollama to ask. See
+    hearth_backend for the model-identity difference and how a reference of
+    the wrong kind is refused rather than coerced.
+    """
+    if backend is None:
+        backend = hearth_backend.get_backend(ollama_url=base_url)
+
+    if backend.name != hearth_backend.BACKEND_OLLAMA:
+        got = backend.chat(model, messages, tools=tools, timeout=timeout,
+                           options=options)
+        return got["message"], got["tokens_in"], got["tokens_out"]
+
     if options is None:
         try:
             num_ctx = _resolve_num_ctx(base_url, model)
@@ -1612,12 +1650,23 @@ def _self_test():
     _usage = _usage_from_response({})
     assert _usage == (0, 0), _usage
 
-    # Regression: chat() itself must return a 3-tuple (message, tokens_in,
-    # tokens_out), pinned here against a stubbed HTTP response so no live
-    # Ollama is needed. Every direct caller of hearth_loop.chat (hearth_evolve,
-    # hearth_grow, hearth_marathon) unpacks 3 values from it; if this drifts
-    # back to a 2-tuple, or a 4-tuple, this fails loudly here instead of as a
-    # ValueError on a real host.
+    # ======================================================================
+    # arity: chat()'s contract, checked against the REAL call sites
+    # ======================================================================
+    #
+    # chat() returns a 3-tuple (message, tokens_in, tokens_out). Four
+    # modules unpack exactly three values from it: hearth_evolve,
+    # hearth_grow, hearth_marathon, and desktop/server/engine.py.
+    #
+    # A previous change to this arity broke every one of them AND every
+    # self-test still passed, because all four inject their own chat_fn in
+    # tests. A mocked chat_fn cannot catch an arity break at a real call
+    # site: the mock has whatever signature the test gave it. So the
+    # guard below deliberately does not use a mock. It reads the
+    # repository's own source, finds every real call to hearth_loop.chat,
+    # and checks each one against this module's actual signature.
+    _ob = hearth_backend.OllamaBackend("http://fake")
+
     class _FakeResp:
         def __init__(self, body):
             self._body = body
@@ -1640,13 +1689,191 @@ def _self_test():
 
     urllib.request.urlopen = _fake_urlopen
     try:
-        _chat_result = chat("http://fake", "mock", [], [])
+        _chat_result = chat("http://fake", "mock", [], [], backend=_ob)
         assert len(_chat_result) == 3, ("chat() arity drifted", _chat_result)
         _cmsg, _ctin, _ctout = _chat_result
         assert _cmsg == {"role": "assistant", "content": "hi"}, _cmsg
         assert (_ctin, _ctout) == (21, 9), (_ctin, _ctout)
     finally:
         urllib.request.urlopen = _real_urlopen
+
+    # The SAME 3-tuple contract on the bundled-engine branch. chat() has two
+    # return statements now, and pinning only the Ollama one leaves the
+    # other free to drift -- which is how this class of break shipped
+    # before. Driven with a stand-in backend, since neither engine is
+    # necessarily installed on the machine running this.
+    class _StubLlamaBackend:
+        name = hearth_backend.BACKEND_LLAMA
+
+        def __init__(self):
+            self.seen = None
+
+        def chat(self, model, messages, tools=None, timeout=None, options=None):
+            self.seen = {"model": model, "tools": tools, "options": options,
+                         "timeout": timeout}
+            return {"message": {"role": "assistant", "content": "from llama"},
+                    "tokens_in": 11, "tokens_out": 4,
+                    "model": model, "backend": self.name}
+
+    _lb = _StubLlamaBackend()
+    _llama_result = chat("http://ignored", r"C:\models\a.gguf", [{"role": "user"}],
+                         ["toolspec"], backend=_lb)
+    assert len(_llama_result) == 3, ("chat() arity drifted on the llama branch",
+                                     _llama_result)
+    _lmsg, _ltin, _ltout = _llama_result
+    assert _lmsg == {"role": "assistant", "content": "from llama"}, _lmsg
+    assert (_ltin, _ltout) == (11, 4), (_ltin, _ltout)
+    # The model reference reaches the backend untouched (it is a GGUF path,
+    # not a registry tag), and the tool specs go through as given.
+    assert _lb.seen["model"] == r"C:\models\a.gguf", _lb.seen
+    assert _lb.seen["tools"] == ["toolspec"], _lb.seen
+    # No num_ctx is invented for llama.cpp: its context is fixed at spawn
+    # time by -c, so a per-request value would be silently discarded. The
+    # Ollama branch's automatic num_ctx probe must not run here either,
+    # since it asks Ollama's /api/show and there is no Ollama to ask.
+    assert _lb.seen["options"] is None, (
+        "chat() must not synthesise Ollama options for the llama backend",
+        _lb.seen)
+
+    # -- static: every real call site in the repo, bound to this signature -
+    import ast  # noqa: PLC0415 - only the guard needs these
+    import inspect  # noqa: PLC0415
+
+    _repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _sig = inspect.signature(chat)
+
+    def _chat_calls_in(path):
+        """(lineno, n_positional, kwarg_names, unpack_targets_or_None) for
+        every call to hearth_loop.chat in one file.
+
+        unpack_targets is the number of names on the left of the
+        assignment when the call's result is tuple-unpacked, which is the
+        RETURN arity a caller depends on, and None when the result is used
+        some other way.
+        """
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                tree = ast.parse(fh.read(), filename=path)
+        except (OSError, SyntaxError):
+            return []
+        # Map each unpacking assignment's value node to its target count.
+        unpacks = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+                for tgt in node.targets:
+                    if isinstance(tgt, (ast.Tuple, ast.List)):
+                        unpacks[id(node.value)] = len(tgt.elts)
+        found = []
+        this_module = os.path.samefile(path, os.path.abspath(__file__)) \
+            if os.path.exists(path) else False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            is_chat = (
+                isinstance(fn, ast.Attribute) and fn.attr == "chat"
+                and isinstance(fn.value, ast.Name) and fn.value.id == "hearth_loop"
+            ) or (
+                # Inside this module the call is unqualified.
+                this_module and isinstance(fn, ast.Name) and fn.id == "chat"
+            )
+            if not is_chat:
+                continue
+            if any(isinstance(a, ast.Starred) for a in node.args):
+                continue  # *args: nothing useful to bind
+            if any(k.arg is None for k in node.keywords):
+                continue  # **kwargs: same
+            found.append((node.lineno, len(node.args),
+                          [k.arg for k in node.keywords],
+                          unpacks.get(id(node), None)))
+        return found
+
+    _checked = []
+    for _sub in ("agent", os.path.join("desktop", "server"), "scripts"):
+        _dir = os.path.join(_repo, _sub)
+        if not os.path.isdir(_dir):
+            continue
+        for _fn in sorted(os.listdir(_dir)):
+            if not _fn.endswith(".py"):
+                continue
+            _path = os.path.join(_dir, _fn)
+            for _lineno, _npos, _kwnames, _unpack in _chat_calls_in(_path):
+                _where = "{}:{}".format(os.path.join(_sub, _fn), _lineno)
+                _checked.append(_where)
+                # 1. The arguments this call site passes must actually bind
+                #    to chat()'s signature. A renamed, removed or reordered
+                #    parameter fails here, at the call site's own line
+                #    number, instead of at runtime on a user's machine.
+                try:
+                    _sig.bind(*([None] * _npos), **{k: None for k in _kwnames})
+                except TypeError as _exc:
+                    raise AssertionError(
+                        "hearth_loop.chat call site {} no longer matches "
+                        "chat{}: {}".format(_where, _sig, _exc)) from _exc
+                # 2. A call site that unpacks the result must unpack exactly
+                #    three values. This is the break that shipped before.
+                if _unpack is not None:
+                    assert _unpack == 3, (
+                        "hearth_loop.chat call site {} unpacks {} values; chat() "
+                        "returns 3 (message, tokens_in, tokens_out)".format(
+                            _where, _unpack))
+
+    # The scan must not pass vacuously. If a refactor moves or renames these
+    # call sites, this fails and someone re-points the guard, rather than the
+    # guard quietly checking nothing.
+    _files_with_calls = {w.split(":")[0].replace("\\", "/") for w in _checked}
+    for _expected in ("agent/hearth_evolve.py", "agent/hearth_grow.py",
+                      "agent/hearth_marathon.py", "desktop/server/engine.py",
+                      "agent/hearth_loop.py"):
+        assert _expected in _files_with_calls, (
+            "the chat() arity guard found no call site in {}; it has moved or "
+            "been renamed, and the guard is no longer guarding it. Found: "
+            "{}".format(_expected, sorted(_files_with_calls)))
+    assert len(_checked) >= 6, ("too few chat() call sites found", _checked)
+
+    # -- dynamic: a real consumer's real call site, no mocked chat_fn ------
+    #
+    # hearth_grow.propose_idea builds its own default chat_fn, which
+    # contains the real `msg, _tokens_in, tokens_out = hearth_loop.chat(...)`
+    # unpacking. Driving it with chat_fn=None executes that exact
+    # expression, so a return-arity change fails here as a ValueError from
+    # the consumer's own line rather than passing as it did last time.
+    import hearth_grow  # noqa: PLC0415 - lazy, hearth_grow imports this module
+
+    # Patch the module object hearth_grow itself resolves, not this file's
+    # globals: run as a script this file is __main__, and hearth_grow's
+    # `import hearth_loop` binds a separate module object. Patching the
+    # wrong one silently reaches the real chat() and starts a server.
+    _loop_mod = hearth_grow.hearth_loop
+    _real_chat = _loop_mod.chat
+    try:
+        _loop_mod.chat = lambda *a, **k: (
+            {"role": "assistant", "content": "an idea worth trying"}, 5, 7)
+        _idea = hearth_grow.propose_idea("m", "http://fake", "", [])
+        assert _idea == "an idea worth trying", _idea
+
+        # And prove the guard has teeth: a 2-tuple must break that real
+        # call site. If this does NOT raise, the consumer is not really
+        # unpacking three values and the guard above is meaningless.
+        _loop_mod.chat = lambda *a, **k: ({"content": "x"}, 5)
+        try:
+            hearth_grow.propose_idea("m", "http://fake", "", [])
+            raise AssertionError(
+                "hearth_grow's real call site accepted a 2-tuple from chat(); "
+                "it is no longer unpacking three values, so the arity guard "
+                "is not guarding anything")
+        except ValueError:
+            pass
+        # A 4-tuple must break it too, in the other direction.
+        _loop_mod.chat = lambda *a, **k: ({"content": "x"}, 5, 7, 9)
+        try:
+            hearth_grow.propose_idea("m", "http://fake", "", [])
+            raise AssertionError(
+                "hearth_grow's real call site accepted a 4-tuple from chat()")
+        except ValueError:
+            pass
+    finally:
+        _loop_mod.chat = _real_chat
 
     # -- Hardware-aware num_ctx: pure ladder selection with synthetic --------
     # -- hardware, exact expected values, independent of the test host -------
@@ -1827,7 +2054,7 @@ def _self_test():
     globals()["_resolve_num_ctx"] = _boom
     urllib.request.urlopen = _capture_urlopen
     try:
-        chat("http://fake", "mock", [], [], options={"num_ctx": 12321})
+        chat("http://fake", "mock", [], [], options={"num_ctx": 12321}, backend=_ob)
         assert captured["body"]["options"] == {"num_ctx": 12321}, captured
     finally:
         urllib.request.urlopen = _real_urlopen
@@ -1838,7 +2065,7 @@ def _self_test():
     globals()["_resolve_num_ctx"] = lambda base_url, model: 7777
     urllib.request.urlopen = _capture_urlopen
     try:
-        chat("http://fake", "mock", [], [])
+        chat("http://fake", "mock", [], [], backend=_ob)
         assert captured["body"]["options"] == {"num_ctx": 7777}, captured
     finally:
         urllib.request.urlopen = _real_urlopen
@@ -1851,7 +2078,7 @@ def _self_test():
     globals()["_resolve_num_ctx"] = _raise_resolve
     urllib.request.urlopen = _capture_urlopen
     try:
-        chat("http://fake", "mock", [], [])
+        chat("http://fake", "mock", [], [], backend=_ob)
         assert captured["body"]["options"] == {"num_ctx": FALLBACK_NUM_CTX}, captured
     finally:
         urllib.request.urlopen = _real_urlopen
