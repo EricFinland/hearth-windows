@@ -15,6 +15,7 @@
     "dist": "electron-builder --win"
   },
   "devDependencies": {
+    "@electron/fuses": "1.8.0",
     "electron": "43.2.0",
     "electron-builder": "26.15.3"
   },
@@ -24,6 +25,14 @@
     "copyright": "Copyright (c) 2026 Eric Catalano",
     "asar": true,
     "npmRebuild": false,
+    "electronFuses": {
+      "runAsNode": false,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false,
+      "onlyLoadAppFromAsar": true,
+      "enableEmbeddedAsarIntegrityValidation": true,
+      "enableCookieEncryption": true
+    },
     "directories": {
       "buildResources": "build",
       "output": "../../build/dist"

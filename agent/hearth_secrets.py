@@ -135,6 +135,30 @@ assembled at runtime from short, non-matching pieces plus the standard
 library's own `secrets` module, so the assembled, matching string never
 exists as contiguous text anywhere in this file on disk. See _self_test().
 
+WHAT REDACTION MAY HIDE, which is a separate property from what detection
+may catch and was learned the hard way. redact() exists so a caller holding
+both the text and the findings can render a safe-to-display copy, and the
+desktop approval card is built on it: the card shows a redacted copy of a
+write while approving executes the real one. That only stays honest if the
+redacted span contains nothing but credential material, because every byte
+inside a span disappears from the card while still reaching disk. It did
+not. _PEM_RE's body accepted any characters at all, so a model could open a
+key block, emit a realistic base64 prefix, append whatever it wanted the
+user not to read, close the block, and hide the lot behind one token.
+Demonstrated by execution against this module, 273 characters concealed.
+Two bounds now hold that line, both proven non-vacuous in _self_test:
+
+  1. A PEM finding covers only the longest run of whole pure-base64 lines
+     inside the block (_pem_key_material_span), never the markers and never
+     a line carrying anything else. Any text a person would actually need
+     to read -- a command, a URL, a sentence -- contains a character
+     outside the base64 alphabet and therefore cannot enter the span.
+  2. No span of any kind, from any detector, may collapse more than
+     MAX_REDACT_SPAN characters. Past that redact() leaves the text
+     visible rather than hiding more, and redaction_summary() reports the
+     exact number of characters concealed so a caller can put it on screen
+     instead of concealing silently.
+
 OTHER KNOWN LIMITATIONS, stated rather than left implicit:
 
   - Scan window: only a head slice plus a tail slice of a document larger
@@ -588,6 +612,103 @@ _PEM_RE = re.compile(
 # considered as candidates.
 _PEM_MIN_BODY_CHARS = 40
 
+# The PEM detector is the ONLY one in this module whose match can span an
+# unbounded amount of text the model chose: every other regex here caps its
+# value group (256 characters for the two assignment forms, a fixed length
+# for the known formats) or restricts it to an alphabet with no whitespace.
+# _PEM_RE's `[\s\S]*?` body accepts anything at all between the markers,
+# and a finding's [start, end) is what redact() collapses into a single
+# "[REDACTED:...]" token. Left as the whole match, that made the redacted
+# span attacker-chosen: a model could emit a realistic-looking base64
+# prefix, append arbitrary text, close the block, and every byte of that
+# text vanished from anything built on redact() -- including the approval
+# card, whose entire job is to show what a write will do. Found by
+# execution, not by reading: 273 characters concealed behind one token.
+#
+# The fix is to stop trusting the match's own extent. A PEM body IS base64
+# and nothing else, so _pem_key_material_span() below picks out the longest
+# run of whole lines that are pure base64, and the finding covers only that
+# run. The BEGIN/END markers stay visible (the user should see that a key
+# block is being written), and so does every line that is not key material,
+# which is exactly the text an attacker would want hidden: a shell command,
+# a URL, a sentence all carry characters outside this alphabet, so none of
+# them can be swallowed into the span.
+_PEM_B64_LINE_RE = re.compile(r"[A-Za-z0-9+/=]+")
+
+# How much key material is judged at a time by _pem_body_is_placeholder.
+# is_placeholder() is written for a single value of the length a variable
+# assignment or a known key format produces, and one of its checks -- the
+# unique-character ratio -- does not survive being handed a long one: a
+# genuine 900-character base64 body draws from a 64-symbol alphabet, so its
+# ratio is about 0.07, far under the 0.35 threshold, and the whole body
+# would be dismissed as a placeholder. Judging it in windows keeps every
+# is_placeholder check meaningful at the length it was tuned for.
+_PEM_PLACEHOLDER_WINDOW = 120
+
+
+def _pem_body_is_placeholder(material):
+    """True only if EVERY window of `material` looks like a placeholder.
+
+    Strictly stronger than the head slice this replaces. `is_placeholder(
+    body[:120])` inspected a fixed 120-character prefix and decided the
+    whole block from it, which cut both ways: a realistic prefix vouched
+    for arbitrary text after it (the concealment bug documented above
+    _PEM_RE), and a placeholder-looking prefix dismissed a real key sitting
+    behind it. Requiring all windows to look fake before suppressing
+    removes both.
+    """
+    if len(material) < _PEM_MIN_BODY_CHARS:
+        return True
+    for i in range(0, len(material), _PEM_PLACEHOLDER_WINDOW):
+        window = material[i:i + _PEM_PLACEHOLDER_WINDOW]
+        if i and len(window) < 20:
+            continue  # a trailing scrap too short to judge on its own
+        if not is_placeholder(window):
+            return False
+    return True
+
+
+def _pem_key_material_span(body):
+    """(start, end, char_count) of the longest run of consecutive whole
+    lines inside `body` that are pure base64, or None if there is no such
+    run. Offsets are relative to `body`.
+
+    Whole LINES, not a character run: a real PEM body is a column of fixed-
+    width base64 lines, and matching line by line is what makes a line
+    carrying anything else (a space, a colon, a semicolon, a dot -- every
+    readable sentence, command, or URL has at least one) unable to join the
+    run at all rather than merely truncating it.
+    """
+    best = None
+    best_chars = 0
+    run_start = run_end = None
+    run_chars = 0
+    pos = 0
+    n = len(body)
+    while pos <= n:
+        nl = body.find("\n", pos)
+        line_end = n if nl == -1 else nl
+        raw = body[pos:line_end]
+        stripped = raw.strip()
+        if stripped and _PEM_B64_LINE_RE.fullmatch(stripped):
+            lead = len(raw) - len(raw.lstrip())
+            if run_start is None:
+                run_start = pos + lead
+                run_chars = 0
+            run_end = pos + lead + len(stripped)
+            run_chars += len(stripped)
+        else:
+            if run_start is not None and run_chars > best_chars:
+                best, best_chars = (run_start, run_end, run_chars), run_chars
+            run_start = run_end = None
+            run_chars = 0
+        if nl == -1:
+            break
+        pos = nl + 1
+    if run_start is not None and run_chars > best_chars:
+        best, best_chars = (run_start, run_end, run_chars), run_chars
+    return best
+
 _CONN_STRING_RE = re.compile(
     r"\b([a-zA-Z][a-zA-Z0-9+.\-]{1,15})://"
     r"([^\s:/@\"'<>]{1,64}):([^\s:/@\"'<>]{1,256})@"
@@ -702,16 +823,26 @@ def _scan_stripe(chunk, base_offset, line_starts, base_line, covered):
 def _scan_pem(chunk, base_offset, line_starts, base_line, covered):
     findings = []
     for m in _PEM_RE.finditer(chunk):
-        body = m.group(2).strip()
-        if len(body) < _PEM_MIN_BODY_CHARS:
+        span = _pem_key_material_span(m.group(2))
+        if span is None:
             continue
-        if is_placeholder(body[:120]):
+        rel_start, rel_end, n_chars = span
+        if n_chars < _PEM_MIN_BODY_CHARS:
             continue
-        start, end = m.start(), m.end()
+        start = m.start(2) + rel_start
+        end = m.start(2) + rel_end
+        # The whole run, newlines stripped out, not the first 120 characters
+        # of whatever sat between the markers. The old head slice was the
+        # other half of the concealment bug documented above _PEM_RE: a
+        # realistic base64 prefix satisfied it and the rest of the block --
+        # placeholder text or attacker payload alike -- was never looked at.
+        material = "".join(chunk[start:end].split())
+        if _pem_body_is_placeholder(material):
+            continue
         findings.append(_make_finding(
             KIND_PRIVATE_KEY_PEM, "critical", 0.95, base_offset, base_offset,
             line_starts, base_line, start, end,
-            "<{} char PEM body>".format(len(body)),
+            "<{} char PEM body>".format(n_chars),
             "a PEM-encoded private key block (BEGIN/END PRIVATE KEY markers with real "
             "content between them); this is a full credential, not a fingerprint of one",
         ))
@@ -862,7 +993,42 @@ def scan(text, path=None):
     }
 
 
-def redact(text, findings):
+# The most any single finding may hide behind one "[REDACTED:...]" token.
+# A second, span-shape-independent bound on the concealment problem
+# documented above _PEM_RE: that fix makes a PEM finding cover only base64
+# key material, and this one makes the amount of it bounded regardless of
+# which detector produced the span or how its regex is later changed. Sized
+# well clear of anything real: a 4096-bit RSA private key is about 3,200
+# base64 characters and a 16384-bit one about 12,000, so 8,192 leaves every
+# key size in ordinary use untouched. Past this, redact() REFUSES to
+# collapse the span and leaves the text visible instead, which is the safe
+# direction: showing the user an implausibly large blob they can read is a
+# smaller failure than hiding an unbounded amount of text from them on an
+# approval card that claims to show exactly what will be written.
+MAX_REDACT_SPAN = 8192
+
+
+def _redaction_spans(text, findings, max_span):
+    """Ordered, non-overlapping (start, end, kind, collapse) tuples.
+    collapse is False for a span the cap refuses to hide."""
+    spans = [
+        (f["start"], f["end"], f["kind"])
+        for f in findings
+        if 0 <= f["start"] < f["end"] <= len(text)
+    ]
+    spans.sort(key=lambda s: s[0])
+    out = []
+    cursor = 0
+    for start, end, kind in spans:
+        if start < cursor:
+            continue  # overlapping span; skip rather than corrupt offsets
+        collapse = max_span is None or (end - start) <= max_span
+        out.append((start, end, kind, collapse))
+        cursor = end
+    return out
+
+
+def redact(text, findings, max_span=MAX_REDACT_SPAN):
     """Return a copy of `text` with every finding's [start, end) span
     replaced by a fixed, kind-labelled placeholder that does not reproduce
     the secret. Findings from `scan()` already carry only a masked preview
@@ -871,25 +1037,48 @@ def redact(text, findings):
     caller has BOTH the original text and the findings on hand (the normal
     case, immediately after calling scan()) and wants a safe-to-display or
     safe-to-log copy of the text itself, not just the finding list.
+
+    A span longer than `max_span` is left VISIBLE rather than collapsed;
+    see MAX_REDACT_SPAN for why that is the safe direction. Pass
+    max_span=None to restore the old unbounded behaviour, which the
+    self-test does to prove the cap is load-bearing.
     """
-    spans = [
-        (f["start"], f["end"], f["kind"])
-        for f in findings
-        if 0 <= f["start"] < f["end"] <= len(text)
-    ]
+    spans = _redaction_spans(text, findings, max_span)
     if not spans:
         return text
-    spans.sort(key=lambda s: s[0])
     out = []
     cursor = 0
-    for start, end, kind in spans:
-        if start < cursor:
-            continue  # overlapping span; skip rather than corrupt offsets
+    for start, end, kind, collapse in spans:
+        if not collapse:
+            continue
         out.append(text[cursor:start])
         out.append("[REDACTED:{}]".format(kind))
         cursor = end
     out.append(text[cursor:])
     return "".join(out)
+
+
+def redaction_summary(text, findings, max_span=MAX_REDACT_SPAN):
+    """How much redact() would hide, so a caller can SAY so rather than
+    quietly doing it.
+
+      concealed_chars - characters of `text` that redact() replaces.
+      collapsed       - how many findings were collapsed.
+      oversized       - how many were left visible because of the cap.
+      longest_span    - the largest collapsed span, in characters.
+
+    An approval card that hides part of a write is honest only if the
+    amount hidden is itself on the card; this is the number to put there.
+    """
+    spans = _redaction_spans(text, findings, max_span)
+    concealed = sum(e - s for s, e, _k, c in spans if c)
+    longest = max((e - s for s, e, _k, c in spans if c), default=0)
+    return {
+        "concealed_chars": concealed,
+        "collapsed": sum(1 for *_x, c in spans if c),
+        "oversized": sum(1 for *_x, c in spans if not c),
+        "longest_span": longest,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1226,6 +1415,133 @@ def _self_test():
 
     # redact() with no findings is a no-op
     assert redact("nothing to see here", []) == "nothing to see here"
+
+    # --- redaction may not conceal attacker-chosen text ---------------------
+    # Built from the working attack, not from a friendly input. A model that
+    # wants a line hidden from the approval card opens a PEM block, emits a
+    # realistic-looking base64 prefix (a short or code-like body scores
+    # "none", so the decoy is load-bearing), appends the payload, and closes
+    # the block. Before _pem_key_material_span existed, the finding's span
+    # was the whole match, redact() collapsed all of it into one token, and
+    # 273 characters -- payload included -- were absent from the card while
+    # still reaching disk.
+    pem_decoy = "\n".join(
+        "".join(_secrets_mod.choice(_ALNUM + "+/") for _ in range(60)) for _ in range(2)
+    )
+    pem_payload = ("ATTACKER PAYLOAD THE USER NEVER SEES: powershell -enc SQBFAFgA "
+                   "; net user bad P@ss /add")
+    pem_attack = ("# notes\n"
+                  "-----BEGIN PRIVATE KEY-----\n"
+                  + pem_decoy + "\n"
+                  + pem_payload + "\n"
+                  "-----END PRIVATE KEY-----\n"
+                  "tail\n")
+    r = scan(pem_attack, path="config.ini")
+    assert meets_threshold(r, "high"), (
+        "the decoy prefix must still be recognised as key material, or this "
+        "test proves nothing about redaction: {}".format(r)
+    )
+    shown = redact(pem_attack, r["findings"])
+    assert pem_payload in shown, (
+        "PEM redaction concealed attacker-chosen text that was not key "
+        "material; the approval card would hide it from the user while the "
+        "write still lands on disk.\ncard would show:\n{}".format(shown)
+    )
+    for keep in ("# notes", "tail", "-----BEGIN PRIVATE KEY-----",
+                 "-----END PRIVATE KEY-----"):
+        assert keep in shown, "redaction swallowed {!r}: {}".format(keep, shown)
+    for decoy_line in pem_decoy.split("\n"):
+        assert decoy_line not in shown, (
+            "the base64 key material itself must still be hidden: {}".format(shown))
+
+    # the same attack under the OLD span rule (whole match) must still hide
+    # the payload -- otherwise the assertion above passes for the wrong
+    # reason and _pem_key_material_span is not what is holding the line.
+    whole_match_finding = [dict(r["findings"][0])]
+    m_old = _PEM_RE.search(pem_attack)
+    whole_match_finding[0]["start"] = m_old.start()
+    whole_match_finding[0]["end"] = m_old.end()
+    assert pem_payload not in redact(pem_attack, whole_match_finding), (
+        "the old whole-match span no longer conceals the payload, so this "
+        "regression test is vacuous"
+    )
+
+    # the head slice cut the other way too, and that direction is a missed
+    # detection rather than a concealment: a block whose first 120 characters
+    # are obvious filler used to vouch for everything behind it, so a real
+    # key parked after the filler was never reported at all. Every window
+    # must look fake before the block is dismissed.
+    filler_first = ("x" * 60 + "\n" + "x" * 60 + "\n"
+                    + "\n".join(_rand_alnum(64) for _ in range(10)))
+    r = scan("-----BEGIN PRIVATE KEY-----\n" + filler_first + "\n-----END PRIVATE KEY-----")
+    assert meets_threshold(r, "critical"), (
+        "a real key behind a placeholder-looking prefix was dismissed on the "
+        "strength of the prefix alone: {}".format(r)
+    )
+
+    # --- and a genuine private key is still protected -----------------------
+    real_pem = fixtures["pem"]
+    r = scan(real_pem, path="id_rsa")
+    assert meets_threshold(r, "critical"), r
+    assert any(f["kind"] == KIND_PRIVATE_KEY_PEM for f in r["findings"]), r
+    shown_real = redact(real_pem, r["findings"])
+    for line in real_pem.split("\n"):
+        if line.startswith("-----"):
+            assert line in shown_real, "the markers should stay visible: {}".format(shown_real)
+        else:
+            assert line not in shown_real, (
+                "a real private key's material leaked onto the card: {}".format(shown_real))
+    assert "[REDACTED:{}]".format(KIND_PRIVATE_KEY_PEM) in shown_real
+
+    # --- the cap on how much one finding may hide ---------------------------
+    # An absurdly large all-base64 body is the residual shape that CAN still
+    # enter a span (it carries no character the line filter would reject),
+    # so the cap is the bound that does not depend on span shape at all.
+    over = "\n".join(_rand_alnum(64) for _ in range(MAX_REDACT_SPAN // 64 + 40))
+    over_pem = "-----BEGIN PRIVATE KEY-----\n" + over + "\n-----END PRIVATE KEY-----"
+    r = scan(over_pem)
+    assert r["findings"], r
+    assert (r["findings"][0]["end"] - r["findings"][0]["start"]) > MAX_REDACT_SPAN, r
+    shown_over = redact(over_pem, r["findings"])
+    assert over.split("\n")[0] in shown_over, (
+        "a span over MAX_REDACT_SPAN must be left visible, not collapsed")
+    summary_over = redaction_summary(over_pem, r["findings"])
+    assert summary_over["oversized"] == 1 and summary_over["concealed_chars"] == 0, summary_over
+    # non-vacuous: with the cap lifted, the same span IS collapsed.
+    assert over.split("\n")[0] not in redact(over_pem, r["findings"], max_span=None), (
+        "MAX_REDACT_SPAN is not what left that span visible; the cap is vacuous")
+
+    # --- redaction_summary reports what was hidden --------------------------
+    r = scan(real_pem)
+    summary = redaction_summary(real_pem, r["findings"])
+    assert summary["collapsed"] == 1 and summary["oversized"] == 0, summary
+    assert summary["concealed_chars"] > 0, summary
+    assert summary["concealed_chars"] == len(real_pem) - len(shown_real) + len(
+        "[REDACTED:{}]".format(KIND_PRIVATE_KEY_PEM)), summary
+    assert redaction_summary("nothing here", []) == {
+        "concealed_chars": 0, "collapsed": 0, "oversized": 0, "longest_span": 0}
+
+    # --- no detector may hand redact() an unbounded span --------------------
+    # The property the PEM bug violated, asserted for every detector at once
+    # rather than for the one that happened to break: a finding's span is
+    # what disappears from an approval card, so no scan of a hostile
+    # document may produce one longer than the cap allows to be hidden.
+    hostile = "\n".join([
+        pem_attack,
+        "sk-" + _rand_alnum(4000),
+        "postgres://u:" + _rand_alnum(200) + "@h/db",
+        _quoted_assignment("api_key", _rand_alnum(240)),
+        "-----BEGIN EC PRIVATE KEY-----\n" + _rand_alnum(64) + "\nrm -rf /\n"
+        + _rand_alnum(64) + "\n-----END EC PRIVATE KEY-----",
+    ])
+    hostile_scan = scan(hostile)
+    hostile_shown = redact(hostile, hostile_scan["findings"])
+    assert "rm -rf /" in hostile_shown, hostile_shown
+    for f in hostile_scan["findings"]:
+        assert (f["end"] - f["start"]) <= MAX_REDACT_SPAN, (
+            "detector {} produced a span longer than MAX_REDACT_SPAN and would "
+            "hide {} characters behind one token: {}".format(
+                f["kind"], f["end"] - f["start"], f))
 
     # --- scan window bounding ------------------------------------------------
     huge = "x" * (MAX_SCAN_CHARS + 5000)

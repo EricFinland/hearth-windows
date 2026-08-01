@@ -261,6 +261,26 @@ def build_installer(unpacked_only=False):
 
     print("\n== packaging ==")
     run(["npm", "run", "pack" if unpacked_only else "dist"], SHELL_DIR, "electron-builder")
+    verify_fuses()
+
+
+def verify_fuses():
+    """Read the Electron fuse wire back out of the packed executable.
+
+    The fuses are requested in desktop/shell/package.json and applied by
+    electron-builder deep inside packaging, by rewriting a sentinel in the
+    executable after the runtime is copied. A silent no-op there -- a
+    renamed option, a skipped step -- produces a build that looks entirely
+    normal and ships an executable that runs arbitrary JavaScript out of an
+    ELECTRON_RUN_AS_NODE environment variable. See desktop/shell/verify-fuses.js
+    for why that must never be signed. Checking here is the only place the
+    result of the request can actually be observed.
+    """
+    print("\n== verifying electron fuses ==")
+    exe = os.path.join(DIST_DIR, "win-unpacked", "Hearth.exe")
+    if not os.path.isfile(exe):
+        raise SystemExit("expected a packed executable at {}".format(exe))
+    run(["node", "verify-fuses.js", exe], SHELL_DIR, "fuse verification")
 
 
 def report(info, unpacked_only=False):

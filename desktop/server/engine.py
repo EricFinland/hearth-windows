@@ -794,6 +794,15 @@ def _secrets_finding_for_approval(scan_result, content):
     for why a scanner whose output reproduces the secret it found would be
     self-defeating.
 
+    Carries one field the scanner itself does not produce: concealed_chars,
+    how many characters of the write this finding set removes from
+    display_args. The approval card tells the user it shows exactly what
+    will be written, and that sentence is only true if the card also says
+    how much of the write it is not showing. hearth_secrets bounds WHICH
+    bytes a finding may hide (only credential material, and never more than
+    MAX_REDACT_SPAN of it); this number is what makes the remainder visible
+    as a quantity rather than silently absent.
+
     Returns None if the result has no findings -- defensive, since every
     caller here already checked meets_threshold(scan_result, ...) first.
     """
@@ -802,6 +811,7 @@ def _secrets_finding_for_approval(scan_result, content):
         return None
     rank = {s: i for i, s in enumerate(hearth_secrets.SEVERITY)}
     top = max(findings, key=lambda f: (rank.get(f.get("severity"), 0), f.get("confidence", 0)))
+    summary = hearth_secrets.redaction_summary(content, findings)
     return {
         "severity": scan_result.get("severity"),
         "count": scan_result.get("count"),
@@ -811,6 +821,7 @@ def _secrets_finding_for_approval(scan_result, content):
         "masked": top.get("masked"),
         "context": _secrets_context_snippet(content, top),
         "reason": top.get("reason"),
+        "concealed_chars": summary["concealed_chars"],
     }
 
 
@@ -2376,6 +2387,74 @@ def _self_test():
     app_mod.SidecarHandler._write_sse(fhN, apprN)
     rawN = b"".join(fhN.wfile.chunks).decode("utf-8")
     assert real_key not in rawN, "the raw secret leaked into the approval_request SSE frame"
+
+    # --- the approval card may not conceal attacker-chosen bytes ------------
+    # The card renders display_args while approving executes cargs, so every
+    # character redaction removes is a character the user is not shown but
+    # still writes. That is correct for credential material and only for
+    # credential material. A model that wanted a line hidden used to be able
+    # to wrap it in a PEM block behind a realistic base64 decoy and have the
+    # whole block collapse into one token: reproduced by execution against
+    # hearth_secrets, 273 characters gone from the card and present on disk.
+    # Driven here through the real gate rather than against the scanner
+    # alone, because display_args is where the consequence actually lands.
+    pem_decoy = "\n".join(hearth_secrets._rand_alnum(60) for _ in range(2))
+    pem_payload = ("ATTACKER PAYLOAD THE USER NEVER SEES: powershell -enc SQBFAFgA "
+                   "; net user bad P@ss /add")
+    pem_attack = ("# notes\n-----BEGIN PRIVATE KEY-----\n" + pem_decoy + "\n"
+                  + pem_payload + "\n-----END PRIVATE KEY-----\ntail\n")
+    pem_script = [
+        ({"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": "write_file",
+                          "arguments": {"path": "id_rsa", "content": pem_attack}}}]}, 1, 1),
+        ({"role": "assistant", "content": "done", "tool_calls": []}, 1, 1),
+    ]
+    engineP = RealEngine(chat_fn=_scripted_chat(pem_script), execute_tool_fn=fake_execute_tool,
+                         checkpoint_fn=fake_checkpoint)
+    sessP = session_mod.Session(ws, "fake-model", "edit", engine=engineP)
+    sessP.submit_prompt("write a key file")
+    apprP, _ = _wait_for_kind(sessP, "approval_request")
+    shown_content = apprP["data"]["args"].get("content", "")
+    assert pem_payload in shown_content, (
+        "the approval card concealed text that was not key material; the user "
+        "would approve a write they were never shown:\n{}".format(shown_content))
+    for decoy_line in pem_decoy.split("\n"):
+        assert decoy_line not in shown_content, (
+            "the key material itself must still be redacted: {}".format(shown_content))
+    findingP = apprP["data"].get("secrets_finding")
+    assert findingP is not None and findingP["kind"] == hearth_secrets.KIND_PRIVATE_KEY_PEM, apprP
+    # and the card states, as a number, how much it is not showing.
+    assert findingP["concealed_chars"] == len(pem_decoy.replace("\n", "")) + 1, findingP
+    sessP.resolve_approval(apprP["data"]["id"], True)
+    _wait_for_kind(sessP, "done")
+    _wait_idle(sessP)
+    pem_write_calls = [c for c in tool_calls_seen
+                       if c[0] == "write_file" and c[1].get("path") == "id_rsa"]
+    assert pem_write_calls and pem_write_calls[-1][1]["content"] == pem_attack, (
+        "the executed write must still be the real, unredacted content")
+
+    # a genuine key, through the same gate, is still not splashed on screen.
+    real_pem = hearth_secrets._build_real_secret_fixtures()["pem"]
+    real_pem_script = [
+        ({"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": "write_file",
+                          "arguments": {"path": "id_rsa", "content": real_pem}}}]}, 1, 1),
+        ({"role": "assistant", "content": "done", "tool_calls": []}, 1, 1),
+    ]
+    engineR = RealEngine(chat_fn=_scripted_chat(real_pem_script), execute_tool_fn=fake_execute_tool,
+                         checkpoint_fn=fake_checkpoint)
+    sessR = session_mod.Session(ws, "fake-model", "edit", engine=engineR)
+    sessR.submit_prompt("write a key file")
+    apprR, _ = _wait_for_kind(sessR, "approval_request")
+    shown_real = apprR["data"]["args"].get("content", "")
+    for line in real_pem.split("\n"):
+        if not line.startswith("-----"):
+            assert line not in shown_real, (
+                "a real private key's material reached the approval card: {}".format(shown_real))
+    assert "[REDACTED:{}]".format(hearth_secrets.KIND_PRIVATE_KEY_PEM) in shown_real, shown_real
+    assert apprR["data"]["secrets_finding"]["concealed_chars"] > 0, apprR
+    sessR.resolve_approval(apprR["data"]["id"], False)
+    _wait_idle(sessR)
 
     # --- prove the wiring is not vacuous: disable the reducer that turns a --
     # --- hearth_secrets scan into an approval-ready finding, rerun the -----
