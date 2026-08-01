@@ -260,6 +260,40 @@ select.input option { background: var(--panel-2); color: var(--fg); }
   color: var(--fg-dim); white-space: pre-wrap; word-break: break-word;
 }
 
+/* ---------- GPU engine acquisition ---------- */
+/* The one line that says which engine is really running. It sits above the
+   diagnosis rather than inside it because it changes on its own schedule:
+   the fetch runs in the background and this row repaints from an SSE
+   stream, while the diagnosis below it is only re-run on a state change. */
+
+.engine-body:empty { display: none; }
+.engine-row {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+}
+.engine-row.is-active     { border-left-color: var(--ok); }
+.engine-row.is-failed     { border-left-color: var(--warn); }
+.engine-row.is-downloading,
+.engine-row.is-installing,
+.engine-row.is-verifying,
+.engine-row.is-planning   { border-left-color: var(--accent); }
+.engine-state {
+  display: block;
+  font-size: 12.5px; font-weight: 560;
+  color: var(--fg-dim);
+}
+.engine-state.is-ok { color: var(--ok); }
+.engine-message { margin: 6px 0 0; font-size: 11.5px; color: var(--fg-dim); }
+.engine-pct {
+  font-size: 11.5px; font-weight: 620;
+  color: var(--accent); font-variant-numeric: tabular-nums;
+}
+.engine-row .btn { margin-top: 8px; }
+
 /* ---------- checkpoints ---------- */
 
 .cp-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; min-height: 0; }

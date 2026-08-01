@@ -7,14 +7,74 @@
   "policy": {
     "bundled_reason": "A CPU build is the only Windows artifact that cannot fail to start: the GPU builds link vendor runtimes that are absent on machines without the matching driver, and a missing DLL is a launch failure rather than slow inference. It is also the smallest x64 artifact.",
     "bundled_variant": "win-cpu-x64",
+    "explicit_upgrade": {
+      "amd": [
+        "win-hip-radeon-x64"
+      ],
+      "intel": [
+        "win-sycl-x64",
+        "win-openvino-x64"
+      ],
+      "nvidia": [
+        "win-cuda-13.3-x64",
+        "win-cuda-12.4-x64"
+      ]
+    },
     "first_run_gpu_fetch": {
       "amd": "win-vulkan-x64",
       "intel": "win-vulkan-x64",
-      "nvidia_blackwell_or_newer": "win-cuda-13.3-x64",
-      "nvidia_older": "win-cuda-13.3-x64",
+      "nvidia": "win-vulkan-x64",
       "other_or_none": null
     },
-    "first_run_reason": "Vulkan is 33.5 MB and covers every desktop GPU vendor, so it is the cheapest fetch that turns on offload. CUDA is faster on NVIDIA but is 537 MB with its cudart companion, which is why it is fetched on demand for NVIDIA hardware rather than bundled for everyone."
+    "first_run_reason": "Vulkan is 33.5 MB and covers every desktop GPU vendor, so it is the cheapest fetch that turns on offload. NVIDIA is mapped to Vulkan too, which is a change from the earlier assumption that CUDA was worth 537 MB on NVIDIA hardware: see `measured`. CUDA remains pinned and installable on request through HEARTH_GPU_ENGINE.",
+    "measured": {
+      "conclusion": "CUDA and Vulkan trade wins within a few per cent of each other on this card: CUDA is 5 to 7 per cent faster at prompt processing on the 7B, Vulkan is 25 per cent faster at prompt processing on the 0.5B F16, and token generation is identical to three significant figures on the 7B. Either is roughly twelve times the CPU build at generation and forty-five times at prompt processing. A margin that small does not justify 504 MB of extra download, so NVIDIA gets Vulkan like everybody else.",
+      "hardware": "NVIDIA GeForce RTX 5080, 16 GB, driver 610.47, CUDA UMD 13.3",
+      "measured_at": "2026-08-01",
+      "release_tag": "b10105",
+      "results": [
+        {
+          "cpu": 13.83,
+          "cuda_13_3": 169.17,
+          "model": "Qwen2.5-7B-Instruct-Q4_K_M",
+          "test": "tg128",
+          "unit": "tokens/s",
+          "vulkan": 169.18
+        },
+        {
+          "cpu": 185.38,
+          "cuda_13_3": 8861.23,
+          "model": "Qwen2.5-7B-Instruct-Q4_K_M",
+          "test": "pp512",
+          "unit": "tokens/s",
+          "vulkan": 8436.09
+        },
+        {
+          "cpu": null,
+          "cuda_13_3": 8501.47,
+          "model": "Qwen2.5-7B-Instruct-Q4_K_M",
+          "test": "pp4096",
+          "unit": "tokens/s",
+          "vulkan": 7913.91
+        },
+        {
+          "cpu": 57.4,
+          "cuda_13_3": 579.35,
+          "model": "Qwen2.5-0.5B-Instruct-F16",
+          "test": "tg256",
+          "unit": "tokens/s",
+          "vulkan": 530.48
+        },
+        {
+          "cpu": 1398.22,
+          "cuda_13_3": 40903.23,
+          "model": "Qwen2.5-0.5B-Instruct-F16",
+          "test": "pp4096",
+          "unit": "tokens/s",
+          "vulkan": 51032.43
+        }
+      ]
+    }
   },
   "project": "llama.cpp",
   "release_tag": "b10105",

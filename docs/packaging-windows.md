@@ -87,13 +87,75 @@ standard library only.
       resources\hearth\desktop\server\    unchanged
       resources\hearth\ui\                unchanged
       resources\hearth\vendor\llama\      llama-server.exe and its backends
+      resources\hearth\vendor\llama_manifest.json    the pin
+      resources\hearth\scripts\vendor_llama.py       the fetcher
 
 The payload layout is not arbitrary. `agent/hearth_llama.app_root()` resolves
 to the parent of the `agent` directory and then looks for `vendor/llama`
 beneath it, so staging the payload this way makes `find_server()` locate the
-bundled engine with no packaging-aware code in the agent at all. The build
-verifies this before packaging: it runs the staged sidecar's own self-test
-with the staged interpreter, and asserts the engine is found as `bundled`.
+bundled engine with no packaging-aware code in the agent at all. The last two
+entries are there for the same kind of reason: `vendor_llama` resolves its
+manifest as `../vendor/llama_manifest.json` relative to itself, and
+`agent/hearth_engine.py` imports it from `app_root()/scripts`, so the GPU
+engine fetch works from an install only if both land exactly there.
+
+The build verifies all of this before packaging. It runs the staged sidecar's
+own self-test with the staged interpreter, asserts the engine is found as
+`bundled`, and computes a GPU fetch plan from the staged manifest for a
+pretend NVIDIA card, so a payload that would leave every user stuck on the
+CPU build fails the build instead of shipping.
+
+## The GPU engine, which is not in the installer
+
+Hearth bundles llama.cpp's **CPU x64** build and fetches a GPU build after
+installation. Both halves of that are deliberate.
+
+The CPU build is bundled because it is the only Windows artifact that cannot
+fail to start. Every GPU build links a vendor runtime that is absent on a
+machine without the matching driver, and on Windows a missing DLL is a
+load-time failure of the executable, not slow inference. Shipping the floor
+means the engine always runs.
+
+It is not what anybody should be running. Measured on an RTX 5080 with the
+pinned build 10105, Qwen2.5-7B-Instruct Q4_K_M:
+
+| build | generation | prompt processing |
+| --- | ---: | ---: |
+| CPU x64 | 13.8 tok/s | 185 tok/s |
+| Vulkan x64 | 169.2 tok/s | 8436 tok/s |
+| CUDA 13.3 x64 | 169.2 tok/s | 8861 tok/s |
+
+So on first launch the sidecar starts `agent/hearth_engine.py` on a
+background thread. It detects the GPU, reads the fetch policy out of
+`vendor/llama_manifest.json`, downloads the matching variant through
+`scripts/vendor_llama.py` against the pinned SHA-256, runs the new binary to
+confirm it works on this machine, and only then writes the pointer that makes
+it the engine `find_server()` returns. Hearth is usable on the CPU build the
+whole time; the swap takes effect at the next model load. Progress is on
+`GET /engine` and `GET /engine/events`, and in the Backend panel.
+
+Vulkan is what NVIDIA gets too, and the table above is why: 5 to 7 per cent
+of prompt-processing throughput is not worth 504 MB of extra download, and
+Vulkan covers AMD and Intel from the same 33 MB artifact. CUDA, ROCm, SYCL
+and OpenVINO stay pinned and can be requested with `HEARTH_GPU_ENGINE`; for
+CUDA the choice between the 12.4 and 13.3 builds is made from the card's
+compute capability and the driver's CUDA ceiling, and refused outright when
+neither build covers the hardware.
+
+Nothing about this can leave a broken install:
+
+* no network, a failed download, or a checksum mismatch leaves the CPU build
+  active and records the reason;
+* a build that downloads correctly but does not run here is deleted, never
+  activated, and remembered as failed for this hardware so the next launch
+  does not repeat it (the Backend panel's "Try again" clears that);
+* an engine that stops working later, after a removed driver or a swapped
+  card, is demoted at launch by `hearth_llama.start()`, which retries on the
+  bundled build inside the same call;
+* `HEARTH_GPU_ENGINE=off` skips the whole thing.
+
+The Backend panel reports whichever of those is true, and never claims GPU
+acceleration that the running engine does not actually have.
 
 ## How the bearer token reaches the interface
 

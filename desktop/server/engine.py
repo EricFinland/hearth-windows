@@ -273,6 +273,7 @@ if _AGENT_DIR not in sys.path:
 
 import hearth_backend  # noqa: E402
 import hearth_checkpoint  # noqa: E402
+import hearth_engine  # noqa: E402
 import hearth_hw  # noqa: E402
 import hearth_idle  # noqa: E402
 import hearth_injection  # noqa: E402

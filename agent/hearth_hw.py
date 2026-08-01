@@ -327,6 +327,119 @@ def gpus():
     return []
 
 
+# --------------------------------------------------------------------------
+# NVIDIA capability: what CUDA build this card and driver could actually run
+# --------------------------------------------------------------------------
+
+#: The minimum NVIDIA driver version each CUDA major release needs on
+#: Windows, from NVIDIA's own CUDA compatibility table. Used only as a
+#: FALLBACK when nvidia-smi does not print its own "CUDA Version" header,
+#: which is the authoritative reading and is preferred wherever it exists.
+_CUDA_MIN_DRIVER = ((13, 580.0), (12, 527.41), (11, 452.39))
+
+#: `nvidia-smi`'s banner carries the highest CUDA version the installed
+#: DRIVER can run, which is not the same thing as an installed toolkit.
+#: Older builds print "CUDA Version: 12.4"; 610.x prints
+#: "CUDA UMD Version: 13.3" (confirmed on the machine this was written on).
+#: Both spellings are accepted, and neither is required.
+_CUDA_HEADER_RE = re.compile(r"CUDA\s+(?:UMD\s+)?Version:\s*([\d.]+)")
+
+
+def _parse_compute_cap(text):
+    """A compute capability string like "12.0" as a (major, minor) tuple.
+
+    None for anything unparseable, including nvidia-smi's own "[N/A]",
+    which it prints for a GPU it can see but cannot fully query. A card
+    whose architecture cannot be established must never be assumed modern:
+    the caller's whole job is refusing to install a build that will not
+    load, and a guess defeats it.
+    """
+    m = re.match(r"^\s*(\d+)\.(\d+)\s*$", text or "")
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _driver_cuda_ceiling(driver_version):
+    """The highest CUDA MAJOR version a driver of this version can run.
+
+    A coarse floor-based reading of NVIDIA's compatibility table, used only
+    when nvidia-smi did not report its own ceiling. Returns None when the
+    driver version cannot be read at all.
+    """
+    try:
+        value = float(re.match(r"^\s*(\d+(?:\.\d+)?)", driver_version or "").group(1))
+    except (AttributeError, ValueError):
+        return None
+    for major, floor in _CUDA_MIN_DRIVER:
+        if value >= floor:
+            return major
+    return None
+
+
+def nvidia_detail():
+    """Per-GPU NVIDIA facts that VRAM alone does not answer, or None.
+
+    Returns a list of dicts:
+
+        {"index": int, "name": str, "compute_capability": (major, minor)|None,
+         "driver_version": str|None, "cuda_driver_major": int|None}
+
+    None (not []) means the question could not be asked at all: no
+    nvidia-smi, a timeout, a nonzero exit. That is different from an empty
+    list, which would mean nvidia-smi ran and found no NVIDIA GPU, and the
+    difference matters to a caller deciding whether to install a CUDA build.
+
+    compute_capability is what actually decides which CUDA toolkit a card
+    needs: 12.0 is Blackwell (RTX 50-series), which the CUDA 12.4 build
+    predates entirely, while CUDA 13 dropped everything below 7.5. Neither
+    fact is derivable from the card's marketing name.
+
+    Never raises.
+    """
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return None
+    out = _run([exe, "--query-gpu=index,name,compute_cap,driver_version",
+                "--format=csv,noheader"])
+    if out is None:
+        return None
+    ceiling = None
+    banner = _run([exe])
+    if banner:
+        m = _CUDA_HEADER_RE.search(banner)
+        if m:
+            try:
+                ceiling = int(float(m.group(1)))
+            except ValueError:
+                ceiling = None
+
+    found = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Split from the right: index is first, and compute_cap and
+        # driver_version are the last two columns, but a card name can
+        # itself contain a comma.
+        head, _, rest = line.partition(",")
+        parts = [p.strip() for p in rest.rsplit(",", 2)]
+        if len(parts) < 3:
+            continue
+        name, cap_text, driver = parts
+        try:
+            index = int(head.strip())
+        except ValueError:
+            continue
+        found.append({
+            "index": index,
+            "name": name,
+            "compute_capability": _parse_compute_cap(cap_text),
+            "driver_version": driver or None,
+            "cuda_driver_major": ceiling if ceiling is not None
+                                 else _driver_cuda_ceiling(driver),
+        })
+    return found
+
+
 def system_ram_bytes():
     """Total physical system RAM in bytes. 0 if it cannot be determined."""
     system = platform.system()
@@ -604,6 +717,87 @@ def _self_test():
             assert wr[0]["vram_bytes"] == 4294967296, wr
     finally:
         globals()["_run"] = old_run2
+
+    # -- nvidia_detail: compute capability and the driver's CUDA ceiling -----
+    # These two readings decide whether a CUDA build can load at all, so
+    # every one of them is driven from a fixture rather than from whatever
+    # card happens to be in the machine running the test.
+    assert _parse_compute_cap("12.0") == (12, 0)
+    assert _parse_compute_cap(" 8.6 ") == (8, 6)
+    # nvidia-smi prints this for a GPU it can see but cannot fully query. A
+    # card whose architecture is unknown must stay unknown, never be
+    # assumed modern: installing CUDA 13 on a card it dropped is precisely
+    # the load-time failure this reading exists to prevent.
+    for junk in ("[N/A]", "", None, "unknown", "12", "12.0.1"):
+        assert _parse_compute_cap(junk) is None, junk
+
+    assert _driver_cuda_ceiling("610.47") == 13, _driver_cuda_ceiling("610.47")
+    assert _driver_cuda_ceiling("580.00") == 13
+    assert _driver_cuda_ceiling("579.99") == 12
+    assert _driver_cuda_ceiling("527.41") == 12
+    assert _driver_cuda_ceiling("470.05") == 11
+    assert _driver_cuda_ceiling("400.00") is None
+    assert _driver_cuda_ceiling("") is None
+    assert _driver_cuda_ceiling(None) is None
+
+    old_run3 = globals()["_run"]
+    old_which = globals()["shutil"].which
+    try:
+        # A card name with a comma in it, which is why the parse splits from
+        # the right for the last two columns and from the left for the index.
+        rows = ("0, NVIDIA RTX A6000, Ada, 8.9, 552.22\n"
+                "1, NVIDIA GeForce RTX 5080, 12.0, 610.47\n")
+        banner = ("| NVIDIA-SMI 610.47   KMD Version: 610.47   "
+                  "CUDA UMD Version: 13.3 |\n")
+
+        def _fake_smi(cmd, timeout=SUBPROCESS_TIMEOUT):
+            return rows if any("query-gpu" in str(c) for c in cmd) else banner
+        globals()["_run"] = _fake_smi
+        globals()["shutil"].which = lambda _n: "nvidia-smi"
+        got = nvidia_detail()
+        assert len(got) == 2, got
+        assert got[0]["name"] == "NVIDIA RTX A6000, Ada", got[0]
+        assert got[0]["compute_capability"] == (8, 9), got[0]
+        assert got[1]["compute_capability"] == (12, 0), got[1]
+        assert got[1]["driver_version"] == "610.47", got[1]
+        # The banner is authoritative, so BOTH cards report the driver's
+        # ceiling of 13 rather than a per-card guess from its own version.
+        assert [g["cuda_driver_major"] for g in got] == [13, 13], got
+
+        # Older nvidia-smi spells the header without "UMD".
+        banner = "| NVIDIA-SMI 550.54   Driver Version: 550.54   CUDA Version: 12.4 |\n"
+        assert [g["cuda_driver_major"] for g in nvidia_detail()] == [12, 12]
+
+        # No banner at all: fall back to the driver-version table, per card.
+        banner = "no header here\n"
+        assert [g["cuda_driver_major"] for g in nvidia_detail()] == [12, 13]
+
+        # nvidia-smi ran but reported nothing: an empty list, which means
+        # "asked, no NVIDIA GPU", not "could not ask".
+        rows = ""
+        assert nvidia_detail() == []
+
+        # nvidia-smi failed. None, distinct from the empty list above.
+        def _fake_dead(cmd, timeout=SUBPROCESS_TIMEOUT):
+            return None
+        globals()["_run"] = _fake_dead
+        assert nvidia_detail() is None
+
+        # No nvidia-smi on PATH at all.
+        globals()["shutil"].which = lambda _n: None
+        assert nvidia_detail() is None
+    finally:
+        globals()["_run"] = old_run3
+        globals()["shutil"].which = old_which
+
+    # The real machine, if it has one: never raises, and reports either
+    # None or a list of well-shaped entries.
+    real = nvidia_detail()
+    assert real is None or isinstance(real, list), real
+    for entry in real or []:
+        assert isinstance(entry["index"], int), entry
+        cap = entry["compute_capability"]
+        assert cap is None or (isinstance(cap, tuple) and len(cap) == 2), entry
 
     print("hearth-hw self-test OK")
     return 0

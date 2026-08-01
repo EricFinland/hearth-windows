@@ -98,6 +98,37 @@ def _default_persist_hook(session):
     session_state.save(session_state.snapshot(session))
 
 
+def start_engine_acquisition(state, stream=None):
+    """Kick off the GPU engine fetch, in the background, at startup.
+
+    Hearth's installer bundles llama.cpp's CPU build because it is the only
+    Windows artifact that cannot fail to start. The right GPU build is
+    fetched afterwards, and this is where "afterwards" begins: as soon as
+    the sidecar is up, and on a thread, so the user is chatting on the CPU
+    engine within seconds while 33 MB arrives behind them. The swap takes
+    effect the next time a model server starts.
+
+    Idempotent and unconditional to call: an installation that already has
+    a verified engine settles into "active" without touching the network, a
+    machine with no GPU settles into "skipped", and a machine with no
+    network settles into "failed" with a message. None of those is a reason
+    not to run, and none of them stops the sidecar from serving.
+
+    Never raises. A sidecar that would not start because engine acquisition
+    misbehaved would be a strictly worse product than one running on the
+    CPU, which is what it is doing anyway while this runs.
+    """
+    stream = stream or sys.stderr
+    try:
+        state.get_engine().start()
+    except Exception as exc:  # noqa: BLE001 - see the docstring: nothing here
+        # is worth failing a launch over.
+        print("[hearth-main] could not start GPU engine acquisition: {}: {}".format(
+            type(exc).__name__, exc), file=stream, flush=True)
+        return False
+    return True
+
+
 def make_server(engine_factory=None, host="127.0.0.1", port=0, token=None,
                 models_fetcher=None, persist_hook=True, restore_state=True,
                 state_loader=None):
@@ -311,6 +342,9 @@ def main(argv=None):
         watch_parent(_parent_gone)
 
     print_handshake(state)
+    # After the handshake, so the shell is already talking to us and the UI
+    # can watch GET /engine/events from the very first frame.
+    start_engine_acquisition(state)
     try:
         server.serve_forever(poll_interval=0.2)
     except KeyboardInterrupt:
@@ -639,6 +673,32 @@ def _self_test_body():
     assert fired3.wait(5), "a heartbeating shell that went silent was not noticed"
     os.close(w2)
     reader2.close()
+
+    # === GPU engine acquisition is started, and cannot break the launch ===
+    class _Acq:
+        def __init__(self, boom=False):
+            self.started = 0
+            self._boom = boom
+
+        def start(self, force=False):  # noqa: ARG002 - signature parity
+            self.started += 1
+            if self._boom:
+                raise RuntimeError("no data directory")
+            return {"state": "planning"}
+
+    good = _Acq()
+    state_eng = app_mod.SidecarState("tok", engine_acquirer=good)
+    assert start_engine_acquisition(state_eng) is True
+    assert good.started == 1, good.started
+
+    # An acquirer that throws is reported and swallowed. A sidecar that
+    # refused to start because a 33 MB optional download misbehaved would
+    # be strictly worse than one running on the CPU build it already has.
+    noisy = io.StringIO()
+    bad = _Acq(boom=True)
+    state_bad = app_mod.SidecarState("tok", engine_acquirer=bad)
+    assert start_engine_acquisition(state_bad, stream=noisy) is False
+    assert "no data directory" in noisy.getvalue(), noisy.getvalue()
 
     print("hearth-desktop-main self-test OK")
 

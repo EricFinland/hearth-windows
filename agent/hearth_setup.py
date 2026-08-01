@@ -103,6 +103,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hearth_backend  # noqa: E402
+import hearth_engine  # noqa: E402
 import hearth_hw  # noqa: E402
 import hearth_llama  # noqa: E402
 import hearth_pull  # noqa: E402
@@ -495,6 +496,72 @@ def _reinstall_remedy():
             "llama-server binary.".format(hearth_llama.ENV_SERVER))
 
 
+def _gpu_engine_finding(info, found):
+    """Where GPU acceleration stands, said in the terms that are true now.
+
+    Hearth ships a CPU build and fetches a GPU one after installation, so
+    there are several honest answers here and exactly one dishonest one.
+    The dishonest one is claiming acceleration that is not in effect, so
+    the ACTIVE case is gated on the engine that is really running reporting
+    GPU offload, not merely on a pointer file existing: if a fetched engine
+    was demoted since it was written, or the environment overrides the
+    binary, this reports the CPU truth even though the pointer is there.
+
+    The other cases are all fine and none of them is a fault:
+
+      * running on a fetched GPU engine    -> ok, naming the device
+      * fetching one right now             -> unknown, with progress
+      * nothing to fetch (no GPU, or a     -> unknown, with the reason
+        policy that covers no such card)
+      * a fetch or a check that failed     -> unknown, with the reason and
+                                              a remedy, because the CPU
+                                              build still works
+    """
+    state = hearth_engine.status()
+    live = state.get("active") or {}
+    detail = {"engine": state, "found_source": found.get("source")}
+
+    if info.get("gpu_offload"):
+        device = next((d["name"] for d in info.get("devices") or []
+                       if d.get("backend") in hearth_llama.GPU_BACKENDS), None)
+        if found.get("source") == hearth_llama.FOUND_ACQUIRED and live:
+            message = ("GPU acceleration is on: Hearth fetched the {} engine for "
+                       "your {} and verified it runs here.".format(
+                           live.get("backend") or info.get("backend"),
+                           device or live.get("device") or "GPU"))
+        else:
+            message = "GPU acceleration is on: {} backend on {}.".format(
+                info.get("backend"), device or "your GPU")
+        return _finding("gpu_engine", FINDING_OK, message, detail=detail)
+
+    # Everything below here is running on the CPU, whatever any pointer says.
+    acq = state.get("state")
+    if acq == hearth_engine.STATE_FAILED:
+        return _finding(
+            "gpu_engine", FINDING_UNKNOWN,
+            "Hearth could not switch to a GPU engine, so generation runs on the "
+            "CPU: {}".format(state.get("error") or "the reason was not recorded"),
+            "Hearth still works. Check your GPU driver, then re-run the engine "
+            "fetch from the Backend panel.", detail=detail)
+    if acq in (hearth_engine.STATE_DOWNLOADING, hearth_engine.STATE_INSTALLING,
+               hearth_engine.STATE_VERIFYING, hearth_engine.STATE_PLANNING):
+        return _finding(
+            "gpu_engine", FINDING_UNKNOWN,
+            "Hearth is fetching a GPU engine ({}). Generation runs on the CPU "
+            "until it is ready.".format(acq), detail=detail)
+    if acq == hearth_engine.STATE_SKIPPED:
+        return _finding(
+            "gpu_engine", FINDING_UNKNOWN,
+            "Hearth is using the CPU engine: {}".format(
+                state.get("message") or "there is no GPU engine to fetch for this "
+                                        "machine"), detail=detail)
+    return _finding(
+        "gpu_engine", FINDING_UNKNOWN,
+        "Hearth has not fetched a GPU engine yet, so generation runs on the CPU.",
+        "Open the Backend panel to fetch one, or set {} to choose a specific "
+        "build.".format(hearth_engine.ENV_ENGINE), detail=detail)
+
+
 def _diagnose_llama(hw=None, backend=None):
     """Diagnose Hearth's own bundled engine, in dependency order.
 
@@ -560,7 +627,13 @@ def _diagnose_llama(hw=None, backend=None):
             detail=info,
         ))
     else:
-        findings.append(_finding("engine_runnable", FINDING_OK, engine_msg, detail=info))
+        device = next((d["name"] for d in info.get("devices") or []
+                       if d.get("backend") in hearth_llama.GPU_BACKENDS), None)
+        findings.append(_finding(
+            "engine_runnable", FINDING_OK,
+            engine_msg + (" Layers run on {}.".format(device) if device else ""),
+            detail=info))
+    findings.append(_gpu_engine_finding(info, found))
 
     models = backend.available_models()
     if not models:
@@ -615,7 +688,15 @@ def _diagnose_llama(hw=None, backend=None):
             "model_fit", FINDING_PROBLEM,
             "{} will run entirely on the CPU and be very slow ({}).".format(
                 ref.display, reason),
-            "Download a smaller model, or use a machine with more GPU memory.",
+            # The remedy has to match the actual cause. "Download a smaller
+            # model" is useless advice to somebody with a 16 GB card whose
+            # engine simply has no GPU backend yet, and that is now the
+            # common case: Hearth ships the CPU build and fetches the GPU
+            # one afterwards, so the fetch is what needs pointing at.
+            ("Hearth has not switched to a GPU engine yet, so no model of any "
+             "size will use your card. Fetch one from the Backend panel."
+             if not info["gpu_offload"] else
+             "Download a smaller model, or use a machine with more GPU memory."),
             detail=detail,
         ))
         return _result(STATUS_MODEL_UNSUITABLE, findings, None,
@@ -1369,6 +1450,84 @@ def _self_test():
                 assert r["status"] == STATUS_MODEL_UNSUITABLE, (
                     "a CPU-only build offloads nothing, which is the "
                     "unsuitable-fit case", r)
+
+                # 7. The GPU engine finding says what is TRUE RIGHT NOW.
+                #    Its one forbidden output is claiming acceleration that
+                #    is not in effect, so each acquisition state is driven
+                #    through it with the engine still reporting CPU.
+                orig_engine_status = hearth_engine.status
+
+                def _gpu_finding(res):
+                    return [f for f in res["findings"]
+                            if f["check"] == "gpu_engine"][0]
+                try:
+                    for state, needle in (
+                        (hearth_engine.STATE_IDLE, "has not fetched"),
+                        (hearth_engine.STATE_DOWNLOADING, "fetching"),
+                        (hearth_engine.STATE_VERIFYING, "fetching"),
+                        (hearth_engine.STATE_SKIPPED, "using the CPU engine"),
+                    ):
+                        hearth_engine.status = (
+                            lambda env=None, _s=state: {
+                                "active": None, "state": _s, "message":
+                                    "no GPU was detected", "error": None,
+                                "variant": None, "backend": None, "device": None,
+                                "failed": []})
+                        f = _gpu_finding(diagnose(backend=_lb, hw=hw_6gb))
+                        assert f["status"] == FINDING_UNKNOWN, f
+                        assert needle in f["message"], (state, f)
+                        assert "GPU acceleration is on" not in f["message"], f
+
+                    # A failure carries the reason and a remedy, and is
+                    # still not a hard problem: the CPU engine works.
+                    hearth_engine.status = lambda env=None: {
+                        "active": None, "state": hearth_engine.STATE_FAILED,
+                        "message": "", "error": "vulkan-1.dll is missing",
+                        "variant": "win-vulkan-x64", "backend": None,
+                        "device": None, "failed": []}
+                    f = _gpu_finding(diagnose(backend=_lb, hw=hw_6gb))
+                    assert "vulkan-1.dll is missing" in f["message"], f
+                    assert f["remedy"], f
+
+                    # MUTATION: a pointer claiming an ACTIVE vulkan engine
+                    # while the binary that actually runs reports CPU. The
+                    # panel must report the CPU truth, not the pointer.
+                    hearth_engine.status = lambda env=None: {
+                        "active": {"variant": "win-vulkan-x64", "backend": "vulkan",
+                                   "device": "NVIDIA GeForce RTX 5080"},
+                        "state": hearth_engine.STATE_ACTIVE, "message": "",
+                        "error": None, "variant": "win-vulkan-x64",
+                        "backend": "vulkan", "device": "NVIDIA GeForce RTX 5080",
+                        "failed": []}
+                    f = _gpu_finding(diagnose(backend=_lb, hw=hw_6gb))
+                    assert "GPU acceleration is on" not in f["message"], (
+                        "the panel must never claim acceleration the running "
+                        "engine does not have", f)
+
+                    # And with the engine really reporting a GPU, it says so
+                    # and names the device.
+                    hearth_llama.probe_binary = lambda path=None, timeout=None: {
+                        "ok": True, "path": path, "build": 10105, "commit": "e6dd0e2",
+                        "backend": "vulkan", "gpu_offload": True,
+                        "devices": [{"tag": "Vulkan0", "backend": "vulkan",
+                                     "name": "NVIDIA GeForce RTX 5080",
+                                     "total_mib": 15977, "free_mib": 15209}],
+                        "error": None}
+                    hearth_llama.find_server = lambda env=None: {
+                        "found": True, "path": "/x/llama-server",
+                        "source": hearth_llama.FOUND_ACQUIRED, "searched": [],
+                        "reason": "the vulkan engine Hearth fetched"}
+                    r = diagnose(backend=_lb, hw=hw_6gb)
+                    f = _gpu_finding(r)
+                    assert f["status"] == FINDING_OK, f
+                    assert "GPU acceleration is on" in f["message"], f
+                    assert "RTX 5080" in f["message"], f
+                    runnable = [x for x in r["findings"]
+                                if x["check"] == "engine_runnable"][0]
+                    assert runnable["status"] == FINDING_OK, runnable
+                    assert "slow" not in runnable["message"], runnable
+                finally:
+                    hearth_engine.status = orig_engine_status
 
             # Every bundled-path result stays JSON-serialisable for the UI.
             assert json.loads(json.dumps(r))["backend"] == hearth_backend.BACKEND_LLAMA

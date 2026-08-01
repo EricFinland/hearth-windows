@@ -174,6 +174,22 @@ def stage(offline=False):
     shutil.copytree(vendor_llama.install_dir(), llama_dest)
     print("  vendor/llama             -> hearth/vendor/llama")
 
+    # The supply chain ships WITH the application, because acquiring the GPU
+    # engine happens on the user's machine after installation and has to use
+    # exactly this code path and exactly these pinned hashes. Shipping only
+    # the manifest, or only the fetcher, would leave agent/hearth_engine.py
+    # unable to do the one thing it exists for. The layout is not arbitrary:
+    # vendor_llama resolves its manifest as ../vendor/llama_manifest.json
+    # relative to itself, and hearth_engine imports it from
+    # hearth_llama.app_root()/scripts, so both files must land exactly here.
+    os.makedirs(os.path.join(payload, "scripts"), exist_ok=True)
+    shutil.copy2(os.path.join(SCRIPTS_DIR, "vendor_llama.py"),
+                 os.path.join(payload, "scripts", "vendor_llama.py"))
+    shutil.copy2(vendor_llama.MANIFEST_PATH,
+                 os.path.join(payload, "vendor", "llama_manifest.json"))
+    print("  scripts/vendor_llama.py  -> hearth/scripts/vendor_llama.py")
+    print("  vendor/llama_manifest    -> hearth/vendor/llama_manifest.json")
+
     shutil.copytree(vendor_python.install_dir(), os.path.join(STAGE_DIR, "python"))
     print("  vendor/python            -> python")
 
@@ -192,15 +208,23 @@ def stage(offline=False):
 def verify_stage():
     """Prove the staged payload works before wrapping it in an installer.
 
-    Two checks, each covering a failure that would otherwise only appear on
-    a user's machine, at launch, as a dialog with a traceback in it.
+    Three checks, each covering a failure that would otherwise only appear
+    on a user's machine, at launch, as a dialog with a traceback in it.
     """
     exe = os.path.join(STAGE_DIR, "python", "python.exe")
     server_dir = os.path.join(STAGE_DIR, "hearth", "desktop", "server")
     agent_dir = os.path.join(STAGE_DIR, "hearth", "agent")
     # PYTHONDONTWRITEBYTECODE so these checks do not leave __pycache__
     # directories in the tree they are checking, which would then be packaged.
-    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    #
+    # HEARTH_ENGINE_DIR points at a directory that does not exist, because
+    # find_server() now prefers a GPU engine hearth_engine fetched, and a
+    # build machine with a GPU has one. Without this the "the bundled engine
+    # is in the payload" check below is answered by the BUILD MACHINE's own
+    # fetched engine and would pass on an installer that shipped no engine
+    # at all. Caught exactly that way, once.
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1",
+               HEARTH_ENGINE_DIR=os.path.join(BUILD_DIR, "no-such-engines"))
 
     # 1. The staged interpreter can run the staged sidecar. This is the real
     #    entry point, run the real way, so it also covers the import
@@ -235,8 +259,40 @@ def verify_stage():
             "the staged payload found llama-server via {!r} rather than as a "
             "bundled binary; the installer would ship without an engine".format(
                 result["llama"]))
+    # 3. The GPU engine fetch can actually run from the staged layout. It
+    #    needs THREE things that only exist because stage() put them there:
+    #    scripts/vendor_llama.py, vendor/llama_manifest.json, and the two
+    #    resolving to each other. Getting this wrong ships an installer
+    #    whose users are permanently stuck on the CPU build with no error
+    #    anybody would ever see, which is exactly the outcome fetching an
+    #    engine exists to prevent. A plan is computed rather than a fetch
+    #    performed: this asks "could it", on a build machine that may have
+    #    no GPU and no network.
+    probe = (
+        "import sys, json; sys.path.insert(0, sys.argv[1]);"
+        "import hearth_engine;"
+        "m = hearth_engine._vendor_llama().load_manifest();"
+        "plan = hearth_engine.choose_variant("
+        "    m, gpus=[{'name': 'test', 'vendor': 'nvidia', 'vram_bytes': 1}],"
+        "    nvidia=[], system='Windows', machine='AMD64', env={});"
+        "print(json.dumps({'tag': m['release_tag'], 'variant': plan['variant'],"
+        " 'reason': plan['reason']}))"
+    )
+    out = subprocess.run([exe, "-c", probe, agent_dir], capture_output=True,
+                         text=True, env=env, cwd=server_dir)
+    if out.returncode != 0:
+        raise SystemExit(
+            "the staged payload cannot run the GPU engine fetch; it would ship "
+            "with every user pinned to the CPU build:\n{}".format(out.stderr.strip()))
+    engine = json.loads(out.stdout.strip())
+    if not engine["variant"]:
+        raise SystemExit(
+            "the staged payload would fetch NO GPU engine for an NVIDIA card: "
+            "{}".format(engine["reason"]))
+
     print("  staged payload verified: sidecar self-test green under python {}, "
-          "bundled engine found".format(result["python"]))
+          "bundled engine found, GPU fetch would install {} from {}".format(
+              result["python"], engine["variant"], engine["tag"]))
 
 
 def build_installer(unpacked_only=False):

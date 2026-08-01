@@ -69,7 +69,12 @@ first. NixOS users, skip ahead to [the NixOS system](#the-nixos-system).
 > the desktop shell, the interface, and a Windows installer that carries its
 > own inference engine and its own Python: `python
 > scripts/build_windows.py` produces it, and
-> [docs/packaging-windows.md](docs/packaging-windows.md) documents it. That
+> [docs/packaging-windows.md](docs/packaging-windows.md) documents it. The
+> installer ships llama.cpp's CPU build, which is the only one that cannot
+> fail to start on an unknown machine, and Hearth fetches the right GPU
+> build for the card it finds on first launch, verifies that it actually
+> runs there, and falls back to the CPU build if it does not. On an RTX
+> 5080 that is 13.8 tokens per second before and 169 after. That
 > installer is **unsigned**, which means the first person to run it meets a
 > full-screen SmartScreen warning whose only visible button is "Don't run".
 > Until there is a code-signing certificate there is no download and nothing

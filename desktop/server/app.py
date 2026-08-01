@@ -101,6 +101,21 @@ Endpoints:
                   same file again continues from it.
   POST /downloads/dismiss  {"id"}: forget a finished download. Refused for
                   one still in flight, which must be cancelled instead.
+  GET  /engine    what inference engine this installation is running on, and
+                  what the GPU engine fetch is doing: a snapshot with a
+                  version, the same shape GET /downloads uses. Hearth's
+                  installer bundles a CPU build and fetches the matching GPU
+                  build afterwards (agent/hearth_engine.py), so this is the
+                  surface that says whether that has happened, is happening,
+                  was skipped, or failed, and why.
+  POST /engine    start or retry the fetch: {} normally, {"force": true} to
+                  retry a variant that already failed on this hardware,
+                  which is what a user does after installing a driver.
+                  Returns immediately with the snapshot. It never blocks:
+                  the CPU engine works throughout.
+  GET  /engine/events  the same snapshot over SSE (event: "engine"), one
+                  frame per change, ?since=<version>. Same bounded slot
+                  pool as GET /events.
   GET  /checkpoints  the current session's checkpoint history, newest first.
   POST /restore   revert the current session's workspace to a prior
                   checkpoint: {"checkpoint_id"}. The response is whatever
@@ -249,7 +264,8 @@ class SidecarState:
                  max_sse_connections=None, persist_hook=None,
                  setup_diagnoser=None, idle_prober=None, idle_cache_seconds=None,
                  local_models_fetcher=None, model_checker=None,
-                 shop_searcher=None, shop_quanter=None, download_manager=None):
+                 shop_searcher=None, shop_quanter=None, download_manager=None,
+                 engine_acquirer=None):
         self.token = token
         self.port = port  # main.py sets this to the real bound port after listen
         self.engine_factory = engine_factory or (lambda: session_mod.NullEngine())
@@ -288,6 +304,12 @@ class SidecarState:
         # worker thread.
         self._downloads = download_manager
         self._downloads_lock = threading.Lock()
+        # The GPU engine acquirer. One per process, like the download queue
+        # and for the same reason: what engine this installation runs on is
+        # a property of the machine, not of a chat session. Lazy, so a test
+        # that never touches /engine never reads the user's data directory.
+        self._engine_acquirer = engine_acquirer
+        self._engine_lock = threading.Lock()
         self.idle_cache_seconds = (
             IDLE_CACHE_SECONDS if idle_cache_seconds is None else idle_cache_seconds)
         self._idle_lock = threading.Lock()  # separate from self._lock below: probing
@@ -322,6 +344,13 @@ class SidecarState:
             if self._downloads is None:
                 self._downloads = downloads_mod.DownloadManager()
             return self._downloads
+
+    def get_engine(self):
+        """The process-wide engine Acquirer, built on first use."""
+        with self._engine_lock:
+            if self._engine_acquirer is None:
+                self._engine_acquirer = engine_mod.hearth_engine.Acquirer()
+            return self._engine_acquirer
 
     def _persist_if_current(self, session):
         """The persist_hook every Session this state creates or adopts is
@@ -596,6 +625,10 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._send_json(200, self.state.get_downloads().snapshot())
         elif path == "/downloads/events":
             self._get_download_events()
+        elif path == "/engine":
+            self._send_json(200, self.state.get_engine().snapshot())
+        elif path == "/engine/events":
+            self._get_engine_events()
         else:
             self._send_json(404, {"error": "not_found"})
 
@@ -622,6 +655,8 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._post_download()
         elif path in ("/downloads/cancel", "/downloads/dismiss"):
             self._post_download_action(path.rsplit("/", 1)[1])
+        elif path == "/engine":
+            self._post_engine()
         else:
             self._send_json(404, {"error": "not_found"})
 
@@ -970,6 +1005,59 @@ class SidecarHandler(BaseHTTPRequestHandler):
                         continue
                     since = snapshot["version"]
                     chunk = "id: {}\nevent: downloads\ndata: {}\n\n".format(
+                        since, json.dumps(snapshot))
+                    self.wfile.write(chunk.encode("utf-8"))
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
+                return
+        finally:
+            self.state.release_sse_slot()
+
+    def _post_engine(self):
+        """POST /engine: start (or retry) the GPU engine fetch.
+
+        Idempotent, and deliberately returns immediately with the current
+        snapshot rather than waiting: the whole point of this surface is
+        that acquiring a GPU engine never blocks anything. {"force": true}
+        retries a variant that already failed on this hardware, which is
+        what a user does after installing a driver.
+        """
+        body = self._read_json()
+        if body is None:
+            self._send_json(400, {"error": "invalid_json"})
+            return
+        acquirer = self.state.get_engine()
+        self._send_json(200, acquirer.start(force=bool(body.get("force"))))
+
+    def _get_engine_events(self):
+        """SSE for the engine fetch. One frame per change, each carrying the
+        WHOLE snapshot, exactly like GET /downloads/events and for the same
+        reason: a client that reconnects wants the current state, not a
+        narrative. Shares the same bounded SSE slot pool."""
+        q = self._query()
+        try:
+            since = int(q.get("since", 0))
+        except ValueError:
+            since = 0
+        acquirer = self.state.get_engine()
+        if not self.state.acquire_sse_slot():
+            self._send_json(429, {"error": "too_many_event_streams"})
+            return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                while True:
+                    snapshot = acquirer.snapshot_after(since, timeout=15)
+                    if snapshot["version"] == since:
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                        continue
+                    since = snapshot["version"]
+                    chunk = "id: {}\nevent: engine\ndata: {}\n\n".format(
                         since, json.dumps(snapshot))
                     self.wfile.write(chunk.encode("utf-8"))
                     self.wfile.flush()
@@ -2188,7 +2276,9 @@ def _self_test():
                                   ("GET", "/downloads"), ("POST", "/downloads"),
                                   ("POST", "/downloads/cancel"),
                                   ("POST", "/downloads/dismiss"),
-                                  ("GET", "/downloads/events")):
+                                  ("GET", "/downloads/events"),
+                                  ("GET", "/engine"), ("POST", "/engine"),
+                                  ("GET", "/engine/events")):
                 status, _ = _raw_request(port_s, method, route,
                                          headers={"Host": "127.0.0.1:{}".format(port_s)})
                 assert status == 401, (route, status)
@@ -2314,6 +2404,146 @@ def _self_test():
             shop_manager.stop()
             server_shop.shutdown()
             server_shop.server_close()
+
+        # === GET/POST /engine and GET /engine/events ===================
+        # The GPU engine fetch has its own surface because it is not a
+        # model download: it is a property of the machine, it needs no
+        # session, and it must be visible on a first launch where nothing
+        # else has happened yet. Driven with a stub Acquirer so no test
+        # touches the network, the user's data directory or a real GPU.
+        engine_acq = engine_mod.hearth_engine.Acquirer(
+            manifest=engine_mod.hearth_engine._fake_manifest(),
+            env={engine_mod.hearth_engine.ENV_ENGINE_DIR:
+                 os.path.join(_tempfile.mkdtemp(prefix="hearth-app-engine-"), "e")},
+            install_fn=lambda variant=None, dest=None, manifest=None, cache=None,
+                              on_progress=None, **_kw: (
+                os.makedirs(dest, exist_ok=True),
+                open(os.path.join(dest, "llama-server.exe"), "wb").write(b"MZ"),
+                on_progress and on_progress(1, 1, "v.zip"),
+                {"server": os.path.join(dest, "llama-server.exe"), "dir": dest})[-1],
+            verify_fn=lambda server, backend: (
+                True,
+                {"ok": True, "backend": "vulkan", "build": 10105,
+                 "devices": [{"tag": "Vulkan0", "backend": "vulkan",
+                              "name": "NVIDIA GeForce RTX 5080",
+                              "total_mib": 15977, "free_mib": 15209}]},
+                "vulkan backend, RTX 5080"),
+            gpus_fn=lambda: [{"name": "NVIDIA GeForce RTX 5080", "vendor": "nvidia",
+                              "vram_bytes": 17_094_934_528, "approximate": False}],
+            nvidia_fn=lambda: None,
+            disk_fn=lambda _p: 500 * 1024 ** 3)
+        state_eng = SidecarState("eng-token", engine_acquirer=engine_acq)
+        server_eng = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state_eng))
+        state_eng.port = server_eng.server_address[1]
+        threading.Thread(target=server_eng.serve_forever, kwargs={"poll_interval": 0.05},
+                         daemon=True).start()
+        try:
+            port_e = state_eng.port
+            headers_e = {"Host": "127.0.0.1:{}".format(port_e),
+                         "Authorization": "Bearer eng-token",
+                         "Content-Type": "application/json"}
+
+            # No session exists, and the engine surface still answers: on a
+            # first launch there is nothing else yet, and this is exactly
+            # when the user needs to be told what engine they are on.
+            status, _ = _raw_request(port_e, "GET", "/session", headers=headers_e)
+            assert status == 404, "this server must genuinely have no session"
+
+            status, data = _raw_request(port_e, "GET", "/engine", headers=headers_e)
+            assert status == 200, (status, data)
+            snap = json.loads(data)
+            assert snap["state"] == engine_mod.hearth_engine.STATE_IDLE, snap
+            assert snap["active"] is None and snap["version"] == 0, snap
+
+            # An SSE reader attached BEFORE the fetch starts sees it happen.
+            req_eng = urllib.request.Request(
+                "http://127.0.0.1:{}/engine/events?since=0".format(port_e),
+                headers={"Authorization": "Bearer eng-token",
+                         "Host": "127.0.0.1:{}".format(port_e)})
+            resp_eng = urllib.request.urlopen(req_eng, timeout=10)
+
+            status, data = _raw_request(port_e, "POST", "/engine", headers=headers_e,
+                                        body="{}")
+            assert status == 200, (status, data)
+            # POST returns AT ONCE rather than waiting for the fetch: the
+            # whole design promise is that this never blocks the app.
+            started = json.loads(data)
+            assert started["state"] != engine_mod.hearth_engine.STATE_FAILED, started
+
+            final = None
+            deadline_eng = time.monotonic() + 15
+            while time.monotonic() < deadline_eng:
+                line = resp_eng.readline().decode("utf-8", "replace")
+                if not line:
+                    break
+                if line.startswith("data: "):
+                    frame = json.loads(line[len("data: "):])
+                    if frame["state"] in engine_mod.hearth_engine.TERMINAL_STATES:
+                        final = frame
+                        break
+            resp_eng.close()
+            assert final is not None, "GET /engine/events never delivered a terminal frame"
+            assert final["state"] == engine_mod.hearth_engine.STATE_ACTIVE, final
+            assert final["active"]["backend"] == "vulkan", final
+            assert "RTX 5080" in final["message"], final
+
+            # The snapshot GET agrees with the stream, which is what makes
+            # a page reload safe.
+            status, data = _raw_request(port_e, "GET", "/engine", headers=headers_e)
+            assert json.loads(data)["active"]["backend"] == "vulkan", data
+
+            # A malformed body is a 400, not a 500 and not a fetch.
+            status, _ = _raw_request(port_e, "POST", "/engine", headers=headers_e,
+                                     body="{not json")
+            assert status == 400, status
+        finally:
+            server_eng.shutdown()
+            server_eng.server_close()
+
+        # === the four route allowlists agree ==========================
+        # This router's table is duplicated, by necessity, in three
+        # JavaScript files: the client (desktop/ui/js/api.js) and two
+        # same-origin proxies (desktop/ui/dev-host.mjs and the packaged
+        # shell's desktop/shell/origin.js), each of which refuses anything
+        # not on its list so that a typo cannot become an open forwarder.
+        # A route added here and missed there is invisible in every Python
+        # test and produces a 404 only in the packaged application. Caught
+        # exactly that way once, with GET /engine, which is why this exists.
+        import re as _re
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        ui_dir = os.path.join(os.path.dirname(here), "ui")
+        shell_dir = os.path.join(os.path.dirname(here), "shell")
+        # Read out of the routing methods themselves, so a route that is
+        # added and not listed cannot be missed by a stale literal here.
+        # Both dispatch spellings count: `path == "/x"` and `path in (...)`.
+        _src = open(os.path.abspath(__file__), encoding="utf-8").read()
+        _dispatch = "".join(
+            _src[_src.index("def do_" + verb):_src.index('_send_json(404, {"error": "not_found"})',
+                                                         _src.index("def do_" + verb))]
+            for verb in ("GET(self)", "POST(self)"))
+        served = set(_re.findall(r'"(/[a-z/]+)"', _dispatch))
+        assert {"/engine", "/engine/events", "/setup", "/downloads/cancel"} <= served, served
+
+        def _js_routes(path):
+            text = open(path, encoding="utf-8").read()
+            marker = "SIDECAR_ROUTES = new Set(["
+            start = text.index(marker) + len(marker)
+            return set(_re.findall(r'"([^"]+)"', text[start:text.index("]);", start)]))
+
+        for rel in (os.path.join(ui_dir, "js", "api.js"),
+                    os.path.join(ui_dir, "dev-host.mjs"),
+                    os.path.join(shell_dir, "origin.js")):
+            if not os.path.isfile(rel):
+                continue  # a packaged payload does not carry the dev host
+            listed = _js_routes(rel)
+            missing = served - listed
+            extra = listed - served
+            assert not missing, ("{} does not allow {}, so the packaged app "
+                                 "would 404 on it".format(os.path.basename(rel),
+                                                          sorted(missing)))
+            assert not extra, ("{} allows {}, which this router does not "
+                               "serve".format(os.path.basename(rel), sorted(extra)))
 
         # === malformed JSON body is rejected, not a 500 ===
         status, data = _raw_request(port, "POST", "/session", headers=auth_headers, body="{not json")

@@ -32,6 +32,7 @@ const ui = {
   connect: $("#btn-connect"),
   sessionNote: $("#session-note"),
   setupBody: $("#setup-body"),
+  engineBody: $("#engine-body"),
   reloadSetup: $("#btn-setup"),
   cpList: $("#cp-list"),
   cpNote: $("#cp-note"),
@@ -185,6 +186,8 @@ async function refreshSetup() {
 
   const healthy = diagnosis.healthy === true;
   state.backendHealthy = healthy;
+  engineBackend = typeof diagnosis.backend === "string" ? diagnosis.backend : null;
+  renderEngine();
   clear(ui.setupBody);
 
   ui.setupBody.appendChild(appendAll(el("div", { class: "setup-head " + (healthy ? "is-ok" : "is-bad") }), [
@@ -200,9 +203,16 @@ async function refreshSetup() {
     ui.setupBody.appendChild(el("p", { class: "setup-message", text: String(next.message ?? "") }));
     if (next.remedy) ui.setupBody.appendChild(el("pre", { class: "setup-remedy", text: String(next.remedy) }));
   } else {
+    // Worded from the backend that was actually diagnosed. The bundled
+    // engine has no URL to be reachable at: Hearth starts it on an
+    // ephemeral loopback port it picks itself, and base_url is null on
+    // that path, so the old unconditional "Ollama is reachable at the
+    // configured URL" was a sentence about the wrong engine.
     ui.setupBody.appendChild(el("p", {
       class: "setup-message",
-      text: `Ollama is reachable at ${diagnosis.base_url ?? "the configured URL"}.`,
+      text: engineBackend === "ollama"
+        ? `Ollama is reachable at ${diagnosis.base_url ?? "the configured URL"}.`
+        : "Hearth's own engine is ready.",
     }));
   }
 
@@ -218,6 +228,138 @@ async function refreshSetup() {
   }
 
   if (!state.session) setConn(healthy ? "ok" : "warn", healthy ? "ready" : "backend not ready");
+}
+
+// -------------------------------------------------------------- engine (GPU)
+
+// The last snapshot GET /engine or its event stream delivered. Held here
+// rather than re-fetched inside refreshSetup so that the Backend panel can
+// be redrawn from a live stream frame without a second round trip.
+let engineSnapshot = null;
+let engineStream = null;
+// Which engine GET /setup last said is active. The GPU engine row is about
+// Hearth's own bundled llama.cpp, so it is hidden when the user is running
+// on Ollama instead: Ollama manages its own GPU, and a row saying "vulkan on
+// your RTX 5080" beside an Ollama session would describe an engine that is
+// not answering anything. null means "not asked yet", which still shows the
+// row, because on a first launch the bundled engine is what will run.
+let engineBackend = null;
+
+const ENGINE_LABEL = {
+  idle: "not started",
+  planning: "checking your GPU",
+  downloading: "downloading",
+  installing: "installing",
+  verifying: "verifying",
+  active: "active",
+  skipped: "not needed",
+  failed: "unavailable",
+};
+
+/** One line in the Backend panel saying what engine is really running.
+ *
+ *  The rule this obeys: never claim GPU acceleration that is not in effect.
+ *  "active" is rendered from the sidecar's own `active` pointer, which only
+ *  exists after the binary was downloaded against a pinned hash AND ran on
+ *  this machine AND reported a GPU device; every other state renders as the
+ *  CPU truth plus what is being done about it. */
+function renderEngine() {
+  const parent = ui.engineBody;
+  clear(parent);
+  const snap = engineSnapshot;
+  if (!snap) return;
+  if (engineBackend && engineBackend !== "llama") return;
+  const state = String(snap.state ?? "idle");
+  const active = snap.active && typeof snap.active === "object" ? snap.active : null;
+  const row = el("div", { class: "engine-row is-" + state });
+
+  if (state === "active" && active) {
+    row.appendChild(el("span", {
+      class: "engine-state is-ok",
+      text: `${String(active.backend ?? "GPU")} on ${String(active.device ?? "your GPU")}`,
+    }));
+  } else {
+    row.appendChild(el("span", {
+      class: "engine-state",
+      text: `CPU engine · GPU ${ENGINE_LABEL[state] ?? state}`,
+    }));
+  }
+
+  const total = Number(snap.bytes_total) || 0;
+  const done = Number(snap.bytes_done) || 0;
+  if (state === "downloading" && total > 0) {
+    const pct = Math.max(0, Math.min(100, (done / total) * 100));
+    const fill = el("div", { class: "bar-fill" });
+    fill.style.width = `${pct.toFixed(1)}%`;
+    row.appendChild(el("div", { class: "bar" }, [fill]));
+    row.appendChild(el("span", {
+      class: "engine-pct",
+      text: `${pct.toFixed(0)}% of ${(total / 1e6).toFixed(0)} MB`,
+    }));
+  }
+
+  if (snap.message) {
+    row.appendChild(el("p", { class: "engine-message", text: String(snap.message) }));
+  }
+
+  // A retry is offered exactly where it is useful: a fetch that failed, or
+  // one that never ran. "Not needed" gets no button, because there is
+  // nothing to retry on a machine with no GPU.
+  if (state === "failed" || state === "idle") {
+    const btn = el("button", {
+      class: "btn btn-ghost btn-sm",
+      type: "button",
+      text: state === "failed" ? "Try again" : "Enable GPU",
+    });
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      try {
+        engineSnapshot = await sidecar.fetchEngine(state === "failed");
+      } catch (err) {
+        engineSnapshot = { ...(engineSnapshot ?? {}), state: "failed", message: errorText(err) };
+      }
+      renderEngine();
+      refreshSetup();
+    });
+    row.appendChild(btn);
+  }
+  parent.appendChild(row);
+}
+
+/** Follow GET /engine/events for as long as the page is open.
+ *
+ *  Opened once at startup, before anything else needs the sidecar: the
+ *  whole point of the design is that a user can work on the CPU engine
+ *  while the GPU one arrives, so the panel has to be able to change under
+ *  them without a reload. A dropped stream is not an error worth showing;
+ *  the snapshot GET on the next refreshSetup covers it. */
+async function watchEngine() {
+  try {
+    engineSnapshot = await sidecar.engine();
+  } catch {
+    return; // the sidecar is not up yet; refreshSetup will report that
+  }
+  renderEngine();
+  if (engineStream) engineStream.abort();
+  engineStream = new AbortController();
+  const since = Number(engineSnapshot?.version) || 0;
+  try {
+    await sidecar.streamEngine({
+      since,
+      signal: engineStream.signal,
+      onSnapshot: (snap) => {
+        const before = engineSnapshot?.state;
+        engineSnapshot = snap;
+        // The engine row redraws on every frame: it is four elements and
+        // reads only this snapshot. The full diagnosis is re-run only when
+        // the state actually CHANGES, because it costs two subprocess
+        // probes of llama-server and a byte counter ticking every 250ms
+        // must not pay for that.
+        renderEngine();
+        if (snap.state !== before) refreshSetup();
+      },
+    });
+  } catch { /* the stream ended; the next refreshSetup re-reads the snapshot */ }
 }
 
 // --------------------------------------------------------------------- models
@@ -881,6 +1023,11 @@ async function boot() {
     onDownloadsChanged: paintDownloadBadge,
   });
   shopView.startDownloadStream();
+
+  // Not awaited: the GPU engine fetch runs for as long as it runs, and the
+  // whole point is that nothing waits for it. watchEngine paints the panel
+  // from the first snapshot and keeps repainting it from the stream.
+  watchEngine();
 
   await Promise.all([refreshSetup(), refreshModels()]);
 

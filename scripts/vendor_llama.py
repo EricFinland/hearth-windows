@@ -90,27 +90,31 @@ Hearth bundles win-cpu-x64 and fetches a GPU build later. The reasoning:
     the CPU build, downloaded by every user including the ones with no
     NVIDIA card at all. It does not belong in an installer.
   * CUDA is also not one choice. The 12.4 build does not cover Blackwell
-    (RTX 50-series), which needs a newer toolkit; the 13.3 build does.
-    Picking between them requires knowing the card, which an installer
-    does not know until it runs on the machine.
+    (RTX 50-series), which needs a newer toolkit; the 13.3 build does, and
+    CUDA 13 in turn dropped the older architectures 12.4 still covers.
+    Picking between them requires knowing the card and the driver, which an
+    installer does not know until it runs on the machine.
   * Vulkan at 33.5 MB is the best value for a first-run GPU fetch: one
     artifact covers NVIDIA, AMD and Intel, and it is smaller than any
-    vendor-specific build. It is slower than CUDA on NVIDIA, so CUDA stays
-    available as an explicit upgrade for people who want it.
+    vendor-specific build.
   * Shipping every variant would be roughly 1 GB of installer to deliver
     one working binary.
 
-So the recommendation a future installer should implement is: bundle
-win-cpu-x64, and on first run detect the GPU (hearth_hw.gpus() already
-does) and fetch one further variant, all of them already pinned here:
+CUDA was assumed to be worth its 537 MB on NVIDIA hardware until somebody
+measured it. On an RTX 5080 with this exact release the two backends are
+within a few per cent of each other and trade wins depending on the model
+(the numbers are in the manifest's policy.measured block). So the first-run
+fetch is Vulkan for every vendor:
 
-    NVIDIA, Blackwell or newer -> win-cuda-13.3-x64 + its cudart
-    NVIDIA, older              -> win-cuda-13.3-x64 or win-vulkan-x64
-    AMD or Intel               -> win-vulkan-x64
+    NVIDIA, AMD or Intel       -> win-vulkan-x64
     no GPU, or fetch failed    -> keep the bundled CPU build
+    HEARTH_GPU_ENGINE=<name>   -> that variant, if the hardware supports it
 
-Every one of those fetches goes through this same script and the same
-pinned hashes, so the first-run path is not a second, weaker supply chain.
+CUDA, ROCm, SYCL and OpenVINO stay pinned and installable through that last
+route, because one card and one release is not enough evidence to delete an
+option. hearth_engine implements the policy; every fetch goes through this
+same script and the same pinned hashes, so the first-run path is not a
+second, weaker supply chain.
 
 ## Layout
 
@@ -306,18 +310,60 @@ DEFAULT_POLICY = {
         "the GPU builds link vendor runtimes that are absent on machines "
         "without the matching driver, and a missing DLL is a launch failure "
         "rather than slow inference. It is also the smallest x64 artifact."),
+    #: Keyed by the vendor string hearth_hw.gpus() reports, so the lookup is
+    #: a dictionary access rather than a chain of special cases. A vendor
+    #: that is absent, or mapped to null, means "stay on the CPU build".
     "first_run_gpu_fetch": {
-        "nvidia_blackwell_or_newer": "win-cuda-13.3-x64",
-        "nvidia_older": "win-cuda-13.3-x64",
+        "nvidia": "win-vulkan-x64",
         "amd": "win-vulkan-x64",
         "intel": "win-vulkan-x64",
         "other_or_none": None,
     },
     "first_run_reason": (
         "Vulkan is 33.5 MB and covers every desktop GPU vendor, so it is the "
-        "cheapest fetch that turns on offload. CUDA is faster on NVIDIA but "
-        "is 537 MB with its cudart companion, which is why it is fetched on "
-        "demand for NVIDIA hardware rather than bundled for everyone."),
+        "cheapest fetch that turns on offload. NVIDIA is mapped to Vulkan "
+        "too, which is a change from the earlier assumption that CUDA was "
+        "worth 537 MB on NVIDIA hardware: see `measured`. CUDA remains "
+        "pinned and installable on request through HEARTH_GPU_ENGINE."),
+    #: The numbers behind first_run_gpu_fetch, kept in the manifest so the
+    #: policy can be argued with rather than merely believed. Measured with
+    #: llama-bench from this same pinned release, three repetitions each.
+    "measured": {
+        "hardware": "NVIDIA GeForce RTX 5080, 16 GB, driver 610.47, CUDA UMD 13.3",
+        "release_tag": "b10105",
+        "measured_at": "2026-08-01",
+        "results": [
+            {"model": "Qwen2.5-7B-Instruct-Q4_K_M", "test": "tg128",
+             "cpu": 13.83, "vulkan": 169.18, "cuda_13_3": 169.17, "unit": "tokens/s"},
+            {"model": "Qwen2.5-7B-Instruct-Q4_K_M", "test": "pp512",
+             "cpu": 185.38, "vulkan": 8436.09, "cuda_13_3": 8861.23, "unit": "tokens/s"},
+            {"model": "Qwen2.5-7B-Instruct-Q4_K_M", "test": "pp4096",
+             "cpu": None, "vulkan": 7913.91, "cuda_13_3": 8501.47, "unit": "tokens/s"},
+            {"model": "Qwen2.5-0.5B-Instruct-F16", "test": "tg256",
+             "cpu": 57.40, "vulkan": 530.48, "cuda_13_3": 579.35, "unit": "tokens/s"},
+            {"model": "Qwen2.5-0.5B-Instruct-F16", "test": "pp4096",
+             "cpu": 1398.22, "vulkan": 51032.43, "cuda_13_3": 40903.23, "unit": "tokens/s"},
+        ],
+        "conclusion": (
+            "CUDA and Vulkan trade wins within a few per cent of each other on "
+            "this card: CUDA is 5 to 7 per cent faster at prompt processing on "
+            "the 7B, Vulkan is 25 per cent faster at prompt processing on the "
+            "0.5B F16, and token generation is identical to three significant "
+            "figures on the 7B. Either is roughly twelve times the CPU build at "
+            "generation and forty-five times at prompt processing. A margin that "
+            "small does not justify 504 MB of extra download, so NVIDIA gets "
+            "Vulkan like everybody else."),
+    },
+    #: Not fetched automatically. Selected only when HEARTH_GPU_ENGINE names
+    #: a variant, and then only when the card and driver actually support it
+    #: (see hearth_engine.cuda_variant_for). Kept because the margin above is
+    #: one card and one release, and somebody with different hardware should
+    #: be able to have the other build without editing code.
+    "explicit_upgrade": {
+        "nvidia": ["win-cuda-13.3-x64", "win-cuda-12.4-x64"],
+        "amd": ["win-hip-radeon-x64"],
+        "intel": ["win-sycl-x64", "win-openvino-x64"],
+    },
 }
 
 
@@ -699,18 +745,42 @@ def read_receipt(env=None):
     return data if isinstance(data, dict) else None
 
 
-def write_receipt(manifest, variant, entry, files, env=None):
-    """Record what is installed, so the next run can be a no-op."""
+def read_dir_receipt(dest):
+    """What was installed into `dest`, or None. The directory-addressed twin
+    of read_receipt, for installs that do not live under vendor_root."""
+    try:
+        with open(os.path.join(dest, RECEIPT_NAME), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_receipt(manifest, variant, entry, files, env=None, dest=None,
+                  archives=None):
+    """Record what is installed, so the next run can be a no-op.
+
+    `archives` lists every pinned artifact that contributed to the install,
+    which for a CUDA engine is the engine archive AND its cudart companion.
+    The top-level release_tag/variant/sha256 keys still describe the ENGINE,
+    because status() compares those against the pin and a companion runtime
+    is not the thing being identified.
+    """
+    path = os.path.join(dest, RECEIPT_NAME) if dest else receipt_path(env)
     data = {
         "release_tag": manifest["release_tag"],
         "variant": variant,
         "asset": entry["asset"],
         "sha256": entry["sha256"],
-        "backend": (VARIANT_TABLE.get(variant) or {}).get("backend"),
+        "backend": (VARIANT_TABLE.get(variant) or {}).get("backend")
+                   or entry.get("backend"),
         "vendored_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "archives": list(archives or [{"variant": variant, "asset": entry["asset"],
+                                       "sha256": entry["sha256"]}]),
         "files": files,
     }
-    with open(receipt_path(env), "w", encoding="utf-8") as fh:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2, sort_keys=True)
         fh.write("\n")
     return data
@@ -771,6 +841,152 @@ def status(manifest=None, variant=None, env=None):
 # The operation
 # --------------------------------------------------------------------------
 
+def required_variants(manifest, variant):
+    """`variant` followed by every companion it requires, engine first.
+
+    The CUDA engines are the reason this exists: llama-b*-bin-win-cuda-13.3
+    links cudart64_13.dll, cublas64_13.dll and cublasLt64_13.dll, which
+    upstream ships in a SEPARATE archive. An install that fetched only the
+    engine would produce a directory whose llama-server.exe cannot load,
+    which is the exact failure this whole exercise exists to avoid.
+
+    Requirements are resolved one level deep on purpose: nothing upstream
+    publishes a companion that itself requires a companion, and a recursive
+    resolver would be untested machinery guarding a case that does not
+    exist. A companion that grew its own `requires` is refused loudly here
+    rather than half-installed.
+    """
+    entry = variant_entry(manifest, variant)
+    out = [variant]
+    for req in entry.get("requires") or []:
+        sub = variant_entry(manifest, req)
+        if sub.get("requires"):
+            raise VendorError(
+                "companion {!r} of {!r} itself requires {}; this resolver only "
+                "goes one level deep".format(req, variant, sub["requires"]))
+        if req not in out:
+            out.append(req)
+    return out
+
+
+def fetch_archive(manifest, entry, cache, offline=False, on_progress=None, log=None):
+    """The verified archive for `entry` on disk, downloading it if needed.
+
+    Returns the path. A cached file is re-verified against the pin before it
+    is reused and deleted if it fails, because a cached file that does not
+    match the pin is not a cache, it is a problem. The returned path has
+    passed verify_file in every branch, so a caller may open it.
+    """
+    log = log or (lambda _msg: None)
+    archive = os.path.join(cache, entry["asset"])
+    if os.path.isfile(archive):
+        try:
+            verify_file(archive, entry["sha256"], entry["size_bytes"])
+            log("reusing verified archive {}".format(archive))
+            return archive
+        except ChecksumError as exc:
+            log("cached archive failed verification, discarding it: {}".format(exc))
+            _unlink(archive)
+    if offline:
+        raise VendorError(
+            "offline mode: {} is not in {} and this run may not download "
+            "it".format(entry["asset"], cache))
+    url = asset_url(manifest, entry)
+    log("downloading {} ({:,} bytes) from {}".format(
+        entry["asset"], entry["size_bytes"], url))
+    os.makedirs(cache, exist_ok=True)
+    download(url, archive, entry["sha256"], entry["size_bytes"],
+             manifest["release_tag"], on_progress=on_progress)
+    verify_file(archive, entry["sha256"], entry["size_bytes"])
+    log("sha256 verified: {}".format(entry["sha256"]))
+    return archive
+
+
+def install_variant(variant, dest, manifest=None, cache=None, offline=False,
+                    keep_all=False, on_progress=None, log=None):
+    """Fetch one pinned variant AND its companions into `dest`.
+
+    The single install primitive. vendor() is this function pointed at
+    vendor/llama; hearth_engine's first-run GPU fetch is this function
+    pointed at a directory under the user's data folder. There is
+    deliberately no second implementation of "download, check, unpack",
+    because the checks are the product.
+
+    Order of operations, which is the security property and is the same one
+    vendor() has always had: every archive is downloaded, then verified
+    against its pinned hash, and only then opened. No archive is opened
+    before its own verification, and nothing here executes anything.
+
+    `dest` is emptied first, so an install is a replacement rather than a
+    merge with whatever a previous, different variant left behind. A file
+    that two archives both want to write is refused rather than silently
+    resolved: which copy of a DLL wins is not something to decide by
+    extraction order.
+
+    `on_progress(done, total, asset)` is called during downloads. The extra
+    third argument is what makes a two-archive CUDA fetch legible: without
+    it a caller watching bytes would see the counter reset to zero halfway
+    through with no way to say why.
+
+    Returns a dict describing what happened. Raises ChecksumError when bytes
+    do not match the pin and VendorError for everything else.
+    """
+    log = log or (lambda _msg: None)
+    manifest = manifest or load_manifest()
+    cache = cache or cache_dir()
+    names = required_variants(manifest, variant)
+    entries = [(n, variant_entry(manifest, n)) for n in names]
+
+    # Every archive is fetched and verified BEFORE anything is extracted, so
+    # a failure on the second download cannot leave a half-populated engine
+    # directory that looks installed. Nothing is opened in this loop.
+    archives = []
+    for name, entry in entries:
+        def _prog(done, total, _asset=entry["asset"]):
+            if on_progress is not None:
+                on_progress(done, total, _asset)
+        archives.append((name, entry, fetch_archive(
+            manifest, entry, cache, offline=offline,
+            on_progress=_prog if on_progress is not None else None, log=log)))
+
+    if os.path.isdir(dest):
+        shutil.rmtree(dest, ignore_errors=True)
+    os.makedirs(dest, exist_ok=True)
+
+    keep = None if keep_all else _is_server_member
+    written = {}
+    for name, entry, archive in archives:
+        # Verified again immediately before the archive is opened. The
+        # earlier check is not redundant with this one: this is the check
+        # that is adjacent to the parse, and adjacency is the property that
+        # survives somebody reordering the loop above.
+        verify_file(archive, entry["sha256"], entry["size_bytes"])
+        for base in extract(archive, dest, keep=keep):
+            if base in written and written[base] != name:
+                raise VendorError(
+                    "{} and {} both provide {!r}; refusing to let one silently "
+                    "overwrite the other".format(written[base], name, base))
+            written[base] = name
+
+    server = os.path.join(dest, SERVER_EXE)
+    if not os.path.isfile(server):
+        raise VendorError(
+            "installing {} wrote {} files to {} but none of them is {}; the "
+            "upstream archive layout has changed".format(
+                variant, len(written), dest, SERVER_EXE))
+
+    files = sorted(written)
+    receipt = write_receipt(
+        manifest, variant, entries[0][1], files, dest=dest,
+        archives=[{"variant": n, "asset": e["asset"], "sha256": e["sha256"]}
+                  for n, e, _ in archives])
+    log("installed {} files to {}".format(len(files), dest))
+    return {"action": "installed", "variant": variant, "variants": names,
+            "release_tag": manifest["release_tag"], "server": server,
+            "sha256": entries[0][1]["sha256"], "files": files, "dir": dest,
+            "receipt": receipt}
+
+
 def vendor(variant=None, manifest=None, force=False, keep_all=False, offline=False,
            on_progress=None, log=None, env=None):
     """Put the pinned llama-server where hearth_llama will find it.
@@ -806,50 +1022,16 @@ def vendor(variant=None, manifest=None, force=False, keep_all=False, offline=Fal
                 "downloaded": False}
 
     archive = os.path.join(cache_dir(env), entry["asset"])
-    downloaded = False
-    if os.path.isfile(archive):
-        try:
-            verify_file(archive, entry["sha256"], entry["size_bytes"])
-            log("reusing verified archive {}".format(archive))
-        except ChecksumError as exc:
-            # A cached file that fails the pin is not a cache, it is a
-            # problem. Delete it and refetch rather than trusting it.
-            log("cached archive failed verification, discarding it: {}".format(exc))
-            _unlink(archive)
+    had_archive = os.path.isfile(archive)
 
-    if not os.path.isfile(archive):
-        if offline:
-            raise VendorError(
-                "offline mode: {} is not in {} and this run may not download "
-                "it".format(entry["asset"], cache_dir(env)))
-        url = asset_url(manifest, entry)
-        log("downloading {} ({:,} bytes) from {}".format(entry["asset"],
-                                                         entry["size_bytes"], url))
-        os.makedirs(cache_dir(env), exist_ok=True)
-        download(url, archive, entry["sha256"], entry["size_bytes"],
-                 manifest["release_tag"], on_progress=on_progress)
-        downloaded = True
-
-    # Verified above, in both the cached and the freshly downloaded case.
-    # Only now is the archive opened.
-    verify_file(archive, entry["sha256"], entry["size_bytes"])
-    log("sha256 verified: {}".format(entry["sha256"]))
-
-    dest = install_dir(env)
-    if os.path.isdir(dest):
-        shutil.rmtree(dest, ignore_errors=True)
-    files = extract(archive, dest, keep=None if keep_all else _is_server_member)
-
-    server = os.path.join(dest, SERVER_EXE)
-    if not os.path.isfile(server):
-        raise VendorError(
-            "{} extracted {} files but none of them is {}; the upstream archive "
-            "layout has changed".format(entry["asset"], len(files), SERVER_EXE))
-    write_receipt(manifest, variant, entry, files, env=env)
-    log("installed {} files to {}".format(len(files), dest))
-    return {"action": "installed", "variant": variant,
-            "release_tag": manifest["release_tag"], "server": server,
-            "sha256": entry["sha256"], "files": files, "downloaded": downloaded}
+    result = install_variant(
+        variant, install_dir(env), manifest=manifest, cache=cache_dir(env),
+        offline=offline, keep_all=keep_all,
+        on_progress=(lambda done, total, _asset: on_progress(done, total))
+                    if on_progress is not None else None,
+        log=log)
+    result["downloaded"] = not had_archive
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -1496,6 +1678,180 @@ def _self_test(live=False):
             raise AssertionError("a cached archive that fails the pin must not be used")
         except VendorError:
             pass
+
+        # -- install_variant: companions, ordering and collisions -----------
+        # The CUDA shape, in miniature: an engine archive plus a separate
+        # runtime archive that must land in the SAME directory, because an
+        # engine installed without its runtime is a binary that cannot load.
+        multi_root = os.path.join(tmp, "multi")
+        multi_cache = os.path.join(multi_root, "cache")
+        os.makedirs(multi_cache)
+        eng_zip = _make_zip(os.path.join(multi_cache, "llama-b1-bin-win-gpu-x64.zip"),
+                            {SERVER_EXE: b"MZ", "ggml-gpu.dll": b"engine"})
+        rt_zip = _make_zip(os.path.join(multi_cache, "cudart-llama-bin-win-gpu-x64.zip"),
+                           {"runtime64_13.dll": b"runtime"})
+        multi_manifest = {
+            "release_tag": "b1",
+            "bundled_variant": "win-cpu-x64",
+            "variants": {
+                "win-cpu-x64": dict(fake_manifest["variants"]["win-cpu-x64"]),
+                "win-gpu-x64": {
+                    "asset": "llama-b1-bin-win-gpu-x64.zip",
+                    "sha256": sha256_file(eng_zip),
+                    "size_bytes": os.path.getsize(eng_zip),
+                    "sha256_source": SRC_HASHED,
+                    "os": "windows", "arch": "x86_64", "backend": "cuda",
+                    "gpu_vendors": ["nvidia"], "requires": ["rt-gpu-x64"],
+                    "note": "test engine",
+                },
+                "rt-gpu-x64": {
+                    "asset": "cudart-llama-bin-win-gpu-x64.zip",
+                    "sha256": sha256_file(rt_zip),
+                    "size_bytes": os.path.getsize(rt_zip),
+                    "sha256_source": SRC_HASHED,
+                    "os": "windows", "arch": "x86_64", "backend": "runtime",
+                    "gpu_vendors": ["nvidia"], "requires": [],
+                    "note": "test runtime",
+                },
+            },
+        }
+        validate_manifest(multi_manifest)
+        assert required_variants(multi_manifest, "win-gpu-x64") == [
+            "win-gpu-x64", "rt-gpu-x64"], required_variants(multi_manifest, "win-gpu-x64")
+        assert required_variants(multi_manifest, "win-cpu-x64") == ["win-cpu-x64"]
+
+        multi_dest = os.path.join(multi_root, "engine")
+        seen_assets = []
+        got = install_variant(
+            "win-gpu-x64", multi_dest, manifest=multi_manifest, cache=multi_cache,
+            offline=True, on_progress=lambda d, t, a: seen_assets.append(a))
+        assert got["variants"] == ["win-gpu-x64", "rt-gpu-x64"], got
+        # The engine AND its runtime are in one directory. This is the whole
+        # point: a CUDA llama-server.exe with no cudart beside it does not run.
+        for name in (SERVER_EXE, "ggml-gpu.dll", "runtime64_13.dll"):
+            assert os.path.isfile(os.path.join(multi_dest, name)), name
+        assert got["receipt"]["variant"] == "win-gpu-x64", got["receipt"]
+        assert [a["variant"] for a in got["receipt"]["archives"]] == [
+            "win-gpu-x64", "rt-gpu-x64"], got["receipt"]["archives"]
+        assert read_dir_receipt(multi_dest) == got["receipt"]
+
+        # Every extraction is IMMEDIATELY preceded by a verification of the
+        # archive it is about to open. Not merely "verified somewhere
+        # earlier": adjacency is the property, because it is what survives
+        # somebody reordering the fetch loop above, and because opening a
+        # zip is running a parser over the file. Recorded as an ordered log
+        # rather than a call count, since a count is satisfied by a
+        # redundant check anywhere at all.
+        log = []
+        real_verify, real_extract = verify_file, extract
+        g = globals()
+        try:
+            g["verify_file"] = lambda p, s, size=None: (
+                log.append(("verify", os.path.basename(p))), real_verify(p, s, size))[1]
+            g["extract"] = lambda a, d, keep=None: (
+                log.append(("extract", os.path.basename(a))), real_extract(a, d, keep=keep))[1]
+            install_variant("win-gpu-x64", os.path.join(multi_root, "ordered"),
+                            manifest=multi_manifest, cache=multi_cache, offline=True)
+        finally:
+            g["verify_file"], g["extract"] = real_verify, real_extract
+        opened = [i for i, (kind, _) in enumerate(log) if kind == "extract"]
+        assert opened, log
+        for i in opened:
+            assert i > 0 and log[i - 1] == ("verify", log[i][1]), (
+                "an archive was opened without a verification immediately "
+                "before it: {}".format(log))
+
+        # MUTATION: poison the COMPANION's pin. The engine archive is
+        # perfectly good, so anything that installed archives one at a time
+        # would leave a directory holding a usable llama-server.exe and no
+        # runtime -- the exact half-installed engine that must never exist.
+        poisoned_rt = json.loads(json.dumps(multi_manifest))
+        poisoned_rt["variants"]["rt-gpu-x64"]["sha256"] = "c" * 64
+        shutil.rmtree(multi_dest, ignore_errors=True)
+        try:
+            install_variant("win-gpu-x64", multi_dest, manifest=poisoned_rt,
+                            cache=multi_cache, offline=True)
+            raise AssertionError("a companion that fails its pin must fail the install")
+        except VendorError:
+            pass
+        assert not os.path.exists(os.path.join(multi_dest, SERVER_EXE)), (
+            "a failed companion must not leave an engine binary behind")
+
+        # MUTATION: two archives that both provide the same filename. Which
+        # copy of a DLL wins is not a thing to decide by extraction order.
+        clash_zip = _make_zip(os.path.join(multi_cache, "cudart-llama-bin-win-clash-x64.zip"),
+                              {"ggml-gpu.dll": b"a different engine's dll"})
+        clash = json.loads(json.dumps(multi_manifest))
+        clash["variants"]["win-gpu-x64"]["requires"] = ["rt-clash-x64"]
+        clash["variants"]["rt-clash-x64"] = {
+            "asset": "cudart-llama-bin-win-clash-x64.zip",
+            "sha256": sha256_file(clash_zip),
+            "size_bytes": os.path.getsize(clash_zip),
+            "sha256_source": SRC_HASHED,
+            "os": "windows", "arch": "x86_64", "backend": "runtime",
+            "gpu_vendors": ["nvidia"], "requires": [], "note": "clashing runtime",
+        }
+        validate_manifest(clash)
+        try:
+            install_variant("win-gpu-x64", os.path.join(multi_root, "clash"),
+                            manifest=clash, cache=multi_cache, offline=True)
+            raise AssertionError("two archives providing the same file must be refused")
+        except VendorError:
+            pass
+
+        # A companion with its own companion is refused rather than
+        # half-resolved by a resolver that only goes one level deep.
+        deep = json.loads(json.dumps(multi_manifest))
+        deep["variants"]["rt-gpu-x64"]["requires"] = ["win-cpu-x64"]
+        try:
+            required_variants(deep, "win-gpu-x64")
+            raise AssertionError("a nested requirement must be refused")
+        except VendorError:
+            pass
+
+        # An install whose archives never produce a server binary is refused
+        # rather than reported as a working engine directory.
+        noserver_zip = _make_zip(os.path.join(multi_cache, "llama-b1-bin-win-empty-x64.zip"),
+                                 {"ggml-only.dll": b"d"})
+        noserver = json.loads(json.dumps(multi_manifest))
+        noserver["variants"]["win-empty-x64"] = {
+            "asset": "llama-b1-bin-win-empty-x64.zip",
+            "sha256": sha256_file(noserver_zip),
+            "size_bytes": os.path.getsize(noserver_zip),
+            "sha256_source": SRC_HASHED,
+            "os": "windows", "arch": "x86_64", "backend": "vulkan",
+            "gpu_vendors": ["nvidia"], "requires": [], "note": "no server",
+        }
+        validate_manifest(noserver)
+        try:
+            install_variant("win-empty-x64", os.path.join(multi_root, "empty"),
+                            manifest=noserver, cache=multi_cache, offline=True)
+            raise AssertionError("an install with no llama-server must be refused")
+        except VendorError:
+            pass
+
+        # -- the policy the first-run fetch is driven by is well formed -----
+        # hearth_engine reads this mapping to decide what to fetch. A vendor
+        # naming a variant the manifest does not publish, or one that does
+        # not claim that vendor, would send the fetch after something that
+        # cannot work, so it is checked here where the manifest lives.
+        policy = manifest.get("policy") or {}
+        fetch = policy.get("first_run_gpu_fetch") or {}
+        assert fetch, "the pin carries no first_run_gpu_fetch policy"
+        for vendor_key, want in fetch.items():
+            if want is None:
+                continue
+            assert want in manifest["variants"], (
+                "policy maps {} to {!r}, which the pin does not publish".format(
+                    vendor_key, want))
+            e = manifest["variants"][want]
+            assert e["os"] == "windows" and e["arch"] == "x86_64", (vendor_key, e)
+            assert e["backend"] not in ("cpu", "runtime"), (
+                "policy maps {} to {!r}, which is not a GPU engine".format(
+                    vendor_key, want))
+            assert vendor_key in e["gpu_vendors"], (
+                "policy maps {} to {!r}, which does not claim that vendor: "
+                "{}".format(vendor_key, want, e["gpu_vendors"]))
 
         # -- live: the real pinned asset ----------------------------------
         if live:

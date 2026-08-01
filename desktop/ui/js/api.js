@@ -31,6 +31,7 @@ const SIDECAR_ROUTES = new Set([
   "/cancel", "/models", "/checkpoints", "/restore", "/setup", "/idle",
   "/shop", "/shop/quants",
   "/downloads", "/downloads/events", "/downloads/cancel", "/downloads/dismiss",
+  "/engine", "/engine/events",
 ]);
 
 export class HttpError extends Error {
@@ -136,12 +137,32 @@ export class Sidecar {
   cancelDownload(id)              { return this.request("POST", "/downloads/cancel", { id }); }
   dismissDownload(id)             { return this.request("POST", "/downloads/dismiss", { id }); }
 
+  engine()             { return this.request("GET", "/engine"); }
+  /** Start (or, with force, retry) the GPU engine fetch. Returns at once:
+   *  the fetch runs on the sidecar's own thread and Hearth stays usable on
+   *  the bundled CPU engine while it happens. */
+  fetchEngine(force = false) { return this.request("POST", "/engine", { force }); }
+
+  /** Open GET /engine/events and call `onSnapshot(snapshot)` per frame.
+   *  Same contract as streamDownloads: every frame is the whole state. */
+  async streamEngine({ since = 0, onSnapshot, signal }) {
+    return this._streamSnapshots("/engine/events", { since, onSnapshot, signal });
+  }
+
   /** Open GET /downloads/events and call `onSnapshot({version, downloads})`
    *  for each frame. Unlike /events this is not a delta log: every frame is
    *  the complete list, so a caller replaces its state rather than folding
    *  events into it, and a reload needs no replay. */
   async streamDownloads({ since = 0, onSnapshot, signal }) {
-    const url = `${this.origin}/downloads/events?since=${encodeURIComponent(since)}`;
+    return this._streamSnapshots("/downloads/events", { since, onSnapshot, signal });
+  }
+
+  /** The shared body of streamDownloads and streamEngine. Both surfaces send
+   *  whole snapshots rather than deltas, so the only thing that differs is
+   *  the path; one implementation means a fix to the frame parsing cannot
+   *  land on one stream and miss the other. */
+  async _streamSnapshots(path, { since = 0, onSnapshot, signal }) {
+    const url = `${this.origin}${path}?since=${encodeURIComponent(since)}`;
     const response = await fetch(url, {
       headers: this._headers({ Accept: "text/event-stream" }),
       cache: "no-store",

@@ -181,6 +181,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import hearth_engine
 import hearth_hw
 import hearth_paths
 import hearth_proc
@@ -212,6 +213,7 @@ BUNDLED_SUBDIRS = ("llama", os.path.join("bin", "llama"), "bin", "vendor/llama")
 
 #: Discovery outcomes.
 FOUND_ENV = "env"
+FOUND_ACQUIRED = "acquired"
 FOUND_BUNDLED = "bundled"
 FOUND_PATH = "path"
 FOUND_MISSING = "missing"
@@ -476,9 +478,16 @@ def find_server(env=None):
     Resolution order, most explicit first:
 
       1. %HEARTH_LLAMA_SERVER% -- a full path to the binary.
-      2. The bundled location under the install root (see BUNDLED_SUBDIRS),
+      2. The GPU engine hearth_engine fetched and verified for this machine,
+         if there is one. It comes before the bundled build because it is
+         strictly better when it exists: it only exists at all after it was
+         downloaded against a pinned hash AND proved to run here AND
+         reported a real GPU device. When it does not exist, or its binary
+         has been deleted, this step is silently skipped and the bundled
+         build takes over, which is what makes the fallback free.
+      3. The bundled location under the install root (see BUNDLED_SUBDIRS),
          which is where a shipped Hearth actually finds it.
-      3. PATH, so a developer with llama.cpp already installed does not have
+      4. PATH, so a developer with llama.cpp already installed does not have
          to stage a copy.
 
     Returns a dict, never raises:
@@ -506,6 +515,16 @@ def find_server(env=None):
         return {"found": False, "path": None, "source": FOUND_MISSING, "searched": searched,
                 "reason": ("{} is set to {!r} but no executable is there; unset it or fix "
                            "the path".format(ENV_SERVER, override))}
+
+    acquired = hearth_engine.active_server_path(env)
+    if acquired:
+        searched.append(acquired)
+        if _is_runnable(acquired):
+            live = hearth_engine.active(env) or {}
+            return {"found": True, "path": os.path.abspath(acquired),
+                    "source": FOUND_ACQUIRED, "searched": searched,
+                    "reason": "the {} engine Hearth fetched and verified for this "
+                              "machine".format(live.get("backend") or "GPU")}
 
     for cand in _bundled_candidates():
         searched.append(cand)
@@ -1469,8 +1488,29 @@ def consume_stream(lines, on_token=None):
     }
 
 
+def engine_level_failure(server):
+    """True when `server` died in a way that blames the BINARY, not the model.
+
+    The distinction is what makes the automatic fallback safe to have. A
+    llama-server that cannot load its backend DLLs never gets as far as
+    printing its own banner: on Windows the loader kills it before main()
+    runs, so there is no version line and no port announcement, and that
+    silence is the signature. A server that started fine and then failed on
+    a corrupt GGUF, or ran out of VRAM, has already printed its version and
+    usually its device block, and demoting the engine for that would throw
+    away a working GPU because of a bad file.
+
+    So: no port, and no version line in anything it managed to say.
+    """
+    if server is None or server.port is not None:
+        return False
+    build, _commit = _parse_version(server.stderr_tail(limit=10000))
+    return build is None
+
+
 def start(model_path, server_path=None, ctx_size=None, n_gpu_layers=None, alias=None,
-          parallel=1, ready_timeout=DEFAULT_READY_TIMEOUT, extra=None, wait=True):
+          parallel=1, ready_timeout=DEFAULT_READY_TIMEOUT, extra=None, wait=True,
+          _allow_fallback=True):
     """Launch a llama-server on `model_path` and wait until it is serving.
 
     The one call a caller normally makes. Picks -ngl from measured VRAM (see
@@ -1478,17 +1518,26 @@ def start(model_path, server_path=None, ctx_size=None, n_gpu_layers=None, alias=
     choose_ctx_size) unless told otherwise, binds loopback on an ephemeral
     port, and returns a started Server.
 
+    When the binary was CHOSEN here rather than named by the caller, and the
+    chosen one is a GPU engine hearth_engine fetched, a startup failure that
+    blames the binary demotes that engine and retries once on the bundled
+    CPU build (see engine_level_failure for what "blames the binary" means).
+    A caller that passed an explicit server_path gets no such second-
+    guessing: it asked for that binary and gets that binary's error.
+
     Raises LlamaError when no binary can be found, when the process dies
     during load, or when readiness times out; the message carries the
     server's own stderr tail, because "exiting due to model loading error"
     plus the line above it is the actual answer the user needs.
     """
+    chosen_here = server_path is None
     if server_path is None:
         found = find_server()
         if not found["found"]:
             raise LlamaError("{} (searched: {})".format(
                 found["reason"], "; ".join(found["searched"])))
         server_path = found["path"]
+        chosen_here = found["source"] == FOUND_ACQUIRED
 
     # long_path, because a GGUF sitting in a redirected Documents folder is
     # exactly the kind of path that goes past MAX_PATH and then "does not
@@ -1496,7 +1545,32 @@ def start(model_path, server_path=None, ctx_size=None, n_gpu_layers=None, alias=
     if not os.path.isfile(hearth_paths.long_path(model_path)):
         raise LlamaError("no model file at {!r}".format(model_path))
 
+    def _fall_back(why):
+        """Demote the fetched engine and retry on the bundled build.
+
+        Returns a started Server, or None when there was nothing to demote,
+        in which case the caller re-raises the original error. The retry
+        passes _allow_fallback=False so a broken bundled build cannot put
+        this into a loop.
+        """
+        if not (chosen_here and _allow_fallback):
+            return None
+        if not hearth_engine.demote(why, server_path=server_path):
+            return None
+        return start(model_path, server_path=None, ctx_size=ctx_size,
+                     n_gpu_layers=n_gpu_layers, alias=alias, parallel=parallel,
+                     ready_timeout=ready_timeout, extra=extra, wait=wait,
+                     _allow_fallback=False)
+
     info = probe_binary(server_path)
+    if chosen_here and not info.get("ok"):
+        # The engine verified when it was installed and does not run now: a
+        # driver was removed, a DLL was deleted, the card was swapped. Do
+        # not spawn it; fall straight back to the build that always works.
+        retried = _fall_back("it no longer runs on this machine: {}".format(
+            info.get("error") or "it reported no version"))
+        if retried is not None:
+            return retried
     reason = {}
     if n_gpu_layers is None:
         n_gpu_layers, reason["gpu_layers"] = choose_gpu_layers(
@@ -1519,9 +1593,16 @@ def start(model_path, server_path=None, ctx_size=None, n_gpu_layers=None, alias=
     if wait:
         try:
             server.wait_ready(timeout=ready_timeout)
-        except LlamaError:
+        except LlamaError as exc:
+            engine_failed = engine_level_failure(server)
             server.stop()
-            raise
+            if engine_failed:
+                retried = _fall_back(
+                    "it exited before announcing a port and printed no version, "
+                    "which is what a build whose libraries are missing does")
+                if retried is not None:
+                    return retried
+            raise exc
     return server
 
 
@@ -2059,6 +2140,13 @@ def _self_test(live=False, model=None):
     # -- binary discovery --------------------------------------------------
     scratch = tempfile.mkdtemp(prefix="hearth-llama-")
     try:
+        # Every find_server() call below passes this, so no test can be
+        # answered by whatever engine the machine running it happens to
+        # have fetched. Discovery now consults hearth_engine, and without
+        # this the "bundled build is found" case silently becomes "the
+        # developer's own GPU engine is found".
+        no_engine = {hearth_engine.ENV_ENGINE_DIR: os.path.join(scratch, "no-engines")}
+
         fake = os.path.join(scratch, _exe(SERVER_BASENAME))
         with open(fake, "w", encoding="utf-8") as fh:
             fh.write("#!/bin/sh\nexit 0\n")
@@ -2066,19 +2154,19 @@ def _self_test(live=False, model=None):
             os.chmod(fake, 0o700)
 
         # 1. Env override wins, and is reported as such.
-        r = find_server(env={ENV_SERVER: fake})
+        r = find_server(env=dict(no_engine, **{ENV_SERVER: fake}))
         assert r["found"] is True and r["source"] == FOUND_ENV, r
         assert os.path.samefile(r["path"], fake), r
         assert r["searched"] == [fake], r
         # A quoted path (as a Windows user pastes it) still resolves.
-        r = find_server(env={ENV_SERVER: '"{}"'.format(fake)})
+        r = find_server(env=dict(no_engine, **{ENV_SERVER: '"{}"'.format(fake)}))
         assert r["found"] is True, r
 
         # 2. A BROKEN override is a distinct, named failure -- it must not
         # fall through to PATH and pretend everything is fine, or the user
         # never learns their setting is wrong.
         missing = os.path.join(scratch, "nope", _exe(SERVER_BASENAME))
-        r = find_server(env={ENV_SERVER: missing})
+        r = find_server(env=dict(no_engine, **{ENV_SERVER: missing}))
         assert r["found"] is False and r["source"] == FOUND_MISSING, r
         assert ENV_SERVER in r["reason"] and "nope" in r["reason"], r
 
@@ -2091,7 +2179,7 @@ def _self_test(live=False, model=None):
         if not hearth_paths.is_windows():
             os.chmod(bundled, 0o700)
         with mock.patch.dict(os.environ, {ENV_SERVER_DIR: os.path.join(scratch, "install")}):
-            r = find_server(env={})
+            r = find_server(env=no_engine)
             assert r["found"] is True and r["source"] == FOUND_BUNDLED, r
             assert os.path.samefile(r["path"], bundled), r
             # Every location tried is reported, so a setup screen can show them.
@@ -2104,7 +2192,7 @@ def _self_test(live=False, model=None):
         with mock.patch.dict(os.environ, {ENV_SERVER_DIR: empty}), \
              mock.patch.object(sys.modules[__name__], "shutil",
                                mock.Mock(which=lambda *a, **k: None)):
-            r = find_server(env={})
+            r = find_server(env=no_engine)
             assert r["found"] is False and r["path"] is None, r
             assert any("PATH" in s for s in r["searched"]), r
             assert r["reason"], r
@@ -2126,6 +2214,223 @@ def _self_test(live=False, model=None):
         assert _is_runnable(None) is False and _is_runnable("") is False
         # A directory is not a runnable binary.
         assert _is_runnable(scratch) is False
+
+        # -- 6. the fetched GPU engine outranks the bundled CPU one --------
+        # It only exists after hearth_engine downloaded it against a pinned
+        # hash and proved it runs here, so when it exists it wins; when it
+        # does not, this step costs nothing and the bundled build takes over.
+        eng_root = os.path.join(scratch, "engines")
+        acq_dir = os.path.join(eng_root, "b1-win-vulkan-x64")
+        os.makedirs(acq_dir)
+        acq_exe = os.path.join(acq_dir, _exe(SERVER_BASENAME))
+        with open(acq_exe, "w", encoding="utf-8") as fh:
+            fh.write("x")
+        if not hearth_paths.is_windows():
+            os.chmod(acq_exe, 0o700)
+        pointer = {"variant": "win-vulkan-x64", "backend": "vulkan", "build": 10105,
+                   "release_tag": "b1", "dir": acq_dir, "server": acq_exe,
+                   "device": "NVIDIA GeForce RTX 5080", "devices": [],
+                   "source": "policy", "verified_at": "2026-08-01T00:00:00Z"}
+        eng_env = {hearth_engine.ENV_ENGINE_DIR: eng_root}
+        hearth_engine._write_json(hearth_engine.active_path(eng_env), pointer)
+        install_root = os.path.join(scratch, "install")
+        with mock.patch.dict(os.environ, {ENV_SERVER_DIR: install_root}):
+            r = find_server(env=eng_env)
+            assert r["found"] is True and r["source"] == FOUND_ACQUIRED, r
+            assert os.path.samefile(r["path"], acq_exe), r
+            assert "vulkan" in r["reason"], r
+
+            # An explicit env override still outranks it: a developer
+            # pointing at a specific build gets that build.
+            r = find_server(env=dict(eng_env, **{ENV_SERVER: fake}))
+            assert r["source"] == FOUND_ENV, r
+
+            # THE FALLBACK, at its cheapest: the pointer survives but the
+            # binary is gone. Nothing raises, nothing is reported as broken,
+            # and the bundled CPU build is simply what runs.
+            os.unlink(acq_exe)
+            r = find_server(env=eng_env)
+            assert r["found"] is True and r["source"] == FOUND_BUNDLED, r
+            assert os.path.samefile(r["path"], bundled), r
+            with open(acq_exe, "w", encoding="utf-8") as fh:
+                fh.write("x")
+            if not hearth_paths.is_windows():
+                os.chmod(acq_exe, 0o700)
+
+            # No pointer at all is the ordinary case and behaves the same.
+            os.unlink(hearth_engine.active_path(eng_env))
+            r = find_server(env=eng_env)
+            assert r["source"] == FOUND_BUNDLED, r
+            hearth_engine._write_json(hearth_engine.active_path(eng_env), pointer)
+
+        # -- engine_level_failure: blaming the binary, not the model -------
+        # The whole automatic fallback rests on this classification, so it
+        # is driven from the real stderr fixtures rather than from prose.
+        class _StderrOnly:
+            def __init__(self, text, port=None):
+                self.port = port
+                self._text = text
+
+            def stderr_tail(self, limit=40):  # noqa: ARG002 - signature parity
+                return self._text
+
+        # Nothing at all on stderr and no port: this is what a Windows
+        # binary whose DLLs are missing looks like. Blame the binary.
+        assert engine_level_failure(_StderrOnly("")) is True
+        assert engine_level_failure(_StderrOnly(
+            "The specified module could not be found.\n")) is True
+        # It printed its version, so it loaded: a later failure is the
+        # model's or the machine's, and must NOT cost the user their GPU.
+        assert engine_level_failure(_StderrOnly(FIXTURE_VERSION)) is False
+        assert engine_level_failure(
+            _StderrOnly(FIXTURE_VERSION + FIXTURE_LOAD_FAILURE)) is False
+        assert engine_level_failure(_StderrOnly(FIXTURE_WIN_VERSION)) is False
+        # It got as far as binding a port, so it is running.
+        assert engine_level_failure(_StderrOnly("", port=45727)) is False
+        assert engine_level_failure(None) is False
+
+        # -- start() demotes an engine that dies at launch, and retries ----
+        # This is the fallback proven end to end: a GPU engine that
+        # verified at install time but cannot start now must leave the user
+        # on a WORKING CPU engine rather than on an error.
+        gguf = os.path.join(scratch, "fallback.gguf")
+        with open(gguf, "wb") as fh:
+            fh.write(b"\0" * 16)
+
+        class _FakeProc:
+            def __init__(self, rc=None):
+                self.returncode = rc
+                self.pid = 4242
+
+            def poll(self):
+                return self.returncode
+
+        spawned = []
+
+        def _fake_spawn(self, n_gpu_layers=None, ctx_size=None, alias=None,
+                        parallel=1, extra=None):  # noqa: ARG001
+            spawned.append(self.server_path)
+            self.proc = _FakeProc()
+            self.argv = [self.server_path]
+
+        def _fake_stop(self, grace=None):  # noqa: ARG001
+            self.proc = None
+            return 1
+
+        def _dll_failure_then_ok(self):
+            """wait_ready that fails like a missing DLL on the fetched
+            engine and succeeds on anything else."""
+            def _inner(inner_self, timeout=None, interval=None):  # noqa: ARG001
+                if os.path.normcase(inner_self.server_path) == os.path.normcase(acq_exe):
+                    inner_self.proc = _FakeProc(rc=3221225781)
+                    raise LlamaError("llama-server exited with code 3221225781")
+                inner_self.port = 45727
+                inner_self.state = STATE_READY
+                return STATE_READY
+            return _inner
+
+        with mock.patch.dict(os.environ, {ENV_SERVER_DIR: install_root,
+                                          hearth_engine.ENV_ENGINE_DIR: eng_root}), \
+             mock.patch.object(sys.modules[__name__], "probe_binary",
+                               lambda p, **k: {"ok": True, "path": p, "build": 10105,
+                                               "commit": "abc", "backend": BACKEND_VULKAN,
+                                               "gpu_offload": True, "devices": [],
+                                               "error": None}), \
+             mock.patch.object(Server, "spawn", _fake_spawn), \
+             mock.patch.object(Server, "stop", _fake_stop), \
+             mock.patch.object(Server, "wait_ready", _dll_failure_then_ok(None)):
+            assert hearth_engine.active_server_path() == acq_exe
+            server = start(gguf, ctx_size=2048, n_gpu_layers=0)
+            # It tried the fetched engine first, then the bundled one, and
+            # the caller got a running server rather than an exception.
+            assert [os.path.normcase(p) for p in spawned] == [
+                os.path.normcase(acq_exe), os.path.normcase(bundled)], spawned
+            assert os.path.normcase(server.server_path) == os.path.normcase(bundled)
+            assert server.state == STATE_READY
+            # The engine was demoted, so the NEXT launch does not repeat the
+            # failure, and the reason is recorded for the setup screen.
+            assert hearth_engine.active() is None
+            state = hearth_engine.read_state()
+            assert state["state"] == hearth_engine.STATE_FAILED, state
+            assert any(f["stage"] == "launch" for f in state["failed"]), state
+
+        # MUTATION: the same crash, but the binary DID print its version, so
+        # the fault is the model's. The engine must survive.
+        hearth_engine._write_json(hearth_engine.active_path(eng_env), pointer)
+        spawned[:] = []
+
+        def _model_failure(inner_self, timeout=None, interval=None):  # noqa: ARG001
+            inner_self._stderr_lines = [FIXTURE_VERSION, FIXTURE_LOAD_FAILURE]
+            inner_self.proc = _FakeProc(rc=1)
+            raise LlamaError("llama-server exited with code 1")
+
+        with mock.patch.dict(os.environ, {ENV_SERVER_DIR: install_root,
+                                          hearth_engine.ENV_ENGINE_DIR: eng_root}), \
+             mock.patch.object(sys.modules[__name__], "probe_binary",
+                               lambda p, **k: {"ok": True, "path": p, "build": 10105,
+                                               "commit": "abc", "backend": BACKEND_VULKAN,
+                                               "gpu_offload": True, "devices": [],
+                                               "error": None}), \
+             mock.patch.object(Server, "spawn", _fake_spawn), \
+             mock.patch.object(Server, "stop", _fake_stop), \
+             mock.patch.object(Server, "wait_ready", _model_failure):
+            try:
+                start(gguf, ctx_size=2048, n_gpu_layers=0)
+                raise AssertionError("a model that will not load must still raise")
+            except LlamaError:
+                pass
+            assert len(spawned) == 1, ("a model failure must not retry on another "
+                                       "engine", spawned)
+            assert hearth_engine.active() is not None, (
+                "a model failure must not cost the user their GPU engine")
+
+        # MUTATION: an engine whose binary no longer runs at all is caught
+        # BEFORE it is spawned, by the probe, and still falls back.
+        spawned[:] = []
+        with mock.patch.dict(os.environ, {ENV_SERVER_DIR: install_root,
+                                          hearth_engine.ENV_ENGINE_DIR: eng_root}), \
+             mock.patch.object(
+                 sys.modules[__name__], "probe_binary",
+                 lambda p, **k: {"ok": os.path.normcase(p) != os.path.normcase(acq_exe),
+                                 "path": p, "build": 10105, "commit": "abc",
+                                 "backend": BACKEND_CPU, "gpu_offload": False,
+                                 "devices": [],
+                                 "error": None if os.path.normcase(p) !=
+                                 os.path.normcase(acq_exe) else
+                                 "[WinError 126] The specified module could not be found"}), \
+             mock.patch.object(Server, "spawn", _fake_spawn), \
+             mock.patch.object(Server, "stop", _fake_stop), \
+             mock.patch.object(Server, "wait_ready",
+                               lambda s, timeout=None, interval=None: setattr(
+                                   s, "port", 45727) or STATE_READY):
+            server = start(gguf, ctx_size=2048, n_gpu_layers=0)
+            assert [os.path.normcase(p) for p in spawned] == [
+                os.path.normcase(bundled)], (
+                "a broken engine must not even be spawned", spawned)
+            assert hearth_engine.active() is None
+
+        # A caller that names a binary explicitly is never second-guessed:
+        # its failure is its own, and no engine is demoted for it.
+        hearth_engine._write_json(hearth_engine.active_path(eng_env), pointer)
+        with mock.patch.dict(os.environ, {ENV_SERVER_DIR: install_root,
+                                          hearth_engine.ENV_ENGINE_DIR: eng_root}), \
+             mock.patch.object(sys.modules[__name__], "probe_binary",
+                               lambda p, **k: {"ok": True, "path": p, "build": 10105,
+                                               "commit": "abc", "backend": BACKEND_VULKAN,
+                                               "gpu_offload": True, "devices": [],
+                                               "error": None}), \
+             mock.patch.object(Server, "spawn", _fake_spawn), \
+             mock.patch.object(Server, "stop", _fake_stop), \
+             mock.patch.object(Server, "wait_ready", _dll_failure_then_ok(None)):
+            spawned[:] = []
+            try:
+                start(gguf, server_path=acq_exe, ctx_size=2048, n_gpu_layers=0)
+                raise AssertionError("an explicitly named binary's failure must raise")
+            except LlamaError:
+                pass
+            assert len(spawned) == 1, spawned
+            assert hearth_engine.active() is not None
+            os.unlink(hearth_engine.active_path(eng_env))
 
         # -- -ngl selection ------------------------------------------------
         # A 4 GiB model file, so the per-layer arithmetic has real numbers.
