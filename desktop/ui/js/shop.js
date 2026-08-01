@@ -231,6 +231,13 @@ export function quantTarget(quant) {
   return quant.path || quant.name || "";
 }
 
+/** What hearth_shop's `artifact` field means, in words a user can read. */
+const ARTIFACT_LABELS = {
+  projector: "vision projector",
+  draft_head: "speculative draft head",
+  calibration: "imatrix calibration data",
+};
+
 /** One quantisation, graded. Used for both the recommended row and the rows
  *  inside the "all quantisations" fold; `featured` only changes the styling. */
 export function renderQuantRow(entry, quant, handlers = {}, { featured = false } = {}) {
@@ -238,7 +245,12 @@ export function renderQuantRow(entry, quant, handlers = {}, { featured = false }
   const tags = [];
   if (quant.recommended) tags.push("recommended");
   if (quant.split_part_count) tags.push(`${quant.split_part_count} files`);
-  if (quant.projector) tags.push("vision projector");
+  // A .gguf that is not a model to run. Listed, because somebody does want
+  // the projector that goes with their vision model, but never recommended
+  // and always labelled, so a 25MB calibration file next to a 42GB model is
+  // explained rather than mysterious. See hearth_shop.artifact_kind.
+  if (ARTIFACT_LABELS[quant.artifact]) tags.push(ARTIFACT_LABELS[quant.artifact]);
+  else if (quant.projector) tags.push("vision projector");
   if (quant.local?.partial_bytes) tags.push(`${formatBytes(quant.local.partial_bytes)} already downloaded`);
   if (quant.local?.present) tags.push("on disk");
 

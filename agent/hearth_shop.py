@@ -1301,13 +1301,14 @@ def kv_for_repo(repo_id, files):
     and applied to every quantisation. The repository name is tried first;
     when it states no parameter count, the LARGEST quantisation present is
     used to estimate one, since the largest file carries the smallest
-    relative error against its bits-per-weight figure. Vision projectors are
-    excluded from that estimate: they are a fraction of the model's size and
+    relative error against its bits-per-weight figure. Files that are not
+    models at all are excluded from that estimate (see artifact_kind): a
+    vision projector or a draft head is a fraction of the model's size and
     would understate it badly.
     """
     sized = [
         f for f in (files or [])
-        if isinstance(f.get("size_bytes"), int) and not is_projector(f)
+        if isinstance(f.get("size_bytes"), int) and artifact_kind(f, files) is None
     ]
     biggest = max(sized, key=lambda f: f["size_bytes"]) if sized else None
     if parse_params_b(repo_id) is not None or biggest is None:
@@ -1470,30 +1471,183 @@ def _edition_groups(quants):
     return [sorted(group, key=_edition_sort_key) for group in groups.values()]
 
 
-# A GGUF whose base name starts with this is a multimodal vision projector,
-# not a language model: it is the image encoder that rides ALONGSIDE one.
-# hearth_hf's own filename survey found these among the files that carry no
-# parseable quantisation label. They are listed like any other file, because
-# a user with a vision model does need to download one, but they are never
-# the answer to "which quantisation should I run", and on a small card a
-# 1.4GB projector would otherwise be the first thing to earn a "great".
-_PROJECTOR_PREFIX = "mmproj"
+# NOT EVERY .gguf IN A GGUF REPOSITORY IS A MODEL. The extension names a
+# container format, nothing more, and quantisation repositories routinely
+# publish containers holding something that is not weights you can chat
+# with. Everything below was measured by walking the file trees of real Hub
+# repositories -- 512 of them for the size figures, 629 for the counts --
+# rather than reasoned about from what ought to be there.
+#
+# A user who clicks the shop's recommended download and gets one of these
+# has downloaded a file that will not load. They stay LISTED, because a user
+# who knows what they are after does sometimes want one, and each carries an
+# artifact_kind() so the UI can name it.
+#
+#   projector    The multimodal vision projector: the image encoder that
+#                rides alongside a language model. 152 files in the survey.
+#                On a small card a 1.4GB projector is the first thing to
+#                earn a "great".
+#   draft_head   A speculative-decoding module: llama.cpp's multi-token
+#                prediction head (published beside every Gemma 4 and recent
+#                Qwen release; 90 files in the survey), and the DFlash and
+#                Eagle3 draft models that serve the same purpose. Carries an
+#                ordinary quantisation label -- "Q4_0", "BF16" -- so nothing
+#                else in the grading path can tell it is not a model.
+#   calibration  An importance matrix. See is_calibration; it is the one
+#                that cannot be matched on the name alone.
+
+# "mmproj" is a coined term for one thing. No model is named after it, so
+# this token is matched ANYWHERE in the filename, which is what catches the
+# three spellings in the survey: the "mmproj-model-Q8_0.gguf" prefix form,
+# the "google_gemma-3-12b-it-mmproj-q8_0.gguf" infix form, and the
+# "Huihui-Qwen3.5-35B-A3B-abliterated.mmproj-Q8_0.gguf" dotted form. Only
+# the first was caught before.
+_PROJECTOR_TOKEN = "mmproj"
+
+# The draft-head tokens, matched only at the START or END of the filename,
+# which is the one place they are the subject rather than a boast. "MTP" in
+# the MIDDLE of a name is a feature the MODEL advertises:
+# "Qwen3.6-27B-Uncensored-HauhauCS-Aggressive-MTP-Q4_K_P.gguf" is a real
+# 18GB model, and "Qwen3.6-27B-...-Native-MTP-Preserved.imatrix.gguf" is
+# real calibration data for one. Both are lost to a token-anywhere match.
+_DRAFT_EDGE_TOKENS = ("mtp", "dflash", "eagle3")
+
+# An importance matrix: the activation statistics an i-quant is calibrated
+# AGAINST, published beside the models built from it.
+_CALIBRATION_TOKEN = "imatrix"
+
+# How large calibration data can be as a share of the biggest .gguf in its
+# own repository. See is_calibration for the measurement this comes from:
+# the observed gap is 0.0094 to 0.1952, and 0.05 sits five times above the
+# largest calibration file and four times below the smallest model.
+CALIBRATION_MAX_SHARE = 0.05
+
+
+def _name_tokens(quant):
+    """The lower-cased filename, minus directory and .gguf, split into whole
+    tokens on every separator publishers use.
+
+    Underscore is included, unlike hearth_hf.parse_quant's split, because a
+    quant label is a single token with underscores inside it ("Q4_K_M") and
+    this is not reading one. mradermacher's
+    "Llama-3.3_70_b_uncensored_continued.imatrix" needs the underscores
+    split to leave "imatrix" as a token at all.
+    """
+    base = str(quant.get("name") or "").rsplit("/", 1)[-1].lower()
+    if base.endswith(_GGUF_SUFFIX):
+        base = base[: -len(_GGUF_SUFFIX)]
+    return [t for t in re.split(r"[-. _]", base) if t]
 
 
 def is_projector(quant):
     """True when this file is a multimodal vision projector rather than a
-    model to run. Matched on the filename prefix, which is the convention
-    llama.cpp's own conversion tooling emits.
+    model to run. See _PROJECTOR_TOKEN for why the token is matched
+    anywhere in the name rather than only as a prefix.
     """
-    base = str(quant.get("name") or "").rsplit("/", 1)[-1].lower()
-    return base.startswith(_PROJECTOR_PREFIX)
+    return _PROJECTOR_TOKEN in _name_tokens(quant)
 
 
-def _offerable(quant):
+def _is_draft_head(quant):
+    """True when this file is a speculative-decoding module rather than a
+    model to run. See _DRAFT_EDGE_TOKENS for why only the ends count.
+    """
+    tokens = _name_tokens(quant)
+    if not tokens:
+        return False
+    return tokens[0] in _DRAFT_EDGE_TOKENS or tokens[-1] in _DRAFT_EDGE_TOKENS
+
+
+def _largest_size(quants):
+    """The biggest size_bytes in `quants`, or 0 when none is known."""
+    sizes = [q.get("size_bytes") for q in quants or []
+             if isinstance(q.get("size_bytes"), int) and q.get("size_bytes") > 0]
+    return max(sizes) if sizes else 0
+
+
+def is_calibration(quant, peers=None):
+    """True when this file is imatrix calibration data rather than a model.
+
+    `peers` is the other files in the same repository listing, and this is
+    the one classifier that genuinely needs them.
+
+    THE NAME ALONE CANNOT ANSWER THIS, and every plausible name-only rule
+    was tried against the survey and found wrong in both directions:
+
+      Matching "imatrix" anywhere loses whole repositories. mradermacher
+      publishes every i-quant repo as "<model>-i1-GGUF"; DavidAU and
+      Brian6145 put "Imatrix" in the repository name outright. Those repos
+      are full of good models -- imatrix is how they were QUANTISED. The
+      repository name is therefore never consulted here, only the filename.
+
+      Matching the trailing token loses models too. FadedRedStar publishes
+      "QwenPaw-Flash-9B-heretic-Q4_K_M-imatrix.gguf" at 5.6GB: a real
+      model with the calibration method appended to its name. Fifty-odd
+      such files across that publisher's repositories.
+
+      Requiring no quantisation label -- calibration data is not a
+      quantisation of anything -- is wrong BOTH ways. It keeps
+      "gemma-4-31B-Queen-it-qat-q4_0-unquantized.imatrix.gguf" (13.8MB of
+      calibration data whose MODEL name happens to contain q4_0) and it
+      drops "Equinox-31B-MXFP4_Q8_0-Imatrix.gguf" (17.6GB of real model
+      whose compound MXFP4_Q8_0 label parse_quant does not read).
+
+    SIZE IS WHAT ACTUALLY SEPARATES THEM, and it separates them cleanly. An
+    importance matrix is a handful of floats per tensor column; it does not
+    scale with the parameter count the way weights do. Across 512 surveyed
+    repositories, taking every file whose name carries the token and
+    dividing by the largest .gguf in its own repository:
+
+      calibration data      0.0003 .. 0.0094   (0.8MB .. 457MB)
+      models with the token 0.1952 .. 1.0000   (2.8GB .. 65GB)
+
+    A twentyfold gap with nothing in it. CALIBRATION_MAX_SHARE sits in the
+    middle of it. Relative rather than absolute because the absolute ranges
+    overlap: bartowski's 457MB imatrix for a huge MoE is larger than a
+    0.8B model quantised to Q4.
+
+    Both conditions are required: the token has to be the first or last
+    whole token of the filename (which catches "imatrix.gguf",
+    "imatrix-fp16.gguf", "foo-imatrix.gguf" and "foo.imatrix.gguf" alike),
+    and the file has to be a small fraction of its repository. With no
+    peers to compare against, or no size, the answer is False -- treating
+    an unknown as a model is the direction that hides nothing.
+    """
+    tokens = _name_tokens(quant)
+    if not tokens or _CALIBRATION_TOKEN not in (tokens[0], tokens[-1]):
+        return False
+    size = quant.get("size_bytes")
+    biggest = _largest_size(peers)
+    if not isinstance(size, int) or size <= 0 or not biggest:
+        return False
+    return size < biggest * CALIBRATION_MAX_SHARE
+
+
+def artifact_kind(quant, peers=None):
+    """What this .gguf is when it is NOT a model to run, or None when it is
+    one: "projector", "draft_head", or "calibration".
+
+    `peers` is the rest of the repository listing, which only the
+    calibration test needs; see is_calibration.
+
+    One function so that the offer (_offerable), the parameter estimate
+    (kv_for_repo) and the listing the UI renders cannot drift apart about
+    which files are models.
+    """
+    if is_projector(quant):
+        return "projector"
+    if _is_draft_head(quant):
+        return "draft_head"
+    if is_calibration(quant, peers):
+        return "calibration"
+    return None
+
+
+def _offerable(quant, peers=None):
     """True when this entry is a thing a user could actually download and
-    run: complete, not a vision projector, graded, and not wont_fit.
+    run: complete, an actual model (see artifact_kind), graded, and not
+    wont_fit.
     """
-    if not quant.get("complete", True) or is_projector(quant):
+    if not quant.get("complete", True) or artifact_kind(quant, peers) is not None:
         return False
     verdict = quant.get("verdict")
     return bool(verdict) and verdict["verdict"] != VERDICT_WONT_FIT
@@ -1513,9 +1667,15 @@ def best_quant(quants):
 
     The returned entry is one of the objects in `quants`, never a copy, so a
     caller can find it again by identity. `quants` is not modified.
+
+    The WHOLE listing is passed to _offerable as the peer set, not just the
+    surviving editions: is_calibration judges a file against the largest
+    .gguf in its repository, and that comparison must be against everything
+    the repository holds.
     """
+    peers = list(quants or [])
     surviving = [group[0] for group in _edition_groups(quants)]
-    return next((q for q in rank_quants(surviving) if _offerable(q)), None)
+    return next((q for q in rank_quants(surviving) if _offerable(q, peers)), None)
 
 
 def quant_verdicts(files, hw=None, context_tokens=None, kv=None, free_disk=None):
@@ -1538,6 +1698,12 @@ def quant_verdicts(files, hw=None, context_tokens=None, kv=None, free_disk=None)
       free_disk_bytes  - what disk_ok was judged against.
       kv_bytes_per_token / kv_confidence - the KV figure the verdict used and
                          how much to trust it.
+      projector        - whether this file is a vision projector.
+      artifact         - what this .gguf is when it is not a model to run
+                         ("projector", "draft_head", "calibration"), or None
+                         when it is one. See artifact_kind. Such a file is
+                         graded and listed like any other, but is never the
+                         repository's recommended download.
       alternate_editions - the other editions of this same quantisation, each
                          a fully graded entry of the same shape. Almost
                          always empty or one entry: the split edition of a
@@ -1587,6 +1753,12 @@ def quant_verdicts(files, hw=None, context_tokens=None, kv=None, free_disk=None)
         quant["kv_bytes_per_token"] = kv["kv_bytes_per_token"]
         quant["kv_confidence"] = kv["kv_confidence"]
         quant["projector"] = is_projector(entry)
+        # What this .gguf is when it is not a model to run, or None when it
+        # is one. The file stays in the listing either way -- somebody does
+        # want the projector for their vision model -- and this is what
+        # lets the UI say which of the three it is instead of showing an
+        # unexplained 25MB file next to a 42GB one.
+        quant["artifact"] = artifact_kind(entry, files)
         # Set on every entry, including the ones that end up as an alternate
         # edition, so nothing in a listing has to be read with a .get().
         quant["alternate_editions"] = []
@@ -2606,6 +2778,41 @@ _FIXTURE_REPO_FILES = {
         ("codellama-13b-instruct.Q3_K_M.gguf", 6_337_769_472),
         ("codellama-13b-instruct.Q4_K_M.gguf", 7_866_070_016),
     ]),
+    # Captured from the live Hub, sizes to the byte-ish, because this is the
+    # repository whose recommended download was a 25MB file that is not a
+    # model. Nothing here fits a 6GB card, which is exactly what promoted
+    # the calibration file: it was the only entry left that was not
+    # wont_fit. Note the repository NAME says i1 (imatrix-quantised) and
+    # every .i1-* file in it is a real, good model.
+    "mradermacher/Llama-3.3_70_b_uncensored_continued-i1-GGUF": _fixture_tree([
+        ("Llama-3.3_70_b_uncensored_continued.i1-IQ1_S.gguf", 15_756_365_824),
+        ("Llama-3.3_70_b_uncensored_continued.i1-Q2_K.gguf", 26_375_100_000),
+        ("Llama-3.3_70_b_uncensored_continued.i1-Q4_K_M.gguf", 42_520_400_000),
+        ("Llama-3.3_70_b_uncensored_continued.i1-Q6_K.gguf", 57_888_100_000),
+        ("Llama-3.3_70_b_uncensored_continued.imatrix.gguf", 24_952_832),
+    ]),
+    # ggml-org's own Gemma repository, which publishes three kinds of .gguf
+    # side by side: the model, the vision projector, and the multi-token
+    # prediction head. The mtp files carry ordinary quantisation labels, so
+    # nothing else in the grading path can tell they are not models.
+    "ggml-org/gemma-4-E2B-it-GGUF": _fixture_tree([
+        ("gemma-4-E2B-it-Q4_0.gguf", 2_841_500_000),
+        ("gemma-4-E2B-it-Q8_0.gguf", 4_967_500_000),
+        ("gemma-4-E2B-it-BF16.gguf", 9_311_300_000),
+        ("mmproj-gemma-4-E2B-it-Q8_0.gguf", 557_400_000),
+        ("mtp-gemma-4-E2B-it-Q4_0.gguf", 59_200_000),
+        ("mtp-gemma-4-E2B-it-BF16.gguf", 170_200_000),
+    ]),
+    # A model whose FILENAME ends in "-imatrix" and which is nonetheless a
+    # 5.6GB model: the calibration method is in the name, the quantisation
+    # label is right there beside it. Real, live, and the reason
+    # is_calibration cannot simply match the word.
+    "FadedRedStar/QwenPaw-Flash-9B-heretic-imatrix-GGUF": _fixture_tree([
+        ("QwenPaw-Flash-9B-heretic-IQ4_NL-imatrix.gguf", 5_418_200_000),
+        ("QwenPaw-Flash-9B-heretic-Q4_K_M-imatrix.gguf", 5_629_100_000),
+        ("mmproj-QwenPaw-Flash-9B-heretic-Q8_0.gguf", 624_200_000),
+        ("mtp-QwenPaw-Flash-9B-heretic-Q8_0.gguf", 2_172_300_000),
+    ]),
     "nebula/Nebula-Mix-9B-GGUF": _fixture_tree([
         ("Nebula-Mix-9B-Q4_K_M.gguf", 5_500_000_000),
     ]),
@@ -3164,6 +3371,154 @@ def _self_test_hf(_hw):
         "model, not a model. It must not be offered even when it is the only "
         "thing on the machine that fits.", best_quant([mmproj]),
     )
+    assert mmproj["artifact"] == "projector", mmproj
+
+    # -- .gguf files that are not models -------------------------------------
+    #
+    # The extension names a container format, not a model. Every fixture
+    # below is a real repository walked on the live Hub, and every
+    # filename and size in it is the Hub's own.
+    #
+    # THE ONE THAT SHIPPED BROKEN: a 70B repository where nothing fits a
+    # 6GB card. Every real quantisation is wont_fit, so the only entry
+    # left standing was the 25MB importance matrix -- calibration data,
+    # not weights. A user clicking the recommended download got a file
+    # that will not load.
+    _imat_repo = "mradermacher/Llama-3.3_70_b_uncensored_continued-i1-GGUF"
+    _imat = quant_verdicts(_fixture_list_fn(_imat_repo)["files"], hw=hw_2060,
+                           context_tokens=8192, free_disk=500 * 1024 ** 3)
+    _cal = next(q for q in _imat if q["name"].endswith(".imatrix.gguf"))
+    assert _cal["quant"] is None, _cal
+    assert _cal["artifact"] == "calibration", _cal
+    assert _cal["verdict"]["verdict"] == VERDICT_GREAT, (
+        "fixture must make the calibration file look like the best thing "
+        "on this card, or the guard below proves nothing", _cal["verdict"],
+    )
+    assert all(q["verdict"]["verdict"] == VERDICT_WONT_FIT
+               for q in _imat if q is not _cal), (
+        "fixture must leave the calibration file as the ONLY survivor, "
+        "which is the situation that promoted it", [q["quant"] for q in _imat],
+    )
+    assert best_quant(_imat) is None, (
+        "24MB of activation statistics is not a model. When a repository "
+        "holds nothing this machine can run, the honest answer is to offer "
+        "nothing.", best_quant(_imat),
+    )
+    # The repository NAME says i1, and its models are imatrix-QUANTISED.
+    # Excluding the repo, or its files, would delete four real models.
+    for _q in _imat:
+        if _q is not _cal:
+            assert _q["artifact"] is None, ("an i1-* model is a model", _q["name"])
+
+    # A file whose name ends in "-imatrix" and which IS a model, because it
+    # carries a quantisation label. Matching the word alone would delete
+    # both of this repository's models.
+    _paw = quant_verdicts(
+        _fixture_list_fn("FadedRedStar/QwenPaw-Flash-9B-heretic-imatrix-GGUF")["files"],
+        hw=hw_5080, context_tokens=8192, free_disk=500 * 1024 ** 3)
+    _paw_models = [q for q in _paw if q["name"].endswith("-imatrix.gguf")]
+    assert len(_paw_models) == 2, [q["name"] for q in _paw]
+    for _q in _paw_models:
+        assert _q["artifact"] is None, (
+            "a Q4_K_M model with 'imatrix' in its name is still a model",
+            _q["name"], _q["quant"],
+        )
+    assert best_quant(_paw)["name"].endswith("-imatrix.gguf"), best_quant(_paw)
+
+    # The multi-token-prediction head: same mistake as a vision projector,
+    # but it carries a real quantisation label, so nothing in the grading
+    # path notices. ggml-org publishes one beside every Gemma 4 model.
+    _gem = quant_verdicts(_fixture_list_fn("ggml-org/gemma-4-E2B-it-GGUF")["files"],
+                          hw=hw_2060, context_tokens=8192, free_disk=500 * 1024 ** 3)
+    _mtp = next(q for q in _gem if q["name"] == "mtp-gemma-4-E2B-it-Q4_0.gguf")
+    assert _mtp["quant"] == "Q4_0", (
+        "fixture must give the draft head a quant label, or this tests "
+        "nothing that the projector test did not", _mtp,
+    )
+    assert _mtp["artifact"] == "draft_head", _mtp
+    assert best_quant([_mtp]) is None, (
+        "a draft head rides alongside a model; it is not one", best_quant([_mtp]),
+    )
+    _gem_best = best_quant(_gem)
+    assert _gem_best["name"] == "gemma-4-E2B-it-Q4_0.gguf", _gem_best
+    assert next(q for q in _gem if q["name"].startswith("mmproj-"))["artifact"] == "projector"
+
+    # The parameter estimate is taken off models only. kv_for_repo sizes an
+    # unnamed repository from its LARGEST file, and a companion really can
+    # be the largest: an F32 vision projector runs to 1.8GB, which is more
+    # than a small model quantised to Q4. Sizing the KV cache from the
+    # projector would then describe a model that is not there.
+    _kv_files = [
+        {"name": "tiny-model-Q4_K_M.gguf", "size_bytes": 1_000_000_000, "quant": "Q4_K_M"},
+        {"name": "mmproj-tiny-model-F32.gguf", "size_bytes": 1_800_000_000, "quant": "F32"},
+    ]
+    assert kv_for_repo("some/unnamed-GGUF", _kv_files)["params_b"] == kv_for_repo(
+        "some/unnamed-GGUF", _kv_files[:1])["params_b"], (
+        "the parameter estimate must come off the model, not the projector",
+        kv_for_repo("some/unnamed-GGUF", _kv_files),
+    )
+
+    # -- how each of the three is matched, and what must NOT match -----------
+    #
+    # Every name below is a real file from the Hub survey; the sizes are
+    # what makes half of them models. The peers list is what
+    # is_calibration compares against, so each case carries a plausible
+    # repository around it.
+    _big = {"name": "model-Q8_0.gguf", "size_bytes": 20_000_000_000}
+
+    def _kind(name, size, peers=()):
+        entry = {"name": name, "size_bytes": size}
+        return artifact_kind(entry, [entry, _big] + list(peers))
+
+    # "mmproj" is matched as a whole token ANYWHERE, which is what the
+    # prefix-only rule missed: two of the three published spellings put it
+    # in the middle, after the model name.
+    for _name in ("mmproj-gemma-4-E2B-it-Q8_0.gguf",
+                  "google_gemma-3-12b-it-mmproj-q8_0.gguf",
+                  "Huihui-Qwen3.5-35B-A3B-abliterated.mmproj-Q8_0.gguf"):
+        assert _kind(_name, 900_000_000) == "projector", (
+            "mmproj is matched as a whole token anywhere; a prefix-only "
+            "rule misses two of the three published spellings", _name)
+    # A draft head is matched only at an END of the name...
+    for _name, _size in (("mtp-gemma-4-E2B-it-Q4_0.gguf", 59_200_000),
+                         ("gemmable-4-12b-Q4_K_M-mtp.gguf", 700_000_000),
+                         ("dflash-Qwen3.6-35B-A3B-Q8_0.gguf", 400_000_000),
+                         ("eagle3-gpt-oss-120b-Q8_0.gguf", 900_000_000)):
+        assert _kind(_name, _size) == "draft_head", _name
+    # ...because in the MIDDLE, "MTP" is a capability the MODEL advertises.
+    # This 18GB file is a real model and must survive.
+    assert _kind("Qwen3.6-27B-Uncensored-HauhauCS-Aggressive-MTP-Q4_K_P.gguf",
+                 17_987_600_000) is None, (
+        "'MTP' inside a model's name is a boast, not the artifact; matching "
+        "the token anywhere deletes a real 18GB model")
+    # Calibration data: first or last token, and small against its repo.
+    for _name in ("Llama-3.3_70_b_uncensored_continued.imatrix.gguf",
+                  "AesCoder-4B-imatrix.gguf", "imatrix.gguf", "imatrix-fp16.gguf",
+                  "foo/bar/AesCoder-4B-imatrix.gguf"):
+        assert _kind(_name, 25_000_000) == "calibration", _name
+    # The two name-only rules that were tried and are wrong, both directions.
+    # A quant label in the MODEL's name does not make calibration data a
+    # model (13.8MB against a 20GB repository)...
+    assert _kind("gemma-4-31B-Queen-it-qat-q4_0-unquantized.imatrix.gguf",
+                 13_800_000) == "calibration", (
+        "a q4_0 in the MODEL's name does not make 13.8MB of calibration "
+        "data a model; requiring an absent quant label keeps this one")
+    # ...and an unreadable compound label does not make a 17.6GB model
+    # calibration data.
+    assert _kind("Equinox-31B-MXFP4_Q8_0-Imatrix.gguf", 17_600_000_000) is None, (
+        "parse_quant does not read the compound MXFP4_Q8_0, so requiring an "
+        "absent quant label would delete this 17.6GB model")
+    # A model that merely contains the letters is not caught by a substring.
+    assert _kind("Qwen-imatrixed-7B-Q4_K_M.gguf", 4_000_000_000) is None
+    # Nothing to compare against means "model", the direction that hides
+    # nothing: an entry with no size cannot be graded and is not offerable
+    # anyway.
+    assert artifact_kind({"name": "AesCoder-4B-imatrix.gguf", "size_bytes": 3_900_000},
+                         None) is None
+    # The threshold is a real cliff, checked from both sides of it.
+    assert _kind("x-imatrix.gguf", int(20_000_000_000 * CALIBRATION_MAX_SHARE) - 1) \
+        == "calibration"
+    assert _kind("x-imatrix.gguf", int(20_000_000_000 * CALIBRATION_MAX_SHARE) + 1) is None
 
     # -- multi-part models are one choice, summed ----------------------------
     qwen32 = by_repo["bartowski/Qwen2.5-Coder-32B-Instruct-GGUF"]
