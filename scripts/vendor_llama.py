@@ -60,9 +60,11 @@ Five rules, each of which exists because the obvious shortcut is unsound:
 
 ## Which variant Hearth ships
 
-llama.cpp publishes eleven Windows artifacts per release (see the manifest
-for the full pinned list at b10105). Sizes, measured from the release
-metadata rather than assumed:
+llama.cpp publishes eleven Windows artifacts per release: nine engine
+builds, plus two CUDA runtime archives that are companions to the CUDA
+engines rather than engines themselves. All eleven are pinned in the
+manifest. The nine engines, with sizes read from the release metadata
+rather than assumed:
 
     win-cpu-x64                18.2 MB   works on any x64 Windows
     win-cpu-arm64              12.1 MB   Windows on ARM
