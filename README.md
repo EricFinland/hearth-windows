@@ -11,7 +11,7 @@
 ![Ollama](https://img.shields.io/badge/LLMs-Ollama-cc785c?style=flat-square&logo=ollama&logoColor=white&labelColor=211c16)
 ![Sandboxed](https://img.shields.io/badge/agents-sandboxed-cc785c?style=flat-square&logo=linux&logoColor=white&labelColor=211c16)
 ![Audited](https://img.shields.io/badge/every%20run-audited-cc785c?style=flat-square&logo=sqlite&logoColor=white&labelColor=211c16)
-![License](https://img.shields.io/badge/license-MIT-cc785c?style=flat-square&labelColor=211c16)
+![License](https://img.shields.io/badge/license-Apache--2.0-cc785c?style=flat-square&labelColor=211c16)
 [![release](https://img.shields.io/github/v/release/EricFinland/hearth?style=flat-square&labelColor=211c16&color=cc785c)](https://github.com/EricFinland/hearth/releases)
 
 ### Local LLMs and autonomous coding agents on your own hardware, at zero cost.
@@ -357,6 +357,21 @@ curl http://your-hearth:8770/metrics
 
 ---
 
+## Licensing
+
+Hearth is [Apache-2.0](LICENSE). The licence carries an explicit patent grant
+and withholds trademark rights: fork the code freely, do not ship the fork as
+Hearth.
+
+Hearth bundles other people's software, including a llama.cpp inference engine,
+a CPython interpreter and an Electron runtime.
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) lists every component, its
+version and its licence, and a copy ships inside the installed application. It
+is generated from what is actually vendored by
+`python scripts/third_party_notices.py`, not written by hand.
+[docs/licensing.md](docs/licensing.md) explains how that works, which components
+are copyleft and what that obliges, and where code signing stands.
+
 ## Contributing & security
 
 Contributions are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md) for the build
@@ -374,6 +389,6 @@ since the containment story there is different from the NixOS system's.
 
 <div align="center">
 
-Built by <a href="https://github.com/EricFinland">Eric Catalano</a> &nbsp;·&nbsp; MIT licensed &nbsp;·&nbsp; <a href="https://ericfinland.github.io/hearth/">Docs</a> &nbsp;·&nbsp; <a href="CONTRIBUTING.md">Contribute</a> &nbsp;·&nbsp; <a href="SECURITY.md">Security</a>
+Built by <a href="https://github.com/EricFinland">Eric Catalano</a> &nbsp;·&nbsp; <a href="LICENSE">Apache-2.0</a> &nbsp;·&nbsp; <a href="THIRD-PARTY-NOTICES.md">Third-party notices</a> &nbsp;·&nbsp; <a href="https://ericfinland.github.io/hearth/">Docs</a> &nbsp;·&nbsp; <a href="CONTRIBUTING.md">Contribute</a> &nbsp;·&nbsp; <a href="SECURITY.md">Security</a>
 
 </div>

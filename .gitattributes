@@ -1,2 +1,11 @@
 *.sh text eol=lf
 *.nix text eol=lf
+
+# Licence texts are checked by digest, not by eye. LICENSE must hash to the
+# canonical Apache-2.0 value and vendor/licenses/ must hash to the values
+# recorded in its MANIFEST.json, so a checkout on Windows must not rewrite
+# their line endings. See scripts/third_party_notices.py.
+LICENSE text eol=lf
+NOTICE text eol=lf
+THIRD-PARTY-NOTICES.md text eol=lf
+vendor/licenses/** text eol=lf

@@ -1,0 +1,16 @@
+Hearth
+Copyright 2026 Eric Catalano
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file in the
+root of this repository, or http://www.apache.org/licenses/LICENSE-2.0.
+
+"Hearth" and the Hearth logo are not licensed under the Apache License.
+Section 6 of that licence grants no trademark rights, and none are granted
+here. A fork may use this code; it may not present itself as Hearth.
+
+Hearth redistributes software written by other people, both in this
+repository and inside the Windows installer it builds. Every component, its
+version, its licence and where that licence text lives is listed in
+THIRD-PARTY-NOTICES.md. That file is generated from what is actually
+vendored, by scripts/third_party_notices.py, and it ships inside the
+installed application.
