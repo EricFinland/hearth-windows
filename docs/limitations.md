@@ -32,28 +32,104 @@ makes a small local model as capable as a large hosted one. It means the
 gap is a known, designed-for reality, not a surprise you'll discover the
 hard way.
 
-## `run_command` is not contained
+## `run_command` is contained, but only against writes, and only if you ask
 
-Say this plainly, because it's the single biggest gap in the Windows
-build: **`run_command` runs through a real shell, with the workspace only
-as its working directory.** A working directory is not a security
-boundary. `cd ..` gets out of it. An absolute path gets out of it. A
-command that never touches the filesystem at all - a network call, a
-registry edit - was never inside it to begin with.
+Say this plainly, because it used to be the single biggest gap in the
+Windows build and it is now a smaller one rather than a closed one.
+**`run_command` runs through a real shell, with the workspace only as its
+working directory.** A working directory is not a security boundary. `cd ..`
+gets out of it. An absolute path gets out of it. A command that never
+touches the filesystem at all - a network call, a registry edit - was never
+inside it to begin with.
 
-The workspace boundary that *does* exist (`agent/hearth_contain.py`'s
-`safe_join`) protects the file tools: read, write, edit, search, list,
-replace. It does not protect `run_command`, because a shell command isn't a
-path Hearth can validate before it runs. On NixOS, this same gap sat behind
-systemd sandboxing and a kernel-level nftables egress wall, so even an
-unconstrained shell command couldn't reach outside its sandbox or phone
-home to an unapproved host. **On Windows, none of that exists.** There is
-no mandatory access control, no syscall filtering, no kernel-level egress
-wall standing behind `run_command`. It runs as an ordinary process with
-your own full account privileges, minus a reduced environment (see below).
+`agent/hearth_sandbox.py` is what now stands behind that shell on Windows.
+It has three levels, and the difference between them matters more than the
+fact that it exists.
 
-An AppContainer or restricted-token sandbox is the real fix for this, and
-it is not built yet. Until it is, treat any `run_command` call that runs in
+| what a command can reach | `off` | `limits` (default) | `workspace` |
+|---|---|---|---|
+| read files outside the workspace | yes | yes | **yes** |
+| write to `%USERPROFILE%` | yes | yes | no |
+| open a network connection | yes | yes | **yes** |
+| spawn a child process | yes | yes | yes |
+| read another process's memory | yes | yes | no |
+| write inside the workspace | yes | yes | yes |
+
+That table is produced by running real commands, not by reading flags:
+`python agent/hearth_sandbox.py --probe` regenerates it on your machine.
+
+**`limits` is the default and blocks nothing in that table.** It is honest
+about that. What it does is drop every removable privilege from the child's
+token, mark the Administrators groups deny-only, cap the command's total
+committed memory and its process count through a Job object, deny it the
+clipboard and the ability to reboot the machine, hand it exactly three
+inherited handles, and place it in a second Job marked kill-on-close so no
+command outlives Hearth. On a normal, non-elevated Windows account the
+privilege drop changes almost nothing, because a standard user's token has
+almost nothing to drop. It is genuinely useful against a runaway build and
+against orphaned processes, and it is real containment only if Hearth is
+run elevated. It costs nothing: no development command behaves differently
+under it.
+
+**`workspace` is the level that is actually a boundary, and it is opt-in.**
+Set `HEARTH_SANDBOX=workspace`. The child then runs at a Windows integrity
+level one step below Medium, and Hearth labels your workspace to match, so
+the kernel's mandatory integrity policy refuses every write the command
+makes to anything else: your home directory, your other repositories, the
+registry under `HKCU`, Hearth's own audit database. Reading another
+process's memory fails too.
+
+Two things it does **not** do, and you should assume an attacker knows both:
+
+- **It does not stop reads.** A command at this level still reads
+  `%USERPROFILE%\.ssh\id_rsa`, `.aws\credentials`, your browser profile,
+  and every other file your account can read. This is measured and asserted
+  in the module's own test, not assumed.
+- **It does not stop the network.** There is no egress wall on Windows.
+  Combined with the point above, everything readable remains exfiltratable.
+
+So `workspace` protects the *integrity* of your machine, not the
+*confidentiality* of it. If that distinction is not enough for what you're
+about to do, the answer is a separate Windows account or a VM, not a
+setting in Hearth.
+
+It also breaks real tools, which is why it is not the default. Measured on
+Windows 11:
+
+| command | `off` | `limits` | `workspace` |
+|---|---|---|---|
+| `git status`, `git commit` | works | works | works |
+| `python -c`, writing files with Python | works | works | works |
+| `dir`, writing inside the workspace | works | works | works |
+| PowerShell | works | works | works |
+| `bash`, `grep`, `sed` (Git for Windows) | works | works | **breaks** |
+| `pip download` / `pip install` | works | works | **breaks** |
+| `npm install` | works | works | **breaks** |
+
+Every MSYS2/Cygwin binary dies at startup with
+`fatal error - NtCreateDirectoryObject(\BaseNamedObjects\msys-2.0...)`,
+because it needs a shared kernel object it can no longer create. That takes
+out all of Git for Windows' `usr\bin`, which is exactly the set of tools a
+Unix-trained model reaches for. `npm install` fails with `EPERM` on its
+cache under `%LOCALAPPDATA%`. Native `git.exe` is unaffected.
+
+Turning the level on also **modifies your workspace**: Hearth stamps an
+integrity label on the directory and everything under it (about four
+seconds for a 14,000-entry repository, once). That label only restricts
+*writes from below Medium*; your own editor, your own shell and Hearth's
+file tools are unaffected, and no other sandboxed process on the machine
+gains access, because the label sits above the Low level that browser and
+document sandboxes run at. `hearth_sandbox.unlabel_tree()` removes it.
+
+Rejected alternatives, with the reason rather than a shrug: a token with
+*restricting* SIDs (the Chromium renderer approach) and an AppContainer
+both leave the child unable to run `git` or `python` at all, because a
+developer's toolchain lives inside the user profile whose ACLs name only
+the user's own SID. Windows Sandbox is a virtual machine per command. All
+three were tried or costed before `workspace` was chosen; the detail is in
+`agent/hearth_sandbox.py`'s docstring.
+
+Until you turn `workspace` on, treat any `run_command` call that runs in
 `bypass` mode, or that you approve in `auto` or `edit` mode, as equivalent
 to handing the model a shell with your own privileges. Because that is
 exactly what it is.
@@ -97,13 +173,15 @@ directly, the wall drops the packet at the kernel regardless of what the
 process thinks it's doing.
 
 The Windows build runs as a normal user-mode process on a machine full of
-your real files. There is no equivalent backstop today. The workspace
+your real files. There is no equivalent backstop today. Two pieces of
+containment have been rebuilt for Windows specifically: the workspace
 boundary (`safe_join`, and the reparse-point pruning that closes the
-NTFS-junction hole it originally had) is the one piece of containment that
-has been rebuilt for Windows specifically and tested against a real
-escape. It is currently the strongest boundary in the system, and it is
-also the *only* boundary in that spot - there is no second layer behind
-it the way there was on NixOS.
+NTFS-junction hole it originally had), which is enforced and tested against
+a real escape, and the `run_command` sandbox above, which is enforced by
+the kernel's integrity policy but only for writes and only when you enable
+it. Neither has a second layer behind it the way it did on NixOS, and
+neither replaces the nftables egress wall: nothing on Windows stops a
+command from reaching the network.
 
 ## What is actually contained
 
@@ -125,7 +203,14 @@ The permission engine (`agent/permissions.py`) is a real boundary for tool
 or denied outright depends on the current mode and, underneath that, on a
 hard-capped capability manifest that applies in every mode including
 `bypass`. What it cannot do is contain what happens once a `run_command`
-call is allowed to proceed - see above.
+call is allowed to proceed - that is the sandbox's job, and only to the
+extent described above.
+
+The sandbox level is deliberately not something the model can choose. It
+comes from `HEARTH_SANDBOX` in Hearth's own environment; the arguments of a
+`run_command` call are ignored entirely for this purpose, so a prompt
+injection cannot talk the agent into asking for a weaker sandbox. There is
+a test for exactly that in `agent/hearth_tools.py`.
 
 ## `.hearthignore` is a tool-level filter, not a secrecy boundary
 

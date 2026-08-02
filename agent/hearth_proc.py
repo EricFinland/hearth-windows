@@ -15,8 +15,16 @@ tool layer. Three things this module exists to guarantee:
      file rather than truncated. Windows caps a command line near 8191
      characters, and Unix-trained models emit long heredocs constantly.
 
-This module does NOT sandbox the child. The working directory is not a security
-boundary. See the spec section on run_command containment.
+Containment is a fourth thing, and it lives in hearth_sandbox rather than here,
+because it is all Windows security API and this module is about running a child
+correctly on any platform. What this module owns is the decision of WHICH path a
+command takes: the plain subprocess path, or a contained one. `run_contained`
+takes a `level` and routes accordingly, so every caller of this function gets
+whatever containment is configured without knowing the mechanism.
+
+The working directory is still not a security boundary at any level. At the
+`workspace` level a mandatory integrity label is, for writes; reads and network
+access remain open. hearth_sandbox's docstring is the honest account.
 
 Standard library only.
 """
@@ -29,6 +37,7 @@ import threading
 import time
 
 import hearth_paths
+import hearth_sandbox
 
 
 MAX_INLINE_COMMAND = 7000  # Windows caps a command line near 8191 characters.
@@ -143,7 +152,16 @@ def _kill_tree(proc):
     proc.kill() reaches only the direct child, which with a shell is the shell
     itself. On Windows taskkill /T walks the tree; on POSIX the process group
     does, which is why the child is started in its own group.
+
+    A sandboxed child is killed through its Job object instead, which is
+    strictly more reliable: taskkill walks parent-pid links that a grandchild
+    can break, while a Job cannot be escaped. hearth_llama still passes plain
+    Popen objects here and must keep working, so this dispatches on the object
+    rather than on a flag.
     """
+    if hasattr(proc, "kill_tree"):
+        proc.kill_tree()
+        return
     try:
         if hearth_paths.is_windows():
             subprocess.run(
@@ -181,17 +199,78 @@ def _unlink_with_retries(path, attempts=5, delay=0.2):
             time.sleep(delay)
 
 
-def run_contained(cmd, cwd, timeout=120, env=None):
+_sandbox_notice_shown = set()
+
+
+def _prepare_level(cwd, level):
+    """Resolve the sandbox level for this call and make `cwd` usable at it.
+
+    Returns the level actually in force. Raises hearth_sandbox.SandboxError
+    when a level that promises a boundary cannot deliver one, because silently
+    dropping to a weaker level is exactly how a security control becomes a
+    label on a settings screen.
+    """
+    level = hearth_sandbox.resolve_level(level)
+    if level != "workspace":
+        return level
+    note = hearth_sandbox.prepare_workspace(cwd, level)
+    if note and note not in _sandbox_notice_shown:
+        _sandbox_notice_shown.add(note)
+        print("[{}]".format(note), file=sys.stderr)
+    return level
+
+
+def run_contained(cmd, cwd, timeout=120, env=None, level=None):
     """Run `cmd` in `cwd`, returning (returncode, stdout, stderr, timed_out).
 
     Output is decoded as UTF-8 with replacement so a byte outside the host
     codepage never silently empties the result. On timeout the whole process
     tree is killed and whatever was captured so far is returned.
+
+    `level` is a hearth_sandbox level ("off", "limits", "workspace"); None
+    means "whatever HEARTH_SANDBOX or the platform default says". At a
+    contained level the child runs under a restricted token in a Job object;
+    see hearth_sandbox for what that does and does not stop.
     """
     argv, spill = _shell_argv(cmd, cwd)
+    child_environment = env or child_env()
+
+    try:
+        level = _prepare_level(cwd, level)
+    except hearth_sandbox.SandboxError as exc:
+        if spill:
+            _unlink_with_retries(spill)
+        return 126, "", (
+            "hearth-sandbox: refusing to run at the 'workspace' level because "
+            "containment could not be established: {}. Fix the workspace, or "
+            "set HEARTH_SANDBOX=limits to run without a write boundary."
+        ).format(exc), False
+
+    proc = None
+    if level in ("limits", "workspace"):
+        try:
+            proc = hearth_sandbox.spawn(argv, cwd, child_environment, level)
+        except hearth_sandbox.SandboxError as exc:
+            if level == "workspace":
+                # This level's whole promise is that a command cannot write
+                # outside the workspace. Running it anyway, uncontained,
+                # would break that promise without telling anyone.
+                if spill:
+                    _unlink_with_retries(spill)
+                return 126, "", (
+                    "hearth-sandbox: refusing to run uncontained at the "
+                    "'workspace' level: {}".format(exc)), False
+            # `limits` claims resource caps and no orphans, not a boundary.
+            # Degrading to the plain path costs the user nothing they were
+            # relying on, and a machine where the Job API fails should not be
+            # a machine where Hearth cannot run a command at all.
+            print("[hearth-sandbox: {}; running without the Job limits]".format(exc),
+                  file=sys.stderr)
+            level = "off"
+
     popen_kw = {
         "cwd": cwd,
-        "env": env or child_env(),
+        "env": child_environment,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "encoding": "utf-8",
@@ -205,7 +284,8 @@ def run_contained(cmd, cwd, timeout=120, env=None):
     captured = {}
 
     try:
-        proc = subprocess.Popen(argv, **popen_kw)
+        if proc is None:
+            proc = subprocess.Popen(argv, **popen_kw)
     except Exception as exc:
         # Broad on purpose: a non-OSError here (still possible on some
         # platforms/launchers) must not skip spill-file cleanup the same way

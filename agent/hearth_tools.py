@@ -6,8 +6,10 @@ tool here (or registering one at runtime). Standard library only.
 
 All file tools operate inside the per-run workspace and refuse paths that escape
 it. On NixOS this sits behind a systemd sandbox and an nftables egress wall. On
-Windows there is no such backstop, so hearth_contain is the boundary itself. Note
-that run_command is scoped by working directory only and is not contained by it.
+Windows there is no such backstop, so hearth_contain is the boundary itself.
+run_command is scoped by working directory, which is not a boundary; what
+constrains it on Windows is hearth_sandbox, and only as far as that module's
+docstring claims (writes, at the opt-in level; never reads, never the network).
 """
 
 import fnmatch
@@ -34,6 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hearth_contain
 import hearth_paths
 import hearth_proc
+import hearth_sandbox
 
 
 def _bin(name, fallback):
@@ -290,12 +293,22 @@ def _explain_oserror(exc):
 def tool_run_command(args, workspace):
     """Run a shell command via hearth_proc.run_contained, with workspace as cwd.
 
-    NOT contained: this runs through a real shell (cmd.exe or /bin/sh) with the
-    workspace only as a working directory, and a working directory is not a
-    security boundary. On NixOS this sits behind systemd isolation and an
-    nftables egress wall; on Windows there is no such backstop. hearth_proc
-    only fixes the timeout-kill, encoding, and command-length defects, not
-    containment.
+    This runs through a real shell (cmd.exe or /bin/sh). The workspace is the
+    working directory, and a working directory has never been a security
+    boundary: `cd ..`, an absolute path, or a command that touches no path at
+    all all sit outside it. What now stands behind that is hearth_sandbox,
+    whose level decides how much of the machine the shell can still reach. At
+    the default Windows level ("limits") the answer is honestly "all of it,
+    minus privileges, orphans and resource exhaustion"; at "workspace" the
+    child cannot WRITE outside the workspace but can still read it and reach
+    the network. Read hearth_sandbox's docstring before believing anything
+    stronger. On NixOS this whole call additionally sits behind systemd
+    isolation and an nftables egress wall, which remain the stronger boundary.
+
+    The sandbox level is NOT taken from `args`. Everything in `args` came from
+    the model, and a model that can be prompt-injected into asking for a
+    weaker sandbox has no sandbox at all; the level comes from the process
+    environment (HEARTH_SANDBOX), which only the user sets.
 
     On timeout the whole process tree is killed (not just the shell) and
     whatever partial output was captured is returned, distinguished from a
@@ -314,7 +327,30 @@ def tool_run_command(args, workspace):
         tail = (out or "")[-1000:]
         return "error: command timed out after {}s (process tree killed)\npartial stdout:\n{}".format(
             timeout, tail)
-    return "exit={}\nstdout:\n{}\nstderr:\n{}".format(rc, (out or "")[-MAX_OUT:], (err or "")[-2000:])
+    return "exit={}\nstdout:\n{}\nstderr:\n{}{}".format(
+        rc, (out or "")[-MAX_OUT:], (err or "")[-2000:], _sandbox_hint(rc, out, err))
+
+
+def _sandbox_hint(rc, out, err):
+    """A one-line explanation when the sandbox, not the command, said no.
+
+    Without this a model at the `workspace` level sees a bare "Access is
+    denied." for a write it was perfectly entitled to attempt and does the
+    thing weak local models always do: retries the identical command, then
+    tries it with more quoting, then gives up ten tool calls later. Naming the
+    cause lets it choose a path inside the workspace instead.
+    """
+    if rc == 0:
+        return ""
+    level = hearth_sandbox.resolve_level()
+    if level != "workspace":
+        return ""
+    blob = ((out or "") + (err or "")).lower()
+    if "access is denied" not in blob and "permission denied" not in blob:
+        return ""
+    return ("\nhint: the sandbox is at the 'workspace' level, which blocks every "
+            "write outside the workspace directory. Write inside the workspace, "
+            "or ask the user to change the sandbox setting.")
 
 
 def _ignored_error(workspace, full, requested_path):
@@ -2107,6 +2143,39 @@ def _self_test():
         if hearth_paths.is_windows():
             r = tool_run_command({"command": "definitelynotarealbinary"}, _ws5)
             assert "not recognized" in r or "exit=" in r, r
+
+        # The sandbox level is the user's setting, never the model's argument.
+        # Every key in `args` arrived from a model that can be prompt-injected,
+        # so a payload that asks for a weaker sandbox has to be ignored rather
+        # than honoured. Proven by running the containment's own failure case
+        # (a write outside the workspace) with every plausible spelling of
+        # "turn the sandbox off" present in args.
+        if hearth_paths.is_windows():
+            _old_level = os.environ.get("HEARTH_SANDBOX")
+            _probe = os.path.join(os.environ["USERPROFILE"], "hearth-tools-sandbox-probe.txt")
+            try:
+                os.environ["HEARTH_SANDBOX"] = "workspace"
+                hearth_sandbox.label_tree(_ws5)
+                r = tool_run_command({
+                    "command": 'echo pwned> "{}"'.format(_probe),
+                    "sandbox": "off", "level": "off", "HEARTH_SANDBOX": "off",
+                }, _ws5)
+                assert not os.path.exists(_probe), (
+                    "a model-supplied argument turned the sandbox off: {}".format(r))
+                assert "hint: the sandbox is at the 'workspace' level" in r, r
+            finally:
+                try:
+                    hearth_sandbox.unlabel_tree(_ws5)
+                except Exception:  # noqa: BLE001 - cleanup must not mask a failure
+                    pass
+                try:
+                    os.unlink(_probe)
+                except OSError:
+                    pass
+                if _old_level is None:
+                    os.environ.pop("HEARTH_SANDBOX", None)
+                else:
+                    os.environ["HEARTH_SANDBOX"] = _old_level
     finally:
         _shutil.rmtree(_ws5, ignore_errors=True)
 

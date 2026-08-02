@@ -83,7 +83,13 @@ def _command_head(args):
     Quoting the path is not a mitigation against this limitation. Shell
     metacharacters like &&, ;, |, &, backticks, and $() can chain an
     unexamined payload after an approved executable name. Reliable containment
-    belongs at the execution layer, not string inspection.
+    belongs at the execution layer, not string inspection: that layer is
+    agent/hearth_sandbox.py, and how much it actually contains depends on the
+    level the user chose. Nothing here should get more permissive because that
+    module exists -- at the default level it stops resource exhaustion and
+    orphans, not access, and even at its strongest level a command can still
+    read every file the user can read and reach the network. An allowlist
+    entry is still a decision to trust the head of a string.
     """
     cmd = ((args or {}).get("command") or "").strip()
     if not cmd:

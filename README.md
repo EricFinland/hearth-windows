@@ -100,9 +100,10 @@ Also worth reading before you trust it with anything real:
   verdicts work, why they're based on KV-cache math rather than parameter
   count, and why it deliberately does not predict tokens per second.
 - **[docs/limitations.md](docs/limitations.md)**: the honest one. Local
-  models are weak compared to hosted ones, `run_command` is not contained,
-  and approving a command by reading its text is not a security control.
-  Read this before running Hearth Code against anything you care about.
+  models are weak compared to hosted ones, the `run_command` sandbox stops
+  writes outside your workspace but never reads or network traffic, and
+  approving a command by reading its text is not a security control. Read
+  this before running Hearth Code against anything you care about.
 - **[docs/security/windows-threat-model.md](docs/security/windows-threat-model.md)**:
   the full threat model this was distilled from.
 

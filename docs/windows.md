@@ -259,6 +259,25 @@ Read [docs/limitations.md](limitations.md) before treating `auto` or
 is that approving a command by reading its text is not a real security
 control on Windows.
 
+What does hold underneath the approval is `agent/hearth_sandbox.py`. Set
+`HEARTH_SANDBOX` to pick a level:
+
+| value | what it does |
+|---|---|
+| `off` | no containment |
+| `limits` (default) | privileges dropped, memory and process caps, no orphaned processes. Blocks no access. |
+| `workspace` | the child cannot write anything outside the workspace, and cannot read another process's memory. It can still read your files and reach the network. |
+
+`workspace` is not the default because it breaks `bash`, `grep`, `sed` (all
+of Git for Windows' MSYS2 tools), `pip install` and `npm install`. Native
+`git`, `python`, PowerShell and `cmd` builtins are unaffected. Enabling it
+stamps an integrity label on your workspace directory, once; that label only
+restricts writes from processes running below Medium integrity, so nothing
+you do yourself changes. Run `python agent/hearth_sandbox.py --probe` to see
+the reachability table measured on your own machine, and
+[docs/limitations.md](limitations.md) for the full account of what stays
+reachable.
+
 ## What Hearth notices before you approve something
 
 Two scanners run underneath the permission gate above. Both follow the same
