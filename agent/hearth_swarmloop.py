@@ -185,14 +185,19 @@ MAX_CYCLES_DEFAULT = 3
 # structured data, rendered verbatim by the account and by any UI, never
 # paraphrased into reassurance. (headline, what_it_means, what_to_do_about_it).
 SWARM_BLIND_SPOTS = (
-    ("Measured against a single work loop, this did not win.",
+    ("Whether this beats a single work loop is unsettled, and it lost the "
+     "first time it was measured.",
      "On this machine, with one 7B and equal ceilings, the relay passed 0 of 7 "
-     "hidden-test tasks. A plain work loop with its stall detectors turned off "
-     "passed 2 of 3 on the only task the model can actually solve, using fewer "
-     "turns on the part that changes files. The relay spends a shared budget "
-     "on a planner and a reviewer that cannot change anything.",
-     "If a loop is stopping early, set stall.window to 0 on an ordinary work "
-     "loop before reaching for roles. See docs/agent-swarm.md for the numbers."),
+     "hidden-test tasks while costing about twice as much. That comparison "
+     "used the work loop's original stall settings, which were later found to "
+     "stop runs at a mean of 5.5 turns out of 18 and were retuned. Re-measured "
+     "on the one task this model can solve, under the current settings, the "
+     "relay passed 2 of 2 where a single loop passed 0 of 2 -- with two runs "
+     "each, which is not a verdict either way.",
+     "Read docs/agent-swarm.md: it carries both measurements and says what "
+     "would settle it. If you are choosing today, start with a single work "
+     "loop. It is simpler, it costs about half as much per run, and the "
+     "relay's advantage over it is plausible rather than demonstrated."),
     ("A reviewer's approval is not a verification.",
      "The reviewer is the same size of model as the implementer, often the "
      "very same weights, reading code it cannot run. Its approval is an "

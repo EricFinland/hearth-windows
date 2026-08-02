@@ -39,7 +39,9 @@ import {
   renderModelCard, renderQuantRow, renderDownloadRow, renderDownloads,
   renderSourceNotice, renderHardware, renderVerdict,
 } from "./shop.js";
-import { account as loopAccount, LoopRunBar, blindSpots } from "./loop.js";
+import {
+  account as loopAccount, LoopRunBar, LoopConfigPanel, blindSpots,
+} from "./loop.js";
 import {
   account as swarmAccount, SwarmRunBar, roleCard,
   blindSpots as swarmBlindSpots,
@@ -279,8 +281,12 @@ function hostileReport(payload) {
     checkpoints: [payload], checkpoint_error: payload,
     ceilings: { max_turns: 40, max_seconds: 7200, max_tokens: 1000000,
                 max_writes: 200, max_tool_calls: 400 },
-    stall_policy: { window: 6, repeat_actions: 4, repeat_errors: 5,
+    stall_policy: { window: 8, repeat_actions: 4, repeat_errors: 8,
                     oscillations: 3, min_turns: 3 },
+    // Which patience setting judged this run. Comes back out of a journal on
+    // disk on a resumed run, so it is model-reachable like everything else
+    // here.
+    patience: payload,
     verdict: { stalled: true, reason: payload,
                detectors: [{ name: payload, detail: payload }] },
     recurring_errors: [[4, payload], [2, payload]],
@@ -302,6 +308,7 @@ function hostileRun(payload, state) {
                 max_writes: 200, max_tool_calls: 400 },
     stall: { window: 6, repeat_actions: 4, repeat_errors: 5,
              oscillations: 3, min_turns: 3 },
+    patience: payload,
     gate_policy: "ask", gate_timeout: 300, allowed_tools: [payload],
     done_command: payload, required_artifacts: [payload], verified: true,
     gates_allowed: 1, gates_denied: 1, gates_timed_out: 1, checkpoints: 3,
@@ -310,6 +317,44 @@ function hostileRun(payload, state) {
     stop_reason: state === "stopped" ? "stalled" : undefined,
     stop_detail: state === "stopped" ? payload : undefined,
     live_workers: 2,
+  };
+}
+
+/* GET /loop's `defaults`: everything the bounds form is drawn from. The
+ * patience list is the newest part of it -- a name, a description and the
+ * price of choosing it, per setting -- and all three reach the page as text
+ * from the sidecar. */
+function hostileLoopDefaults(payload) {
+  return {
+    config: {
+      ceilings: { max_turns: 40, max_seconds: 7200, max_tokens: 1000000,
+                  max_writes: 200, max_tool_calls: 400 },
+      stall: { window: 8, repeat_actions: 4, repeat_errors: 8,
+               oscillations: 3, min_turns: 3 },
+      patience: payload, gate_policy: "deny", gate_timeout: 300,
+      allowed_tools: [payload], done_command: null, required_artifacts: null,
+    },
+    tools: [{ name: payload, risk: "edit", effect: { auto: "allow", plan: "deny" } }],
+    gate_policies: ["deny", "stop", "ask"],
+    modes: ["plan", "auto"],
+    patience: [
+      { name: payload, label: payload, summary: payload, cost: payload,
+        settings: { window: 4, repeat_actions: 3, repeat_errors: 4,
+                    oscillations: 2, min_turns: 2 } },
+      { name: "balanced", label: payload, summary: payload, cost: payload,
+        settings: { window: 8, repeat_actions: 4, repeat_errors: 8,
+                    oscillations: 3, min_turns: 3 } },
+    ],
+    default_patience: "balanced",
+    limits: {
+      ceilings: { max_turns: [1, 5000], max_seconds: [1, 604800],
+                  max_tokens: [1, 1000000000], max_writes: [1, 20000],
+                  max_tool_calls: [1, 100000] },
+      stall: { window: [0, 1000], repeat_actions: [0, 1000],
+               repeat_errors: [0, 1000], oscillations: [0, 1000],
+               min_turns: [0, 1000] },
+      gate_timeout_seconds: [5, 3600],
+    },
   };
 }
 
@@ -345,6 +390,27 @@ for (const payload of PAYLOADS) {
   check("work loop blind spots", payload,
     probe((host) => host.appendChild(blindSpots(
       [{ headline: payload, means: payload, remedy: payload }]))));
+
+  // The bounds form itself. Its labels and its patience descriptions arrive
+  // from the sidecar over the same HTTP the rest of this file distrusts, and
+  // a run restored from a journal on disk supplies `config.patience` -- a
+  // string the agent's own write_file could have put there. The form is what
+  // a person reads before leaving a model running unattended on their files,
+  // so it is exactly the wrong place for text that can lie about itself.
+  check("work loop config panel", payload,
+    probe((host) => {
+      const panel = new LoopConfigPanel(host);
+      panel.render(hostileLoopDefaults(payload), HOSTILE_BLIND);
+      panel.applyConfig({
+        ceilings: { max_turns: 5, max_seconds: 60, max_tokens: 100,
+                    max_writes: 2, max_tool_calls: 9 },
+        stall: { window: 3, repeat_actions: 3, repeat_errors: 3,
+                 oscillations: 3, min_turns: 3 },
+        patience: payload, gate_policy: "deny", gate_timeout: 300,
+        allowed_tools: [payload], done_command: payload,
+        required_artifacts: [payload],
+      });
+    }));
 
   // ---- the agent swarm. Every field here is model output: a relay's plan
   // and its reviewer's critique are prose a local model wrote, the role names

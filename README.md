@@ -143,13 +143,49 @@ every report: it measures **change, not correctness**. Work that happens
 outside the workspace is invisible to it, and steady progress toward a wrong
 answer never trips a single detector.
 
+### How long it keeps trying is your call
+
+"Stopped making progress" is a judgement made at a threshold, and the first
+thresholds this loop shipped with were wrong. A benchmark caught them: 8 of 8
+unattended runs stopped `stalled` at a mean of **5.5 turns out of 18 allowed**,
+and the same loop with detection switched off solved a task the defaults never
+solved. The cause was specific. A failing completion check contributes its own
+output to every turn's errors, so `repeat_errors=5` was not "the model is
+repeating itself", it was a hard cap of five turns on any run whose tests do
+not go green almost immediately.
+
+So the defaults were re-measured, and the decision is now one named setting
+rather than five numbers:
+
+| setting | it stops when | on an 18-turn budget, a hopeless run costs |
+| --- | --- | --- |
+| Give up early | the first sign of repetition | 6.3 turns, and it stops runs that would have finished |
+| **Balanced** (default) | the workspace is going in circles | 10.3 turns |
+| Keep trying | the workspace is provably frozen | 16.3 turns, near enough the whole budget |
+
+Balanced solved every task the fully patient arm solved, for 46% of the tokens
+that arm spent on the runs that could never pass.
+
+It sits next to the ceilings in the app, before a run starts, with the price of
+each choice printed under it. `POST /session` takes `loop.patience`; the CLI
+takes `--patience`. The five thresholds are still there for anyone who wants
+them, and editing one relabels the run **custom** rather than leaving a preset
+name on screen that no longer describes it.
+
+**A patience setting cannot widen a ceiling.** Turns, wall clock, tokens, tool
+calls and the unattended write budget bound the most patient setting exactly as
+they bound the least, and there is still no way to spell "unlimited" over HTTP.
+The numbers, the method and the trade in both directions are in
+**[docs/agent-swarm.md](docs/agent-swarm.md)**; re-run them with
+`scripts/loop_bench.py`.
+
 A loop runs in `auto` or `plan`, never `edit` (which would gate its own first
 write) and never `bypass` (refused at construction and again on restore). It
 gets a capability manifest that `permissions.decide` enforces as a hard cap,
 a budget of unattended writes, and a deny-by-default policy for anything
 dangerous. Pre-authorise specific commands with `--allow-command git`.
 
-### The agent swarm, and why it did not win
+### The agent swarm, and the verdict that moved
 
 `agent/hearth_swarmloop.py` runs the same goal as a relay of three narrow
 roles: a planner that reads, an implementer that is the only role allowed to
@@ -161,21 +197,24 @@ and nothing here makes two concurrent writers to one workspace safe), and share
 It is reachable from the app the same way the loop is, it is bounded the same
 way, `bypass` is unreachable from it, and it explains itself role by role.
 
-**And on this hardware it lost.** Against a single work loop with the same
-model, ceilings and hidden tests, the relay passed 0 of 7 tasks while costing
-2.34x the tokens and 1.91x the wall clock. On the one task the model can
-actually solve, a plain work loop with `stall.window = 0` passed 2 of 3 and the
-relay passed 0 of 3.
+**Measured twice, with opposite results.** The first comparison, against a
+single work loop with the same model, ceilings and hidden tests, had the relay
+passing 0 of 7 tasks while costing 2.34x the tokens and 1.91x the wall clock.
+What it did identify correctly is that the loop gave up early: 8 of 8 runs at
+the stall settings of the day stopped as `stalled` at a mean of 5.5 turns out
+of 18. **That finding was folded back into the loop itself** (above).
 
-The relay does correctly identify what goes wrong with a single loop, which is
-that it gives up early: 8 of 8 default single runs stopped as `stalled` at a
-mean of 5.5 turns out of 18. But its fix is worse than the direct one, because
-it spends part of a shared budget on two roles that cannot change anything.
+Retuning the loop changed the relay too, because every phase of a relay is one
+of those loops. Re-measured on the one task this model can solve, the relay
+passed **2 of 2** where a single loop passed 0 of 2, in both cases by the same
+route: the implementer stalls at turn 8 with something half-built, a reviewer
+reads that failure with a clean context, and the next implementer phase
+finishes it in one turn. Two trials each is not a verdict, and the relay still
+costs about twice as much per run.
 
-It ships because it is bounded, honest and useful to have measured, and because
-the shape may pay off with a bigger budget or genuinely different models per
-role. It is not the thing to reach for first. The numbers, the method and what
-would change the answer are in
+Start with a single work loop: simpler, cheaper, and the relay's advantage over
+it is now plausible rather than demonstrated. Both measurements, the mechanism,
+and what would actually settle it are in
 **[docs/agent-swarm.md](docs/agent-swarm.md)**.
 
 Every turn takes a checkpoint, so any point is recoverable with the same undo

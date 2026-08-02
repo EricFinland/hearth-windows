@@ -83,6 +83,13 @@ const STALL_FIELDS = [
   { key: "min_turns", label: "Never judge before turn" },
 ];
 
+/* What the panel calls a set of thresholds matching no preset. The same word
+ * hearth_workloop.patience_of returns, and like it, derived from the numbers
+ * rather than remembered beside them: the label on screen is computed from the
+ * five inputs every time they change, so it can never describe a run as
+ * "Balanced" while the run is something else. */
+const CUSTOM_PATIENCE = "custom";
+
 const GATE_TEXT = {
   deny: "Refuse it, tell the model why, and keep going. A model that keeps "
       + "trying the same refused thing looks identical every turn, so stall "
@@ -218,6 +225,38 @@ export class LoopConfigPanel {
     }
     this.root.appendChild(ceilBox);
 
+    // ---- patience: one choice, beside the ceilings, never behind a chevron
+    // The five stall thresholds below are meaningless without the benchmark
+    // that produced them, so the decision a person can actually make is
+    // "how long should it keep trying". It sits here, in the open, next to
+    // the bounds, because it changes what the run costs -- and its price is
+    // printed under it rather than left in the docs: the most patient setting
+    // really can spend the whole budget on something that was never going to
+    // work. The names, the descriptions and the price all arrive from the
+    // server (hearth_workloop.patience_choices), so this page cannot describe
+    // a setting more kindly than the module implementing it.
+    this.patienceChoices = defaults.patience || [];
+    this.patienceSelect = el("select", { class: "input", id: "loop-patience" });
+    for (const p of this.patienceChoices) {
+      this.patienceSelect.appendChild(el("option", { value: p.name, text: p.label }));
+    }
+    this.patienceSelect.appendChild(el("option", {
+      value: CUSTOM_PATIENCE, text: "Custom (your own thresholds)",
+    }));
+    this.patienceSelect.value = cfg.patience
+      || defaults.default_patience || CUSTOM_PATIENCE;
+    this.patienceSelect.addEventListener("change", () => this._applyPatience());
+    this.patienceSummary = el("p", { class: "loop-hint" });
+    this.patienceCost = el("p", { class: "panel-note is-warn" });
+    this.root.appendChild(appendAll(el("div", { class: "loop-patience" }), [
+      appendAll(el("label", { class: "field", for: "loop-patience" }), [
+        el("span", { class: "field-label", text: "How long it keeps trying" }),
+        this.patienceSelect,
+      ]),
+      this.patienceSummary,
+      this.patienceCost,
+    ]));
+
     // ---- what it may do -------------------------------------------------
     const toolWrap = el("div", { class: "loop-tools" });
     this.toolsNote = el("p", { class: "loop-hint" });
@@ -339,10 +378,12 @@ export class LoopConfigPanel {
     }
     this.stallWarning = el("p", { class: "panel-note is-warn" });
     this.root.appendChild(appendAll(el("details", { class: "loop-details" }), [
-      el("summary", { text: "Stall detection" }),
+      el("summary", { text: "Stall detection, in detail" }),
       el("p", {
         class: "loop-hint",
-        text: "Zero switches a detector off. Ceilings still bound the run.",
+        text: "The thresholds behind the setting above. Change one and the "
+            + "setting becomes Custom. Zero switches a detector off. Ceilings "
+            + "still bound the run either way.",
       }),
       stallBox,
       this.stallWarning,
@@ -446,6 +487,55 @@ export class LoopConfigPanel {
     if (this.gateTimeoutField) this.gateTimeoutField.hidden = policy !== "ask";
   }
 
+  /** Picking a named setting writes its thresholds into the five inputs, so
+   *  what is sent is still literally what is on screen -- the chooser is a
+   *  shortcut for filling the form, never a second, invisible source of
+   *  truth. Choosing "Custom" changes nothing: it is a description of the
+   *  numbers, not an instruction. */
+  _applyPatience() {
+    const chosen = (this.patienceChoices || []).find(
+      (p) => p.name === this.patienceSelect.value);
+    if (chosen) {
+      for (const f of STALL_FIELDS) {
+        const entry = this.inputs.get("stall." + f.key);
+        const value = (chosen.settings || {})[f.key];
+        if (entry && Number.isFinite(value)) entry.input.value = String(value);
+      }
+    }
+    this._changed();
+  }
+
+  /** The name for whatever is currently in the five inputs, derived the same
+   *  way hearth_workloop.patience_of derives it: by comparing the numbers.
+   *  Nothing here trusts the select's own value, because a user who edits a
+   *  threshold by hand has stopped running the preset that was showing. */
+  _patienceName() {
+    const now = {};
+    for (const f of STALL_FIELDS) {
+      const entry = this.inputs.get("stall." + f.key);
+      if (!entry) return CUSTOM_PATIENCE;
+      now[f.key] = Math.round(Number(entry.input.value));
+    }
+    const match = (this.patienceChoices || []).find(
+      (p) => STALL_FIELDS.every((f) => Number((p.settings || {})[f.key]) === now[f.key]));
+    return match ? match.name : CUSTOM_PATIENCE;
+  }
+
+  _syncPatience() {
+    if (!this.patienceSelect) return CUSTOM_PATIENCE;
+    const name = this._patienceName();
+    this.patienceSelect.value = name;
+    const chosen = (this.patienceChoices || []).find((p) => p.name === name);
+    setText(this.patienceSummary, chosen ? chosen.summary
+      : "Your own thresholds. What stops this run is whatever you typed below.");
+    // The price of the choice, in the place the choice is made. Not a
+    // tooltip, not the docs: a run that cannot succeed spends real time and
+    // real electricity, and the setting that decides how much is this one.
+    setText(this.patienceCost, chosen ? chosen.cost || "" : "");
+    this.patienceCost.hidden = !(chosen && chosen.cost);
+    return name;
+  }
+
   _changed() {
     const verified = Boolean(this.doneCommand && (this.doneCommand.value.trim()
       || (this.artifacts && this.artifacts.value.trim())));
@@ -455,6 +545,7 @@ export class LoopConfigPanel {
         + "its own work. Nothing will verify it.");
       this.doneWarning.hidden = verified;
     }
+    this._syncPatience();
     if (this.stallWarning) {
       const off = STALL_FIELDS.filter((f) => {
         const entry = this.inputs.get("stall." + f.key);
@@ -492,6 +583,12 @@ export class LoopConfigPanel {
       if (box.checked && !box.disabled) tools.push(name);
     }
     const out = { ceilings, stall, gate_policy: this.gateSelect.value };
+    // The name goes with the numbers, and only when it actually describes
+    // them. The server re-derives the label from the thresholds anyway, so a
+    // name that disagreed with what is on screen would be dropped there --
+    // but it must never be sent in the first place.
+    const patience = this._patienceName();
+    if (patience !== CUSTOM_PATIENCE) out.patience = patience;
     if (this.gateSelect.value === "ask") {
       out.gate_timeout_seconds = Math.round(Number(this.gateTimeout.value));
     }
@@ -580,6 +677,9 @@ export class LoopRunBar {
       el("strong", { text: stateLabel }),
       run.resumed ? el("span", { class: "lrb-tag", text: "resumed" }) : null,
       el("span", { class: "lrb-tag", text: run.mode }),
+      // Which patience setting will decide whether this run is called
+      // stalled, while it still matters rather than only in the account.
+      run.patience ? el("span", { class: "lrb-tag", text: `patience: ${run.patience}` }) : null,
       run.verified
         ? el("span", { class: "lrb-tag is-ok", text: "completion checked" })
         : el("span", { class: "lrb-tag is-warn", text: "no completion check" }),
@@ -679,6 +779,20 @@ export function account(report, accountText, blind) {
         el("code", { class: "mono", text: d.name || "" }),
         el("span", { text: " " + (d.detail || "") }),
       ]))));
+  }
+
+  // A stall is a judgement made at a threshold this user chose, not a fact
+  // about the work, and the account says which setting made it. Without this
+  // line "stopped making progress" reads as a property of the run, and the
+  // one thing the reader could change about it stays invisible.
+  if (r.stop_reason === "stalled" && r.patience) {
+    nodes.push(el("div", {
+      class: "lac-sub lac-patience",
+      text: `Judged at the "${r.patience}" patience setting`
+          + (Number.isFinite(r.turns) && Number.isFinite(ceilings.max_turns)
+            ? `, with ${Math.max(0, ceilings.max_turns - r.turns)} of `
+              + `${ceilings.max_turns} turns unspent.` : "."),
+    }));
   }
 
   // "the same 3 tests failed each time" -- the quantified evidence.

@@ -269,6 +269,24 @@ PROGRESS_BLIND_SPOTS = (
      "No verdict at all is reached before the run's min_turns threshold, so "
      "the first few turns are unjudged by design.",
      "Ceilings, not stall detection, are what bound those turns."),
+    ("A completion check that fails quietly is invisible to the error detector.",
+     "The repeated-error detector reads the check's output for error-shaped "
+     "lines. A check that fails by printing 'wrong at 3 of 6 indices', with no "
+     "word like error, failed or traceback anywhere in it, contributes no "
+     "signature at all. Measured on this machine: a task built that way ran to "
+     "its full turn ceiling under every patience setting, including the most "
+     "eager one, because nothing had anything to repeat.",
+     "Make the check say FAILED (most test runners already do), or accept that "
+     "the ceilings are the only thing that will stop that run."),
+    ("How long it keeps trying is a setting, not a fact.",
+     "'Stopped making progress' means it crossed the thresholds THIS run was "
+     "given. Measured on this machine, the eager settings this loop first "
+     "shipped with stopped runs that went on to pass their tests when they "
+     "were allowed to continue; the patient ones spend nearly the whole "
+     "budget on a task that can never pass. Both are real costs and the "
+     "setting decides which one you pay.",
+     "Pick the patience setting deliberately before starting, and read which "
+     "one judged the run at the top of this account."),
 )
 
 # Directories never walked when fingerprinting the workspace. Version control
@@ -686,9 +704,12 @@ def action_fingerprint(calls):
 class StallPolicy:
     """Thresholds for the four stall detectors. Separate from Ceilings
     because a ceiling is a budget the user chose to spend and a stall is a
-    judgement about whether spending it is achieving anything."""
+    judgement about whether spending it is achieving anything.
 
-    def __init__(self, window=6, repeat_actions=4, repeat_errors=5,
+    The defaults are the `balanced` preset below, measured rather than
+    guessed. _self_test asserts the two cannot drift apart."""
+
+    def __init__(self, window=8, repeat_actions=4, repeat_errors=8,
                  oscillations=3, min_turns=3):
         self.window = window                  # turns without a NEW workspace state
         self.repeat_actions = repeat_actions  # consecutive identical action sets
@@ -705,6 +726,137 @@ class StallPolicy:
     def from_dict(cls, d):
         d = d or {}
         return cls(**{k: d[k] for k in cls().to_dict() if k in d})
+
+
+# --------------------------------------------------------------------------
+# patience, as one choice instead of five numbers
+# --------------------------------------------------------------------------
+
+# WHY THESE NUMBERS ARE WHAT THEY ARE
+# ===================================
+#
+# The first shipped defaults (window=6, repeat_actions=4, repeat_errors=5,
+# oscillations=3, min_turns=3) were reasoned about, not measured, and a
+# benchmark caught them: across 8 unattended runs on this machine's 7B, ALL 8
+# stopped `stalled` at a mean of 5.5 turns out of 18 allowed, and the same loop
+# with every detector switched off solved a task the default settings never
+# solved. The loop was giving up less than a third of the way into a budget the
+# user had already granted.
+#
+# The mechanism turned out to be specific and worth naming, because it is not
+# obvious from the thresholds alone: a failing completion check contributes its
+# own output to the turn's errors on EVERY turn (see run_workloop, which feeds
+# the gate's output into turn_errors on purpose so the account can say "the
+# same 3 tests failed each time"). While a run is working toward a gate it has
+# not passed yet, that gate fails the same way every turn. So repeat_errors=5
+# was not "the model is stuck repeating itself" -- it was a hard cap of five
+# turns on any run whose tests do not go green almost immediately. Steady,
+# genuine, file-changing progress tripped it.
+#
+# The retuned numbers come from replaying recorded runs through the real
+# detectors (scripts/loop_bench.py, which explains why replay is exact rather
+# than approximate). Both directions were measured, because both cost the user
+# real time and electricity: whether a solvable task still gets solved, and how
+# many turns a hopeless one burns before it is stopped.
+#
+# WHAT A MORE PATIENT SETTING ACTUALLY COSTS
+# ==========================================
+#
+# It is not free, and the `cost` line of each preset says so in the place the
+# choice is made rather than only in the docs. Patience buys the runs that
+# needed a few more turns; it pays for them with the runs that were never going
+# to work and now grind on longer. `keep_trying` genuinely can spend the entire
+# budget on a task that cannot be done. That is the user's call to make, and
+# they can only make it if it is written where they choose.
+#
+# Ceilings remain the real bound in every preset. Nothing here can widen one:
+# a preset holds stall thresholds and nothing else, which _self_test asserts
+# structurally rather than trusting.
+PATIENCE_SETTINGS = (
+    {
+        "name": "give_up_early",
+        "label": "Give up early",
+        "summary": "Stop at the first sign of repetition. Cheapest when a run "
+                   "is not going to work, and the most likely to stop one that "
+                   "would have.",
+        "cost": "Measured on this machine's 7B against an 18-turn budget: it ends "
+                "a run that cannot succeed after about 6 turns, and it also "
+                "ended runs that went on to pass their tests when they were "
+                "allowed to continue. Pick it when you would rather be told "
+                "quickly and are paying for the electricity.",
+        "settings": {"window": 4, "repeat_actions": 3, "repeat_errors": 4,
+                     "oscillations": 2, "min_turns": 2},
+    },
+    {
+        "name": "balanced",
+        "label": "Balanced",
+        "summary": "Keep working while the workspace keeps changing, and stop "
+                   "once it is clearly going in circles. This is the default.",
+        "cost": "A run that cannot succeed still spends about 10 turns of an "
+                "18-turn budget before this notices. That is the price of not "
+                "abandoning the runs that were about to finish, and in the same "
+                "measurement it kept every one of those.",
+        "settings": {"window": 8, "repeat_actions": 4, "repeat_errors": 8,
+                     "oscillations": 3, "min_turns": 3},
+    },
+    {
+        "name": "keep_trying",
+        "label": "Keep trying",
+        "summary": "Only stop when the workspace is provably frozen: nothing "
+                   "new for a long stretch, or the identical tool call over and "
+                   "over. Repeated errors alone will not end the run.",
+        "cost": "A run that cannot succeed will spend almost all of its turns, "
+                "tokens and wall clock before stopping: about 16 turns of an "
+                "18-turn budget in the same measurement, and the whole budget "
+                "when the completion check fails without printing anything "
+                "error-shaped. Choose this when the ceilings you set ARE the "
+                "budget you are willing to lose.",
+        "settings": {"window": 16, "repeat_actions": 8, "repeat_errors": 0,
+                     "oscillations": 0, "min_turns": 6},
+    },
+)
+PATIENCE_ORDER = tuple(p["name"] for p in PATIENCE_SETTINGS)
+DEFAULT_PATIENCE = "balanced"
+#: What patience_of() returns for thresholds that match no preset. Not a
+#: choosable setting: a caller may always type its own five numbers, and the
+#: account has to be able to say honestly that it did.
+CUSTOM_PATIENCE = "custom"
+
+
+def stall_policy_for(name):
+    """The StallPolicy for a named patience setting. Unknown names are refused
+    rather than quietly defaulted: a run that silently ignores the setting a
+    user picked is worse than one that will not start."""
+    for preset in PATIENCE_SETTINGS:
+        if preset["name"] == name:
+            return StallPolicy(**preset["settings"])
+    raise ValueError("unknown patience setting {!r}; choose one of {}".format(
+        name, ", ".join(PATIENCE_ORDER)))
+
+
+def patience_of(policy):
+    """The name of the preset `policy` matches, or "custom".
+
+    Derived from the numbers rather than remembered alongside them, so a
+    config that arrived over HTTP with hand-edited thresholds can never be
+    labelled with a preset it does not actually match."""
+    got = policy.to_dict() if hasattr(policy, "to_dict") else dict(policy or {})
+    for preset in PATIENCE_SETTINGS:
+        if preset["settings"] == got:
+            return preset["name"]
+    return CUSTOM_PATIENCE
+
+
+def patience_choices():
+    """The preset list as plain data, for a UI to render.
+
+    Ships whole -- label, summary and the cost of choosing it -- for the same
+    reason PROGRESS_BLIND_SPOTS does: the person who most needs to know what
+    patience costs is the one about to leave a run going unattended, and they
+    will never read this file."""
+    return [{"name": p["name"], "label": p["label"], "summary": p["summary"],
+             "cost": p["cost"], "settings": dict(p["settings"])}
+            for p in PATIENCE_SETTINGS]
 
 
 class ProgressLedger:
@@ -1046,6 +1198,12 @@ class LoopReport:
         self.run_id = run_id
         self.ceilings = ceilings
         self.stall_policy = stall_policy
+        # Which named patience setting this run actually ran under, derived
+        # from the thresholds themselves. The account says it out loud because
+        # "stopped making progress" means something different at each setting,
+        # and a reader who does not know which one was in force cannot weigh
+        # the verdict they are being given.
+        self.patience = patience_of(stall_policy) if stall_policy else CUSTOM_PATIENCE
         self.stop_reason = None
         self.stop_detail = ""
         self.turns = 0
@@ -1090,6 +1248,7 @@ class LoopReport:
             "checkpoint_error": self.checkpoint_error,
             "ceilings": self.ceilings.to_dict() if self.ceilings else {},
             "stall_policy": self.stall_policy.to_dict() if self.stall_policy else {},
+            "patience": self.patience,
             "verdict": self.verdict, "recurring_errors": self.recurring,
             "last_error": self.last_error, "completion": self.completion,
             "created": self.created, "modified": self.modified,
@@ -1122,6 +1281,11 @@ class LoopReport:
         L.append("workspace  {}".format(self.workspace))
         L.append("model      {}".format(self.model))
         L.append("mode       {} (bypass is not reachable from a loop)".format(self.mode))
+        L.append("patience   {}{}".format(
+            self.patience,
+            "" if self.stall_policy is None else "  ({})".format(", ".join(
+                "{}={}".format(k, v) for k, v in
+                sorted(self.stall_policy.to_dict().items())))))
         L.append("run        {}".format(self.run_id))
         L.append("")
 
@@ -1130,6 +1294,18 @@ class LoopReport:
         if self.stop_reason == STOP_STALLED:
             for det in (self.verdict.get("detectors") or []):
                 L.append("  [{}] {}".format(det["name"], det["detail"]))
+            # A stall is a JUDGEMENT, made at a threshold this user chose, and
+            # the honest thing is to say that the judgement was tunable rather
+            # than present it as a fact about the work. The run below the most
+            # patient setting had turns left; whether they were worth spending
+            # is not something this module can know.
+            if self.patience != PATIENCE_ORDER[-1] and self.ceilings is not None \
+                    and self.turns < (self.ceilings.max_turns or 0):
+                L.append("  this judgement was made at the {!r} patience setting, with "
+                         "{} of {} turns unspent. A more patient setting would have "
+                         "kept going.".format(
+                             self.patience, self.ceilings.max_turns - self.turns,
+                             self.ceilings.max_turns))
         if self.completion:
             ok = self.completion.get("done")
             L.append("  completion check: {}".format(
@@ -1457,6 +1633,7 @@ def run_workloop(goal, model, workspace, *,
             "model": model, "workspace": workspace, "mode": mode,
             "allowed_tools": sorted(manifest), "gate_policy": gate_policy,
             "ceilings": ceilings.to_dict(), "stall": policy.to_dict(),
+            "patience": patience_of(policy),
             "done_command": done_command, "ts": time.time(),
         })
 
@@ -2004,6 +2181,71 @@ def _self_test():  # noqa: PLR0915 - one function on purpose, per house style
     assert c.exceeded({"turns": 5, "tokens": 100})[0] == "turns", "order is deterministic"
     assert Ceilings(max_turns=-1).exceeded({"turns": 10**9}) is None, "-1 disables"
     assert Ceilings.from_dict(c.to_dict()).to_dict() == c.to_dict()
+
+    # === patience presets ================================================
+    # (a) The shipped default IS the balanced preset. Two places hold these
+    # five numbers -- the constructor signature, which is what a reader sees,
+    # and the preset table, which is what the UI offers -- and they drifting
+    # apart would mean the app's "Balanced" and the library's default were
+    # quietly different runs.
+    assert StallPolicy().to_dict() == dict(
+        [p for p in PATIENCE_SETTINGS if p["name"] == "balanced"][0]["settings"]), \
+        "StallPolicy's defaults and the balanced preset must be the same numbers"
+    assert DEFAULT_PATIENCE in PATIENCE_ORDER
+    assert patience_of(StallPolicy()) == DEFAULT_PATIENCE
+
+    # (b) A preset holds stall thresholds and NOTHING else. This is the
+    # structural half of "a stall policy must not be able to widen a ceiling":
+    # there is no key a preset could carry that Ceilings would read, so the
+    # question cannot arise at this layer at all. The behavioural half is
+    # test (13) below, which runs the most patient preset into a ceiling.
+    _ceiling_keys = set(Ceilings().to_dict())
+    for preset in PATIENCE_SETTINGS:
+        assert set(preset["settings"]) == set(StallPolicy().to_dict()), preset["name"]
+        assert not set(preset["settings"]) & _ceiling_keys, \
+            ("a patience preset must not carry anything a ceiling reads", preset["name"])
+        for field in ("label", "summary", "cost"):
+            assert preset[field].strip(), (preset["name"], field)
+        # Round trip: every preset must be recognisable from its numbers alone.
+        assert patience_of(stall_policy_for(preset["name"])) == preset["name"]
+
+    # (c) The most patient setting says, where it is chosen, that it can spend
+    # the whole budget. Requirement, not decoration: a user who picks patience
+    # without being told what it costs was misled by this module.
+    _keep = [p for p in PATIENCE_SETTINGS if p["name"] == PATIENCE_ORDER[-1]][0]
+    assert "cannot succeed" in _keep["cost"], _keep["cost"]
+
+    # (d) The names are in order of patience, so the word a user reads means
+    # what it says. A threshold of 0 is a detector switched OFF, which is the
+    # most patient value there is, not the least -- ranking it as 0 would call
+    # the loosest preset the strictest.
+    def _rank(v):
+        return float("inf") if v == 0 else v
+    for earlier, later in zip(PATIENCE_SETTINGS, PATIENCE_SETTINGS[1:]):
+        for key in earlier["settings"]:
+            assert _rank(later["settings"][key]) >= _rank(earlier["settings"][key]), \
+                ("presets must be ordered least to most patient", key,
+                 earlier["name"], later["name"])
+
+    # (e) An unknown name is REFUSED, never defaulted. A run that silently
+    # ignores the setting a user picked is worse than one that will not start,
+    # because nothing on screen would ever say so.
+    for bad in ("nonsense", "", None, "BALANCED"):
+        try:
+            stall_policy_for(bad)
+            raise AssertionError("unknown patience must be refused: {!r}".format(bad))
+        except ValueError:
+            pass
+    assert patience_of(StallPolicy(window=999)) == CUSTOM_PATIENCE, \
+        "hand-typed thresholds must never be labelled with a preset they do not match"
+    assert CUSTOM_PATIENCE not in PATIENCE_ORDER, \
+        "'custom' is what patience_of reports, not something a caller may ask for"
+
+    # (f) The CLI's preset and its one numeric override agree.
+    assert _cli_stall_policy("balanced", None).to_dict() == StallPolicy().to_dict()
+    assert _cli_stall_policy("give_up_early", 0).window == 0
+    assert _cli_stall_policy("give_up_early", 0).repeat_actions == \
+        stall_policy_for("give_up_early").repeat_actions
 
     # === ProgressLedger ==================================================
     # Each detector is isolated by disabling the others, so a test that passes
@@ -2733,9 +2975,111 @@ def _self_test():  # noqa: PLR0915 - one function on purpose, per house style
         if permissions.risk_of(t_) == "dangerous":
             assert got == "gate", (t_, got)
 
+    # (13) A PATIENCE SETTING CANNOT WIDEN A CEILING. The most patient preset
+    # there is, on a run that never finishes and never trips a detector, must
+    # still stop at every ceiling, at exactly the value the ceiling names.
+    # Patience decides when a run is judged pointless; it has no vote on what
+    # the run is allowed to spend, and this is the test that says so out loud.
+    _patient = stall_policy_for(PATIENCE_ORDER[-1])
+
+    def _bounded(chat, limit):
+        """A chat_fn that refuses to be called more than `limit` times.
+
+        Without it, the natural way to break ceiling enforcement -- letting a
+        patient policy skip the check -- produces a run that never ends, and
+        the test HANGS instead of failing. A test that can only fail by never
+        returning is not a test anyone will trust at 3am, so a runaway is
+        turned into a named, immediate failure here."""
+        n = {"i": 0}
+
+        def _chat(messages, tools, on_token):
+            n["i"] += 1
+            if n["i"] > limit:
+                raise AssertionError(
+                    "ran {} turns without reaching any ceiling: a patience setting "
+                    "must never buy even one turn past one".format(n["i"]))
+            return chat(messages, tools, on_token)
+        return _chat
+
+    def _patient_run(name, ceilings, limit=25, **kw):
+        chat = kw.pop("chat_fn", scripted([("thinking", [])]))
+        return run_workloop("endless", "m", ws("patient-" + name),
+                            journal=jr("p-" + name),
+                            chat_fn=_bounded(chat, limit),
+                            execute_tool_fn=kw.pop("execute_tool_fn", tool_ok),
+                            checkpoint_fn=None, ceilings=ceilings, stall=_patient, **kw)
+
+    r13 = _patient_run("turns", Ceilings(max_turns=3))
+    assert r13.stop_reason == STOP_CEILING and r13.turns == 3, \
+        ("the most patient stall setting must not buy a single turn beyond the turn "
+         "ceiling", r13.stop_reason, r13.turns, r13.stop_detail)
+    assert "turns ceiling" in r13.stop_detail, r13.stop_detail
+
+    r13b = _patient_run("tokens", Ceilings(max_turns=999, max_tokens=100))
+    assert r13b.stop_reason == STOP_CEILING and "tokens ceiling" in r13b.stop_detail, \
+        (r13b.stop_reason, r13b.stop_detail)
+
+    _clk13 = {"t": 0.0}
+    r13c = _patient_run("wall", Ceilings(max_turns=999, max_seconds=10),
+                        clock=lambda: _clk13.__setitem__("t", _clk13["t"] + 4.0)
+                        or _clk13["t"])
+    assert r13c.stop_reason == STOP_CEILING and "wall clock" in r13c.stop_detail, \
+        (r13c.stop_reason, r13c.stop_detail)
+
+    d13 = ws("patient-writes")
+    r13d = run_workloop(
+        "write forever", "m", d13, journal=jr("p-writes"),
+        chat_fn=_bounded(scripted(
+            [("t", [("write_file", {"path": "a.txt", "content": "1"})]),
+             ("t", [("write_file", {"path": "b.txt", "content": "2"})]),
+             ("t", [("write_file", {"path": "c.txt", "content": "3"})])]), 25),
+        execute_tool_fn=writing_tool, checkpoint_fn=None,
+        ceilings=Ceilings(max_turns=999, max_writes=2), stall=_patient)
+    assert r13d.stop_reason == STOP_CEILING and "unattended writes" in r13d.stop_detail, \
+        ("the unattended write budget binds the most patient run too",
+         r13d.stop_reason, r13d.stop_detail)
+
+    # ...and the account names which patience setting was in force, because
+    # "stopped making progress" means something different at each one.
+    assert r13.patience == PATIENCE_ORDER[-1]
+    assert r13.to_dict()["patience"] == PATIENCE_ORDER[-1]
+    assert "patience   {}".format(PATIENCE_ORDER[-1]) in r13.render(), r13.render()[:400]
+
+    # A stalled run at a less patient setting says the judgement was tunable
+    # and how much budget was left, rather than presenting it as a fact about
+    # the work.
+    d13e = ws("patience-stalled")
+    r13e = run_workloop(
+        "go in circles", "m", d13e, journal=jr("p-stalled"),
+        chat_fn=scripted([("thinking", [("read_file", {"path": "a"})])]),
+        execute_tool_fn=tool_ok, checkpoint_fn=None,
+        ceilings=Ceilings(max_turns=50),
+        stall=stall_policy_for("give_up_early"))
+    assert r13e.stop_reason == STOP_STALLED, (r13e.stop_reason, r13e.stop_detail)
+    assert r13e.patience == "give_up_early"
+    _body13 = r13e.render()
+    assert "more patient setting would have kept going" in _body13, _body13[:600]
+    # The number it names is what is LEFT, not what was used. Reporting the
+    # spend here and calling it unspent would tell a reader the run had far
+    # less budget remaining than it did, which is the exact fact the sentence
+    # exists to give them.
+    assert "{} of 50 turns unspent".format(50 - r13e.turns) in _body13, _body13[:600]
+    assert r13e.turns < 50
+
     shutil.rmtree(tmp_root, ignore_errors=True)
     print("hearth-workloop self-test OK")
     return 0
+
+
+def _cli_stall_policy(patience, window):
+    """The named preset, with --stall-window overriding its window if given.
+
+    One place so the CLI cannot end up meaning something different from the
+    sidecar, which does the same thing in loop_engine.parse_loop_config."""
+    policy = stall_policy_for(patience)
+    if window is not None:
+        policy.window = window
+    return policy
 
 
 def main(argv=None):
@@ -2757,7 +3101,12 @@ def main(argv=None):
     p.add_argument("--max-seconds", type=int, default=7200)
     p.add_argument("--max-tokens", type=int, default=1000000)
     p.add_argument("--max-writes", type=int, default=200)
-    p.add_argument("--stall-window", type=int, default=6)
+    p.add_argument("--patience", default=DEFAULT_PATIENCE, choices=list(PATIENCE_ORDER),
+                   help="how long to keep going without visible progress; "
+                        "--stall-window overrides this preset's window")
+    p.add_argument("--stall-window", type=int, default=None,
+                   help="turns without a new workspace state before stopping; "
+                        "0 switches that detector off")
     p.add_argument("--run-id", default=None)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--ollama-url", default=DEFAULT_OLLAMA)
@@ -2792,7 +3141,7 @@ def main(argv=None):
         done_command=a.done_command, required_artifacts=a.artifact,
         ceilings=Ceilings(max_turns=a.max_turns, max_seconds=a.max_seconds,
                           max_tokens=a.max_tokens, max_writes=a.max_writes),
-        stall=StallPolicy(window=a.stall_window),
+        stall=_cli_stall_policy(a.patience, a.stall_window),
         ollama_url=a.ollama_url, token=token, emit=_emit,
         run_id=a.run_id, resume=a.resume)
     sys.stdout.write("\n\n")

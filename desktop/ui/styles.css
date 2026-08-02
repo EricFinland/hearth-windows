@@ -922,6 +922,13 @@ kbd {
 .loop-field.is-scary .field-label > span:first-child { color: var(--warn); }
 .loop-field.is-scary .input { border-color: rgba(226,178,74,.34); }
 
+/* How long it keeps trying. Sits with the ceilings rather than in a fold,
+ * because it changes what a run costs as directly as they do, and its price
+ * is printed under it in the warning colour: the most patient setting really
+ * can spend the whole budget on something that was never going to work. */
+.loop-patience { margin-top: 14px; }
+.loop-patience .panel-note { margin-top: 6px; }
+
 .loop-details {
   margin-top: 14px; padding-top: 12px;
   border-top: 1px solid var(--line-soft);

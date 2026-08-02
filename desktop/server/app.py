@@ -3041,7 +3041,10 @@ def _self_test():
                     ({"allowed_tools": ["read_file", "exfiltrate"]}, "exfiltrate"),
                     ({"allowed_tools": []}, "allowed_tools"),
                     ({"required_artifacts": ["../escape"]}, "escape"),
-                    ({"gate_timeout_seconds": 1}, "gate_timeout_seconds")):
+                    ({"gate_timeout_seconds": 1}, "gate_timeout_seconds"),
+                    ({"patience": "infinite"}, "patience"),
+                    ({"patience": "custom"}, "patience"),
+                    ({"patience": 4}, "patience")):
                 st, body = _raw_request(port_l, "POST", "/session", headers=headers_l,
                                         body=json.dumps({
                                             "workspace": loop_ws, "model": "m",
@@ -3049,6 +3052,45 @@ def _self_test():
                                             "loop": bad}))
                 assert st == 400, (bad, st, body)
                 assert needle in json.loads(body)["error"], (bad, body)
+
+            # ---- 4b. THE PATIENCE A USER PICKS IS THE ONE THAT RUNS -----
+            # named: "the patience chosen over HTTP is the patience enforced"
+            # Five stall thresholds mean nothing to someone who has not read
+            # the benchmark, so the transport takes a name. The failure this
+            # guards against is the quiet one: a name accepted, echoed back on
+            # screen, and then not actually used.
+            for _name in loop_mod.hearth_workloop.PATIENCE_ORDER:
+                st, body = _raw_request(port_l, "POST", "/session", headers=headers_l,
+                                        body=json.dumps({
+                                            "workspace": loop_ws, "model": "m",
+                                            "mode": "auto", "engine": "loop",
+                                            "loop": {"patience": _name,
+                                                     "ceilings": {"max_turns": 3}}}))
+                assert st == 200, (_name, st, body)
+                _made = json.loads(body)["loop"]
+                assert _made["patience"] == _name, (_name, _made)
+                assert _made["stall"] == loop_mod.hearth_workloop.stall_policy_for(
+                    _name).to_dict(), ("the thresholds the run is given must be the "
+                                       "chosen setting's", _name, _made["stall"])
+                # ...and no patience setting moves the ceiling that was sent
+                # alongside it. Patience decides when a run is judged
+                # pointless; it has no vote on what the run may spend.
+                assert _made["ceilings"]["max_turns"] == 3, (_name, _made)
+                assert _made["ceilings"] == dict(
+                    loop_mod.hearth_workloop.Ceilings().to_dict(), max_turns=3), \
+                    ("a patience preset must not widen a ceiling", _name, _made)
+
+            # the choice, its cost, and the honest limits are all readable
+            # BEFORE a run starts, from the same snapshot the form draws from
+            st, body = _raw_request(port_l, "GET", "/loop", headers=headers_l)
+            _snap4 = json.loads(body)
+            _choices = _snap4["defaults"]["patience"]
+            assert [p["name"] for p in _choices] == list(
+                loop_mod.hearth_workloop.PATIENCE_ORDER), _choices
+            assert all(p["cost"] for p in _choices), (
+                "a user choosing patience must be told what choosing it costs, in "
+                "the place they choose it", _choices)
+            assert _snap4["config"]["patience"] in loop_mod.hearth_workloop.PATIENCE_ORDER
 
             # an unattended run cannot be given a mode nobody can supervise,
             # and bypass is refused before the loop branch is even reached

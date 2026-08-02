@@ -389,6 +389,12 @@ class LoopStatus:
                 "spend": {"turns": 0, "elapsed": 0.0, "tokens": 0,
                           "writes": 0, "tool_calls": 0},
                 "ceilings": dict(ceilings), "stall": dict(stall),
+                # Derived from the thresholds this run was actually given, so
+                # the strip above the transcript can name the setting that
+                # will decide when it is called stalled -- while it still
+                # matters, not only in the account afterwards.
+                "patience": hearth_workloop.patience_of(
+                    hearth_workloop.StallPolicy.from_dict(dict(stall))),
                 "gate_policy": gate_policy, "gate_timeout": gate_timeout,
                 "allowed_tools": list(allowed_tools),
                 "done_command": done_command,
@@ -626,15 +632,38 @@ def parse_loop_config(raw):
         # No spelling of "unlimited" exists here: see the module docstring.
         ceilings[key] = _bounded_int(value, "ceilings." + key, low, high)
 
+    # Patience first, because it is the BASE the five numbers are applied on
+    # top of. A caller may send only a name (the ordinary case, and what the
+    # UI's chooser does), only numbers, or both -- and when both, the numbers
+    # win, because they are the more specific statement. What comes back is
+    # labelled by patience_of() from the resulting numbers rather than by the
+    # name that was asked for, so a config carrying hand-edited thresholds can
+    # never be displayed under a preset it does not actually match.
+    patience_raw = raw.get("patience")
+    if patience_raw is None:
+        base = hearth_workloop.StallPolicy()
+    else:
+        if not isinstance(patience_raw, str):
+            raise ConfigError("patience must be one of {}".format(
+                ", ".join(hearth_workloop.PATIENCE_ORDER)))
+        try:
+            base = hearth_workloop.stall_policy_for(patience_raw)
+        except ValueError as exc:
+            # Refused, never defaulted. A run that silently ignored the
+            # setting a user picked would show that setting on screen and
+            # behave as something else.
+            raise ConfigError(str(exc))
+
     stall_raw = raw.get("stall") or {}
     if not isinstance(stall_raw, dict):
         raise ConfigError("loop.stall must be an object")
-    stall = hearth_workloop.StallPolicy().to_dict()
+    stall = base.to_dict()
     for key, value in stall_raw.items():
         if key not in STALL_LIMITS:
             raise ConfigError("unknown stall setting {!r}".format(key))
         low, high = STALL_LIMITS[key]
         stall[key] = _bounded_int(value, "stall." + key, low, high)
+    patience = hearth_workloop.patience_of(hearth_workloop.StallPolicy.from_dict(stall))
 
     gate_policy = raw.get("gate_policy") or "deny"
     if gate_policy not in hearth_workloop.GATE_POLICIES:
@@ -693,7 +722,8 @@ def parse_loop_config(raw):
         required_artifacts = cleaned or None
 
     return {
-        "ceilings": ceilings, "stall": stall, "gate_policy": gate_policy,
+        "ceilings": ceilings, "stall": stall, "patience": patience,
+        "gate_policy": gate_policy,
         "gate_timeout": gate_timeout, "allowed_tools": allowed_tools,
         "done_command": done_command, "required_artifacts": required_artifacts,
     }
@@ -725,6 +755,12 @@ def config_defaults():
         ],
         "gate_policies": list(hearth_workloop.GATE_POLICIES),
         "modes": list(LOOP_MODES),
+        # The patience choice, whole: each name with what it means and what
+        # choosing it costs. Shipped as data for the same reason the blind
+        # spots are -- the page must not be able to describe a setting more
+        # kindly than the module that implements it.
+        "patience": hearth_workloop.patience_choices(),
+        "default_patience": hearth_workloop.DEFAULT_PATIENCE,
         "limits": {
             "ceilings": {k: list(v) for k, v in CEILING_LIMITS.items()},
             "stall": {k: list(v) for k, v in STALL_LIMITS.items()},
@@ -803,6 +839,7 @@ class LoopEngine:
         return {
             "ceilings": self._ceilings.to_dict(),
             "stall": self._stall.to_dict(),
+            "patience": hearth_workloop.patience_of(self._stall),
             "gate_policy": self._gate_policy,
             "gate_timeout": self._gate_timeout,
             "allowed_tools": sorted(tools),
@@ -824,6 +861,7 @@ class LoopEngine:
         return {
             "ceilings": self._ceilings.to_dict(),
             "stall": self._stall.to_dict(),
+            "patience": hearth_workloop.patience_of(self._stall),
             "gate_policy": self._gate_policy,
             "gate_timeout_seconds": self._gate_timeout,
             "allowed_tools": sorted(tools),
@@ -1201,6 +1239,72 @@ def _self_test():  # noqa: PLR0915
     # A stall detector may be switched off (0), because a run with none is
     # still bounded by its ceilings and that is the user's call to make.
     assert parse_loop_config({"stall": {"window": 0}})["stall"]["window"] == 0
+
+    # ---- patience: the named setting has to REACH the run ----------------
+    # Five numeric thresholds are meaningless to anyone who has not read the
+    # benchmark, so POST /session takes a name. The tests below are about the
+    # one failure that would make that name a lie: being accepted, echoed back,
+    # and then not used.
+    assert base["patience"] == hearth_workloop.DEFAULT_PATIENCE, base
+    for name in hearth_workloop.PATIENCE_ORDER:
+        got = parse_loop_config({"patience": name})
+        assert got["patience"] == name, got
+        assert got["stall"] == hearth_workloop.stall_policy_for(name).to_dict(), \
+            ("the named setting must reach the run's actual thresholds, not merely "
+             "be echoed back", name, got["stall"])
+        # ...all the way through to the object run_workloop is handed.
+        eng_p = build_loop_engine(got, journal_factory=journal_for)
+        assert eng_p._stall.to_dict() == hearth_workloop.stall_policy_for(name).to_dict(), \
+            ("the engine must be built with the chosen patience", name)
+        assert eng_p.manifest()["patience"] == name, \
+            "and must say which one it is running, so the screen cannot disagree"
+    assert parse_loop_config({"patience": "keep_trying"})["stall"] \
+        != parse_loop_config({"patience": "give_up_early"})["stall"], \
+        "the presets must actually differ, or the choice is decoration"
+
+    # An unknown name is REFUSED rather than defaulted: a run that ignored the
+    # setting a user picked would show that setting on screen and behave as
+    # something else entirely.
+    for bad in ("patient", "", "BALANCED", 3, None if False else "custom"):
+        refuses("patience {!r}".format(bad),
+                lambda b=bad: parse_loop_config({"patience": b}))
+
+    # Explicit numbers are the more specific statement and win over the
+    # preset -- and the result is then labelled honestly as custom, never as
+    # the preset it no longer matches.
+    mixed = parse_loop_config({"patience": "keep_trying", "stall": {"window": 3}})
+    assert mixed["stall"]["window"] == 3, mixed
+    assert mixed["stall"]["repeat_actions"] == \
+        hearth_workloop.stall_policy_for("keep_trying").repeat_actions, \
+        "an unmentioned threshold keeps the preset's value"
+    assert mixed["patience"] == hearth_workloop.CUSTOM_PATIENCE, mixed
+
+    # A PATIENCE SETTING CANNOT WIDEN A CEILING. Not "does not by default":
+    # cannot. Every preset, including the most patient, leaves every ceiling
+    # exactly where it was, and the ceiling bounds still refuse everything
+    # they refused before.
+    for name in hearth_workloop.PATIENCE_ORDER:
+        assert parse_loop_config({"patience": name})["ceilings"] == \
+            hearth_workloop.Ceilings().to_dict(), \
+            ("patience must not move a ceiling", name)
+        assert parse_loop_config(
+            {"patience": name, "ceilings": {"max_turns": 5}})["ceilings"]["max_turns"] == 5
+        for bad in (0, -1, None, 10 ** 12):
+            refuses("{} patience with an unbounded turn ceiling".format(name),
+                    lambda b=bad, n=name: parse_loop_config(
+                        {"patience": n, "ceilings": {"max_turns": b}}))
+
+    # The UI's own copy of the choice comes from here, whole, with the cost of
+    # each setting attached -- a page must not be able to offer a name the
+    # server would refuse, nor describe it more kindly than the module does.
+    _defaults = config_defaults()
+    assert [p["name"] for p in _defaults["patience"]] == \
+        list(hearth_workloop.PATIENCE_ORDER), _defaults["patience"]
+    assert _defaults["default_patience"] == hearth_workloop.DEFAULT_PATIENCE
+    for p in _defaults["patience"]:
+        assert p["label"] and p["summary"] and p["cost"], p
+        assert parse_loop_config({"patience": p["name"]})["stall"] == p["settings"], p
+    assert _defaults["config"]["patience"] == hearth_workloop.DEFAULT_PATIENCE
 
     # The capability manifest may only NARROW, and a widening attempt is
     # REFUSED rather than intersected: silently dropping a tool the caller
