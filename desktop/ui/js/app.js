@@ -11,6 +11,7 @@ import { el, icon, appendAll, clear, setText, neutralize, $ } from "./dom.js";
 import { blob } from "./safe-text.js";
 import { ShopView } from "./shop.js";
 import { LoopConfigPanel, LoopRunBar, account as loopAccount } from "./loop.js";
+import { SwarmConfigPanel, SwarmRunBar, account as swarmAccount } from "./swarm.js";
 
 const RECENTS_KEY = "hearth.recentWorkspaces"; // workspace paths only; the bearer token is never stored
 const MAX_RECENTS = 8;
@@ -34,6 +35,9 @@ const ui = {
   loopPanel: $("#loop-panel"),
   loopConfig: $("#loop-config"),
   loopRunBar: $("#loop-runbar"),
+  swarmPanel: $("#swarm-panel"),
+  swarmConfig: $("#swarm-config"),
+  swarmRunBar: $("#swarm-runbar"),
   connect: $("#btn-connect"),
   sessionNote: $("#session-note"),
   setupBody: $("#setup-body"),
@@ -77,13 +81,28 @@ const state = {
   loop: null,
   loopStream: null,
   loopGeneration: 0,
+  // The last GET /swarm snapshot. Its own gauge and its own stream, for the
+  // reason app.py keeps two: a relay's state carries phases and roles that a
+  // loop has no notion of, and one merged shape would be half empty whichever
+  // engine was running.
+  swarm: null,
+  swarmStream: null,
+  swarmGeneration: 0,
   // True once the account for the CURRENT run has been put in the transcript,
   // so a reconnect that replays the terminal event does not print it twice.
   accountShownFor: null,
+  // The swarm keeps its OWN marker rather than sharing accountShownFor. Both
+  // gauges stream for the life of the page, so a shared marker lets one
+  // engine clear the other's: a finished loop's account would be re-appended
+  // to the transcript every time a running relay's snapshot set the marker
+  // back to null. Two runs, two markers.
+  swarmAccountShownFor: null,
 };
 
 const loopConfigPanel = new LoopConfigPanel(ui.loopConfig);
 const loopRunBar = new LoopRunBar(ui.loopRunBar);
+const swarmConfigPanel = new SwarmConfigPanel(ui.swarmConfig);
+const swarmRunBar = new SwarmRunBar(ui.swarmRunBar);
 
 // ---------------------------------------------------------------------- views
 
@@ -712,6 +731,81 @@ function startLoopStream() {
   })();
 }
 
+function isSwarmSession() {
+  return state.session ? state.session.engine === "swarm" : ui.engine.value === "swarm";
+}
+
+/** Show or hide the swarm bounds form, on the same terms as the loop's: it is
+ *  meaningful before a run AND while one is live, because reading the numbers
+ *  back matters as much as typing them in. */
+function updateSwarmPanel() {
+  const wanted = ui.engine.value === "swarm" || isSwarmSession();
+  ui.swarmPanel.hidden = !wanted;
+  swarmConfigPanel.setMode(ui.mode.value);
+}
+
+function applySwarmSnapshot(snapshot) {
+  state.swarm = snapshot;
+  swarmConfigPanel.render(snapshot.defaults, snapshot.blind_spots);
+  swarmConfigPanel.applyConfig(snapshot.config);
+  updateSwarmPanel();
+  swarmRunBar.render(
+    isSwarmSession() || snapshot.run || snapshot.pending ? snapshot : null);
+
+  // The account is the product. Put it in the transcript exactly once per
+  // run, driven by the gauge rather than by the terminal event, so it also
+  // appears for a page that connected after the relay had already ended.
+  const run = snapshot.run;
+  if (run && run.state === "stopped" && snapshot.report
+      && state.swarmAccountShownFor !== run.run_id) {
+    state.swarmAccountShownFor = run.run_id;
+    transcript.clearPlaceholder();
+    transcript.closeAgent();
+    transcript.append(swarmAccount(snapshot.report, snapshot.account,
+                                   snapshot.blind_spots, snapshot.loop_blind_spots));
+  }
+  if (run && run.state !== "stopped") state.swarmAccountShownFor = null;
+}
+
+function stopSwarmStream() {
+  state.swarmGeneration += 1;
+  if (state.swarmStream) {
+    state.swarmStream.abort();
+    state.swarmStream = null;
+  }
+}
+
+/** Watch GET /swarm/events, for the life of the page. Same reasoning as
+ *  startLoopStream: an inherited unfinished relay has to be visible before
+ *  anything is started, and the last account has to stay readable after. */
+function startSwarmStream() {
+  const generation = ++state.swarmGeneration;
+  (async () => {
+    let backoff = 400;
+    while (generation === state.swarmGeneration) {
+      const controller = new AbortController();
+      state.swarmStream = controller;
+      try {
+        await sidecar.streamSwarm({
+          since: state.swarm ? state.swarm.version : 0,
+          signal: controller.signal,
+          onSnapshot: (snapshot) => {
+            if (generation !== state.swarmGeneration) return;
+            backoff = 400;
+            applySwarmSnapshot(snapshot);
+          },
+        });
+        if (generation !== state.swarmGeneration) return;
+        await sleep(150);
+      } catch (err) {
+        if (controller.signal.aborted || generation !== state.swarmGeneration) return;
+        await sleep(backoff);
+        backoff = Math.min(backoff * 2, 5000);
+      }
+    }
+  })();
+}
+
 // ------------------------------------------------------------------- session
 
 async function loadSession({ quiet = false } = {}) {
@@ -774,6 +868,15 @@ async function startSession() {
     ui.mode.focus();
     return;
   }
+  if (engine === "swarm" && !["auto", "plan"].includes(mode)) {
+    ui.sessionNote.className = "panel-note is-error";
+    setText(ui.sessionNote,
+      "A swarm needs 'auto' (the implementer may read and write unattended; "
+      + "anything dangerous is gated) or 'plan' (every role read-only). "
+      + "'edit' gates every write and nobody is awake to approve them.");
+    ui.mode.focus();
+    return;
+  }
 
   if (!workspace) {
     ui.sessionNote.className = "panel-note is-error";
@@ -800,9 +903,11 @@ async function startSession() {
     // Read off the live form at the moment the button is pressed, so what is
     // sent is exactly what the operator has on screen.
     if (engine === "loop") body.loop = loopConfigPanel.read();
+    if (engine === "swarm") body.swarm = swarmConfigPanel.read();
     const session = await sidecar.createSession(body);
     state.lastEventId = 0;
     state.accountShownFor = null;
+    state.swarmAccountShownFor = null;
     transcript.reset();
     transcript.showPlaceholder(
       session.engine === "loop" ? "Work loop ready" : "Session ready",
@@ -1092,6 +1197,70 @@ function handleEvent(event) {
     case "loop_stop":
       break;
 
+    // ---- agent swarm -----------------------------------------------------
+    // Same division as the loop: the transcript carries the NARRATIVE and
+    // GET /swarm carries the totals. What is extra here is that every entry
+    // names the role, because "which role did what" is the whole thing a
+    // relay has to be able to explain.
+    case "swarm_start":
+      transcript.addNotice("quiet", "Agent swarm started.",
+        `${data.mode} mode · ${(data.roles || []).map((r) => r.name).join(" → ")}`
+        + " · one budget shared by every role");
+      break;
+
+    case "phase_start":
+      transcript.closeAgent();
+      transcript.addNotice("quiet", `${data.role} is working.`,
+        [`cycle ${data.cycle}`,
+         data.writes ? "may change files" : "read-only",
+         `on ${data.model}`,
+        ].filter(Boolean).join(" · "));
+      break;
+
+    case "phase_end":
+      transcript.addNotice(
+        data.bound_by === "global" ? "warn" : "quiet",
+        `${data.role} handed off.`,
+        [`ended: ${data.stop_reason || "unknown"}`,
+         data.bound_by === "role" ? "used its own turn budget" : null,
+         data.bound_by === "global" ? "hit the SHARED budget" : null,
+        ].filter(Boolean).join(" · "));
+      break;
+
+    case "swarm_swap":
+      transcript.addNotice("quiet", `Loaded ${data.model} for the ${data.role}.`,
+        `${data.seconds}s of wall clock spent swapping models.`);
+      break;
+
+    case "lease_refused":
+      // The write lease firing is worth saying out loud: it means a read-only
+      // role tried to change a file and was stopped.
+      transcript.addNotice("warn",
+        `The ${data.role} tried to use ${data.tool} and was refused.`,
+        "Only the implementer holds the write lease. Nothing was changed.");
+      break;
+
+    case "swarm_resuming":
+      transcript.addNotice("warn", "Resuming the relay that was interrupted.",
+        `${data.completed_phases ?? 0} phase(s) already completed. Phase `
+        + `${data.interrupted_phase} was interrupted and will NOT be resumed: there `
+        + "is no way to know whether its last tool call reached the workspace.");
+      break;
+
+    case "swarm_abandoned":
+      transcript.addNotice("warn", "An unfinished relay was left alone.",
+        data.reason || "");
+      break;
+
+    case "swarm_report":
+      // The account is rendered from GET /swarm, so it appears for a page
+      // that connected after the relay ended too. Nothing to draw here.
+      refreshCheckpoints();
+      break;
+
+    case "swarm_stop":
+      break;
+
     case "done":
       transcript.closeAgent();
       state.running = false;
@@ -1171,6 +1340,16 @@ ui.stop.addEventListener("click", cancel);
 // session exists: a person deciding whether to run one unattended needs to
 // see what would bound it while they are still deciding.
 ui.engine.addEventListener("change", () => {
+  if (ui.engine.value === "swarm" && ui.mode.value === "edit") {
+    // Same rescue as the loop's below, and for the same reason: 'edit' gates
+    // every write and a relay has nobody to answer those gates.
+    ui.mode.value = "auto";
+    ui.sessionNote.className = "panel-note";
+    setText(ui.sessionNote,
+      "Switched to 'auto': a swarm cannot use 'edit', which gates every write "
+      + "with nobody awake to approve them. Check what each role allows below "
+      + "before starting.");
+  }
   if (ui.engine.value === "loop" && ui.mode.value === "edit") {
     // 'edit' gates every write and a loop has nobody to answer those gates.
     // Move to the mode that actually works, visibly, rather than failing at
@@ -1187,9 +1366,10 @@ ui.engine.addEventListener("change", () => {
       + "below before starting.");
   }
   updateLoopPanel();
+  updateSwarmPanel();
   updateTurnUi();
 });
-ui.mode.addEventListener("change", () => updateLoopPanel());
+ui.mode.addEventListener("change", () => { updateLoopPanel(); updateSwarmPanel(); });
 
 ui.composer.addEventListener("input", () => {
   autosize();
@@ -1270,6 +1450,16 @@ async function boot() {
     void err;  // the stream below retries; a first-read failure is not fatal
   }
   startLoopStream();
+
+  // The swarm gauge, on the same terms and for the same reasons: an inherited
+  // unfinished relay must be on screen before the user types anything, since
+  // starting something else is what forfeits the chance to resume it.
+  try {
+    applySwarmSnapshot(await sidecar.swarm());
+  } catch (err) {
+    void err;
+  }
+  startSwarmStream();
 
   await Promise.all([refreshSetup(), refreshModels()]);
 

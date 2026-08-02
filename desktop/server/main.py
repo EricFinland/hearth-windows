@@ -93,6 +93,7 @@ import app as app_mod  # noqa: E402
 import engine as engine_mod
 import loop_engine as loop_mod
 import session_state
+import swarm_engine as swarm_mod
 
 
 def _default_persist_hook(session):
@@ -118,21 +119,43 @@ def restore_engine_factory(persisted, default_factory, state):
     session WAS and never what a session is allowed to be. Falling back to
     the defaults (rather than dropping the session) keeps the run visible,
     which is the point, while denying the file any say in its bounds.
+
+    A swarm is rebuilt on exactly the same terms, and its ROLES are never
+    taken from the file: build_swarm_engine derives them from this build's own
+    DEFAULT_ROLES, narrowed by the (re-validated) tool manifest. A state file
+    that named its own roles could name a second writing role, and the
+    single-writer property that keeps two agents from corrupting one
+    workspace would become something a file on disk could switch off.
     """
-    if not isinstance(persisted, dict) or persisted.get("engine_kind") != "loop":
+    if not isinstance(persisted, dict):
         return default_factory
-    if persisted.get("mode") not in loop_mod.LOOP_MODES:
-        # A loop cannot run in this mode, so do not rebuild one that would
-        # refuse its own first prompt. The chat engine restores normally.
+    kind = persisted.get("engine_kind")
+    if kind not in ("loop", "swarm"):
+        return default_factory
+
+    # (module, its mode set, its config parser, its error, its builder, its gauge)
+    spec = {
+        "loop": (loop_mod.LOOP_MODES, loop_mod.parse_loop_config,
+                 loop_mod.ConfigError, loop_mod.build_loop_engine,
+                 state.get_loop_status, "work loop"),
+        "swarm": (swarm_mod.SWARM_MODES, swarm_mod.parse_swarm_config,
+                  swarm_mod.ConfigError, swarm_mod.build_swarm_engine,
+                  state.get_swarm_status, "swarm"),
+    }[kind]
+    modes, parse, config_error, build, status_of, label = spec
+
+    if persisted.get("mode") not in modes:
+        # It cannot run in this mode, so do not rebuild one that would refuse
+        # its own first prompt. The chat engine restores normally.
         return default_factory
     try:
-        config = loop_mod.parse_loop_config(persisted.get("engine_config"))
-    except loop_mod.ConfigError as exc:
-        print("[hearth-main] persisted work loop config is not acceptable ({}); "
-              "restoring the run with default ceilings instead".format(exc),
+        config = parse(persisted.get("engine_config"))
+    except config_error as exc:
+        print("[hearth-main] persisted {} config is not acceptable ({}); "
+              "restoring the run with default ceilings instead".format(label, exc),
               file=sys.stderr)
-        config = loop_mod.parse_loop_config({})
-    return lambda: loop_mod.build_loop_engine(config, status=state.get_loop_status())
+        config = parse({})
+    return lambda: build(config, status=status_of())
 
 
 def start_engine_acquisition(state, stream=None):
@@ -427,12 +450,74 @@ def _self_test():
     return 0
 
 
+def _self_test_restore_engine_factory():
+    """restore_engine_factory rebuilds the RIGHT kind of engine, and believes
+    the state file about nothing that grants authority.
+
+    Untested until a swarm engine turned this function from a single `if` into
+    a dispatch. A session that comes back as the wrong kind is not a lost
+    setting: a chat engine has no pending_run(), so an unfinished run's
+    journal sits on disk with nothing in the application able to see it, and
+    the user is told nothing at all about what was in flight.
+    """
+    import app as app_mod  # noqa: PLC0415
+
+    state = app_mod.SidecarState("t")
+    sentinel = object()
+
+    def default():
+        return sentinel
+
+    def kind_of(persisted):
+        got = restore_engine_factory(persisted, default, state)()
+        return "default" if got is sentinel else getattr(got, "ENGINE_KIND", "chat")
+
+    # The three engine kinds land on the three factories.
+    assert kind_of({"engine_kind": "chat", "mode": "auto"}) == "default"
+    assert kind_of({"engine_kind": "loop", "mode": "auto"}) == "loop"
+    assert kind_of({"engine_kind": "swarm", "mode": "auto"}) == "swarm"
+    assert kind_of({"engine_kind": "nonsense", "mode": "auto"}) == "default"
+    assert kind_of(None) == "default"
+    assert kind_of("not a dict") == "default"
+
+    # A mode the engine may not run in restores as a chat rather than
+    # rebuilding an engine that would refuse its own first prompt. bypass is
+    # the one that matters: it must never come back as a loop or a swarm.
+    for kind in ("loop", "swarm"):
+        for mode in ("bypass", "edit", None, "nonsense"):
+            assert kind_of({"engine_kind": kind, "mode": mode}) == "default", (kind, mode)
+
+    # A config the parser refuses falls back to the DEFAULTS rather than being
+    # honoured, because this file is writable by the agent's own write_file.
+    for kind, ceiling_key in (("loop", "max_turns"), ("swarm", "max_cycles")):
+        eng = restore_engine_factory(
+            {"engine_kind": kind, "mode": "auto",
+             "engine_config": {"ceilings": {ceiling_key: -1}}}, default, state)()
+        assert getattr(eng, "ENGINE_KIND", None) == kind, kind
+        got = eng.manifest()["ceilings"][ceiling_key]
+        assert got > 0, ("a state file must not be able to hand its successor an "
+                         "unbounded run", kind, got)
+
+    # A swarm rebuilt from a state file gets THIS BUILD's roles, with exactly
+    # one writer, whatever the file says. Roles are not a persisted field at
+    # all, and adding one must not silently start working.
+    eng = restore_engine_factory(
+        {"engine_kind": "swarm", "mode": "auto",
+         "engine_config": {"roles": [{"name": "evil", "writes": True}]}},
+        default, state)()
+    roles = eng.manifest()["roles"]
+    assert [r["name"] for r in roles] == ["planner", "implementer", "reviewer"], roles
+    assert sum(1 for r in roles if r["writes"]) == 1, roles
+
+
 def _self_test_body():
     import io
     import http.client
     import threading
     import time
     import urllib.request
+
+    _self_test_restore_engine_factory()
 
     # Binds 127.0.0.1 on an ephemeral (non-zero, non-fixed) port.
     server, state = make_server()

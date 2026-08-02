@@ -258,6 +258,7 @@ import downloads as downloads_mod
 import engine as engine_mod
 import loop_engine as loop_mod
 import session as session_mod
+import swarm_engine as swarm_mod
 
 
 MAX_SSE_CONNECTIONS = 16  # bound on concurrent GET /events streams; see acquire_sse_slot
@@ -305,6 +306,22 @@ class WorkspaceBusyError(RuntimeError):
     SidecarHandler turns this into a 409."""
 
 
+def _engine_kind(engine):
+    """What kind of engine a session is running, as the UI names it.
+
+    Read off the live object's own ENGINE_KIND (the same attribute
+    session_state persists so a restart rebuilds the right kind), never off a
+    remembered request field. Defaults to "chat" for the interactive engine,
+    which has no ENGINE_KIND because it is the default.
+
+    One function rather than an isinstance test per engine at each of the
+    three places that ask, because adding a third engine and missing one of
+    those places is how a page ends up drawing chat controls over a running
+    relay.
+    """
+    return getattr(engine, "ENGINE_KIND", "chat") if engine is not None else None
+
+
 class SidecarState:
     """Shared state behind every request. One instance per server process;
     ThreadingHTTPServer runs each request on its own thread, so mutation of
@@ -316,7 +333,7 @@ class SidecarState:
                  setup_diagnoser=None, idle_prober=None, idle_cache_seconds=None,
                  local_models_fetcher=None, model_checker=None,
                  shop_searcher=None, shop_quanter=None, download_manager=None,
-                 engine_acquirer=None, loop_builder=None):
+                 engine_acquirer=None, loop_builder=None, swarm_builder=None):
         self.token = token
         self.port = port  # main.py sets this to the real bound port after listen
         self.engine_factory = engine_factory or (lambda: session_mod.NullEngine())
@@ -378,6 +395,14 @@ class SidecarState:
         # scripted chat_fn. What is under test stays the production code
         # path; only the model is a stand-in.
         self.loop_builder = loop_builder or loop_mod.build_loop_engine
+        # The swarm's gauge (GET /swarm), and how POST /session builds a relay
+        # engine. Its own gauge rather than a shared one with the loop: the
+        # two carry different shapes (a relay's state has phases and roles in
+        # it), and a single gauge would have to be a union that is half empty
+        # whichever engine is running. Same lifetime argument as the loop's --
+        # process-wide, outliving the session, so an account stays readable.
+        self._swarm_status = swarm_mod.SwarmStatus()
+        self.swarm_builder = swarm_builder or swarm_mod.build_swarm_engine
         self.idle_cache_seconds = (
             IDLE_CACHE_SECONDS if idle_cache_seconds is None else idle_cache_seconds)
         self._idle_lock = threading.Lock()  # separate from self._lock below: probing
@@ -424,6 +449,25 @@ class SidecarState:
         """The process-wide work-loop gauge."""
         return self._loop_status
 
+    def get_swarm_status(self):
+        """The process-wide swarm gauge."""
+        return self._swarm_status
+
+    def swarm_snapshot(self, since=None, timeout=None):
+        """GET /swarm's body: the gauge, plus the two facts only this layer
+        knows. Same construction as loop_snapshot, for the same reasons."""
+        status = self._swarm_status
+        snap = (status.snapshot() if since is None
+                else status.snapshot_after(since, timeout=timeout))
+        session = self.get_session()
+        engine = getattr(session, "engine", None) if session is not None else None
+        is_swarm = isinstance(engine, swarm_mod.SwarmEngine)
+        snap["engine"] = ("swarm" if is_swarm
+                          else (_engine_kind(engine) if session is not None else None))
+        snap["config"] = engine.manifest() if is_swarm else None
+        snap["defaults"] = swarm_mod.config_defaults()
+        return snap
+
     def loop_snapshot(self, since=None, timeout=None):
         """GET /loop's body: the gauge, plus the two facts only this layer
         knows.
@@ -445,7 +489,11 @@ class SidecarState:
         session = self.get_session()
         engine = getattr(session, "engine", None) if session is not None else None
         is_loop = isinstance(engine, loop_mod.LoopEngine)
-        snap["engine"] = "loop" if is_loop else ("chat" if session is not None else None)
+        # Named via _engine_kind rather than "chat", so a live SWARM session
+        # is reported as a swarm here instead of being mislabelled a chat --
+        # which is what a page would then draw over a running relay.
+        snap["engine"] = ("loop" if is_loop
+                          else (_engine_kind(engine) if session is not None else None))
         snap["config"] = engine.manifest() if is_loop else None
         # The form's raw material: defaults, hard bounds, and what each tool
         # would actually be allowed to do in each mode. Static, so it costs a
@@ -587,6 +635,7 @@ class SidecarState:
         # `config` in loop_snapshot() just changed, so a watcher blocked on
         # GET /loop/events must wake for it.
         self._loop_status.touch()
+        self._swarm_status.touch()
         return s
 
 
@@ -749,6 +798,10 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._send_json(200, self.state.loop_snapshot())
         elif path == "/loop/events":
             self._get_loop_events()
+        elif path == "/swarm":
+            self._send_json(200, self.state.swarm_snapshot())
+        elif path == "/swarm/events":
+            self._get_swarm_events()
         else:
             self._send_json(404, {"error": "not_found"})
 
@@ -791,10 +844,12 @@ class SidecarHandler(BaseHTTPRequestHandler):
         # Which engine this session runs, so a page reloaded (or restarted)
         # into a live loop shows the loop controls instead of a chat box.
         # Read off the live object, not off a remembered request field.
-        is_loop = isinstance(s.engine, loop_mod.LoopEngine)
-        out["engine"] = "loop" if is_loop else "chat"
-        if is_loop:
-            out["loop"] = s.engine.manifest()
+        kind = _engine_kind(s.engine)
+        out["engine"] = kind
+        if kind in ("loop", "swarm"):
+            # Under its own engine name, so a page does not have to guess
+            # which shape of manifest it is holding.
+            out[kind] = s.engine.manifest()
         self._send_json(200, out)
 
     def _post_session(self):
@@ -839,12 +894,36 @@ class SidecarHandler(BaseHTTPRequestHandler):
         # validated `loop` config. This is the field that makes the work loop
         # reachable from the application at all.
         engine_kind = body.get("engine") or "chat"
-        if engine_kind not in ("chat", "loop"):
-            self._send_json(400, {"error": "engine must be 'chat' or 'loop'"})
+        if engine_kind not in ("chat", "loop", "swarm"):
+            self._send_json(400, {
+                "error": "engine must be 'chat', 'loop' or 'swarm'"})
             return
         engine_factory = None
         loop_config = None
-        if engine_kind == "loop":
+        engine_config = None
+        if engine_kind == "swarm":
+            if mode not in swarm_mod.SWARM_MODES:
+                self._send_json(400, {
+                    "error": "a swarm cannot run in {!r} mode".format(mode),
+                    "remedy": ("Choose 'auto' (the implementer may read and write "
+                               "files unattended; anything dangerous is gated) or "
+                               "'plan' (every role read-only). 'edit' gates every "
+                               "write and nobody is awake to approve them."),
+                    "modes": list(swarm_mod.SWARM_MODES),
+                })
+                return
+            try:
+                engine_config = swarm_mod.parse_swarm_config(body.get("swarm"))
+            except swarm_mod.ConfigError as exc:
+                # Named, never clamped, for the reason the loop gives: an
+                # unattended run must not quietly get bounds other than the
+                # ones its operator read on screen.
+                self._send_json(400, {"error": str(exc)})
+                return
+            status = self.state.get_swarm_status()
+            build = self.state.swarm_builder
+            engine_factory = (lambda cfg=engine_config, st=status: build(cfg, status=st))
+        elif engine_kind == "loop":
             if mode not in loop_mod.LOOP_MODES:
                 self._send_json(400, {
                     "error": "a work loop cannot run in {!r} mode".format(mode),
@@ -876,8 +955,8 @@ class SidecarHandler(BaseHTTPRequestHandler):
             return
         out = s.to_dict()
         out["engine"] = engine_kind
-        if loop_config is not None:
-            out["loop"] = s.engine.manifest()
+        if loop_config is not None or engine_config is not None:
+            out[engine_kind] = s.engine.manifest()
         self._send_json(200, out)
 
     def _post_prompt(self):
@@ -937,7 +1016,12 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "no_session"})
             return
         cancelled = s.cancel()
+        # Both gauges, because Stop is the ONE kill switch for every engine
+        # and whichever one is running has a watcher that must wake now
+        # rather than a keep-alive later. Touching the idle one costs a
+        # version bump nobody reads.
         self.state.get_loop_status().touch()
+        self.state.get_swarm_status().touch()
         self._send_json(200, {"cancelled": cancelled})
 
     def _get_events(self):
@@ -1234,6 +1318,41 @@ class SidecarHandler(BaseHTTPRequestHandler):
                         continue
                     since = snapshot["version"]
                     chunk = "id: {}\nevent: loop\ndata: {}\n\n".format(
+                        since, json.dumps(snapshot))
+                    self.wfile.write(chunk.encode("utf-8"))
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
+                return
+        finally:
+            self.state.release_sse_slot()
+
+    def _get_swarm_events(self):
+        """SSE for the swarm's run state. Same shape and same reasoning as
+        _get_loop_events: a gauge, whole snapshot per frame, only the latest
+        value ever wanted. Shares the same bounded SSE slot pool."""
+        q = self._query()
+        try:
+            since = int(q.get("since", 0))
+        except ValueError:
+            since = 0
+        if not self.state.acquire_sse_slot():
+            self._send_json(429, {"error": "too_many_event_streams"})
+            return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                while True:
+                    snapshot = self.state.swarm_snapshot(since=since, timeout=15)
+                    if snapshot["version"] == since:
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                        continue
+                    since = snapshot["version"]
+                    chunk = "id: {}\nevent: swarm\ndata: {}\n\n".format(
                         since, json.dumps(snapshot))
                     self.wfile.write(chunk.encode("utf-8"))
                     self.wfile.flush()

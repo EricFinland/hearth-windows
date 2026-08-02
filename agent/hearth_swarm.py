@@ -1,5 +1,27 @@
 #!/usr/bin/env python3
-"""hearth swarm: the manager that turns one goal into a coordinated team.
+"""hearth swarm (LEGACY, Linux/systemd): a manager that fans out to child units.
+
+NOT THE AGENT SWARM THE DESKTOP APPLICATION USES. That is
+`agent/hearth_swarmloop.py`, driven by `desktop/server/swarm_engine.py`, and
+the two are different designs for different machines:
+
+  this module         fans a goal out to CONCURRENT specialist agents, each a
+                      separate `hearth-agent@.service` systemd unit started
+                      with `sudo systemctl start`. It only works on the NixOS
+                      host, it defaults to `mode="bypass"`, and it assumes
+                      several models can be resident at once.
+  hearth_swarmloop    a sequential RELAY of narrow roles inside one process,
+                      because on a 16GB consumer GPU only one model is
+                      resident at a time and nothing in this repository makes
+                      two concurrent writers to one workspace safe. bypass is
+                      unreachable from it by construction.
+
+Keep them apart when editing. Nothing in the Windows application imports this
+file; it is retained for the Linux host, where the systemd units it drives
+actually exist.
+
+WHAT IT DOES
+============
 
 A manager decomposes a goal into independent subtasks (one model call), spawns a
 specialist agent per subtask through the existing queue -> hearth-spawn ->

@@ -40,6 +40,10 @@ import {
   renderSourceNotice, renderHardware, renderVerdict,
 } from "./shop.js";
 import { account as loopAccount, LoopRunBar, blindSpots } from "./loop.js";
+import {
+  account as swarmAccount, SwarmRunBar, roleCard,
+  blindSpots as swarmBlindSpots,
+} from "./swarm.js";
 
 // Any payload that manages to execute sets this. It must stay false.
 window.__xssFired = false;
@@ -341,6 +345,88 @@ for (const payload of PAYLOADS) {
   check("work loop blind spots", payload,
     probe((host) => host.appendChild(blindSpots(
       [{ headline: payload, means: payload, remedy: payload }]))));
+
+  // ---- the agent swarm. Every field here is model output: a relay's plan
+  // and its reviewer's critique are prose a local model wrote, the role names
+  // and phase stop reasons ride back out of a journal on disk, and the
+  // account is what a person reads to decide whether to trust the result.
+  check("swarm account", payload,
+    probe((host) => host.appendChild(swarmAccount(
+      hostileSwarmReport(payload), payload, HOSTILE_BLIND, HOSTILE_BLIND))));
+  for (const state of ["running", "stopping", "stopped"]) {
+    check("swarm run bar (" + state + ")", payload,
+      probe((host) => new SwarmRunBar(host).render({
+        run: hostileSwarmRun(payload, state), pending: null,
+        blind_spots: HOSTILE_BLIND,
+      })));
+  }
+  for (const resumable of [true, false]) {
+    check("swarm pending card (resumable=" + resumable + ")", payload,
+      probe((host) => new SwarmRunBar(host).render({
+        run: null, pending: hostileSwarmPending(payload, resumable),
+        blind_spots: HOSTILE_BLIND,
+      })));
+  }
+  check("swarm role card", payload,
+    probe((host) => host.appendChild(roleCard(hostileRoles(payload)))));
+  check("swarm blind spots", payload,
+    probe((host) => host.appendChild(swarmBlindSpots(
+      [{ headline: payload, means: payload, remedy: payload }]))));
+}
+
+/* A relay report with the payload in every untrusted field at once, so one
+ * missed `text:` fails rather than being masked by its neighbours. */
+function hostileSwarmReport(payload) {
+  return {
+    run_id: payload, goal: payload, model: payload, workspace: payload,
+    mode: "auto", stop_reason: "exhausted", stop_detail: payload,
+    cycles: 2, turns: 9, elapsed: 90, tokens: 500, writes: 3, tool_calls: 12,
+    ceilings: { max_turns: 40, max_seconds: 7200, max_tokens: 1000000,
+                max_writes: 200, max_tool_calls: 400, max_cycles: 3 },
+    phases: [{ index: 1, cycle: 1, role: payload, model: payload, turns: 2,
+               tokens: 100, stop_reason: payload, bound_by: "role" }],
+    plan: payload, last_review: payload, reviewer_approved: true,
+    verified: false,
+    completion: { done: false, verified: true, detail: payload, output: payload },
+    created: [payload], modified: [payload], deleted: [payload],
+    notices: [payload], live_workers: 2, swaps: 1, swap_seconds: 3,
+    lease_refusals: 1,
+  };
+}
+
+function hostileSwarmRun(payload, state) {
+  return {
+    run_id: payload, goal: payload, model: payload, workspace: payload,
+    mode: "auto", state, resumed: true, started_at: Date.now() / 1000,
+    elapsed: 12, cycle: 1, phase: 2, role: payload, turn: 3,
+    spend: { turns: 3, elapsed: 12, tokens: 40, writes: 2, tool_calls: 5 },
+    ceilings: { max_turns: 40, max_seconds: 7200, max_tokens: 1000000,
+                max_writes: 200, max_tool_calls: 400, max_cycles: 3 },
+    phases: [{ index: 1, cycle: 1, role: payload, model: payload,
+               state: "done", turns: 2, tokens: 90, stop_reason: payload,
+               bound_by: "global", writes: true }],
+    verified: false, reviewer_approved: true,
+    swaps: 1, swap_seconds: 4, lease_refusals: 2,
+    stop_reason: state === "stopped" ? "exhausted" : undefined,
+    stop_detail: state === "stopped" ? payload : undefined,
+    live_workers: 2,
+  };
+}
+
+function hostileSwarmPending(payload, resumable) {
+  return {
+    run_id: payload, goal: payload, completed_phases: 4, interrupted_phase: 5,
+    resumable, refusal: payload, journal_goal_differs: true,
+  };
+}
+
+function hostileRoles(payload) {
+  return [
+    { name: payload, purpose: payload, writes: true, max_turns: 12,
+      tools: [{ name: payload, risk: "edit", effect: { auto: "allow" } }] },
+    { name: payload, purpose: payload, writes: false, max_turns: 3,
+      tools: [{ name: payload, risk: "safe", effect: { auto: "allow" } }] },
+  ];
 }
 
 // A completed run takes a different headline branch, and an unverified
@@ -638,7 +724,95 @@ const BIDI_SURFACES = [
   { label: "loop blind spot headline", selector: ".lbs-item strong",
     build: (host, text) => host.appendChild(blindSpots(
       [{ headline: text, means: text, remedy: text }])) },
+  // The agent swarm. A reordered plan or critique would misreport what a role
+  // actually said, and the phase strip is the only place "which role did what"
+  // is answered -- a reordered role name there attributes work to the wrong
+  // agent, which is precisely the account this feature exists to provide.
+  { label: "swarm account stop detail", selector: ".lac-detail",
+    build: (host, text) => host.appendChild(swarmAccount(
+      bidiSwarmReport(text), "", [], [])) },
+  { label: "swarm account plan", selector: ".lac pre.blob",
+    build: (host, text) => host.appendChild(swarmAccount(
+      bidiSwarmReport(text), "", [], [])) },
+  { label: "swarm account phase attribution", selector: ".swm-phases li span",
+    build: (host, text) => host.appendChild(swarmAccount(
+      bidiSwarmReport(text), "", [], [])) },
+  { label: "swarm account created files", selector: ".lac-files .mono",
+    build: (host, text) => host.appendChild(swarmAccount(
+      bidiSwarmReport(text), "", [], [])) },
+  { label: "swarm account notice", selector: ".lac-note",
+    build: (host, text) => host.appendChild(swarmAccount(
+      bidiSwarmReport(text), "", [], [])) },
+  { label: "swarm account full text", selector: ".lac-full pre.blob",
+    build: (host, text) => host.appendChild(swarmAccount(
+      bidiSwarmReport(text), text, [], [])) },
+  { label: "swarm run bar goal", selector: ".lrb-goal",
+    build: (host, text) => new SwarmRunBar(host).render(
+      { run: bidiSwarmRun(text), pending: null }) },
+  { label: "swarm run bar active role", selector: ".lrb-title strong",
+    build: (host, text) => new SwarmRunBar(host).render(
+      { run: bidiSwarmRun(text), pending: null }) },
+  { label: "swarm phase strip role", selector: ".swm-step-role",
+    build: (host, text) => new SwarmRunBar(host).render(
+      { run: bidiSwarmRun(text), pending: null }) },
+  { label: "swarm pending goal (read off a journal on disk)", selector: ".lrb-goal",
+    build: (host, text) => new SwarmRunBar(host).render(
+      { run: null, pending: bidiSwarmPending(text) }) },
+  { label: "swarm pending refusal", selector: ".lrb-pending .lrb-detail",
+    build: (host, text) => new SwarmRunBar(host).render(
+      { run: null, pending: bidiSwarmPending(text) }) },
+  { label: "swarm role name", selector: ".swm-role-name",
+    build: (host, text) => host.appendChild(roleCard(
+      [{ name: text, purpose: text, writes: true, max_turns: 3, tools: [] }])) },
+  { label: "swarm role purpose", selector: ".swm-role-purpose",
+    build: (host, text) => host.appendChild(roleCard(
+      [{ name: text, purpose: text, writes: false, max_turns: 3, tools: [] }])) },
+  { label: "swarm blind spot headline", selector: ".swm-blind .lbs-item strong",
+    build: (host, text) => host.appendChild(swarmBlindSpots(
+      [{ headline: text, means: text, remedy: text }])) },
 ];
+
+function bidiSwarmReport(text) {
+  return {
+    run_id: "r", goal: text, model: "m", workspace: "w", mode: "auto",
+    stop_reason: "exhausted", stop_detail: text, cycles: 1, turns: 3,
+    elapsed: 10, tokens: 5, writes: 1, tool_calls: 2,
+    ceilings: { max_turns: 40, max_seconds: 7200, max_tokens: 1000,
+                max_writes: 200, max_tool_calls: 400, max_cycles: 3 },
+    phases: [{ index: 1, cycle: 1, role: text, turns: 1, tokens: 5,
+               stop_reason: text, bound_by: "role" }],
+    plan: text, last_review: "", reviewer_approved: false, verified: false,
+    completion: {}, created: [text], modified: [], deleted: [],
+    notices: [text], live_workers: 0, swaps: 0, lease_refusals: 0,
+  };
+}
+
+function bidiSwarmRun(text) {
+  return {
+    run_id: "r", goal: text, model: "m", workspace: "w", mode: "auto",
+    state: "running", resumed: false, started_at: Date.now() / 1000,
+    elapsed: 5, cycle: 1, phase: 1, role: text, turn: 1,
+    spend: { turns: 1, elapsed: 5, tokens: 9, writes: 0, tool_calls: 1 },
+    ceilings: { max_turns: 40, max_seconds: 7200, max_tokens: 1000,
+                max_writes: 200, max_tool_calls: 400, max_cycles: 3 },
+    phases: [{ index: 1, cycle: 1, role: text, state: "running", turns: 1,
+               tokens: 9, writes: true }],
+    verified: false, reviewer_approved: false, swaps: 0, lease_refusals: 0,
+    live_workers: 0,
+  };
+}
+
+/* resumable:false deliberately. The refusal string is the untrusted one --
+ * it is lifted verbatim out of a journal header on disk -- and it is only
+ * rendered on the NOT-resumable branch. With resumable:true the selector
+ * matches the fixed "send resume" line instead, and the check would pass
+ * while testing a constant. */
+function bidiSwarmPending(text) {
+  return {
+    run_id: "r", goal: text, completed_phases: 1, interrupted_phase: 2,
+    resumable: false, refusal: text, journal_goal_differs: false,
+  };
+}
 
 function bidiReport(text) {
   return {

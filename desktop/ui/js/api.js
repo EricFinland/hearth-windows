@@ -33,6 +33,7 @@ const SIDECAR_ROUTES = new Set([
   "/downloads", "/downloads/events", "/downloads/cancel", "/downloads/dismiss",
   "/engine", "/engine/events",
   "/loop", "/loop/events",
+  "/swarm", "/swarm/events",
 ]);
 
 export class HttpError extends Error {
@@ -152,6 +153,17 @@ export class Sidecar {
    *  contract as streamDownloads: every frame is the whole state. */
   async streamLoop({ since = 0, onSnapshot, signal }) {
     return this._streamSnapshots("/loop/events", { since, onSnapshot, signal });
+  }
+
+  /** The agent swarm's run state: which role is active, the phases so far,
+   *  and the ONE budget every role shares. Same versioned-whole-snapshot
+   *  contract as loop(), and there is deliberately no stopSwarm() either --
+   *  cancel() is the one kill switch for every engine. */
+  swarm()              { return this.request("GET", "/swarm"); }
+
+  /** Open GET /swarm/events and call `onSnapshot(snapshot)` per frame. */
+  async streamSwarm({ since = 0, onSnapshot, signal }) {
+    return this._streamSnapshots("/swarm/events", { since, onSnapshot, signal });
   }
 
   engine()             { return this.request("GET", "/engine"); }

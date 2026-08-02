@@ -149,6 +149,35 @@ gets a capability manifest that `permissions.decide` enforces as a hard cap,
 a budget of unattended writes, and a deny-by-default policy for anything
 dangerous. Pre-authorise specific commands with `--allow-command git`.
 
+### The agent swarm, and why it did not win
+
+`agent/hearth_swarmloop.py` runs the same goal as a relay of three narrow
+roles: a planner that reads, an implementer that is the only role allowed to
+change a file, and a reviewer that reads the result with a clean context. They
+take turns, never run at once (only one model fits in this machine's memory,
+and nothing here makes two concurrent writers to one workspace safe), and share
+**one** budget rather than getting one each.
+
+It is reachable from the app the same way the loop is, it is bounded the same
+way, `bypass` is unreachable from it, and it explains itself role by role.
+
+**And on this hardware it lost.** Against a single work loop with the same
+model, ceilings and hidden tests, the relay passed 0 of 7 tasks while costing
+2.34x the tokens and 1.91x the wall clock. On the one task the model can
+actually solve, a plain work loop with `stall.window = 0` passed 2 of 3 and the
+relay passed 0 of 3.
+
+The relay does correctly identify what goes wrong with a single loop, which is
+that it gives up early: 8 of 8 default single runs stopped as `stalled` at a
+mean of 5.5 turns out of 18. But its fix is worse than the direct one, because
+it spends part of a shared budget on two roles that cannot change anything.
+
+It ships because it is bounded, honest and useful to have measured, and because
+the shape may pay off with a bigger budget or genuinely different models per
+role. It is not the thing to reach for first. The numbers, the method and what
+would change the answer are in
+**[docs/agent-swarm.md](docs/agent-swarm.md)**.
+
 Every turn takes a checkpoint, so any point is recoverable with the same undo
 the desktop app uses. Every turn is journalled, so a machine that loses power
 mid-run comes back knowing which turn was interrupted and refusing to resume

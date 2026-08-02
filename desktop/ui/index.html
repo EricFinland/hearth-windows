@@ -97,6 +97,7 @@
           <select class="input" id="in-engine">
             <option value="chat" selected>Chat &middot; one reply per message</option>
             <option value="loop">Work loop &middot; keeps going until done or stopped</option>
+            <option value="swarm">Agent swarm &middot; roles take turns: plan, build, review</option>
           </select>
         </label>
 
@@ -116,6 +117,11 @@
       <section class="panel" id="loop-panel" aria-labelledby="p-loop" hidden>
         <h2 class="panel-title" id="p-loop">Work loop bounds</h2>
         <div id="loop-config"></div>
+      </section>
+
+      <section class="panel" id="swarm-panel" aria-labelledby="p-swarm" hidden>
+        <h2 class="panel-title" id="p-swarm">Agent swarm bounds</h2>
+        <div id="swarm-config"></div>
       </section>
 
       <section class="panel" aria-labelledby="p-env">
@@ -146,6 +152,7 @@
 
     <main class="chat">
       <div class="loop-runbar" id="loop-runbar" role="status" aria-live="polite" hidden></div>
+      <div class="loop-runbar" id="swarm-runbar" role="status" aria-live="polite" hidden></div>
       <div class="transcript" id="transcript" role="log" aria-live="polite" aria-relevant="additions text"></div>
 
       <div class="composer">
