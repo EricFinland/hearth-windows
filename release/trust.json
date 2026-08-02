@@ -1,0 +1,42 @@
+{
+  "_comment": [
+    "The update trust anchor. This file is committed, is copied into the",
+    "installer by scripts/build_windows.py, and ships inside every install.",
+    "It is the only thing agent/hearth_update.py trusts: a release manifest",
+    "is accepted when an active key listed here signed it, and refused",
+    "otherwise, whatever host served it and whatever certificate that host",
+    "presented.",
+    "",
+    "NOTHING HAS BEEN PUBLISHED. `feed` points at releases.hearth.invalid,",
+    "an RFC 2606 reserved name that can never resolve, so a shipped Hearth",
+    "cannot fetch an update from anywhere at all. The update surface says so",
+    "in those words rather than reporting 'up to date'. Turning this on is a",
+    "deliberate act: put a real https host in `feed`, rebuild, and upload a",
+    "feed directory made by scripts/release_manifest.py. See docs/updates.md.",
+    "",
+    "THE KEY BELOW WAS GENERATED ON A DEVELOPMENT MACHINE and its private",
+    "half has never left it. Before the first real release, generate a fresh",
+    "one on a machine that is not the release host, keep the seed offline,",
+    "and replace this entry:",
+    "    python scripts/release_manifest.py keygen --key-id <new-id>",
+    "Rotating later means adding the new key as 'active', shipping a build",
+    "that carries it, and only then signing with it; the old key is marked",
+    "'revoked' once nobody is running a build that predates the new one."
+  ],
+  "app_id": "com.hearthlocal.hearth",
+  "channels": [
+    "stable"
+  ],
+  "default_channel": "stable",
+  "feed": "https://releases.hearth.invalid/updates/",
+  "keys": [
+    {
+      "added_at": "2026-08-02T23:04:41Z",
+      "algorithm": "ed25519",
+      "key_id": "hearth-release-2026-08",
+      "public_key": "062177bf9b973fd99d1c71db595d12bd230b2abb5052e827bd463bc912b78b5d",
+      "status": "active"
+    }
+  ],
+  "schema": 1
+}

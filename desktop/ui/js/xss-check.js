@@ -46,6 +46,7 @@ import {
   account as swarmAccount, SwarmRunBar, roleCard,
   blindSpots as swarmBlindSpots,
 } from "./swarm.js";
+import { updateCard } from "./update.js";
 
 // Any payload that manages to execute sets this. It must stay false.
 window.__xssFired = false;
@@ -505,6 +506,52 @@ for (const payload of [PAYLOADS[0], PAYLOADS[5]]) {
     }, payload, HOSTILE_BLIND))));
 }
 
+// ---------------------------------------------------------------------------
+// The Updates panel.
+//
+// Release notes, the version string, the release date and the key id all
+// arrive from a release manifest. That manifest is signed with a key pinned
+// inside the application, so this content is not attacker-chosen the way a
+// Hugging Face listing is -- but "whoever holds the signing key wrote it" is a
+// statement about authorship, not about safety, and a UI that is only inert
+// while the key is uncompromised is not inert. It is also the one panel whose
+// button runs an installer, so it gets the same treatment as everything else:
+// every field is poisoned at once and the result is inspected.
+// ---------------------------------------------------------------------------
+
+function hostileUpdate(payload, state) {
+  return {
+    state,
+    current_version: payload,
+    channel: payload,
+    configured: true,
+    auto_check: true,
+    message: payload,
+    error: state === "failed" ? payload : null,
+    trust_error: state === "failed" ? payload : null,
+    signed_by: payload,
+    bytes_done: 1_000_000,
+    bytes_total: 4_000_000,
+    available: {
+      version: payload, released_at: payload, notes: payload,
+      size_bytes: 117_000_000, name: payload,
+    },
+    staged: state === "ready"
+      ? {
+        version: payload, name: payload, sha256: payload, size_bytes: 117_000_000,
+        released_at: payload, signed_by: payload, path: payload,
+      }
+      : null,
+  };
+}
+
+for (const payload of PAYLOADS) {
+  for (const state of ["available", "downloading", "failed", "ready"]) {
+    check(`update panel (${state})`, payload,
+      probe((host) => host.appendChild(updateCard(hostileUpdate(payload, state), {}))));
+  }
+}
+
 // The live transcript surfaces, rendered into the visible stage so the result
 // can be read by eye as well as asserted.
 transcript.addUser(PAYLOADS[0]);
@@ -911,6 +958,40 @@ function bidiPending(text) {
     resumable: false, refusal: text, journal_goal_differs: false,
   };
 }
+
+/* The Updates panel, with one field poisoned at a time so the geometry
+ * assertion measures one element rather than a whole card's layout. The
+ * release notes and the sidecar's own sentence are the two that matter most:
+ * they are the prose a person reads before deciding to run an installer, and
+ * a version number that displays backwards is a version number that could
+ * talk somebody into a downgrade. */
+function bidiUpdate(field, text) {
+  const snap = {
+    state: "available", current_version: "0.1.0", configured: true,
+    auto_check: true, message: "Hearth 0.2.0 is available.", error: null,
+    signed_by: "hearth-release-2026-08",
+    available: { version: "0.2.0", released_at: "2026-08-02T00:00:00Z",
+                 notes: "Fixes a thing.", size_bytes: 117_000_000,
+                 name: "Hearth-Setup-0.2.0.exe" },
+    staged: null,
+  };
+  if (field === "notes") snap.available.notes = text;
+  if (field === "message") snap.message = text;
+  if (field === "released_at") snap.available.released_at = text;
+  if (field === "current_version") snap.current_version = text;
+  return snap;
+}
+
+BIDI_SURFACES.push(
+  { label: "update panel release notes", selector: "pre.update-notes",
+    build: (host, text) => host.appendChild(updateCard(bidiUpdate("notes", text), {})) },
+  { label: "update panel status line", selector: "p.update-note",
+    build: (host, text) => host.appendChild(updateCard(bidiUpdate("message", text), {})) },
+  { label: "update panel release metadata", selector: ".update-meta",
+    build: (host, text) => host.appendChild(updateCard(bidiUpdate("released_at", text), {})) },
+  { label: "update panel running version", selector: ".update-version",
+    build: (host, text) => host.appendChild(updateCard(bidiUpdate("current_version", text), {})) },
+);
 
 function bidiHost(label) {
   const host = el("div", { class: "bidi-probe" }, [el("div", { class: "bidi-label", text: label })]);

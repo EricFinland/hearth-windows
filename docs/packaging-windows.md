@@ -89,6 +89,8 @@ standard library only.
       resources\hearth\vendor\llama\      llama-server.exe and its backends
       resources\hearth\vendor\llama_manifest.json    the pin
       resources\hearth\scripts\vendor_llama.py       the fetcher
+      resources\hearth\release\trust.json            the update signing key
+      resources\hearth\release\version.json          what this build is
 
 The payload layout is not arbitrary. `agent/hearth_llama.app_root()` resolves
 to the parent of the `agent` directory and then looks for `vendor/llama`
@@ -101,9 +103,16 @@ engine fetch works from an install only if both land exactly there.
 
 The build verifies all of this before packaging. It runs the staged sidecar's
 own self-test with the staged interpreter, asserts the engine is found as
-`bundled`, and computes a GPU fetch plan from the staged manifest for a
-pretend NVIDIA card, so a payload that would leave every user stuck on the
-CPU build fails the build instead of shipping.
+`bundled`, computes a GPU fetch plan from the staged manifest for a pretend
+NVIDIA card, and reads the staged update trust anchor back to confirm it
+carries an active signing key and a version. A payload that would leave every
+user stuck on the CPU build, or unable to verify an update at all, fails the
+build instead of shipping.
+
+`release/trust.json` holds the Ed25519 **public** key every release manifest
+is checked against, and `release/version.json` is generated from
+`desktop/shell/package.json` at stage time so the two cannot drift. See
+[updates.md](updates.md) for the whole update mechanism.
 
 ## The GPU engine, which is not in the installer
 
@@ -167,10 +176,13 @@ fresh bearer token. That line is the only place the token is ever emitted.
 The renderer asks for it with `window.hearth.handshake()`, a
 `contextBridge` function exposed by `preload.js`. `contextIsolation` is on,
 `nodeIntegration` is off, `sandbox` is on, and the bridge exposes exactly
-three names: `shell`, `handshake()` and `pickFolder()`. No Node, no
-filesystem, no `ipcRenderer` itself. The main process checks that a handshake
-request came from its own window, loaded from its own origin, before
-answering.
+four names: `shell`, `handshake()`, `pickFolder()` and `installUpdate()`. No
+Node, no filesystem, no `ipcRenderer` itself. The main process checks that
+every one of those calls came from its own window, loaded from its own
+origin, before answering. `installUpdate()` takes no arguments on purpose:
+the page cannot name a file, and the main process reads the verified receipt
+from the sidecar itself, re-hashes it and asks the user. See
+[updates.md](updates.md).
 
 **No HTTP route returns the token, in the packaged app or anywhere reachable
 from it.** `desktop/ui/dev-host.mjs` does serve it at `GET
@@ -245,6 +257,11 @@ substitute for it, and no build flag turns it off.
 Until then, this installer is for people who have been told directly what to
 expect.
 
+Hearth's own updater does not depend on any of this. It verifies each release
+against an Ed25519 key built into the application, which protects users today,
+on an unsigned build, and keeps protecting them after a certificate is bought.
+[updates.md](updates.md) sets out exactly what each of the two covers.
+
 ## Versioning
 
 The desktop app carries its own version line, starting at 0.1.0. That is
@@ -279,8 +296,11 @@ Three files, and nothing above them:
 - `desktop/shell/origin.js` - serve `desktop/ui/` and forward the sidecar's
   routes on one origin. Tauri does not need this at all: the Rust side owns
   the sidecar and the webview reaches it without a browser origin.
-- `desktop/shell/main.js` and `preload.js` - the window, and a bridge
-  exposing `shell`, `handshake()` and `pickFolder()`.
+- `desktop/shell/main.js` and `preload.js` - the window, a bridge exposing
+  `shell`, `handshake()`, `pickFolder()` and `installUpdate()`, and the
+  verify-then-spawn step behind that last one. A Tauri port has to reimplement
+  the three checks it makes (staging-directory containment, a fresh SHA-256,
+  and a version read from something tamper-evident), not only the spawn.
 
 `desktop/ui/` does not know which shell it is running under. It asks
 `globalThis.hearth` for a handshake and a folder picker and uses nothing else

@@ -30,4 +30,13 @@ contextBridge.exposeInMainWorld("hearth", {
 
   /** Native folder chooser. Resolves {path} or {error}. */
   pickFolder: () => ipcRenderer.invoke("hearth:pick-folder"),
+
+  /** Run the staged, verified update. Resolves {started, version}, {error},
+   *  or {cancelled}. The page cannot say WHICH installer to run and cannot
+   *  pass a path: the main process reads the verified receipt from the
+   *  sidecar itself, re-hashes the file, refuses anything outside the staging
+   *  directory, refuses a version that is not newer than its own, and asks
+   *  the user before spawning anything. This name is a request, not a
+   *  command. */
+  installUpdate: () => ipcRenderer.invoke("hearth:install-update"),
 });

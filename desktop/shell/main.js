@@ -22,8 +22,11 @@
  */
 
 const { app, BrowserWindow, ipcMain, dialog, shell, session } = require("electron");
-const { existsSync, mkdirSync } = require("node:fs");
-const { join, resolve } = require("node:path");
+const { existsSync, mkdirSync, createReadStream, statSync } = require("node:fs");
+const { join, resolve, sep } = require("node:path");
+const { createHash } = require("node:crypto");
+const { spawn } = require("node:child_process");
+const { request: httpRequest } = require("node:http");
 
 const { startOrigin } = require("./origin");
 const { startSidecar, stopSidecar } = require("./sidecar");
@@ -87,6 +90,208 @@ function defaultWorkspace() {
     return app.getPath("home");
   }
   return dir;
+}
+
+/* --------------------------------------------------------------- updating
+ *
+ * This is the only code in Hearth that executes a downloaded file, and it is
+ * here rather than in the sidecar on purpose: agent/hearth_update.py decides
+ * whether bytes are trustworthy, and a module that makes that decision must
+ * not also be able to act on it. The sidecar fetches a release manifest,
+ * verifies its Ed25519 signature against the key pinned in release/trust.json,
+ * refuses downgrades and expired manifests, downloads the installer, checks
+ * its SHA-256 against the SIGNED manifest, and stops. Then this runs.
+ *
+ * Three checks happen HERE, and none of them is ceremony:
+ *
+ *   1. The path must be inside the staging directory, which this process
+ *      derives itself from the same rule agent/hearth_paths.py uses, rather
+ *      than believing the path it was handed. A response that could name any
+ *      file would turn "install the update" into "run that".
+ *   2. The size and SHA-256 are recomputed from the file on disk. The sidecar
+ *      already verified it, but a verified installer then SITS on disk for as
+ *      long as the user takes to click, and every other process running as
+ *      that user can write to it in that window. Hashing immediately before
+ *      the spawn narrows the window to the width of one syscall. This is the
+ *      check that Authenticode will one day duplicate at the OS level; until
+ *      a certificate exists it is the only one.
+ *   3. The version must be strictly greater than app.getVersion(). That value
+ *      comes out of the asar, and EnableEmbeddedAsarIntegrityValidation (see
+ *      verify-fuses.js) makes the asar tamper-evident, so it is a better
+ *      answer than any file in the install directory. Downgrade protection
+ *      that only lived in the sidecar could be undone by editing a file next
+ *      to it.
+ *
+ * Then the user is shown what will run, and only a yes proceeds.
+ */
+
+/** Where verified installers are staged, derived here rather than trusted.
+ *
+ *  Mirrors agent/hearth_paths.data_dir(): HEARTH_DATA_DIR when set, else
+ *  %LOCALAPPDATA%\Hearth on Windows. Deriving it independently is the whole
+ *  point -- a containment check that asks the thing being checked where the
+ *  boundary is checks nothing.
+ */
+function stagingRoot() {
+  if (process.env.HEARTH_UPDATE_DIR) {
+    return resolve(process.env.HEARTH_UPDATE_DIR, "staged");
+  }
+  const data = process.env.HEARTH_DATA_DIR
+    || (process.platform === "win32"
+      ? join(process.env.LOCALAPPDATA || join(app.getPath("home"), "AppData", "Local"), "Hearth")
+      : join(app.getPath("home"), ".local", "share", "hearth"));
+  return resolve(data, "update", "staged");
+}
+
+/** [major, minor, patch] or null. Same strictness as hearth_update.parse_version:
+ *  exactly three dotted decimals, because the comparison downgrade protection
+ *  rests on has to be a total order with no surprises. */
+function parseVersion(text) {
+  const match = /^(\d{1,6})\.(\d{1,6})\.(\d{1,6})$/.exec(String(text || "").trim());
+  return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
+}
+
+function newerThan(a, b) {
+  for (let i = 0; i < 3; i++) {
+    if (a[i] !== b[i]) return a[i] > b[i];
+  }
+  return false;
+}
+
+function sha256OfFile(path) {
+  return new Promise((done, fail) => {
+    const hash = createHash("sha256");
+    const stream = createReadStream(path);
+    stream.on("error", fail);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("end", () => done(hash.digest("hex")));
+  });
+}
+
+/** GET a sidecar route from the main process, with the bearer token.
+ *  Bounded: an update snapshot is a few hundred bytes and anything past
+ *  64 KiB is a malfunction, not a snapshot. */
+function sidecarGet(path) {
+  return new Promise((done, fail) => {
+    const req = httpRequest({
+      host: "127.0.0.1",
+      port: handshake.port,
+      method: "GET",
+      path,
+      headers: {
+        host: `127.0.0.1:${handshake.port}`,
+        authorization: `Bearer ${handshake.token}`,
+        accept: "application/json",
+      },
+    }, (res) => {
+      let body = "";
+      res.setEncoding("utf-8");
+      res.on("data", (chunk) => {
+        body += chunk;
+        if (body.length > 65536) {
+          req.destroy();
+          fail(new Error("the sidecar's reply is implausibly large"));
+        }
+      });
+      res.on("end", () => {
+        try { done(JSON.parse(body)); } catch (err) { fail(err); }
+      });
+    });
+    req.on("error", fail);
+    req.end();
+  });
+}
+
+/** Verify and run the staged installer. Resolves {error} or never resolves,
+ *  because success means this process is on its way out. */
+async function installStagedUpdate() {
+  let snapshot;
+  try {
+    snapshot = await sidecarGet("/update");
+  } catch (err) {
+    return { error: `Hearth could not read its own update state: ${err.message}` };
+  }
+  const staged = snapshot && snapshot.staged;
+  if (!staged || !staged.path) {
+    return { error: "There is no verified update ready to install." };
+  }
+
+  const target = resolve(staged.path);
+  const root = stagingRoot();
+  if (target !== root && !target.startsWith(root + sep)) {
+    return { error: "Refusing to run an installer from outside Hearth's update folder." };
+  }
+  if (!/\.exe$/i.test(target) || !existsSync(target)) {
+    return { error: "The staged installer is not where it should be. Check for updates again." };
+  }
+
+  const installed = parseVersion(app.getVersion());
+  const offered = parseVersion(staged.version);
+  if (!installed || !offered) {
+    return { error: "Refusing an update whose version cannot be read." };
+  }
+  if (!newerThan(offered, installed)) {
+    // The sidecar refuses rollbacks too, using a floor in the user's data
+    // directory. This is the second, independent refusal, and it is the one
+    // that reads the running version out of the integrity-checked asar.
+    return {
+      error: `Refusing to "update" from ${app.getVersion()} to ${staged.version}. `
+        + "That is a downgrade, not an update.",
+    };
+  }
+
+  let size;
+  let digest;
+  try {
+    size = statSync(target).size;
+    digest = await sha256OfFile(target);
+  } catch (err) {
+    return { error: `Hearth could not read the staged installer: ${err.message}` };
+  }
+  if (size !== staged.size_bytes || digest !== staged.sha256) {
+    return {
+      error: "The staged installer changed on disk after it was verified, so it "
+        + "will not be run. Nothing has been installed. Check for updates again.",
+    };
+  }
+
+  const answer = await dialog.showMessageBox(mainWindow, {
+    type: "question",
+    buttons: ["Install and restart", "Not now"],
+    defaultId: 0,
+    cancelId: 1,
+    title: "Install Hearth " + staged.version,
+    message: `Install Hearth ${staged.version}?`,
+    detail:
+      `Hearth ${app.getVersion()} will close and the installer will run.\n\n`
+      + `This installer was signed by ${staged.signed_by || "the release key"} `
+      + "and its contents match that signature.\n\n"
+      + `SHA-256: ${digest}`,
+    noLink: true,
+  });
+  if (answer.response !== 0) return { error: null, cancelled: true };
+
+  try {
+    // Detached, so it outlives this process: the installer's first job is to
+    // replace the executable that started it. /S is electron-builder's NSIS
+    // silent switch -- the user has already been asked, here, with the
+    // version and the hash in front of them, and asking twice trains people
+    // to click through.
+    const child = spawn(target, ["/S"], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: false,
+    });
+    child.unref();
+  } catch (err) {
+    return { error: `The installer would not start: ${err.message}` };
+  }
+
+  // Quit immediately rather than waiting: the sidecar (and with it
+  // llama-server, and with it several gigabytes of VRAM) has to be gone
+  // before the installer can replace the files it is running from.
+  setImmediate(() => app.quit());
+  return { started: true, version: staged.version };
 }
 
 // ------------------------------------------------------------------- state
@@ -184,6 +389,11 @@ function registerIpc(origin) {
     };
   });
 
+  ipcMain.handle("hearth:install-update", async (event) => {
+    if (!fromOurRenderer(event, origin)) throw new Error("refused");
+    return installStagedUpdate();
+  });
+
   ipcMain.handle("hearth:pick-folder", async (event) => {
     if (!fromOurRenderer(event, origin)) throw new Error("refused");
     const result = await dialog.showOpenDialog(mainWindow, {
@@ -215,6 +425,9 @@ async function boot() {
     started = await startSidecar({
       python,
       serverDir: SERVER_DIR,
+      // The running version, read from the asar rather than from a file in
+      // the install directory. See sidecar.js and hearth_update.current_version.
+      extraEnv: { HEARTH_APP_VERSION: app.getVersion() },
       onLog: log,
       onExit: (code) => {
         if (quitting) return;

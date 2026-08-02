@@ -68,7 +68,7 @@ const HEARTBEAT_MS = 15000;
  *  fields never reach it: the line that parses as a handshake is consumed
  *  here and not forwarded, so a log sink cannot become a token sink.
  */
-function startSidecar({ python, serverDir, onLog = () => {}, onExit = () => {} }) {
+function startSidecar({ python, serverDir, extraEnv = {}, onLog = () => {}, onExit = () => {} }) {
   return new Promise((resolvePromise, rejectPromise) => {
     let child;
     try {
@@ -78,7 +78,13 @@ function startSidecar({ python, serverDir, onLog = () => {}, onExit = () => {} }
         // the liveness handle --watch-parent keys on; see the note above.
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
-        env: { ...process.env, PYTHONUNBUFFERED: "1" },
+        // extraEnv carries facts only this process knows. Today that is
+        // HEARTH_APP_VERSION, read from app.getVersion() -- which comes out
+        // of the asar, whose contents the embedded integrity fuse makes
+        // tamper-evident, and is therefore a better answer than any file in
+        // the install directory. agent/hearth_update.py prefers it for
+        // exactly that reason.
+        env: { ...process.env, PYTHONUNBUFFERED: "1", ...extraEnv },
       });
     } catch (err) {
       rejectPromise(new Error(`could not start the sidecar: ${err.message}`));

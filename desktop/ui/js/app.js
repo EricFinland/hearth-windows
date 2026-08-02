@@ -5,13 +5,14 @@
  * the sidecar itself.
  */
 
-import { Sidecar, HttpError, readHandshake, pickFolder, hasShellBridge } from "./api.js";
+import { Sidecar, HttpError, readHandshake, pickFolder, hasShellBridge, installUpdate } from "./api.js";
 import { Transcript } from "./transcript.js";
 import { el, icon, appendAll, clear, setText, neutralize, $ } from "./dom.js";
 import { blob } from "./safe-text.js";
 import { ShopView } from "./shop.js";
 import { LoopConfigPanel, LoopRunBar, account as loopAccount } from "./loop.js";
 import { SwarmConfigPanel, SwarmRunBar, account as swarmAccount } from "./swarm.js";
+import { renderUpdate } from "./update.js";
 
 const RECENTS_KEY = "hearth.recentWorkspaces"; // workspace paths only; the bearer token is never stored
 const MAX_RECENTS = 8;
@@ -42,6 +43,7 @@ const ui = {
   sessionNote: $("#session-note"),
   setupBody: $("#setup-body"),
   engineBody: $("#engine-body"),
+  updateBody: $("#update-body"),
   reloadSetup: $("#btn-setup"),
   cpList: $("#cp-list"),
   cpNote: $("#cp-note"),
@@ -399,6 +401,149 @@ async function watchEngine() {
       },
     });
   } catch { /* the stream ended; the next refreshSetup re-reads the snapshot */ }
+}
+
+// -------------------------------------------------------------------- updates
+
+let updateSnapshot = null;
+let updatePollTimer = null;
+
+/* WHY THIS PANEL POLLS AND EVERY OTHER GAUGE STREAMS.
+ *
+ * Chromium allows six simultaneous HTTP/1.1 connections per origin, and this
+ * page already holds five open forever: GET /events, /downloads/events,
+ * /engine/events, /loop/events and /swarm/events. A sixth permanent stream
+ * takes the last socket, and then no ordinary request can start at all --
+ * not a prompt, not a model list, not the Cancel button on the very download
+ * the sixth stream was watching. Measured on the packaged application:
+ * `netstat` showed exactly six ESTABLISHED sockets from the renderer to the
+ * origin server, and every fetch after that hung until it was aborted, while
+ * the same request from the main process answered in 3 ms.
+ *
+ * So the Updates panel is the one gauge that does not get a stream. It reads
+ * GET /update once at startup and then once a second only while a check or a
+ * download is actually in flight, which leaves the sixth socket free between
+ * polls. GET /update/events still exists and is still tested: it is the right
+ * shape for a client that can afford a connection, and a Tauri shell (which
+ * has no such limit, because there is no browser origin) can use it.
+ *
+ * The real fix is to stop having five permanent streams, by multiplexing the
+ * gauges onto one. That is a change to four other files and is not this
+ * change.
+ */
+const UPDATE_POLL_MS = 1000;
+
+/** True while the sidecar is doing something whose progress is worth watching. */
+function updateInFlight(snap) {
+  return Boolean(snap) && (snap.state === "checking" || snap.state === "downloading");
+}
+
+function scheduleUpdatePoll() {
+  if (updatePollTimer) {
+    clearTimeout(updatePollTimer);
+    updatePollTimer = null;
+  }
+  if (!updateInFlight(updateSnapshot)) return;
+  updatePollTimer = setTimeout(async () => {
+    updatePollTimer = null;
+    try {
+      updateSnapshot = await sidecar.update();
+    } catch {
+      return; // the panel keeps showing the last snapshot
+    }
+    renderUpdatePanel();
+    scheduleUpdatePoll();
+  }, UPDATE_POLL_MS);
+}
+
+/** Redraw the Updates panel from whatever the last snapshot said.
+ *
+ *  Every button here is a request to the sidecar and nothing more. "Install"
+ *  is the exception and it is not an exception in this file either: it calls
+ *  the shell, which reads the verified receipt from the sidecar itself,
+ *  re-hashes the staged file, refuses anything outside the staging directory
+ *  or any version that is not newer than its own, and asks the user again
+ *  with the hash in front of them. This page cannot name a file and cannot
+ *  make anything run. */
+function renderUpdatePanel() {
+  renderUpdate(ui.updateBody, updateSnapshot, {
+    onCheck: async (button) => {
+      button.disabled = true;
+      try {
+        updateSnapshot = await sidecar.checkForUpdate(true);
+      } catch (err) {
+        updateSnapshot = { ...(updateSnapshot ?? {}), state: "failed", error: errorText(err) };
+      }
+      renderUpdatePanel();
+      scheduleUpdatePoll();
+    },
+    onDownload: async (button) => {
+      button.disabled = true;
+      try {
+        updateSnapshot = await sidecar.downloadUpdate();
+      } catch (err) {
+        updateSnapshot = { ...(updateSnapshot ?? {}), state: "failed", error: errorText(err) };
+      }
+      renderUpdatePanel();
+      scheduleUpdatePoll();
+    },
+    onCancel: async () => {
+      try { updateSnapshot = await sidecar.cancelUpdate(); } catch { /* the next poll will say */ }
+      renderUpdatePanel();
+      scheduleUpdatePoll();
+    },
+    onDismiss: async () => {
+      try { updateSnapshot = await sidecar.dismissUpdate(); } catch { /* the next poll will say */ }
+      renderUpdatePanel();
+      scheduleUpdatePoll();
+    },
+    onAutoCheck: async (enabled) => {
+      try { updateSnapshot = await sidecar.setUpdateAutoCheck(enabled); } catch { /* ignore */ }
+      renderUpdatePanel();
+    },
+    onInstall: async (button) => {
+      button.disabled = true;
+      const result = await installUpdate();
+      if (result && result.error) {
+        updateSnapshot = { ...(updateSnapshot ?? {}), state: "failed", error: result.error };
+        renderUpdatePanel();
+        return;
+      }
+      if (result && result.cancelled) {
+        button.disabled = false;
+        return;
+      }
+      // Success means this window is about to close. Say so rather than
+      // leaving a dead button behind.
+      updateSnapshot = { ...(updateSnapshot ?? {}), state: "ready",
+        message: "Closing Hearth and starting the installer…" };
+      renderUpdatePanel();
+    },
+  });
+}
+
+/** Read the updater's state once, kick off the one automatic check per
+ *  launch, and then poll only for as long as something is happening.
+ *
+ *  The check is automatic; nothing else is. `auto_check` is a persisted
+ *  setting and the sidecar itself is what honours the interval, so a page
+ *  reloaded ten times does not make ten network requests. */
+async function watchUpdates() {
+  try {
+    updateSnapshot = await sidecar.update();
+  } catch {
+    return; // the sidecar is not up yet
+  }
+  renderUpdatePanel();
+  if (updateSnapshot.configured && updateSnapshot.auto_check !== false) {
+    // force=false, so the sidecar's own interval decides whether this
+    // actually opens the network.
+    try {
+      updateSnapshot = await sidecar.checkForUpdate(false);
+      renderUpdatePanel();
+    } catch { /* the panel keeps showing the last snapshot */ }
+  }
+  scheduleUpdatePoll();
 }
 
 // --------------------------------------------------------------------- models
@@ -1437,6 +1582,11 @@ async function boot() {
   // whole point is that nothing waits for it. watchEngine paints the panel
   // from the first snapshot and keeps repainting it from the stream.
   watchEngine();
+
+  // Likewise the updater. Nothing here blocks a session, and nothing here
+  // downloads or installs anything on its own: the automatic part is one
+  // signed-JSON GET, and only if the user has left that on.
+  watchUpdates();
 
   // The work loop gauge, likewise started before any session exists. Two
   // things depend on that: an unfinished run inherited from a restart has to

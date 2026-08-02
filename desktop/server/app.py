@@ -260,6 +260,12 @@ import loop_engine as loop_mod
 import session as session_mod
 import swarm_engine as swarm_mod
 
+# engine's import above is what extends sys.path to reach agent/. The updater
+# is pulled in here rather than through engine_mod because it has nothing to
+# do with running a turn: it is a property of the installation, like the
+# download queue and the GPU engine acquirer.
+import hearth_update as update_mod  # noqa: E402
+
 
 MAX_SSE_CONNECTIONS = 16  # bound on concurrent GET /events streams; see acquire_sse_slot
 
@@ -333,7 +339,8 @@ class SidecarState:
                  setup_diagnoser=None, idle_prober=None, idle_cache_seconds=None,
                  local_models_fetcher=None, model_checker=None,
                  shop_searcher=None, shop_quanter=None, download_manager=None,
-                 engine_acquirer=None, loop_builder=None, swarm_builder=None):
+                 engine_acquirer=None, loop_builder=None, swarm_builder=None,
+                 updater=None):
         self.token = token
         self.port = port  # main.py sets this to the real bound port after listen
         self.engine_factory = engine_factory or (lambda: session_mod.NullEngine())
@@ -378,6 +385,12 @@ class SidecarState:
         # that never touches /engine never reads the user's data directory.
         self._engine_acquirer = engine_acquirer
         self._engine_lock = threading.Lock()
+        # The updater. Process-wide for the same reason as the two above: what
+        # version is installed is a property of the machine, not of a chat
+        # session. Lazy, so a test that never touches /update never reads the
+        # trust file or the user's data directory.
+        self._updater = updater
+        self._update_lock = threading.Lock()
         # The work loop's gauge (GET /loop). Process-wide, like the download
         # queue and the engine acquirer, and for the same reason plus one
         # more: GET /loop/events must not have to chase a session being
@@ -444,6 +457,13 @@ class SidecarState:
             if self._engine_acquirer is None:
                 self._engine_acquirer = engine_mod.hearth_engine.Acquirer()
             return self._engine_acquirer
+
+    def get_updater(self):
+        """The process-wide Updater, built on first use."""
+        with self._update_lock:
+            if self._updater is None:
+                self._updater = update_mod.Updater()
+            return self._updater
 
     def get_loop_status(self):
         """The process-wide work-loop gauge."""
@@ -802,6 +822,10 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._send_json(200, self.state.swarm_snapshot())
         elif path == "/swarm/events":
             self._get_swarm_events()
+        elif path == "/update":
+            self._send_json(200, self.state.get_updater().snapshot())
+        elif path == "/update/events":
+            self._get_update_events()
         else:
             self._send_json(404, {"error": "not_found"})
 
@@ -830,6 +854,8 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._post_download_action(path.rsplit("/", 1)[1])
         elif path == "/engine":
             self._post_engine()
+        elif path == "/update":
+            self._post_update()
         else:
             self._send_json(404, {"error": "not_found"})
 
@@ -1288,6 +1314,80 @@ class SidecarHandler(BaseHTTPRequestHandler):
             return
         acquirer = self.state.get_engine()
         self._send_json(200, acquirer.start(force=bool(body.get("force"))))
+
+    def _post_update(self):
+        """POST /update: drive the updater.
+
+        Four actions, and deliberately no fifth. There is no "install": this
+        surface never launches anything, because the whole point of
+        agent/hearth_update.py is that the code which decides whether bytes
+        are trustworthy cannot also run them. The shell reads the verified
+        receipt off GET /update, re-hashes the file itself, and spawns it --
+        see desktop/shell/main.js.
+
+        Every action returns immediately with the current snapshot. A check
+        and a download both happen on the updater's own thread, so neither
+        can hold a request open or block a turn.
+        """
+        body = self._read_json()
+        if body is None:
+            self._send_json(400, {"error": "invalid_json"})
+            return
+        action = body.get("action")
+        updater = self.state.get_updater()
+        if action == "check":
+            self._send_json(200, updater.check(force=bool(body.get("force"))))
+        elif action == "download":
+            self._send_json(200, updater.download())
+        elif action == "cancel":
+            self._send_json(200, updater.cancel())
+        elif action == "dismiss":
+            self._send_json(200, updater.dismiss())
+        elif action == "auto_check":
+            enabled = body.get("enabled")
+            if not isinstance(enabled, bool):
+                self._send_json(400, {"error": "enabled must be true or false"})
+                return
+            self._send_json(200, updater.set_auto_check(enabled))
+        else:
+            self._send_json(400, {"error": "unknown update action"})
+
+    def _get_update_events(self):
+        """SSE for the update check and download. Whole snapshot per frame,
+        exactly like GET /engine/events and for the same reason: a client that
+        reconnects wants the current state, not a narrative. Shares the same
+        bounded SSE slot pool."""
+        q = self._query()
+        try:
+            since = int(q.get("since", 0))
+        except ValueError:
+            since = 0
+        updater = self.state.get_updater()
+        if not self.state.acquire_sse_slot():
+            self._send_json(429, {"error": "too_many_event_streams"})
+            return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                while True:
+                    snapshot = updater.snapshot_after(since, timeout=15)
+                    if snapshot["version"] == since:
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                        continue
+                    since = snapshot["version"]
+                    chunk = "id: {}\nevent: update\ndata: {}\n\n".format(
+                        since, json.dumps(snapshot))
+                    self.wfile.write(chunk.encode("utf-8"))
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
+                return
+        finally:
+            self.state.release_sse_slot()
 
     def _get_loop_events(self):
         """SSE for the work loop's run state. One frame per change, each
@@ -2836,6 +2936,193 @@ def _self_test():
         finally:
             server_eng.shutdown()
             server_eng.server_close()
+
+        # === GET/POST /update and GET /update/events ===================
+        # The updater has its own surface for the same reasons the engine
+        # fetch does: it is a property of the installation, it needs no
+        # session, and it has to be readable on a first launch. Driven
+        # through a real Updater wired to a fake feed, so what is under test
+        # is the production verification path -- signature, downgrade check,
+        # hash -- reached over real HTTP, with only the network replaced.
+        import datetime as _datetime
+        import hashlib as _hashlib
+        import urllib.error
+
+        upd_tmp = _tempfile.mkdtemp(prefix="hearth-app-update-")
+        seed = _hashlib.sha256(b"app.py update route test key").digest()
+        wrong_seed = _hashlib.sha256(b"an attacker's key").digest()
+        upd_trust = {
+            "schema": 1, "app_id": "com.example.app",
+            "feed": "https://updates.example.com/u/",
+            "channels": ["stable"], "default_channel": "stable",
+            "keys": [{"key_id": "route-test", "algorithm": "ed25519",
+                      "public_key": update_mod.hearth_ed25519.to_hex(
+                          update_mod.hearth_ed25519.public_key(seed)),
+                      "status": "active"}]}
+        upd_installer = b"MZ" + b"pretend installer" * 64
+
+        def _upd_document(version, key_seed=seed):
+            signed = {
+                "schema": 1, "app_id": "com.example.app", "channel": "stable",
+                "version": version, "released_at": "2026-08-01T00:00:00Z",
+                "expires_at": "2026-11-01T00:00:00Z", "minimum_version": "0.0.0",
+                "notes": "Route test release.",
+                "artifact": {"name": "Hearth-Setup-{}.exe".format(version),
+                             "path": "stable/{}/Hearth-Setup-{}.exe".format(version, version),
+                             "size_bytes": len(upd_installer),
+                             "sha256": _hashlib.sha256(upd_installer).hexdigest()}}
+            signature = update_mod.hearth_ed25519.sign(
+                key_seed, update_mod.canonical_bytes(signed))
+            return {"signed": signed,
+                    "signatures": [{"key_id": "route-test", "algorithm": "ed25519",
+                                    "signature": update_mod.hearth_ed25519.to_hex(signature)}]}
+
+        _upd_served = {"document": _upd_document("0.2.0")}
+
+        class _UpdFeed:
+            """The feed, in memory. Serves whatever _upd_served currently
+            holds, so one server can be walked from a good release to a
+            forged one to a rollback without restarting anything."""
+
+            def open(self, target, timeout=None):
+                url = target if isinstance(target, str) else target.full_url
+                if url.endswith("/manifest.json"):
+                    body = json.dumps(_upd_served["document"]).encode("utf-8")
+                elif url.endswith(".exe"):
+                    body = _upd_served.get("artifact", upd_installer)
+                else:
+                    raise urllib.error.HTTPError(url, 404, "not found", {}, None)
+                return update_mod._FakeResponse(body)
+
+        updater = update_mod.Updater(
+            trust=upd_trust,
+            env={"HEARTH_DATA_DIR": upd_tmp,
+                 update_mod.ENV_VERSION: "0.1.0"},
+            opener_fn=lambda _base: _UpdFeed(),
+            disk_fn=lambda _p: 10 ** 12,
+            now_fn=lambda: _datetime.datetime(2026, 8, 5,
+                                              tzinfo=_datetime.timezone.utc))
+        state_upd = SidecarState("upd-token", updater=updater)
+        server_upd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state_upd))
+        state_upd.port = server_upd.server_address[1]
+        threading.Thread(target=server_upd.serve_forever, kwargs={"poll_interval": 0.05},
+                         daemon=True).start()
+        try:
+            port_u = state_upd.port
+            headers_u = {"Host": "127.0.0.1:{}".format(port_u),
+                         "Authorization": "Bearer upd-token",
+                         "Content-Type": "application/json"}
+
+            # No session, and the update surface still answers.
+            status, _ = _raw_request(port_u, "GET", "/session", headers=headers_u)
+            assert status == 404, "this server must genuinely have no session"
+
+            status, data = _raw_request(port_u, "GET", "/update", headers=headers_u)
+            assert status == 200, (status, data)
+            snap = json.loads(data)
+            assert snap["current_version"] == "0.1.0", snap
+            assert snap["state"] == update_mod.STATE_IDLE, snap
+            assert snap["staged"] is None, snap
+
+            # An SSE reader attached BEFORE the check starts sees it happen.
+            req_upd = urllib.request.Request(
+                "http://127.0.0.1:{}/update/events?since=0".format(port_u),
+                headers={"Authorization": "Bearer upd-token",
+                         "Host": "127.0.0.1:{}".format(port_u)})
+            resp_upd = urllib.request.urlopen(req_upd, timeout=10)
+
+            status, data = _raw_request(port_u, "POST", "/update", headers=headers_u,
+                                        body=json.dumps({"action": "check", "force": True}))
+            assert status == 200, (status, data)
+
+            def _await_update(states, stream, timeout=20):
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    line = stream.readline().decode("utf-8", "replace")
+                    if not line:
+                        return None
+                    if line.startswith("data: "):
+                        frame = json.loads(line[len("data: "):])
+                        if frame["state"] in states:
+                            return frame
+                return None
+
+            found = _await_update({update_mod.STATE_AVAILABLE, update_mod.STATE_FAILED},
+                                  resp_upd)
+            assert found is not None, "GET /update/events delivered no verdict"
+            assert found["state"] == update_mod.STATE_AVAILABLE, found
+            assert found["available"]["version"] == "0.2.0", found
+            assert found["signed_by"] == "route-test", found
+
+            status, _ = _raw_request(port_u, "POST", "/update", headers=headers_u,
+                                     body=json.dumps({"action": "download"}))
+            assert status == 200
+            found = _await_update({update_mod.STATE_READY, update_mod.STATE_FAILED},
+                                  resp_upd)
+            resp_upd.close()
+            assert found is not None and found["state"] == update_mod.STATE_READY, found
+            assert found["staged"]["version"] == "0.2.0", found
+            assert found["staged"]["sha256"] == _hashlib.sha256(upd_installer).hexdigest()
+            # The staged file really is on disk, and really is the artifact.
+            with open(found["staged"]["path"], "rb") as fh:
+                assert fh.read() == upd_installer
+
+            # The snapshot GET agrees with the stream, which is what makes a
+            # page reload safe.
+            status, data = _raw_request(port_u, "GET", "/update", headers=headers_u)
+            assert json.loads(data)["staged"]["version"] == "0.2.0", data
+
+            # A rollback over the same route is refused, and the staged 0.2.0
+            # is still what is offered.
+            updater.dismiss()
+            _upd_served["document"] = _upd_document("0.1.5")
+            updater.check_once(force=True)
+            status, data = _raw_request(port_u, "GET", "/update", headers=headers_u)
+            snap = json.loads(data)
+            assert snap["state"] == update_mod.STATE_FAILED, snap
+            assert "rollback" in snap["error"], snap["error"]
+
+            # A manifest signed by a key this build does not trust is refused
+            # over the route too, and nothing is staged.
+            _upd_served["document"] = _upd_document("0.9.0", key_seed=wrong_seed)
+            updater.check_once(force=True)
+            status, data = _raw_request(port_u, "GET", "/update", headers=headers_u)
+            snap = json.loads(data)
+            assert snap["state"] == update_mod.STATE_FAILED, snap
+            assert "no trusted key" in snap["error"], snap["error"]
+            assert snap["staged"] is None, snap
+
+            # auto_check is a real, persisted setting reachable from the UI.
+            status, data = _raw_request(port_u, "POST", "/update", headers=headers_u,
+                                        body=json.dumps({"action": "auto_check",
+                                                         "enabled": False}))
+            assert status == 200 and json.loads(data)["auto_check"] is False, data
+            status, _ = _raw_request(port_u, "POST", "/update", headers=headers_u,
+                                     body=json.dumps({"action": "auto_check",
+                                                      "enabled": "yes"}))
+            assert status == 400, "a non-boolean must not be accepted as a setting"
+
+            # An unknown action is a 400, and a malformed body is a 400 --
+            # neither is a 500 and neither starts anything.
+            status, _ = _raw_request(port_u, "POST", "/update", headers=headers_u,
+                                     body=json.dumps({"action": "install"}))
+            assert status == 400, "there is no install action on this surface"
+            status, _ = _raw_request(port_u, "POST", "/update", headers=headers_u,
+                                     body="{not json")
+            assert status == 400, status
+
+            # Unauthenticated, the whole surface is closed.
+            for method, path, body in (("GET", "/update", None),
+                                       ("GET", "/update/events", None),
+                                       ("POST", "/update", "{}")):
+                status, _ = _raw_request(port_u, method, path,
+                                         headers={"Host": "127.0.0.1:{}".format(port_u)},
+                                         body=body)
+                assert status == 401, (method, path, status)
+        finally:
+            server_upd.shutdown()
+            server_upd.server_close()
+            shutil.rmtree(upd_tmp, ignore_errors=True)
 
         # ==============================================================
         # === the work loop is reachable from the application ==========

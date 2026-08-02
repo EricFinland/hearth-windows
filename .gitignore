@@ -40,3 +40,9 @@ vendor/python/
 # desktop/shell/build/, which holds the committed application icon.
 /build/
 desktop/shell/node_modules/
+
+# release signing keys. The PUBLIC half lives in release/trust.json, which IS
+# committed and ships inside the installer; the private seed belongs offline
+# and must never be in a repository. *.key above already covers it; this entry
+# is here so the intent is visible in the ignore file rather than inferred.
+release/keys/

@@ -34,6 +34,7 @@ const SIDECAR_ROUTES = new Set([
   "/engine", "/engine/events",
   "/loop", "/loop/events",
   "/swarm", "/swarm/events",
+  "/update", "/update/events",
 ]);
 
 export class HttpError extends Error {
@@ -176,6 +177,35 @@ export class Sidecar {
    *  Same contract as streamDownloads: every frame is the whole state. */
   async streamEngine({ since = 0, onSnapshot, signal }) {
     return this._streamSnapshots("/engine/events", { since, onSnapshot, signal });
+  }
+
+  /** What the updater knows: the running version, the channel, whether this
+   *  build even has a release feed, what the last check found, and whether a
+   *  verified installer is staged.
+   *
+   *  There is deliberately no install() here. Nothing in this UI, and nothing
+   *  in the sidecar, launches an installer: the shell does that, after
+   *  re-hashing the staged file itself. See desktop/shell/main.js. */
+  update()                 { return this.request("GET", "/update"); }
+  checkForUpdate(force = true) { return this.request("POST", "/update", { action: "check", force }); }
+  downloadUpdate()         { return this.request("POST", "/update", { action: "download" }); }
+  cancelUpdate()           { return this.request("POST", "/update", { action: "cancel" }); }
+  dismissUpdate()          { return this.request("POST", "/update", { action: "dismiss" }); }
+  setUpdateAutoCheck(enabled) {
+    return this.request("POST", "/update", { action: "auto_check", enabled: Boolean(enabled) });
+  }
+
+  /** Open GET /update/events and call `onSnapshot(snapshot)` per frame.
+   *
+   *  The shipped panel deliberately does NOT call this, and app.js explains
+   *  why at length: a browser allows six HTTP/1.1 connections per origin,
+   *  this page already holds five open forever, and a sixth permanent stream
+   *  leaves nothing for ordinary requests -- measured on the packaged app,
+   *  where every fetch hung until it was aborted. The route is real and
+   *  tested, and a host without a browser origin (Tauri) or any non-browser
+   *  client can use it; app.js polls GET /update instead. */
+  async streamUpdate({ since = 0, onSnapshot, signal }) {
+    return this._streamSnapshots("/update/events", { since, onSnapshot, signal });
   }
 
   /** Open GET /downloads/events and call `onSnapshot({version, downloads})`
@@ -342,6 +372,25 @@ export async function readHandshake() {
   if (!response.ok) throw new HttpError(response.status, null);
   const body = await response.json();
   return { origin: "", token: body.token, default_workspace: body.default_workspace || "" };
+}
+
+/** Ask the shell to run the staged, verified update.
+ *
+ *  This page cannot name a file and cannot pass a path: it asks, and the
+ *  shell decides. Resolves {started, version}, {cancelled}, or {error}; never
+ *  throws. A host with no updater (the dev host) says so rather than
+ *  pretending, because "nothing happened" is the worst possible answer to
+ *  "install the update".
+ */
+export async function installUpdate() {
+  try {
+    if (globalThis.hearth && typeof globalThis.hearth.installUpdate === "function") {
+      return await globalThis.hearth.installUpdate();
+    }
+    return { error: "This host cannot install updates. Download Hearth again instead." };
+  } catch (err) {
+    return { error: String((err && err.message) || err) };
+  }
 }
 
 /** Native folder chooser. Resolves {path} or {error}; never throws. */

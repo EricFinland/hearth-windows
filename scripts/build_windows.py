@@ -190,6 +190,37 @@ def stage(offline=False):
     print("  scripts/vendor_llama.py  -> hearth/scripts/vendor_llama.py")
     print("  vendor/llama_manifest    -> hearth/vendor/llama_manifest.json")
 
+    # The update trust anchor. release/trust.json holds the Ed25519 PUBLIC key
+    # that agent/hearth_update.py checks every release manifest against, and it
+    # has to travel inside the application: a key fetched at update time from
+    # the same place as the update is not a key, it is a suggestion. This is
+    # the single most important file in the payload after the code itself,
+    # which is why verify_stage() below refuses to build without it.
+    #
+    # version.json is written FROM desktop/shell/package.json rather than kept
+    # as a second committed copy, so the two cannot drift and the updater
+    # cannot be told it is running a version that was never built. The shell
+    # additionally passes app.getVersion() down in HEARTH_APP_VERSION, which
+    # the updater prefers because it comes out of the integrity-checked asar;
+    # this file is the fallback for a payload run without the shell.
+    release_dest = os.path.join(payload, "release")
+    os.makedirs(release_dest, exist_ok=True)
+    trust_src = os.path.join(REPO_ROOT, "release", "trust.json")
+    if not os.path.isfile(trust_src):
+        raise SystemExit(
+            "release/trust.json is missing. Without it the installer ships an "
+            "application that cannot verify its own updates. Generate a signing "
+            "key with:\n    python scripts/release_manifest.py keygen --key-id <id>")
+    shutil.copy2(trust_src, os.path.join(release_dest, "trust.json"))
+    with open(os.path.join(SHELL_DIR, "package.json"), "r", encoding="utf-8") as fh:
+        app_version = json.load(fh)["version"]
+    with open(os.path.join(release_dest, "version.json"), "w", encoding="utf-8") as fh:
+        json.dump({"version": app_version, "app_id": "com.hearthlocal.hearth"},
+                  fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    print("  release/trust.json       -> hearth/release/trust.json")
+    print("  version {:<16} -> hearth/release/version.json".format(app_version))
+
     shutil.copytree(vendor_python.install_dir(), os.path.join(STAGE_DIR, "python"))
     print("  vendor/python            -> python")
 
@@ -290,9 +321,45 @@ def verify_stage():
             "the staged payload would fetch NO GPU engine for an NVIDIA card: "
             "{}".format(engine["reason"]))
 
+    # 4. The updater can read its own trust anchor from the staged layout, and
+    #    reports the version this build actually is. Getting this wrong ships
+    #    an application that cannot verify an update -- which, unlike a missing
+    #    GPU engine, is not a performance problem: it is a build with no way to
+    #    deliver a security fix, and no user would ever see an error saying so.
+    #    The `configured` assertion is the other half: nothing has been
+    #    published, so a build whose pinned feed points at a resolvable host is
+    #    a build that was configured by accident.
+    probe = (
+        "import sys, json; sys.path.insert(0, sys.argv[1]);"
+        "import hearth_update as u;"
+        "t = u.load_trust();"
+        "print(json.dumps({'version': u.current_version({}),"
+        " 'keys': [k['key_id'] for k in t['keys'] if k['status'] == 'active'],"
+        " 'configured': u.configured(t, {}), 'feed': t['feed']}))"
+    )
+    out = subprocess.run([exe, "-c", probe, agent_dir], capture_output=True,
+                         text=True, env=env, cwd=server_dir)
+    if out.returncode != 0:
+        raise SystemExit(
+            "the staged payload cannot read its update trust anchor; it would "
+            "ship unable to verify any update at all:\n{}".format(out.stderr.strip()))
+    updater = json.loads(out.stdout.strip())
+    if not updater["keys"]:
+        raise SystemExit("the staged release/trust.json carries no active signing key")
+    if not updater["version"]:
+        raise SystemExit(
+            "the staged payload cannot tell which version it is; the updater "
+            "would refuse to run at all")
+    if updater["configured"]:
+        print("  NOTE: this build's update feed is {}, a resolvable host. Make "
+              "sure that is deliberate.".format(updater["feed"]))
+
     print("  staged payload verified: sidecar self-test green under python {}, "
           "bundled engine found, GPU fetch would install {} from {}".format(
               result["python"], engine["variant"], engine["tag"]))
+    print("  update trust anchor: version {}, active key(s) {}, feed {}{}".format(
+        updater["version"], ", ".join(updater["keys"]), updater["feed"],
+        "" if updater["configured"] else "  (unresolvable: nothing published)"))
 
 
 def build_installer(unpacked_only=False):
