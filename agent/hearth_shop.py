@@ -122,14 +122,28 @@ tier was computed from, not about the tier's own meaning:
                    verdict must say which one is true rather than let the
                    user infer "nothing runs here" from an absent GPU that
                    was never even looked for successfully.
-  shared_memory_likely - True when the GPU behind this verdict reports as
-                   Intel or vendor-unknown (see SHARED_MEMORY_LIKELY_VENDORS):
-                   hearth_hw could not confirm this is a discrete card with
-                   real dedicated VRAM, as opposed to a shared-memory figure
-                   carved out of system RAM. Shared memory does not perform
-                   like VRAM, so a verdict resting on one is graded
+  shared_memory_likely - True when the memory figure behind this verdict may
+                   not be dedicated VRAM at all, but a slice carved out of
+                   system RAM. hearth_hw's integrated flag decides this
+                   wherever it has an answer, and the vendor rule
+                   (SHARED_MEMORY_LIKELY_VENDORS) decides where it does not.
+                   Shared memory does not
+                   perform like VRAM, so a verdict resting on one is graded
                    conservatively - a would-be great is downgraded to good -
                    exactly like an approximate VRAM reading already is.
+
+                   Integrated graphics is the common case, not the exotic
+                   one: most laptops have an AMD or Intel GPU sharing the
+                   CPU's memory and no discrete card at all. Such a machine
+                   reports a small dedicated carve-out (512MB is typical),
+                   and the shop's job there is to let the fit arithmetic
+                   reach the honest answer - a 7B will not fit that, it will
+                   spill onto the CPU - rather than to invent a larger figure
+                   from the system RAM total. Inventing one would have the
+                   shop recommend a model that thrashes, which is a worse
+                   failure than recommending nothing.
+  gpu_integrated - the GPU's hearth_hw integrated flag, passed through: True,
+                   False, or None when it could not be established.
 
 Disk space is a separate, independent check (free_disk_bytes / disk_ok):
 a user with 8GB free cannot install a 17GB model, and finding that out at 90%
@@ -221,17 +235,28 @@ RAM_RESERVE_MIN_BYTES = 2 * 1024 ** 3
 # and then fail on the last few bytes.
 DISK_BUFFER_BYTES = 512 * 1024 ** 2
 
-# GPU vendors whose reported vram_bytes this module trusts as real, dedicated
-# VRAM. Intel's shipping lineup is overwhelmingly integrated graphics that
-# shares system RAM (Intel does sell discrete Arc cards, but hearth_hw has no
-# signal beyond vendor name to tell the two apart), and vendor "unknown"
-# means hearth_hw could not even confirm the card is one of these two. Both
-# get graded conservatively rather than trusted at face value: shared system
-# memory does not perform like dedicated VRAM, so a "great" built on a
-# shared-memory figure would be exactly the kind of dishonest verdict this
-# module exists to avoid. AMD and NVIDIA discrete desktop/laptop cards are
-# the trusted common case; AMD APUs exist too and are a known gap here, the
-# same kind of judgment call this module already documents for kv_confidence.
+# GPU vendors whose reported vram_bytes this module does not trust as real,
+# dedicated VRAM on the strength of the vendor alone. Vendor "unknown" means
+# hearth_hw could not establish who made the part at all, and Intel's
+# shipping lineup is overwhelmingly integrated graphics that shares system
+# RAM. Both get graded conservatively rather than trusted at face value:
+# shared system memory does not perform like dedicated VRAM, so a "great"
+# built on a shared-memory figure would be exactly the kind of dishonest
+# verdict this module exists to avoid.
+#
+# This is now the FALLBACK signal, not the primary one. The primary is
+# hearth_hw's per-GPU "integrated" flag, which reads the actual part rather
+# than the vendor: it catches an AMD APU (a Radeon 880M reporting a 512MB
+# carve-out of system RAM, which used to be graded here as if it were 512MB
+# of dedicated VRAM on a discrete card), and it clears a discrete Intel Arc,
+# which the vendor rule alone never could. Intel is only on this list
+# because there used to be no signal beyond the vendor name to tell an Iris
+# from an Arc A770; where there is one now, it wins in both directions.
+#
+# So the rule in _gpu_vram_bytes is: the integrated flag decides when it has
+# an answer, and this list decides when it does not (None). A vendor of
+# "unknown" never gets an answer from the flag, which is correct, since not
+# knowing who made a part is not a basis for trusting its memory figure.
 SHARED_MEMORY_LIKELY_VENDORS = (hearth_hw.VENDOR_INTEL, hearth_hw.VENDOR_UNKNOWN)
 
 
@@ -463,35 +488,52 @@ def _gpu_vram_bytes(hw):
     honest.
 
     vendor is the detected GPU's vendor string (see hearth_hw's VENDOR_*
-    constants), or None when no GPU was detected. shared_memory_likely is
-    True when that vendor is in SHARED_MEMORY_LIKELY_VENDORS: an Intel or
-    unknown-vendor card's reported "VRAM" may actually be shared system
-    memory, which does not perform like dedicated VRAM.
+    constants), or None when no GPU was detected. integrated is that GPU's
+    hearth_hw integrated flag: True, False, or None when hearth_hw could
+    not tell.
+
+    shared_memory_likely is True when the reported "VRAM" may actually be
+    a slice of system RAM rather than dedicated memory, which does not
+    perform like dedicated VRAM. The integrated flag answers this whenever
+    it has an answer, in both directions: True makes it shared however
+    trusted the vendor is (an AMD APU), False makes it dedicated however
+    cautious the vendor rule is (a discrete Intel Arc). Only when the flag
+    is None does SHARED_MEMORY_LIKELY_VENDORS decide.
+
+    Virtual display adapters are excluded before any of this. hearth_hw
+    already drops them from gpus(), and this repeats the filter because a
+    caller can pass any hw-shaped dict, including one recorded before the
+    exclusion existed.
 
     gpu_detected is False only when hearth_hw's gpu list was empty, i.e. no
     GPU was found at all - a fact distinct from "a GPU was found and it is
     too small", which is what vram_bytes == 0 alone cannot tell a caller.
     When gpu_detected is False, vram_bytes is 0, approximate is False (an
     empty list is an exact reading of "nothing", not a guess), vendor is
-    None, and shared_memory_likely is False (there is no GPU for the flag
-    to describe).
+    None, integrated is None, and shared_memory_likely is False (there is
+    no GPU for the flag to describe).
     """
-    gpus = hw.get("gpus") or []
+    gpus = [g for g in (hw.get("gpus") or []) if not g.get("virtual")]
     if not gpus:
         return {
             "vram_bytes": 0,
             "approximate": False,
             "vendor": None,
+            "integrated": None,
             "shared_memory_likely": False,
             "gpu_detected": False,
         }
     best = max(gpus, key=lambda g: g.get("vram_bytes", 0))
     vendor = best.get("vendor")
+    integrated = best.get("integrated")
     return {
         "vram_bytes": best.get("vram_bytes", 0),
         "approximate": bool(best.get("approximate", False)),
         "vendor": vendor,
-        "shared_memory_likely": vendor in SHARED_MEMORY_LIKELY_VENDORS,
+        "integrated": integrated,
+        "shared_memory_likely": (integrated is True or
+                                 (integrated is None and
+                                  vendor in SHARED_MEMORY_LIKELY_VENDORS)),
         "gpu_detected": True,
     }
 
@@ -524,6 +566,40 @@ _SHARED_MEMORY_NOTE = (
     "which does not perform like real VRAM, so this verdict is graded "
     "conservatively."
 )
+
+# The same caution, for the case where hearth_hw did not merely fail to rule
+# out shared memory but positively identified an integrated GPU. Hedging
+# ("could not be confirmed") would be underselling what is known: an AMD or
+# Intel integrated part has no dedicated video memory at all, and the number
+# beside it is a carve-out of system RAM that the CPU is also using.
+_INTEGRATED_MEMORY_NOTE = (
+    " This is an integrated GPU: it has no video memory of its own, and the "
+    "figure above is the small slice of system RAM its driver reserves, not a "
+    "VRAM total. Anything larger than that slice runs out of the same memory "
+    "and at the same bandwidth as the CPU, so this verdict is graded "
+    "conservatively."
+)
+
+
+def _reading_notes(vram_approximate, shared_memory_likely, integrated):
+    """Every caveat a verdict's message carries about the figure behind it.
+
+    A confirmed integrated GPU gets ONE note, not two. The approximate note
+    explains the number as a VRAM reading that might be wrong because there
+    was no nvidia-smi to ask; the integrated note explains the same number
+    as the small slice of system RAM a driver reserved. The second account
+    is both more specific and more useful, and printing them together puts
+    two different explanations of one figure in front of a user and invites
+    them to trust neither.
+    """
+    if shared_memory_likely and integrated is True:
+        return _INTEGRATED_MEMORY_NOTE
+    note = ""
+    if vram_approximate:
+        note += _VRAM_APPROX_NOTE
+    if shared_memory_likely:
+        note += _SHARED_MEMORY_NOTE
+    return note
 
 
 def _gpu_clause(gpu_detected, platform_name):
@@ -579,7 +655,12 @@ def verdict_for(model, hw, context_tokens=None):
                               "does not fit" phrasing.
       gpu_vendor            - the detected GPU's vendor string, or None when
                               gpu_detected is False.
-      shared_memory_likely  - True when gpu_vendor is Intel or unknown (see
+      gpu_integrated        - the GPU's hearth_hw integrated flag: True when
+                              it shares system memory, False when it has
+                              memory of its own, None when that could not be
+                              established.
+      shared_memory_likely  - True when gpu_integrated is True, or when
+                              gpu_vendor is Intel or unknown (see
                               SHARED_MEMORY_LIKELY_VENDORS): the vram_bytes
                               reading may be shared system memory rather
                               than dedicated VRAM. Like vram_approximate,
@@ -626,6 +707,7 @@ def verdict_for(model, hw, context_tokens=None):
     vram_bytes = gpu_info["vram_bytes"]
     vram_approximate = gpu_info["approximate"]
     gpu_vendor = gpu_info["vendor"]
+    gpu_integrated = gpu_info["integrated"]
     shared_memory_likely = gpu_info["shared_memory_likely"]
     gpu_detected = gpu_info["gpu_detected"]
     platform_name = hw.get("platform")
@@ -645,6 +727,7 @@ def verdict_for(model, hw, context_tokens=None):
         "vram_approximate": vram_approximate,
         "gpu_detected": gpu_detected,
         "gpu_vendor": gpu_vendor,
+        "gpu_integrated": gpu_integrated,
         "shared_memory_likely": shared_memory_likely,
         "platform": platform_name,
         "ram_bytes": ram_bytes,
@@ -670,6 +753,8 @@ def verdict_for(model, hw, context_tokens=None):
                 reasons.append("the VRAM reading behind it is approximate")
             if shared_memory_likely:
                 reasons.append(
+                    "this GPU is integrated and shares system memory"
+                    if gpu_integrated is True else
                     "this GPU's memory could not be confirmed as dedicated VRAM"
                 )
             verdict = VERDICT_GOOD
@@ -680,10 +765,8 @@ def verdict_for(model, hw, context_tokens=None):
         else:
             verdict = VERDICT_GOOD
             message = "Runs fully on the GPU, but headroom is tight."
-        if vram_approximate:
-            message += _VRAM_APPROX_NOTE
-        if shared_memory_likely:
-            message += _SHARED_MEMORY_NOTE
+        message += _reading_notes(vram_approximate, shared_memory_likely,
+                                  gpu_integrated)
         return {
             **common_fields,
             "verdict": verdict,
@@ -708,10 +791,8 @@ def verdict_for(model, hw, context_tokens=None):
             f"Does not fit the GPU at {context_tokens} tokens of context, "
             f"but fits up to about {max_context_tokens} tokens."
         )
-        if vram_approximate:
-            message += _VRAM_APPROX_NOTE
-        if shared_memory_likely:
-            message += _SHARED_MEMORY_NOTE
+        message += _reading_notes(vram_approximate, shared_memory_likely,
+                                  gpu_integrated)
         return {
             **common_fields,
             "verdict": VERDICT_REDUCED_CONTEXT,
@@ -728,10 +809,8 @@ def verdict_for(model, hw, context_tokens=None):
     if ram_fit["fits"]:
         message = ("{}; will run on CPU (or spill partly onto it) and be "
                     "noticeably slower.").format(_gpu_clause(gpu_detected, platform_name))
-        if vram_approximate:
-            message += _VRAM_APPROX_NOTE
-        if shared_memory_likely:
-            message += _SHARED_MEMORY_NOTE
+        message += _reading_notes(vram_approximate, shared_memory_likely,
+                                  gpu_integrated)
         return {
             **common_fields,
             "verdict": VERDICT_CPU_SPILLOVER,
@@ -748,10 +827,8 @@ def verdict_for(model, hw, context_tokens=None):
         message = "{}, and the model does not fit in system RAM either.".format(
             _gpu_clause(gpu_detected, platform_name)
         )
-    if vram_approximate:
-        message += _VRAM_APPROX_NOTE
-    if shared_memory_likely:
-        message += _SHARED_MEMORY_NOTE
+    message += _reading_notes(vram_approximate, shared_memory_likely,
+                              gpu_integrated)
     return {
         **common_fields,
         "verdict": VERDICT_WONT_FIT,
@@ -1879,6 +1956,7 @@ def _hardware_summary(hw, context_tokens, free_disk):
         "vram_approximate": gpu["approximate"],
         "gpu_detected": gpu["gpu_detected"],
         "gpu_vendor": gpu["vendor"],
+        "gpu_integrated": gpu["integrated"],
         "shared_memory_likely": gpu["shared_memory_likely"],
         "ram_bytes": _ram_budget_bytes(hw),
         "system_ram_bytes": hw.get("system_ram_bytes", 0) or 0,
@@ -2395,9 +2473,11 @@ def _self_test():
 
     # -- synthetic hardware, so the self-test passes on a machine with no ----
     # -- GPU and does not depend on whatever hardware happens to be present --
-    def _hw(vram_bytes, ram_bytes, approximate=False, vendor="nvidia", platform="synthetic"):
-        gpus = [{"name": "synthetic", "vram_bytes": vram_bytes, "vendor": vendor,
-                 "approximate": approximate}] if vram_bytes else []
+    def _hw(vram_bytes, ram_bytes, approximate=False, vendor="nvidia",
+            platform="synthetic", integrated=None, name="synthetic"):
+        gpus = [{"name": name, "vram_bytes": vram_bytes, "vendor": vendor,
+                 "approximate": approximate, "integrated": integrated,
+                 "virtual": False}] if vram_bytes else []
         return {"platform": platform, "gpus": gpus, "system_ram_bytes": ram_bytes,
                 "cpu_count": 8}
 
@@ -2583,6 +2663,87 @@ def _self_test():
     assert v_amd["shared_memory_likely"] is False, v_amd
     assert v_intel["gpu_vendor"] == hearth_hw.VENDOR_INTEL, v_intel
     assert v_unknown["gpu_vendor"] == hearth_hw.VENDOR_UNKNOWN, v_unknown
+
+    # -- CRITICAL 3b: integrated graphics, which the vendor rule missed -----
+    # An AMD APU is the case the vendor rule was documented as not covering,
+    # and it is the case most laptops actually are. A Radeon 880M reports
+    # 512MB: that is a slice of the same system RAM the CPU is using, not
+    # half a gigabyte of dedicated VRAM on a small discrete card, and AMD
+    # being a "trusted discrete vendor" used to mean the difference was
+    # invisible here. hearth_hw's integrated flag now carries it.
+    syn_7b_q4 = {
+        "id": "synthetic/7b-q4km", "label": "Synthetic 7B Q4_K_M", "params_b": 7.0,
+        "quantization": "Q4_K_M", "download_bytes": 4_683_073_536,
+        "description": "test fixture", "license": "test", "focus": "coding",
+        "kv_bytes_per_token": 131_072, "kv_confidence": "published_config",
+    }
+    hw_amd_igpu = _hw(512 * 1024 ** 2, 32 * 1024 ** 3, approximate=True,
+                      vendor=hearth_hw.VENDOR_AMD, integrated=True,
+                      platform="Windows", name="AMD Radeon(TM) 880M Graphics")
+    v_igpu = verdict_for(syn_7b_q4, hw_amd_igpu, context_tokens=8192)
+    assert v_igpu["gpu_detected"] is True, v_igpu
+    assert v_igpu["gpu_integrated"] is True, v_igpu
+    assert v_igpu["shared_memory_likely"] is True, (
+        "an integrated GPU's memory figure is shared system RAM, whatever "
+        "its vendor is", v_igpu,
+    )
+    assert v_igpu["verdict"] == VERDICT_CPU_SPILLOVER, (
+        "a 7B Q4_K_M must never be reported as fitting a GPU with no "
+        "dedicated video memory", v_igpu,
+    )
+    assert "integrated GPU" in v_igpu["message"], v_igpu
+    # And the same-sized reading on a GPU hearth_hw cleared as discrete is
+    # still trusted: the flag has to work in both directions or it is just
+    # a blanket downgrade.
+    hw_amd_discrete = _hw(24 * 1024 ** 3, 64 * 1024 ** 3,
+                          vendor=hearth_hw.VENDOR_AMD, integrated=False)
+    assert verdict_for(syn_14gb, hw_amd_discrete,
+                       context_tokens=8192)["verdict"] == VERDICT_GREAT
+
+    # An integrated part with a large carve-out configured in firmware is
+    # still integrated: it fits on paper and must not be called "great".
+    hw_igpu_large = _hw(24 * 1024 ** 3, 64 * 1024 ** 3,
+                        vendor=hearth_hw.VENDOR_AMD, integrated=True)
+    v_igpu_large = verdict_for(syn_14gb, hw_igpu_large, context_tokens=8192)
+    assert v_igpu_large["verdict"] == VERDICT_GOOD, v_igpu_large
+    assert "integrated" in v_igpu_large["message"], v_igpu_large
+    assert v_igpu_large["required_bytes"] == v_nvidia["required_bytes"], (
+        "the flag changes the confidence, never the arithmetic", v_igpu_large,
+    )
+    # A discrete Intel Arc is the other direction: Intel's vendor rule alone
+    # would downgrade it forever, and the flag is what clears it.
+    hw_arc = _hw(16 * 1024 ** 3, 64 * 1024 ** 3, vendor=hearth_hw.VENDOR_INTEL,
+                 integrated=False)
+    assert verdict_for(syn_7b_q4, hw_arc, context_tokens=8192)["verdict"] == VERDICT_GREAT, (
+        "SHARED_MEMORY_LIKELY_VENDORS may only add caution; a GPU hearth_hw "
+        "positively identified as discrete keeps it"
+    )
+
+    # -- a virtual display adapter must never be graded as a GPU -----------
+    # Some shims report a nonzero AdapterRAM. Left in the list, the largest
+    # entry wins and the shop grades a model against memory that does not
+    # exist on any real device.
+    hw_with_shim = {
+        "platform": "Windows",
+        "gpus": [
+            {"name": "Parsec Virtual Display Adapter", "vram_bytes": 4 * 1024 ** 3,
+             "vendor": hearth_hw.VENDOR_UNKNOWN, "approximate": True,
+             "virtual": True, "integrated": None},
+            {"name": "AMD Radeon(TM) 880M Graphics", "vram_bytes": 512 * 1024 ** 2,
+             "vendor": hearth_hw.VENDOR_AMD, "approximate": True,
+             "virtual": False, "integrated": True},
+        ],
+        "system_ram_bytes": 32 * 1024 ** 3, "cpu_count": 24,
+    }
+    shim = _gpu_vram_bytes(hw_with_shim)
+    assert shim["vendor"] == hearth_hw.VENDOR_AMD, shim
+    assert shim["vram_bytes"] == 512 * 1024 ** 2, (
+        "a virtual adapter's phantom memory must not be graded against", shim,
+    )
+    assert shim["integrated"] is True, shim
+    # A machine with nothing but shims has no GPU, and says so.
+    only_shim = dict(hw_with_shim, gpus=[hw_with_shim["gpus"][0]])
+    assert _gpu_vram_bytes(only_shim)["gpu_detected"] is False, only_shim
 
     # -- CRITICAL 4: "no GPU was detected" must read as a different sentence
     # from "a GPU was detected and it does not fit" - conflating the two is

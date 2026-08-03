@@ -39,6 +39,42 @@ Detection preference order:
            for AMD, then lspci for a name-only fallback with no VRAM figure.
            System RAM comes from /proc/meminfo.
 
+NVIDIA IS NOT THE COMMON CASE. nvidia-smi answers first because it is the
+only reading here that is exact, but most laptops have no NVIDIA card at
+all: they have AMD or Intel graphics integrated into the CPU package, and
+Vulkan is the engine that covers those. Everything below the nvidia-smi
+path therefore has to work as well as that path does, and three facts get
+read rather than guessed:
+
+  vendor       Who makes the silicon. Read from the PCI vendor ID in
+               Win32_VideoController.PNPDeviceID first (PCI\VEN_1002 is
+               AMD, VEN_10DE NVIDIA, VEN_8086 Intel), then from
+               AdapterCompatibility, then from the marketing name. The
+               name is the weakest of the three and comes last: it is
+               free text chosen by an OEM, and "AMD Radeon(TM) 880M
+               Graphics" and "Intel(R) Arc(TM) Graphics" have nothing in
+               common but the word Graphics.
+
+  virtual      Whether this "GPU" is a real one. Windows lists screen
+               capture and remote desktop shims in exactly the same class
+               as real hardware: Parsec, RDP, Citrix, DisplayLink,
+               VMware, IddSampleDriver. They have no compute capability
+               whatsoever, and one of them sorting ahead of a real GPU is
+               enough to make a machine look like it has no GPU. gpus()
+               excludes them; display_adapters() still shows them, and
+               probe() names them, so their presence is visible rather
+               than silently dropped.
+
+  integrated   Whether the memory figure is dedicated VRAM or a slice
+               carved out of system RAM. An integrated GPU reports a
+               small dedicated carve-out (512MB is typical) and then
+               shares the rest with the CPU. That number is real, but it
+               is not what "VRAM" means on a discrete card, and a caller
+               that grades a model fit against it must know which kind it
+               has. Reported as True, False, or None when this module
+               genuinely cannot tell, never guessed into a confident
+               answer.
+
 Standard library only. Every external command is optional: a missing tool,
 a timeout, or a nonzero exit degrades to "no data", never a raised exception.
 Pure detection: no writes, no network.
@@ -100,16 +136,201 @@ def _run(cmd, timeout=SUBPROCESS_TIMEOUT):
     return proc.stdout
 
 
+#: PCI vendor IDs, as they appear in a Windows PNPDeviceID
+#: ("PCI\VEN_1002&DEV_150E&..."), a Linux sysfs `vendor` file ("0x1002"),
+#: or an lspci -nn tag. This is the only vendor signal that is a fact
+#: rather than a reading of marketing text, so it is consulted first
+#: wherever it exists. The second entry under each vendor is the ID used
+#: by some of that vendor's older or secondary display devices.
+_PCI_VENDOR_IDS = {
+    "10de": VENDOR_NVIDIA, "12d2": VENDOR_NVIDIA,
+    "1002": VENDOR_AMD, "1022": VENDOR_AMD,
+    "8086": VENDOR_INTEL, "8087": VENDOR_INTEL, "163c": VENDOR_INTEL,
+}
+
+_PNP_VEN_RE = re.compile(r"ven_([0-9a-f]{4})", re.I)
+
+#: Vendor from free text, in the order they are tried. Word boundaries on
+#: the short and ambiguous tokens (rtx, gtx, nvs, ati, arc, hd graphics):
+#: as bare substrings, "arc" matches "Architecture", "ati" matches
+#: "Creative" and "Integrated", and one bad vendor call sends a machine to
+#: the wrong engine or to no engine at all. The distinctive words (nvidia,
+#: geforce, radeon, intel, iris) do not need boundaries and do not get
+#: them, because OEMs punctuate them unpredictably: "Intel(R)", "NVIDIA,",
+#: "AMD Radeon(TM)".
+_VENDOR_NAME_PATTERNS = (
+    (VENDOR_NVIDIA, re.compile(
+        r"nvidia|geforce|quadro|tesla|titan|\brtx\b|\bgtx\b|\bnvs\b", re.I)),
+    (VENDOR_AMD, re.compile(
+        r"\bamd\b|radeon|advanced micro|firepro|instinct|\bati\b", re.I)),
+    (VENDOR_INTEL, re.compile(
+        r"intel|\biris\b|uhd graphics|\bhd graphics\b|\barc\b|\bxe graphics\b", re.I)),
+)
+
+#: Names that mean "this is not a GPU". Windows enumerates remote desktop,
+#: screen capture and virtual monitor drivers in Win32_VideoController
+#: alongside real hardware, and on this machine the Parsec one sorts FIRST,
+#: which is how a Radeon 880M came to be reported as an unknown GPU. None
+#: of these can run a single inference operation.
+#:
+#: "basic display" and "basic render" are here for a different reason: they
+#: are real hardware running Microsoft's fallback driver because the vendor
+#: driver is missing or failed. There is no Vulkan or CUDA runtime behind
+#: them either, so fetching a GPU engine for one would install a build that
+#: cannot load.
+_VIRTUAL_ADAPTER_RE = re.compile(
+    r"virtual|remote display|remote desktop|\brdp\b|indirect display|"
+    r"displaylink|usb (?:display|graphics)|mirror driver|"
+    r"basic display|basic render|hyper-?v video|vmware|virtualbox|"
+    r"parallels|\bqxl\b|\bspice\b|citrix|teradici|\bvnc\b|nomachine|"
+    r"\bidd(?:\w*driver)?\b|meta virtual|\bdummy\b", re.I)
+
+#: Names that mean "the memory figure beside this is a slice of system RAM".
+#:
+#: AMD's integrated parts are named on a scheme that is unambiguous once
+#: you look at it: three digits and an M (610M, 660M, 680M, 780M, 880M,
+#: 890M) for the current APU graphics, a bare "Radeon Graphics" or
+#: "Radeon(TM) Graphics" for the desktop APUs, "Vega 3" through "Vega 11"
+#: for the Ryzen 2000-5000 APUs, "Radeon R2".."R7" for the older ones. The
+#: discrete mobile parts use FOUR digits and an M (RX 5500M, RX 6800M), so
+#: the three-digit rule does not touch them.
+_AMD_INTEGRATED_RE = re.compile(
+    r"\b\d{3}m\b"
+    r"|radeon\s*(?:\(?(?:tm|r)\)?\s*)?graphics\b"
+    r"|\bvega\s*(?:[3-9]|1[01])\b"
+    r"|\bradeon\s*r[2-7]\b"
+    r"|\bapu\b", re.I)
+
+#: Intel's discrete line is Arc with a model number (A380, A770, B580).
+#: Arc WITHOUT a model number is the integrated Arc in Meteor Lake and
+#: Lunar Lake, and everything else Intel sells for a desktop or laptop
+#: (UHD, HD, Iris, Iris Xe) is integrated.
+_INTEL_ARC_RE = re.compile(r"\barc\b", re.I)
+_INTEL_ARC_MODEL_RE = re.compile(r"\b[ab]\d{3}\b", re.I)
+
+#: A dedicated-memory figure at or below this means integrated, for an AMD
+#: or Intel part whose NAME did not already say so. No discrete card of the
+#: last decade ships with a gibibyte or less of dedicated memory, and the
+#: integrated parts carve out 512MB by default. Deliberately below the 2GB
+#: line, where genuinely small discrete cards (an RX 550 2GB, a GT 1030
+#: 2GB) do still exist.
+INTEGRATED_VRAM_CEILING_BYTES = 1024 ** 3
+
+
 def _vendor_from_name(name):
-    """Best-effort vendor guess from a free-text GPU name string."""
-    n = (name or "").lower()
-    if any(tok in n for tok in ("nvidia", "geforce", "quadro", "rtx", "gtx", "tesla")):
-        return VENDOR_NVIDIA
-    if any(tok in n for tok in ("amd", "radeon", "advanced micro")):
-        return VENDOR_AMD
-    if any(tok in n for tok in ("intel", "iris")):
-        return VENDOR_INTEL
+    """Best-effort vendor guess from a free-text GPU name string.
+
+    The weakest of the three vendor signals this module has, and the last
+    one tried: see _classify_adapter. Also used on
+    Win32_VideoController.AdapterCompatibility, which is the same kind of
+    free text ("Advanced Micro Devices, Inc.", "Intel Corporation") from a
+    more disciplined source.
+    """
+    n = name or ""
+    for vendor, pattern in _VENDOR_NAME_PATTERNS:
+        if pattern.search(n):
+            return vendor
     return VENDOR_UNKNOWN
+
+
+def _vendor_from_pci_id(text):
+    """Vendor from anything carrying a PCI vendor ID, or VENDOR_UNKNOWN.
+
+    Accepts a Windows PNPDeviceID ("PCI\\VEN_1002&DEV_150E&..."), a bare
+    four-hex-digit ID, or "0x1002" as Linux sysfs spells it.
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return VENDOR_UNKNOWN
+    m = _PNP_VEN_RE.search(t)
+    if m:
+        return _PCI_VENDOR_IDS.get(m.group(1).lower(), VENDOR_UNKNOWN)
+    if t.startswith("0x"):
+        t = t[2:]
+    if re.fullmatch(r"[0-9a-f]{4}", t):
+        return _PCI_VENDOR_IDS.get(t, VENDOR_UNKNOWN)
+    return VENDOR_UNKNOWN
+
+
+def _is_virtual_adapter(name, pnp_id, vendor):
+    """Is this display adapter a shim rather than a GPU?
+
+    Two independent signals, either of which is enough:
+
+      1. The name is one of the known virtual, remote or fallback drivers.
+         Cheap, works on every platform, and covers the case seen here
+         ("Parsec Virtual Display Adapter").
+
+      2. On Windows, the device is not on the PCI bus AND no vendor could
+         be established for it. Every real GPU on a PC, integrated ones
+         included, enumerates as PCI\\VEN_xxxx; the shims enumerate under
+         ROOT\\, SWD\\ or USB\\. The "and no vendor" half is what keeps
+         this from becoming a rule that a real GPU could fall foul of: an
+         adapter Hearth CAN identify as AMD, Intel or NVIDIA is treated as
+         real however it is attached, so a non-PCI GPU on some future or
+         unusual platform is not excluded by this rule alone.
+    """
+    if _VIRTUAL_ADAPTER_RE.search(name or ""):
+        return True
+    pnp = (pnp_id or "").strip().upper()
+    if pnp and not pnp.startswith("PCI\\") and vendor == VENDOR_UNKNOWN:
+        return True
+    return False
+
+
+def _is_integrated(name, vendor, vram_bytes):
+    """True, False, or None when this module cannot tell.
+
+    None is a real answer and is never rounded to False: a caller grading
+    a model fit needs to know the difference between "this is dedicated
+    VRAM" and "nobody checked", and reporting a shared-memory figure as
+    dedicated VRAM would have the shop recommend a model that thrashes.
+    """
+    n = name or ""
+    if vendor == VENDOR_NVIDIA:
+        # NVIDIA ships no integrated PC graphics. Every GeForce, Quadro
+        # and Tesla part carries its own memory.
+        return False
+    if vendor == VENDOR_INTEL:
+        if _INTEL_ARC_RE.search(n) and _INTEL_ARC_MODEL_RE.search(n):
+            return False
+        return True
+    if vendor == VENDOR_AMD:
+        if _AMD_INTEGRATED_RE.search(n):
+            return True
+        vram = vram_bytes or 0
+        if 0 < vram <= INTEGRATED_VRAM_CEILING_BYTES:
+            return True
+        if vram > INTEGRATED_VRAM_CEILING_BYTES:
+            return False
+        return None
+    return None
+
+
+def _classify_adapter(name, vram_bytes, pnp_id=None, compatibility=None,
+                      vendor=None):
+    """One display adapter as the dict every detection path here returns.
+
+    The vendor decision lives in exactly one place, and it reads the three
+    signals strongest-first: the PCI vendor ID, then AdapterCompatibility
+    (the driver's own statement of who wrote it), then the marketing name.
+    A caller that already KNOWS the vendor beyond doubt (nvidia-smi
+    answered, or a sysfs vendor file was read) passes it in and the guesses
+    are skipped.
+    """
+    if vendor is None:
+        vendor = _vendor_from_pci_id(pnp_id)
+        if vendor == VENDOR_UNKNOWN:
+            vendor = _vendor_from_name(compatibility)
+        if vendor == VENDOR_UNKNOWN:
+            vendor = _vendor_from_name(name)
+    return {
+        "name": name,
+        "vram_bytes": int(vram_bytes or 0),
+        "vendor": vendor,
+        "virtual": _is_virtual_adapter(name, pnp_id, vendor),
+        "integrated": _is_integrated(name, vendor, vram_bytes),
+    }
 
 
 def _parse_nvidia_smi(output):
@@ -150,12 +371,15 @@ def _parse_nvidia_smi(output):
             continue
         unit = (m.group(2) or "MiB").lower()
         vram_bytes = int(value * _UNIT_MULTIPLIERS.get(unit, _UNIT_MULTIPLIERS["mib"]))
-        gpus.append({
-            "name": name,
-            "vram_bytes": vram_bytes,
-            "vendor": VENDOR_NVIDIA,
-            "approximate": False,
-        })
+        entry = _classify_adapter(name, vram_bytes, vendor=VENDOR_NVIDIA)
+        entry["approximate"] = False
+        # nvidia-smi enumerates CUDA-capable devices, not display adapters,
+        # so anything it reports is a real GPU whatever it is called. The
+        # name-based virtual check must not reach these: a vGPU slice is
+        # commonly named "NVIDIA ... Virtual ...", and dropping it would
+        # leave a machine that nvidia-smi just answered for with no GPU.
+        entry["virtual"] = False
+        gpus.append(entry)
     return gpus
 
 
@@ -168,7 +392,17 @@ def _gpus_nvidia_smi():
 
 
 def _gpus_windows_powershell():
-    """Fallback GPU read via PowerShell Get-CimInstance Win32_VideoController.
+    """The Windows GPU read: PowerShell Get-CimInstance Win32_VideoController.
+
+    This is the path that answers on every Windows machine without an
+    NVIDIA card, which is most of them, so it asks for everything the class
+    knows that bears on the three questions in the module docstring, not
+    just a name and a size:
+
+      PNPDeviceID           the PCI vendor ID, and whether this is a PCI
+                            device at all.
+      AdapterCompatibility  the driver's own statement of who wrote it
+                            ("Advanced Micro Devices, Inc.").
 
     AdapterRAM is signed 32-bit in this WMI class, so it wraps above ~4GB and
     can even read negative for a large card. Treat this reading as a floor,
@@ -179,7 +413,8 @@ def _gpus_windows_powershell():
         return []
     script = (
         "Get-CimInstance Win32_VideoController | "
-        "Select-Object Name,AdapterRAM | ConvertTo-Json -Compress"
+        "Select-Object Name,AdapterRAM,PNPDeviceID,AdapterCompatibility | "
+        "ConvertTo-Json -Compress"
     )
     out = _run([ps, "-NoProfile", "-NonInteractive", "-Command", script], timeout=10)
     if not out or not out.strip():
@@ -199,12 +434,13 @@ def _gpus_windows_powershell():
         name = item.get("Name") or "Unknown GPU"
         ram = item.get("AdapterRAM")
         vram_bytes = int(ram) if isinstance(ram, (int, float)) and ram > 0 else 0
-        gpus.append({
-            "name": name,
-            "vram_bytes": vram_bytes,
-            "vendor": _vendor_from_name(name),
-            "approximate": True,
-        })
+        entry = _classify_adapter(
+            name, vram_bytes,
+            pnp_id=item.get("PNPDeviceID"),
+            compatibility=item.get("AdapterCompatibility"),
+        )
+        entry["approximate"] = True
+        gpus.append(entry)
     return gpus
 
 
@@ -212,11 +448,19 @@ def _gpus_windows_wmic():
     """Last-resort GPU read via the deprecated `wmic` CSV output.
 
     Same AdapterRAM 32-bit-signed caveat as the PowerShell path applies here.
+
+    PNPDeviceID is asked for and AdapterCompatibility deliberately is not.
+    This output is split on commas with no quoting, and every real
+    AdapterCompatibility value contains one ("Advanced Micro Devices,
+    Inc."), which would shift every later column on the row. PNPDeviceID
+    never contains a comma, and it is the stronger of the two signals
+    anyway.
     """
     exe = shutil.which("wmic")
     if not exe:
         return []
-    out = _run([exe, "path", "Win32_VideoController", "get", "Name,AdapterRAM", "/format:csv"])
+    out = _run([exe, "path", "Win32_VideoController", "get",
+                "Name,AdapterRAM,PNPDeviceID", "/format:csv"])
     if not out:
         return []
     lines = [l for l in out.splitlines() if l.strip()]
@@ -228,6 +472,7 @@ def _gpus_windows_wmic():
         ram_idx = header.index("AdapterRAM")
     except ValueError:
         return []
+    pnp_idx = header.index("PNPDeviceID") if "PNPDeviceID" in header else None
     gpus = []
     for line in lines[1:]:
         parts = line.split(",")
@@ -238,12 +483,10 @@ def _gpus_windows_wmic():
             continue
         ram_str = parts[ram_idx].strip()
         vram_bytes = int(ram_str) if ram_str.isdigit() else 0
-        gpus.append({
-            "name": name,
-            "vram_bytes": vram_bytes,
-            "vendor": _vendor_from_name(name),
-            "approximate": True,
-        })
+        pnp = parts[pnp_idx].strip() if pnp_idx is not None and len(parts) > pnp_idx else None
+        entry = _classify_adapter(name, vram_bytes, pnp_id=pnp)
+        entry["approximate"] = True
+        gpus.append(entry)
     return gpus
 
 
@@ -268,16 +511,15 @@ def _gpus_linux_amd_sysfs():
         vendor = VENDOR_UNKNOWN
         try:
             with open(vendor_path, encoding="utf-8", errors="replace") as f:
-                vid = f.read().strip().lower()
-            vendor = {"0x1002": VENDOR_AMD, "0x10de": VENDOR_NVIDIA, "0x8086": VENDOR_INTEL}.get(vid, VENDOR_UNKNOWN)
+                vendor = _vendor_from_pci_id(f.read().strip())
         except OSError:
             pass
-        gpus.append({
-            "name": entry,
-            "vram_bytes": vram_bytes,
-            "vendor": vendor,
-            "approximate": False,
-        })
+        # The name here is "card0", which says nothing, so the integrated
+        # call falls to the size rule: an APU's mem_info_vram_total is the
+        # same small carve-out Windows reports for one.
+        found = _classify_adapter(entry, vram_bytes, vendor=vendor)
+        found["approximate"] = False
+        gpus.append(found)
     return gpus
 
 
@@ -294,21 +536,25 @@ def _gpus_linux_lspci():
         if not any(tag in line for tag in ("VGA compatible controller", "3D controller", "Display controller")):
             continue
         name = line.strip()
-        gpus.append({
-            "name": name,
-            "vram_bytes": 0,
-            "vendor": _vendor_from_name(name),
-            "approximate": True,
-        })
+        entry = _classify_adapter(name, 0)
+        entry["approximate"] = True
+        gpus.append(entry)
     return gpus
 
 
-def gpus():
-    """Detected GPUs as a list of dicts with keys name, vram_bytes, vendor
-    (plus an "approximate" flag: True when the vram_bytes reading is a
-    known-unreliable fallback, as documented in the module docstring).
+def display_adapters():
+    """Every display adapter this machine reports, virtual ones included.
 
-    Empty list when nothing could be detected; this function never raises.
+    Each is a dict with keys name, vram_bytes, vendor, approximate (True
+    when the vram_bytes reading is a known-unreliable fallback, as
+    documented in the module docstring), virtual, and integrated.
+
+    Callers that want to run something on a GPU want gpus(), which is this
+    list with the virtual adapters removed. This function exists so that
+    "there is a Parsec adapter here and it is not a GPU" can be reported
+    rather than silently dropped.
+
+    Empty list when nothing could be detected; never raises.
     """
     system = platform.system()
     found = _gpus_nvidia_smi()
@@ -325,6 +571,21 @@ def gpus():
             return found
         return _gpus_linux_lspci()
     return []
+
+
+def gpus():
+    """Detected GPUs as a list of dicts with keys name, vram_bytes, vendor,
+    approximate, virtual and integrated.
+
+    Virtual display adapters are excluded: a Parsec, RDP, Citrix or
+    DisplayLink shim is enumerated by Windows in the same class as real
+    hardware and can run nothing. Leaving them in was a real bug and not a
+    cosmetic one, because a caller that reads the FIRST entry (the engine
+    picker did) or the vendor of any entry could be handed a shim's
+    "unknown" and conclude the machine has no usable GPU. Empty list when
+    nothing usable could be detected; never raises.
+    """
+    return [g for g in display_adapters() if not g.get("virtual")]
 
 
 # --------------------------------------------------------------------------
@@ -487,10 +748,17 @@ def cpu_count():
 
 
 def probe():
-    """Everything this module knows about the machine, as one JSON-safe dict."""
+    """Everything this module knows about the machine, as one JSON-safe dict.
+
+    "gpus" holds the usable GPUs. "virtual_adapters" names the display
+    adapters that were found and excluded, so that a machine reporting no
+    GPU can say whether it really has none or only has shims.
+    """
+    adapters = display_adapters()
     return {
         "platform": platform.system(),
-        "gpus": gpus(),
+        "gpus": [g for g in adapters if not g.get("virtual")],
+        "virtual_adapters": [g.get("name") for g in adapters if g.get("virtual")],
         "system_ram_bytes": system_ram_bytes(),
         "cpu_count": cpu_count(),
     }
@@ -563,12 +831,131 @@ def _self_test():
     assert boundary["fits"] is True, boundary
 
     # -- vendor detection --------------------------------------------------
-    assert _vendor_from_name("NVIDIA GeForce RTX 4090") == VENDOR_NVIDIA
-    assert _vendor_from_name("AMD Radeon RX 7900 XTX") == VENDOR_AMD
-    assert _vendor_from_name("Intel(R) Iris(R) Xe Graphics") == VENDOR_INTEL
+    # Every one of these is a string a real Windows machine reports. The
+    # integrated parts are the ones that matter most here: they are what
+    # most laptops have, they are what Vulkan exists to cover, and getting
+    # one of them wrong is worth more lost performance than any of the
+    # discrete cases, because the user has no faster alternative to fall
+    # back on.
+    for name in ("NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 5080",
+                 "NVIDIA GeForce GTX 1080 Ti", "NVIDIA T1000 8GB",
+                 "Quadro P2000", "NVIDIA TITAN Xp", "Tesla V100-PCIE-16GB"):
+        assert _vendor_from_name(name) == VENDOR_NVIDIA, name
+    for name in ("AMD Radeon RX 7900 XTX", "AMD Radeon(TM) 880M Graphics",
+                 "AMD Radeon(TM) Graphics", "AMD Radeon RX 6800M",
+                 "AMD Radeon Vega 8 Graphics", "Radeon RX 550",
+                 "Advanced Micro Devices, Inc.", "AMD Radeon Pro W6800",
+                 "ATI Mobility Radeon HD 4200"):
+        assert _vendor_from_name(name) == VENDOR_AMD, name
+    for name in ("Intel(R) Iris(R) Xe Graphics", "Intel(R) UHD Graphics 630",
+                 "Intel(R) HD Graphics 520", "Intel(R) Arc(TM) A770 Graphics",
+                 "Intel(R) Arc(TM) Graphics", "Intel Corporation"):
+        assert _vendor_from_name(name) == VENDOR_INTEL, name
     assert _vendor_from_name("Some Mystery Card") == VENDOR_UNKNOWN
+    assert _vendor_from_name("Parsec Cloud, Inc.") == VENDOR_UNKNOWN
     assert _vendor_from_name("") == VENDOR_UNKNOWN
     assert _vendor_from_name(None) == VENDOR_UNKNOWN
+    # The short tokens are matched as words, not as substrings: without
+    # boundaries every one of these becomes a false vendor call.
+    assert _vendor_from_name("Matrox G200eR2 Architecture") == VENDOR_UNKNOWN
+    assert _vendor_from_name("Creative Labs Display Device") == VENDOR_UNKNOWN
+
+    # -- vendor from the PCI ID, which outranks any name -------------------
+    assert _vendor_from_pci_id(r"PCI\VEN_1002&DEV_150E&SUBSYS_39A81043&REV_C1") == VENDOR_AMD
+    assert _vendor_from_pci_id(r"PCI\VEN_10DE&DEV_2C02") == VENDOR_NVIDIA
+    assert _vendor_from_pci_id(r"PCI\VEN_8086&DEV_7D55") == VENDOR_INTEL
+    assert _vendor_from_pci_id("0x1002") == VENDOR_AMD          # Linux sysfs spelling
+    assert _vendor_from_pci_id("10de") == VENDOR_NVIDIA
+    assert _vendor_from_pci_id(r"PCI\VEN_15AD&DEV_0405") == VENDOR_UNKNOWN  # VMware
+    assert _vendor_from_pci_id(r"ROOT\DISPLAY\0000") == VENDOR_UNKNOWN
+    assert _vendor_from_pci_id("") == VENDOR_UNKNOWN
+    assert _vendor_from_pci_id(None) == VENDOR_UNKNOWN
+
+    # -- virtual adapters are not GPUs -------------------------------------
+    # A Parsec adapter sorting ahead of a Radeon 880M is the exact bug this
+    # pins: the picker read the first entry, got "unknown", and the machine
+    # ran on CPU with a real GPU sitting idle beside it.
+    for name in ("Parsec Virtual Display Adapter",
+                 "Microsoft Remote Display Adapter",
+                 "Microsoft Basic Display Adapter",
+                 "Microsoft Basic Render Driver",
+                 "Citrix Indirect Display Adapter",
+                 "DisplayLink USB Device",
+                 "VMware SVGA 3D",
+                 "VirtualBox Graphics Adapter",
+                 "Hyper-V Video",
+                 "IddSampleDriver Device",
+                 "Red Hat QXL controller"):
+        assert _is_virtual_adapter(name, None, VENDOR_UNKNOWN) is True, name
+    # A real GPU is never virtual, whatever else is true of it.
+    for name in ("AMD Radeon(TM) 880M Graphics", "NVIDIA GeForce RTX 5080",
+                 "Intel(R) Iris(R) Xe Graphics", "AMD Radeon RX 7900 XTX"):
+        assert _is_virtual_adapter(name, r"PCI\VEN_1002&DEV_150E", VENDOR_AMD) is False, name
+    # The structural rule: not on the PCI bus AND unidentifiable.
+    assert _is_virtual_adapter("Something Odd", r"ROOT\DISPLAY\0000", VENDOR_UNKNOWN) is True
+    # ... but a device Hearth CAN identify is real however it is attached,
+    # so this rule can never be what excludes a genuine GPU on its own.
+    assert _is_virtual_adapter("Intel(R) Arc(TM) Graphics", r"ACPI\INTC1234",
+                               VENDOR_INTEL) is False
+    assert _is_virtual_adapter("Some Card", None, VENDOR_UNKNOWN) is False
+
+    # -- integrated versus dedicated memory ---------------------------------
+    # True here means "the memory figure beside this is carved out of system
+    # RAM", which the shop must know before it calls anything a good fit.
+    assert _is_integrated("AMD Radeon(TM) 880M Graphics", VENDOR_AMD, 536870912) is True
+    assert _is_integrated("AMD Radeon(TM) 780M Graphics", VENDOR_AMD, 0) is True
+    assert _is_integrated("AMD Radeon(TM) Graphics", VENDOR_AMD, 0) is True
+    assert _is_integrated("AMD Radeon Vega 8 Graphics", VENDOR_AMD, 0) is True
+    assert _is_integrated("AMD Radeon R5 Graphics", VENDOR_AMD, 0) is True
+    # AMD's discrete mobile parts use four digits and an M, so the
+    # three-digit rule must not reach them.
+    assert _is_integrated("AMD Radeon RX 6800M", VENDOR_AMD, 12 * 1024 ** 3) is False
+    assert _is_integrated("AMD Radeon RX 7900 XTX", VENDOR_AMD, 24 * 1024 ** 3) is False
+    # Vega 56 and 64 are discrete cards; Vega 3 to 11 are APU graphics.
+    assert _is_integrated("Radeon RX Vega 64", VENDOR_AMD, 8 * 1024 ** 3) is False
+    # A size at or below the ceiling says integrated even with a name that
+    # gives nothing away.
+    assert _is_integrated("AMD Radeon Series", VENDOR_AMD, 512 * 1024 ** 2) is True
+    # An AMD card with no name signal and no readable size cannot be
+    # classified, and says so rather than guessing "dedicated".
+    assert _is_integrated("AMD Radeon Series", VENDOR_AMD, 0) is None
+    # Intel is integrated unless it is an Arc with a model number.
+    assert _is_integrated("Intel(R) UHD Graphics 630", VENDOR_INTEL, 1024 ** 3) is True
+    assert _is_integrated("Intel(R) Iris(R) Xe Graphics", VENDOR_INTEL, 0) is True
+    assert _is_integrated("Intel(R) Arc(TM) Graphics", VENDOR_INTEL, 0) is True
+    assert _is_integrated("Intel(R) Arc(TM) A770 Graphics", VENDOR_INTEL, 16 * 1024 ** 3) is False
+    assert _is_integrated("Intel(R) Arc(TM) B580 Graphics", VENDOR_INTEL, 12 * 1024 ** 3) is False
+    # NVIDIA ships no integrated PC graphics.
+    assert _is_integrated("NVIDIA GeForce RTX 5080", VENDOR_NVIDIA, 17 * 1024 ** 3) is False
+    assert _is_integrated("Mystery Device", VENDOR_UNKNOWN, 0) is None
+
+    # -- _classify_adapter: the PCI ID outranks a misleading name ----------
+    # The PCI vendor ID ALONE, with a name that says nothing and no
+    # AdapterCompatibility at all. This is the only assertion that pins the
+    # strongest of the three vendor signals: every other fixture here also
+    # carries a name or a compatibility string that would answer on its own,
+    # so without this one the PCI reading could be deleted entirely and
+    # nothing would notice.
+    got = _classify_adapter("Standard Display Adapter", 536870912,
+                            pnp_id=r"PCI\VEN_1002&DEV_150E")
+    assert got["vendor"] == VENDOR_AMD, got
+    assert got["virtual"] is False and got["integrated"] is True, got
+    for pnp, want in ((r"PCI\VEN_10DE&DEV_2C02", VENDOR_NVIDIA),
+                      (r"PCI\VEN_8086&DEV_7D55", VENDOR_INTEL)):
+        got = _classify_adapter("Standard Display Adapter", 0, pnp_id=pnp)
+        assert got["vendor"] == want, (pnp, got)
+    # All three signals present and agreeing is the ordinary case.
+    got = _classify_adapter("Standard Display Adapter", 536870912,
+                            pnp_id=r"PCI\VEN_1002&DEV_150E",
+                            compatibility="Advanced Micro Devices, Inc.")
+    assert got["vendor"] == VENDOR_AMD, got
+    # No PCI ID: AdapterCompatibility answers before the name is consulted.
+    got = _classify_adapter("Standard Display Adapter", 0,
+                            compatibility="Intel Corporation")
+    assert got["vendor"] == VENDOR_INTEL, got
+    # A caller that already knows the vendor is believed and not re-guessed.
+    got = _classify_adapter("card0", 8 * 1024 ** 3, vendor=VENDOR_NVIDIA)
+    assert got["vendor"] == VENDOR_NVIDIA and got["integrated"] is False, got
 
     # -- nvidia-smi CSV parsing ---------------------------------------------
     parsed = _parse_nvidia_smi("NVIDIA GeForce RTX 4090, 24564 MiB\n")
@@ -599,6 +986,8 @@ def _self_test():
         "name": "Good GPU",
         "vram_bytes": 8192 * 1024 * 1024,
         "vendor": VENDOR_NVIDIA,
+        "virtual": False,
+        "integrated": False,
         "approximate": False,
     }], malformed
     assert _parse_nvidia_smi("Only Bad GPU, 1.2.3 MiB\n") == []
@@ -609,6 +998,16 @@ def _self_test():
     assert len(comma_name) == 1, comma_name
     assert comma_name[0]["name"] == "NVIDIA RTX 6000, Ada Generation", comma_name
     assert comma_name[0]["vram_bytes"] == 49140 * 1024 * 1024, comma_name
+
+    # A vGPU slice is commonly named with the word "Virtual" in it, and
+    # nvidia-smi only enumerates CUDA-capable devices, so what it reports is
+    # real by definition. The name-based virtual rule must not reach this
+    # path: excluding it would leave a machine nvidia-smi had just answered
+    # for with no GPU at all.
+    vgpu = _parse_nvidia_smi("NVIDIA A40-8Q Virtual GPU, 8192 MiB\n")
+    assert len(vgpu) == 1, vgpu
+    assert vgpu[0]["virtual"] is False, vgpu
+    assert vgpu[0]["vendor"] == VENDOR_NVIDIA, vgpu
 
     # -- _run: missing executables never raise ------------------------------
     assert _run(["this-executable-does-not-exist-anywhere-12345"]) is None
@@ -640,11 +1039,16 @@ def _self_test():
     detected = gpus()
     assert isinstance(detected, list)
     for g in detected:
-        assert set(("name", "vram_bytes", "vendor")).issubset(g.keys()), g
+        assert set(("name", "vram_bytes", "vendor", "virtual",
+                    "integrated")).issubset(g.keys()), g
         assert isinstance(g["name"], str) and g["name"], g
         assert isinstance(g["vram_bytes"], int), g
         assert g["vram_bytes"] >= 0, g
         assert g["vendor"] in (VENDOR_NVIDIA, VENDOR_AMD, VENDOR_INTEL, VENDOR_UNKNOWN), g
+        assert g["virtual"] is False, ("gpus() must not return a virtual adapter", g)
+        assert g["integrated"] in (True, False, None), g
+    for g in display_adapters():
+        assert isinstance(g.get("virtual"), bool), g
 
     # -- system_ram_bytes(): a real machine reports a plausible positive value
     ram = system_ram_bytes()
@@ -661,9 +1065,11 @@ def _self_test():
 
     # -- probe(): the JSON-safe combined view --------------------------------
     p = probe()
-    assert set(("platform", "gpus", "system_ram_bytes", "cpu_count")).issubset(p.keys()), p
+    assert set(("platform", "gpus", "virtual_adapters", "system_ram_bytes",
+                "cpu_count")).issubset(p.keys()), p
     assert p["platform"] == platform.system()
     assert isinstance(p["gpus"], list)
+    assert isinstance(p["virtual_adapters"], list), p
     assert isinstance(p["system_ram_bytes"], int)
     assert isinstance(p["cpu_count"], int)
     # Must be trivially JSON-serialisable, since the shop ships it over the wire.
@@ -696,6 +1102,35 @@ def _self_test():
             assert good_result[0]["vram_bytes"] == 8589934592, good_result
             assert good_result[0]["vendor"] == VENDOR_AMD, good_result
 
+        # THE REGRESSION FIXTURE. This is the literal Win32_VideoController
+        # reading from the machine the bug was found on: an ASUS G14 with a
+        # Radeon 880M and Parsec installed. Parsec's shim sorts FIRST, has
+        # no AdapterRAM and no identifiable vendor, and the engine picker
+        # read the first entry's vendor, got "unknown", and left the machine
+        # on the CPU build with a perfectly good Vulkan-capable GPU beside
+        # it. Every assertion below failed before this commit.
+        def _fake_g14(cmd, timeout=SUBPROCESS_TIMEOUT):
+            return json.dumps([
+                {"Name": "Parsec Virtual Display Adapter", "AdapterRAM": None,
+                 "PNPDeviceID": "ROOT\\DISPLAY\\0000",
+                 "AdapterCompatibility": "Parsec Cloud, Inc."},
+                {"Name": "AMD Radeon(TM) 880M Graphics", "AdapterRAM": 536870912,
+                 "PNPDeviceID": "PCI\\VEN_1002&DEV_150E&SUBSYS_39A81043&REV_C1"
+                                "\\4&35FE04F8&0&0041",
+                 "AdapterCompatibility": "Advanced Micro Devices, Inc."},
+            ])
+        globals()["_run"] = _fake_g14
+        if shutil.which("powershell") or shutil.which("powershell.exe"):
+            g14 = _gpus_windows_powershell()
+            assert len(g14) == 2, g14
+            parsec, radeon = g14
+            assert parsec["virtual"] is True, parsec
+            assert radeon["virtual"] is False, radeon
+            assert radeon["vendor"] == VENDOR_AMD, radeon
+            assert radeon["integrated"] is True, radeon
+            assert radeon["vram_bytes"] == 536870912, radeon
+            assert radeon["approximate"] is True, radeon
+
         def _fake_none(cmd, timeout=SUBPROCESS_TIMEOUT):
             return None
         globals()["_run"] = _fake_none
@@ -703,6 +1138,32 @@ def _self_test():
         assert _gpus_windows_wmic() == []
     finally:
         globals()["_run"] = old_run
+
+    # -- gpus() drops the shims; display_adapters() and probe() name them ---
+    # Driven through a stubbed display_adapters so this holds on any host.
+    old_adapters = globals()["display_adapters"]
+    try:
+        fixture = [
+            {"name": "Parsec Virtual Display Adapter", "vram_bytes": 0,
+             "vendor": VENDOR_UNKNOWN, "approximate": True, "virtual": True,
+             "integrated": None},
+            {"name": "AMD Radeon(TM) 880M Graphics", "vram_bytes": 536870912,
+             "vendor": VENDOR_AMD, "approximate": True, "virtual": False,
+             "integrated": True},
+        ]
+        globals()["display_adapters"] = lambda: fixture
+        assert [g["name"] for g in gpus()] == ["AMD Radeon(TM) 880M Graphics"], gpus()
+        p_g14 = probe()
+        assert p_g14["virtual_adapters"] == ["Parsec Virtual Display Adapter"], p_g14
+        assert len(p_g14["gpus"]) == 1, p_g14
+
+        # A machine whose ONLY adapter is a shim has no GPU, and the shim is
+        # still named rather than vanishing.
+        globals()["display_adapters"] = lambda: [fixture[0]]
+        assert gpus() == []
+        assert probe()["virtual_adapters"] == ["Parsec Virtual Display Adapter"]
+    finally:
+        globals()["display_adapters"] = old_adapters
 
     # -- wmic CSV parser fixture ---------------------------------------------
     wmic_csv = "Node,AdapterRAM,Name\r\nHOST,4294967296,NVIDIA GeForce RTX 3080\r\n"

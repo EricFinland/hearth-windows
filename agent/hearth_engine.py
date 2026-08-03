@@ -30,6 +30,52 @@ ROCm, SYCL and OpenVINO builds stay pinned behind HEARTH_GPU_ENGINE for
 people whose hardware or workload differs from the one card this was
 measured on.
 
+## Integrated graphics gets Vulkan too, and that was measured, not assumed
+
+The numbers above are from a desktop with a discrete card, which is the
+machine this was developed on and not the machine most people have. Most
+laptops have an AMD or Intel GPU sharing the CPU's memory, and there is a
+real argument that such a GPU is not worth 33 MB and a download, because
+generation on an integrated part is limited by the same memory bus the CPU
+is already using. So it was measured rather than assumed, on a Ryzen AI 9
+HX 370 with a Radeon 880M and 32 GB of LPDDR5X, build 10105, llama-server's
+own timings, a 2071-token prompt, best of three:
+
+    Qwen2.5-Coder-7B-Instruct Q4_K_M   prompt tok/s   generation tok/s
+      bundled CPU build                        41.4              11.9
+      Vulkan, no layers offloaded             230.2              10.3
+      Vulkan, all layers offloaded             90.2              13.8
+
+    Qwen2.5-Coder-1.5B-Instruct Q4_0   prompt tok/s   generation tok/s
+      bundled CPU build                       196.6              45.6
+      Vulkan, no layers offloaded            1045.0              37.1
+      Vulkan, all layers offloaded           1425.2              57.2
+
+Generation is where the sceptical argument holds: on the 7B, moving every
+layer onto the integrated GPU buys 16 per cent, and moving none of them
+actually costs 13 per cent against the CPU build. Prompt processing is
+where the argument collapses. It is compute-bound rather than
+bandwidth-bound, and the Vulkan build is 5.6 times faster at it on the 7B
+even with zero layers resident, because llama.cpp still runs the batched
+matrix multiplications on the GPU.
+
+For a coding assistant that is the number that decides, because the prompt
+is always the large half. One realistic turn on the 7B, 2071 tokens in and
+128 out: 60.8 seconds on the CPU build, 21.4 seconds on Vulkan. The
+crossover, below which the CPU build is genuinely faster, is a prompt of
+roughly 230 tokens. Hearth Code never sends one that short.
+
+So integrated graphics gets Vulkan, and the policy is the same for every
+vendor. One consequence is worth stating plainly, because it looks like a
+bug and is not: hearth_hw reports an integrated GPU's small dedicated
+carve-out (512 MB here) rather than the shared heap the driver advertises,
+so hearth_llama.choose_gpu_layers offloads NO layers on this machine. That
+is the fastest of the three configurations for the 7B, and the second
+fastest for the 1.5B. Reporting the shared heap instead would move both
+models to the "all layers offloaded" row, which is a 2.5x LOSS on 7B prompt
+processing, and would also have the shop calling a 14B a comfortable fit on
+a machine with no video memory at all.
+
 ## CUDA 12.4 versus 13.3 is not a free choice
 
 Both are pinned, and picking wrong produces a binary that cannot load rather
@@ -332,6 +378,57 @@ def _plan(variant=None, backend=None, vendor=None, reason="", source="policy",
             "size_bytes": size, "entry": entry}
 
 
+#: How each vendor spells its own name, for messages a user reads. The
+#: internal constants are lowercase, and "a amd GPU" was shipped in a
+#: user-facing string because a format placeholder was fed one of them
+#: directly. Every sentence below is built so that no article has to be
+#: chosen from a value at runtime.
+_VENDOR_LABELS = {
+    hearth_hw.VENDOR_NVIDIA: "NVIDIA",
+    hearth_hw.VENDOR_AMD: "AMD",
+    hearth_hw.VENDOR_INTEL: "Intel",
+}
+
+
+def _vendor_label(vendor):
+    return _VENDOR_LABELS.get(vendor, vendor or "unrecognised")
+
+
+def _pick_gpu(gpus):
+    """The GPU whose vendor decides which engine this machine fetches.
+
+    This used to be "the first entry hearth_hw returned", and that was a
+    real bug rather than a stylistic one. Windows enumerates virtual
+    display adapters in the same class as real hardware, and on a laptop
+    with Parsec installed the shim sorted first: its vendor is "unknown",
+    the policy has no engine for "unknown", and a Radeon 880M that Vulkan
+    covers perfectly ran on the CPU build instead. hearth_hw now excludes
+    those shims, and this function is the second half of the fix, so that a
+    machine listing more than one real GPU still picks a sensible one
+    rather than whichever the driver stack happened to enumerate first.
+
+    The order of preference:
+      1. an adapter that is not virtual, if any is;
+      2. among those, one whose vendor could actually be identified, since
+         a vendor of "unknown" is the one value the policy cannot act on;
+      3. among those, a discrete GPU over an integrated one, because on a
+         laptop with both it is the discrete card that will run the model;
+      4. among those, the largest.
+
+    Returns None for an empty list. An adapter whose integrated flag is
+    None (hearth_hw could not tell) is ranked WITH the discrete ones: not
+    knowing is not a reason to demote a card below an integrated one.
+    """
+    candidates = [g for g in gpus if not g.get("virtual")] or list(gpus)
+    known = [g for g in candidates
+             if g.get("vendor") and g.get("vendor") != hearth_hw.VENDOR_UNKNOWN]
+    pool = known or candidates
+    if not pool:
+        return None
+    return max(pool, key=lambda g: (0 if g.get("integrated") is True else 1,
+                                    g.get("vram_bytes") or 0))
+
+
 def cuda_variant_for(nvidia, available=None):
     """The CUDA build this machine's NVIDIA hardware can run, or None.
 
@@ -442,8 +539,14 @@ def choose_variant(manifest, gpus=None, nvidia=None, system=None, machine=None,
             gpus = hearth_hw.gpus()
         except Exception:  # noqa: BLE001 - detection must never break a launch
             gpus = []
-    vendors = [g.get("vendor") for g in gpus if g.get("vendor")]
-    vendor = vendors[0] if vendors else None
+    # hearth_hw.gpus() already drops virtual adapters; this repeats the
+    # filter because choose_variant is also called with a caller-supplied
+    # list, and a shim must not decide the engine down either path.
+    shims = [g.get("name") or "?" for g in gpus if g.get("virtual")]
+    gpus = [g for g in gpus if not g.get("virtual")]
+    picked = _pick_gpu(gpus)
+    vendor = (picked or {}).get("vendor") or None
+    gpu_name = (picked or {}).get("name") or "?"
     if nvidia is None and (vendor == hearth_hw.VENDOR_NVIDIA or override == "cuda"):
         try:
             nvidia = hearth_hw.nvidia_detail()
@@ -477,6 +580,11 @@ def choose_variant(manifest, gpus=None, nvidia=None, system=None, machine=None,
         return _finish(name, "override", "{}={}".format(ENV_ENGINE, override))
 
     if not gpus:
+        if shims:
+            return _plan(reason="the only display adapters on this machine are "
+                                "virtual ones ({}), which cannot run a model, so "
+                                "the bundled CPU build is already the right "
+                                "engine".format(", ".join(shims)))
         return _plan(reason="no GPU was detected, so the bundled CPU build is "
                             "already the right engine")
 
@@ -486,11 +594,29 @@ def choose_variant(manifest, gpus=None, nvidia=None, system=None, machine=None,
                      reason="this Hearth's pin carries no first-run GPU policy")
     name = policy.get(vendor) if vendor else None
     if not name:
+        # Two different situations, and they must not read the same. One is
+        # "we could not work out what this GPU is", which is a limitation of
+        # Hearth's detection and something the user can override. The other
+        # is "we know exactly what it is and have no engine for it", which
+        # is a limitation of the pin.
+        if vendor in (None, hearth_hw.VENDOR_UNKNOWN):
+            return _plan(vendor=vendor,
+                         reason="Hearth could not work out who makes the graphics "
+                                "in this machine, which reports itself as {!r}. "
+                                "Rather than install a GPU engine that might not "
+                                "load, it is staying on the bundled CPU build: "
+                                "everything works, just slower than the hardware "
+                                "probably can. If you know this GPU supports "
+                                "Vulkan, set {}=vulkan and Hearth will fetch the "
+                                "Vulkan engine and test it here before using "
+                                "it.".format(gpu_name, ENV_ENGINE))
         return _plan(vendor=vendor,
-                     reason="the pin's first-run policy has no GPU engine for a {} "
-                            "GPU, so the CPU build stays".format(vendor or "unrecognised"))
-    return _finish(name, "policy", "a {} GPU ({}) is covered by the pinned {} "
-                                   "build".format(vendor, gpus[0].get("name") or "?", name))
+                     reason="this Hearth's pin has no GPU engine for {} graphics "
+                            "({}), so the bundled CPU build stays".format(
+                                _vendor_label(vendor), gpu_name))
+    return _finish(name, "policy",
+                   "this machine's {} GPU ({}) is covered by the pinned {} "
+                   "build".format(_vendor_label(vendor), gpu_name, name))
 
 
 def _total_size(manifest, variant):
@@ -1171,10 +1297,106 @@ def _self_test(live=False):
         plan = choose_variant(manifest, gpus=[], env=env, **win)
         assert plan["variant"] is None and "no GPU" in plan["reason"], plan
 
-        # An unrecognised vendor is not guessed at.
+        # -- THE REGRESSION: a virtual adapter must not decide the engine --
+        # This is the literal Win32_VideoController reading from an ASUS
+        # G14 with Parsec installed, in the order Windows returns it. The
+        # picker used to read the FIRST entry, get "unknown" from Parsec's
+        # shim, and leave a Vulkan-capable Radeon 880M running on the CPU
+        # build. All three assertions failed before this commit.
+        g14 = [
+            {"name": "Parsec Virtual Display Adapter", "vram_bytes": 0,
+             "vendor": "unknown", "approximate": True, "virtual": True,
+             "integrated": None},
+            {"name": "AMD Radeon(TM) 880M Graphics", "vram_bytes": 536870912,
+             "vendor": "amd", "approximate": True, "virtual": False,
+             "integrated": True},
+        ]
+        plan = choose_variant(manifest, gpus=g14, env=env, **win)
+        assert plan["variant"] == "win-vulkan-x64", plan
+        assert plan["vendor"] == "amd", plan
+        assert "880M" in plan["reason"], plan
+
+        # An integrated GPU is still a GPU: Vulkan is the artifact chosen
+        # precisely because it covers AMD and Intel from one build.
+        for name, vendor in (("Intel(R) Iris(R) Xe Graphics", "intel"),
+                             ("AMD Radeon(TM) Graphics", "amd")):
+            igpu = [{"name": name, "vendor": vendor, "vram_bytes": 128 * 1024 ** 2,
+                     "virtual": False, "integrated": True}]
+            p = choose_variant(manifest, gpus=igpu, env=env, **win)
+            assert p["variant"] == "win-vulkan-x64", (name, p)
+
+        # With both a discrete card and the integrated one beside it, the
+        # discrete card decides, whatever order they were enumerated in.
+        hybrid = [
+            {"name": "AMD Radeon(TM) 880M Graphics", "vram_bytes": 536870912,
+             "vendor": "amd", "virtual": False, "integrated": True},
+            {"name": "NVIDIA GeForce RTX 4060 Laptop GPU",
+             "vram_bytes": 8 * 1024 ** 3, "vendor": "nvidia",
+             "virtual": False, "integrated": False},
+        ]
+        assert _pick_gpu(hybrid)["vendor"] == "nvidia", _pick_gpu(hybrid)
+        assert _pick_gpu(list(reversed(hybrid)))["vendor"] == "nvidia"
+        # Through choose_variant, not just _pick_gpu directly: the picker
+        # has to be the thing choose_variant actually consults, or reading
+        # the first entry again would pass every assertion above.
+        for order in (hybrid, list(reversed(hybrid))):
+            p = choose_variant(manifest, gpus=order, nvidia=_nvidia((8, 9)),
+                               env=env, **win)
+            assert p["vendor"] == "nvidia", (order, p)
+            assert "RTX 4060" in p["reason"], p
+        # A real adapter that is not a shim and whose vendor could not be
+        # established must not out-rank the identifiable GPU behind it,
+        # whichever order they come in. Reading the first entry gets this
+        # wrong, and "unknown" is the one value the policy cannot act on.
+        muddled = [{"name": "Standard Display Adapter", "vram_bytes": 0,
+                    "vendor": "unknown", "virtual": False, "integrated": None},
+                   {"name": "AMD Radeon(TM) 880M Graphics", "vram_bytes": 536870912,
+                    "vendor": "amd", "virtual": False, "integrated": True}]
+        p = choose_variant(manifest, gpus=muddled, env=env, **win)
+        assert p["vendor"] == "amd", p
+        assert p["variant"] == "win-vulkan-x64", p
+        # A card whose integrated flag could not be established is ranked
+        # with the discrete ones, not demoted below an integrated part.
+        unsure = [{"name": "AMD Radeon(TM) 880M Graphics", "vram_bytes": 536870912,
+                   "vendor": "amd", "virtual": False, "integrated": True},
+                  {"name": "AMD Radeon Series", "vram_bytes": 0, "vendor": "amd",
+                   "virtual": False, "integrated": None}]
+        assert _pick_gpu(unsure)["name"] == "AMD Radeon Series", _pick_gpu(unsure)
+        assert _pick_gpu([]) is None
+
+        # Only shims: there is no GPU here, and the reason names them
+        # rather than implying the machine was never looked at.
+        plan = choose_variant(manifest, gpus=[g14[0]], env=env, **win)
+        assert plan["variant"] is None, plan
+        assert "Parsec Virtual Display Adapter" in plan["reason"], plan
+        assert "virtual" in plan["reason"], plan
+
+        # An unrecognisable GPU is not guessed at, and the message has to
+        # tell a person what that means for them and what they can do about
+        # it. The old one read "the pin's first-run policy has no GPU engine
+        # for a unknown GPU, so the CPU build stays", which names an
+        # internal document, says nothing actionable, and is not English.
         plan = choose_variant(manifest, gpus=[{"name": "S3 ViRGE", "vendor": "unknown",
                                                "vram_bytes": 1}], env=env, **win)
         assert plan["variant"] is None, plan
+        assert "S3 ViRGE" in plan["reason"], plan
+        assert ENV_ENGINE in plan["reason"], plan
+        assert "a unknown GPU" not in plan["reason"], plan
+        assert "first-run policy" not in plan["reason"], plan
+        # A GPU Hearth CAN identify but the pin has no build for reads
+        # differently: that is the pin's limit, not a detection failure.
+        no_build = json.loads(json.dumps(manifest))
+        no_build["policy"]["first_run_gpu_fetch"] = {"nvidia": "win-vulkan-x64"}
+        plan = choose_variant(no_build, gpus=g14, env=env, **win)
+        assert plan["variant"] is None, plan
+        assert "no GPU engine for AMD graphics" in plan["reason"], plan
+        # No sentence a user reads picks an article from an internal
+        # constant. "a amd GPU" shipped once; it does not ship again.
+        for bad in (" a amd ", " a intel ", " a unknown ", " a nvidia "):
+            for probe_gpus in (g14, [g14[0]], hybrid):
+                r = choose_variant(manifest, gpus=probe_gpus, env=env,
+                                   nvidia=_nvidia((8, 9)), **win)["reason"]
+                assert bad not in " " + r + " ", (bad, r)
 
         # A pin with no policy at all does not crash and does not invent one.
         empty = json.loads(json.dumps(manifest))
