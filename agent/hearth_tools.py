@@ -1008,11 +1008,25 @@ def tool_git_status(args, workspace):
     """Show git status of the run workspace. Read-only.
 
     Runs via argv (see _run_git_argv), never a shell string, and scoped to
-    the run workspace (not HEARTH_REPO)."""
+    the run workspace (not HEARTH_REPO).
+
+    The trailing `-- .` pathspec is what makes "scoped to the run workspace"
+    true rather than aspirational. git discovers a repository by walking UP
+    from the working directory, so a workspace that merely sits inside one
+    gets that whole repository's status. Measured, not imagined: on a machine
+    whose home directory is itself a git repo, a workspace under it came back
+    as the home repo's branch plus a page of entries like
+    `?? ../../../../.ssh/`, which is both useless to the run and a list of
+    the user's files handed to a model that asked about its own workspace.
+    The pathspec limits the report to the workspace subtree, which is what
+    every caller already believed this returned; a workspace that IS a repo,
+    or that is a subdirectory of one the user deliberately pointed at, still
+    reports its own contents exactly as before."""
     git = shutil.which("git")
     if not git:
         return "git is not installed or not on PATH"
-    rc, out, err = _run_git_argv([git, "status", "--short", "--branch"], workspace, timeout=60)
+    rc, out, err = _run_git_argv([git, "status", "--short", "--branch", "--", "."],
+                                 workspace, timeout=60)
     if rc != 0:
         # Return code is checked, not masked: a git failure (not a repo, a
         # corrupt index, etc.) is reported as an error rather than silently
@@ -1031,8 +1045,12 @@ def tool_git_diff(args, workspace):
     if not git:
         return "git is not installed or not on PATH"
     argv = [git, "diff", "--stat"]
-    if args.get("path"):
-        argv += ["--", args["path"]]
+    # `-- .` for the same reason as tool_git_status: without a pathspec, git
+    # diffs the whole repository it discovered by walking up from the
+    # workspace, not the workspace. An explicit path is already a pathspec
+    # and is left exactly as the caller typed it, which is the property the
+    # RCE regression test below pins.
+    argv += ["--", args["path"]] if args.get("path") else ["--", "."]
     rc, out, err = _run_git_argv(argv, workspace, timeout=60)
     if rc != 0:
         # Return code is checked, not masked: a git failure is reported as
@@ -1965,12 +1983,31 @@ def _self_test():
     _specs = ollama_tool_specs(WINDOWS_TOOLS)
     assert len(_specs) == len(WINDOWS_TOOLS), len(_specs)
 
-    # git tools read the run workspace, not HEARTH_REPO.
+    # git tools read the run workspace, not HEARTH_REPO, and never report on
+    # a repository that merely CONTAINS the workspace.
+    #
+    # This used to assert "not a git repository", which is a claim about the
+    # machine rather than about the code: it holds only where the temp
+    # directory happens not to sit under any repo. On a machine whose home
+    # directory is a git repo - real, and how this was found - git walked up,
+    # found it, and returned that repo's whole working tree as
+    # `?? ../../../../<user's files>`. The assertion below is the property
+    # actually being claimed, and it is true on every machine: whatever git
+    # reports, it names nothing outside the workspace.
     _ws6 = os.path.realpath(_tempfile.mkdtemp(prefix="hearth-git-"))
     try:
         r = tool_git_status({}, _ws6)
         assert "/home/operator" not in r, r
-        assert "not a git repository" in r.lower() or "git is not installed" in r.lower(), r
+        # The leading `## branch...upstream` line is git's own header, not a
+        # path (and it legitimately contains "..."). Every other line of
+        # --short output is a path, and none of them may point outside the
+        # workspace.
+        _entries = [ln for ln in r.splitlines() if not ln.startswith("##")]
+        assert not any(".." in ln for ln in _entries), (
+            "git_status named a path outside the workspace", r)
+        d = tool_git_diff({}, _ws6)
+        assert "/home/operator" not in d, d
+        assert ".." not in d, ("git_diff named a path outside the workspace", d)
     finally:
         _shutil.rmtree(_ws6, ignore_errors=True)
 

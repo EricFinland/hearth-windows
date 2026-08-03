@@ -194,6 +194,7 @@ import uuid
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hearth_backend  # noqa: E402
 import hearth_checkpoint  # noqa: E402
+import hearth_contain  # noqa: E402
 import hearth_loop  # noqa: E402
 import hearth_paths  # noqa: E402
 import hearth_tools  # noqa: E402
@@ -1494,10 +1495,29 @@ def _run_done_command(command, workspace, token, timeout, workers, runner=None):
 
 
 def _missing_artifacts(required, workspace):
-    """Artifacts that must exist and be non-empty but do not."""
+    """Artifacts that must exist and be non-empty but do not.
+
+    Every name is resolved through the workspace containment check, never
+    joined by hand. The list arrives from HTTP config and the config parser
+    already refuses a rooted path outright (hearth_contain.is_rooted); this is
+    the second layer, so that a caller reaching run_workloop directly cannot
+    turn a completion check into a probe for which files exist elsewhere on
+    the machine. The hand-rolled join this replaces branched on
+    os.path.isabs, whose answer for "/etc/passwd" changed between Python 3.12
+    and 3.13, so the same name was checked in two different places depending
+    on the interpreter.
+
+    A name that will not resolve inside the workspace counts as missing,
+    which is the honest answer: no artifact the loop is allowed to see is
+    there, so the loop is not done.
+    """
     missing = []
     for name in required or ():
-        p = name if os.path.isabs(name) else os.path.join(workspace, name)
+        try:
+            p = hearth_contain.safe_join(workspace, name)
+        except ValueError:
+            missing.append(name)
+            continue
         try:
             if os.path.getsize(p) > 0:
                 continue
@@ -1995,6 +2015,40 @@ def _self_test():  # noqa: PLR0915 - one function on purpose, per house style
         os.makedirs(os.path.dirname(p) or d, exist_ok=True)
         with open(p, "w", encoding="utf-8") as fh:
             fh.write(text)
+
+    # === _missing_artifacts ==============================================
+    # The completion check resolves every artifact name through the workspace
+    # containment check, so it can never be turned into a probe for which
+    # files exist elsewhere on the machine. The config parsers refuse a rooted
+    # path before it gets here (hearth_contain.is_rooted); this is the layer
+    # underneath that, tested on its own because a caller can reach
+    # run_workloop() without going through parse_loop_config().
+    _art_ws = ws("artifacts")
+    write(_art_ws, "out/report.txt", "content")
+    write(_art_ws, "empty.txt", "")
+    assert _missing_artifacts(["out/report.txt"], _art_ws) == []
+    assert _missing_artifacts(["out/nope.txt"], _art_ws) == ["out/nope.txt"]
+    assert _missing_artifacts(["empty.txt"], _art_ws) == ["empty.txt"], \
+        "an existing but empty artifact is not a produced artifact"
+    assert _missing_artifacts(None, _art_ws) == []
+
+    # A rooted name is resolved INSIDE the workspace, never against the real
+    # filesystem, and reports missing because nothing is there. The control
+    # case is the point: a file that certainly exists on the host, named
+    # absolutely, must still come back missing. Before this went through
+    # safe_join the branch was os.path.isabs, whose answer for a
+    # single-leading-slash path changed in Python 3.13 - so on 3.12 this
+    # stat'ed the real file and on 3.13 it did not, from the same source.
+    _host_file = os.path.abspath(__file__)
+    assert os.path.getsize(_host_file) > 0, "the control case needs a real file"
+    _rooted = "/" + _host_file.replace("\\", "/").lstrip("/")
+    assert _missing_artifacts([_rooted], _art_ws) == [_rooted], (
+        "an absolute path to a real file outside the workspace was accepted "
+        "as a produced artifact")
+    assert _missing_artifacts([_host_file], _art_ws) == [_host_file], (
+        "a drive-qualified path to a real file outside the workspace was "
+        "accepted as a produced artifact")
+    assert _missing_artifacts(["../../etc/passwd"], _art_ws) == ["../../etc/passwd"]
 
     # === CancelToken =====================================================
     t = CancelToken()

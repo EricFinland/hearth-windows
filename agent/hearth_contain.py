@@ -428,6 +428,44 @@ def safe_join(root, path):
     return full
 
 
+def is_rooted(path):
+    r"""True when `path` names a place on the filesystem rather than a place
+    inside a workspace.
+
+    This classifies; safe_join above resolves. The two give different answers
+    for the same string on purpose, and they are not in tension:
+
+      safe_join answers "can this be made safe", for a path a TOOL asked for
+      mid-run. A leading separator is workspace-root-relative there, so
+      "/src/main.py" lands inside the workspace instead of being refused.
+      That is the documented ruling at the top of this module and every agent
+      depends on it.
+
+      is_rooted answers "did the person mean what this will do", for a path a
+      HUMAN typed into a config that the server accepts over HTTP. Somebody
+      who writes "/etc/passwd" or "C:\build\out.txt" into a required-artifacts
+      list means a location on their disk. Quietly rereading that as
+      "<workspace>/etc/passwd" is contained, and still wrong: the run would
+      then wait forever on a file the user never asked for, never sees, and
+      cannot find in the error message. Refusing it says so, at the only
+      moment anyone is still in a position to fix the typo.
+
+    Deliberately does not use os.path.isabs, which answers differently
+    depending on the interpreter: ntpath.isabs stopped treating a single
+    leading slash as absolute in Python 3.13, so a validation rule written on
+    it refused "/etc/passwd" under a 3.12 sidecar and accepted it under a 3.13
+    one, on the same machine, with the same config. A boundary that moves when
+    the runtime is upgraded is not a boundary. This answers the same on every
+    platform and every version.
+    """
+    text = (path or "").replace("\\", "/")
+    if text.startswith("/"):
+        return True  # POSIX absolute, and UNC "//host/share"
+    # A drive qualifier, absolute ("C:/x") or drive-relative ("C:x"). Both name
+    # a place on a specific volume; neither is inside a workspace.
+    return len(text) >= 2 and text[1] == ":" and text[0].isalpha()
+
+
 def is_reparse(path):
     """True for symlinks and for NTFS junctions.
 
@@ -493,6 +531,16 @@ def _self_test():
         assert safe_join(root, "") == root
         # A leading slash is treated as workspace-relative, not filesystem-absolute.
         assert safe_join(root, "/sub/a.txt") == os.path.realpath(os.path.join(root, "sub", "a.txt"))
+
+        # is_rooted classifies what safe_join resolves, and must answer the
+        # same on every platform and every Python version - see its docstring
+        # for the os.path.isabs change that made this its own function.
+        for rooted in ("/etc/passwd", "/", "\\windows\\x", "C:\\Windows\\win.ini",
+                       "c:/w/x", "C:x", "//host/share/x", "\\\\host\\share\\x"):
+            assert is_rooted(rooted) is True, rooted
+        for relative in ("out/report.txt", "a.txt", "", "sub/deep/f",
+                         "../escape", "a/../../b", "CC:/not-a-drive", "1:/x"):
+            assert is_rooted(relative) is False, relative
 
         # Traversal is refused.
         for bad in ("../evil.txt", "../../evil.txt", "sub/../../evil.txt", "sub/deep/../../../evil.txt"):

@@ -771,6 +771,17 @@ def _self_test():
                         progress_interval=0.0)
     first = q.start("acme/Model-GGUF", "m-Q4_K_M.gguf")
     second = q.start("acme/Model-GGUF", "m-Q8_0")
+    # Wait for the FIRST job to be picked up before reading the second one's
+    # queue position, because the position depends on it. Both jobs are
+    # enqueued at once, at positions 1 and 2; position 1 only belongs to the
+    # second job once the worker thread has popped the first and renumbered.
+    # The check used to snapshot immediately and so raced the worker: it saw
+    # 2 whenever the scheduler had not run the worker yet, and failed for a
+    # reason that had nothing to do with queueing. Waiting on the observable
+    # state transition is deterministic. A sleep would only make the race
+    # narrower.
+    check("the first job leaves the queue before the second is inspected",
+          wait_for(q, first["id"], (STATUS_DOWNLOADING,)) is not None)
     queued = next(j for j in q.snapshot()["downloads"] if j["id"] == second["id"])
     check("a second job waits in the queue with a visible position",
           queued["status"] == STATUS_QUEUED and queued["queue_position"] == 1, queued)

@@ -74,6 +74,7 @@ for _p in (_AGENT_DIR, _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import hearth_contain  # noqa: E402
 import hearth_swarmloop  # noqa: E402
 import hearth_workloop  # noqa: E402
 import permissions  # noqa: E402
@@ -580,7 +581,12 @@ def parse_swarm_config(raw):
             raise ConfigError("at most {} required artifacts".format(
                 MAX_REQUIRED_ARTIFACTS))
         for path in cleaned:
-            if os.path.isabs(path) or ".." in path.replace("\\", "/").split("/"):
+            # hearth_contain.is_rooted, not os.path.isabs: ntpath.isabs stopped
+            # calling a single leading slash absolute in Python 3.13, so this
+            # check refused "/etc/passwd" under a 3.12 sidecar and accepted it
+            # under a 3.14 one. The artifact list is user-supplied over HTTP,
+            # so the rule has to be the same rule on every interpreter.
+            if hearth_contain.is_rooted(path) or ".." in path.replace("\\", "/").split("/"):
                 raise ConfigError(
                     "required artifact {!r} must be a path inside the workspace"
                     .format(path))
@@ -1090,7 +1096,9 @@ def _self_test():  # noqa: PLR0915
     assert "rm_rf" in msg and "narrow" in msg, msg
     refuses("an empty manifest", lambda: parse_swarm_config({"allowed_tools": []}))
 
-    for bad in ("/etc/passwd", "C:\\Windows\\x", "../escape", "a/../../b"):
+    for bad in ("/etc/passwd", "C:\\Windows\\x", "../escape", "a/../../b",
+                "\\windows\\system32\\drivers\\etc\\hosts", "//host/share/x",
+                "C:relative"):
         refuses("artifact {!r}".format(bad),
                 lambda b=bad: parse_swarm_config({"required_artifacts": [b]}))
 

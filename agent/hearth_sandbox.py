@@ -86,6 +86,16 @@ Rejected, with the reason rather than a shrug:
   plus Hyper-V, and shares no filesystem by default. Wrong shape for a tool
   that runs a shell command every few seconds.
 
+One thing the contained levels have to survive, because it is not
+hypothetical: Hearth itself running elevated. An administrator's unfiltered
+token -- what an elevated terminal, a scheduled task with highest privileges,
+or a login over OpenSSH all hand you, as opposed to the UAC-filtered token an
+ordinary interactive logon gets -- owns every object it creates as
+BUILTIN\Administrators rather than as the user. Deny the child that group,
+which is exactly what these levels do and the only case in which doing so buys
+anything, and the child is then locked out of Hearth's own files. See
+own_created_objects() for the measurement and the fix.
+
 Standard library only; `ctypes` does all of it. Every entry point degrades to
 a plain answer off Windows, so the Linux daemon path (systemd + bwrap +
 nftables, which is a stronger sandbox than anything here) is untouched.
@@ -253,6 +263,12 @@ def _a32():
         a.SetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int,
                                           ctypes.c_void_p, wintypes.DWORD]
         a.SetTokenInformation.restype = wintypes.BOOL
+        a.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                          ctypes.c_void_p, wintypes.DWORD,
+                                          ctypes.POINTER(wintypes.DWORD)]
+        a.GetTokenInformation.restype = wintypes.BOOL
+        a.EqualSid.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        a.EqualSid.restype = wintypes.BOOL
         a.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR,
                                              ctypes.POINTER(ctypes.c_void_p)]
         a.ConvertStringSidToSidW.restype = wintypes.BOOL
@@ -291,6 +307,8 @@ TOKEN_QUERY = 0x0008
 TOKEN_ADJUST_DEFAULT = 0x0080
 DISABLE_MAX_PRIVILEGE = 0x1
 TOKEN_INTEGRITY_LEVEL = 25
+TOKEN_USER = 1
+TOKEN_OWNER = 4
 SE_GROUP_INTEGRITY = 0x20
 
 HANDLE_FLAG_INHERIT = 0x1
@@ -336,6 +354,10 @@ class _SID_AND_ATTRIBUTES(ctypes.Structure):
 
 class _TOKEN_MANDATORY_LABEL(ctypes.Structure):
     _fields_ = [("Label", _SID_AND_ATTRIBUTES)]
+
+
+class _TOKEN_OWNER(ctypes.Structure):
+    _fields_ = [("Owner", ctypes.c_void_p)]
 
 
 class _SECURITY_ATTRIBUTES(ctypes.Structure):
@@ -477,6 +499,122 @@ def build_token(level):
             k.CloseHandle(token)
             raise _win_error("SetTokenInformation(TokenIntegrityLevel)")
     return token
+
+
+# --------------------------------------------------------------------------
+# Default owner
+# --------------------------------------------------------------------------
+
+_owner_note = "not attempted"
+
+
+def _token_sid(token, info_class):
+    """(sid_pointer, backing_buffer) from a token query whose structure starts
+    with a PSID. TOKEN_USER and TOKEN_OWNER both do.
+
+    The buffer comes back with the pointer because the pointer points INTO it.
+    Drop the buffer and the SID is freed underneath the caller, which is the
+    kind of bug that works in testing and corrupts a token in production.
+    """
+    a = _a32()
+    need = wintypes.DWORD()
+    a.GetTokenInformation(token, info_class, None, 0, ctypes.byref(need))
+    if not need.value:
+        return None, None
+    buf = (ctypes.c_byte * need.value)()
+    if not a.GetTokenInformation(token, info_class, buf, need.value, ctypes.byref(need)):
+        return None, None
+    return ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p)).contents.value, buf
+
+
+def own_created_objects():
+    r"""Make objects this process creates be owned by the user rather than by
+    the Administrators group. Returns a one-line note; never raises.
+
+    This is not housekeeping, it is what makes the contained levels usable at
+    all when Hearth runs elevated. Measured, on a machine where Hearth was
+    started over OpenSSH (sshd hands an administrator the unfiltered token,
+    not the UAC-filtered one an interactive logon gets, so the process runs
+    at High integrity with Administrators enabled):
+
+      Every command a contained child ran against a file Hearth had just
+      written came back exit 1, "Access is denied." The same command at level
+      `off` worked. The child was not being denied by anything this module
+      intends: it was being denied by the file.
+
+    The chain is short. An elevated token carries SE_GROUP_OWNER on
+    BUILTIN\Administrators rather than on the user, so every object the
+    process creates is OWNED by Administrators. Windows 11's per-user
+    %LOCALAPPDATA%\Temp grants SYSTEM, Administrators and OWNER RIGHTS, and
+    carries no ACE for the user at all. The contained child holds
+    Administrators deny-only. Owner is Administrators, so OWNER RIGHTS does
+    not help it either; there is no third path, so the answer is no.
+
+    Moving the token's default owner to the user SID fixes it at the source
+    and nowhere else:
+
+      - It changes nothing about what THIS process may do. The user is a
+        member of Administrators either way; only the owner stamped on new
+        objects changes.
+      - It is a no-op on the ordinary non-elevated token, whose default owner
+        is already the user. Most runs never take the write path below.
+      - It does not weaken containment. The child still has Administrators
+        denied, so anything reachable only through the admin group is still
+        out of reach; what comes back is access to files Hearth itself wrote,
+        via the CREATOR OWNER / OWNER RIGHTS ACEs Windows' own directories
+        are built on.
+      - It is per-process. This is the same thing the "System objects:
+        Default owner for objects created by members of the Administrators
+        group" policy does machine-wide, applied to Hearth alone rather than
+        asking the user to change a security policy.
+
+    Called at import rather than from spawn(), and that is forced rather than
+    chosen: an object's owner is fixed when the object is created, and the
+    objects a contained child has to reach -- the script hearth_proc spills
+    for an over-long command, a file a tool wrote a moment ago -- exist
+    before spawn() is ever called. There is no later moment at which this
+    could work.
+    """
+    if not hearth_paths.is_windows():
+        return "not Windows: nothing to align"
+    a, k = _a32(), _k32()
+    token = wintypes.HANDLE()
+    if not a.OpenProcessToken(k.GetCurrentProcess(),
+                              TOKEN_QUERY | TOKEN_ADJUST_DEFAULT,
+                              ctypes.byref(token)):
+        return "could not open this process's token: {}".format(
+            ctypes.WinError(ctypes.get_last_error()))
+    try:
+        user_sid, _user_buf = _token_sid(token, TOKEN_USER)
+        owner_sid, _owner_buf = _token_sid(token, TOKEN_OWNER)
+        if not user_sid:
+            return "could not read this process's user SID; default owner left alone"
+        if owner_sid and a.EqualSid(owner_sid, user_sid):
+            return "not elevated: new objects are already owned by the user"
+        info = _TOKEN_OWNER()
+        info.Owner = user_sid
+        if not a.SetTokenInformation(token, TOKEN_OWNER, ctypes.byref(info),
+                                     ctypes.sizeof(info)):
+            return "could not move the default owner to the user: {}".format(
+                ctypes.WinError(ctypes.get_last_error()))
+        return ("elevated: new objects will be owned by the user rather than by "
+                "the Administrators group, so a contained command can still "
+                "read what Hearth writes")
+    finally:
+        k.CloseHandle(token)
+
+
+def owner_note():
+    """What own_created_objects() decided at import. For a doctor page: on an
+    elevated install this is the difference between every command working and
+    every command returning "Access is denied."."""
+    return _owner_note
+
+
+try:
+    _owner_note = own_created_objects()
+except Exception as _exc:  # noqa: BLE001 - importing this module must never fail
+    _owner_note = "default owner unchanged: {}: {}".format(type(_exc).__name__, _exc)
 
 
 # --------------------------------------------------------------------------
@@ -1216,6 +1354,31 @@ def _self_test(live=False):
         assert SANDBOX_INTEGRITY_SID in read_label_sddl(ws)
         unlabel_tree(ws)
         assert not is_labelled(ws), "unlabel_tree left the label behind"
+
+        # A contained child must be able to read what Hearth itself just
+        # wrote. This one spawns a real process even without --live, unlike
+        # every other process-creation check in this module, because the
+        # failure it guards is invisible on an ordinary non-elevated
+        # developer machine and total on an elevated one: with the default
+        # owner left as the Administrators group, EVERY command a contained
+        # child ran against a Hearth-written file came back "Access is
+        # denied.". A regression that only bites elevated users has to be
+        # caught by the test everybody runs, and one cmd.exe costs
+        # milliseconds, not the seconds --live exists to gate.
+        assert isinstance(owner_note(), str) and owner_note(), owner_note()
+        handoff = os.path.join(ws, "handoff.txt")
+        with open(handoff, "w", encoding="utf-8") as fh:
+            fh.write("HANDOFF-CANARY")
+        proc = spawn('{} /d /s /c type "{}"'.format(
+            os.environ.get("COMSPEC") or "cmd.exe", handoff),
+            ws, dict(os.environ), "limits")
+        seen, seen_err = proc.communicate()
+        assert "HANDOFF-CANARY" in seen, (
+            "a contained child could not read a file Hearth had just written: "
+            "{!r} / {!r}. The usual cause is this process running elevated, "
+            "whose token owns new objects as the Administrators group while "
+            "the child holds that group deny-only. See own_created_objects()."
+            .format(seen, seen_err))
 
         if live:
             _live_checks(ws)

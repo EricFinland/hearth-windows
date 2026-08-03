@@ -29,6 +29,30 @@ SIGNALS, AND WHICH ONES ARE HONEST.
   discipline, same encoding="utf-8", errors="replace" safety, same "any
   failure at all becomes no data, never an exception").
 
+  On a machine with no NVIDIA card there is no such reading at all, and
+  that is most laptops: AMD or Intel integrated graphics, a non-NVIDIA
+  discrete card, a headless box with no GPU. nvidia-smi is the only GPU
+  query available here, so on those machines this signal is absent, and
+  absence is deliberately not converted into either answer. It is not
+  "the GPU is free" and it is not "the GPU is busy". The permissive
+  contract at the bottom of this docstring already resolves that
+  correctly - work proceeds, because only positive evidence refuses - but
+  a caller reading state=idle would otherwise be entitled to think the
+  GPU had been checked and found free, so probe() carries an explicit
+  gpu_signal_note saying it was not checked, and _classify puts that note
+  in the reason it hands back. Saying which signals were unavailable is
+  the same discipline this module already applies to Linux input
+  idleness; there is no reason GPU contention should get a quieter
+  failure than that one.
+
+  What contention even means also changes on those machines, and the
+  change is in the honest direction. An integrated GPU has no separate
+  VRAM pool - it carves out of system RAM - so a neighbour saturating it
+  shows up as system memory pressure and CPU-side scheduling delay,
+  budgets Hearth's model sizing already works against, rather than as a
+  hidden second resource this module is the only place that could have
+  seen.
+
   This was wrong in an earlier version of this module, in two ways found
   by testing against real machines rather than by inspection, and both are
   worth recording because the fix depends on understanding why they broke:
@@ -452,6 +476,34 @@ def _run_bounded(cmd, timeout=GPU_SUBPROCESS_TIMEOUT):
     return proc.stdout
 
 
+def _nvidia_smi():
+    """Path to nvidia-smi, or None when this machine has no NVIDIA GPU query.
+
+    Pulled out of _gpu_contention so the self-test can drive the parsing and
+    the ownership arithmetic on any machine. It used to call shutil.which
+    inline and return before a stubbed _run_bounded was ever consulted, which
+    made every one of the regression fixtures below silently dead code on a
+    machine without an NVIDIA card - the fixtures pinning two bugs that had
+    each already shipped once. A regression test that only runs on the
+    hardware where the bug did not happen is not a regression test.
+    """
+    return shutil.which("nvidia-smi")
+
+
+def _gpu_signal_note(available):
+    """One sentence about why there is no GPU contention reading, or "" when
+    there is one. See the module docstring's GPU contention section."""
+    if available:
+        return ""
+    if _nvidia_smi():
+        return ("nvidia-smi is installed but did not answer, so GPU contention "
+                "was not checked")
+    return ("no queryable GPU on this machine (nvidia-smi is the only GPU query "
+            "available here), so GPU contention was not checked; on integrated "
+            "graphics it would show up as system memory pressure anyway, which "
+            "is a different budget")
+
+
 def _own_resident_vram_bytes(policy=None):
     """Total bytes of VRAM Hearth's OWN inference stack currently holds.
 
@@ -510,7 +562,7 @@ def _gpu_contention(policy):
     across every GPU nvidia-smi lists: one contended card is enough reason
     to stay out of the way even if a second card is idle.
     """
-    exe = shutil.which("nvidia-smi")
+    exe = _nvidia_smi()
     if not exe:
         return None, None, None, False
     out = _run_bounded([
@@ -573,6 +625,14 @@ def _gpu_contention(policy):
 # signals and never touch the real machine.
 # ---------------------------------------------------------------------------
 
+def _note_unchecked_gpu(signals, reasons):
+    """Append the "GPU was not checked" note, when there is one, to a verdict
+    that is letting work proceed. Not appended to a busy verdict: something
+    else already said no, and the missing signal cannot change that."""
+    if not signals.get("gpu_signal_available") and signals.get("gpu_signal_note"):
+        reasons.append(signals["gpu_signal_note"])
+
+
 def _classify(signals, policy):
     """(state, confidence, reasons) from one instantaneous signals reading.
 
@@ -617,6 +677,7 @@ def _classify(signals, policy):
                     "confidence lowered".format(signals["cpu_load_frac"])
                 )
                 confidence = "medium"
+            _note_unchecked_gpu(signals, reasons)
             return STATE_IDLE, confidence, reasons
         reasons.append(
             "input idle {:.0f}s, between the {:.0f}s active and {:.0f}s idle thresholds"
@@ -627,6 +688,7 @@ def _classify(signals, policy):
     reasons.append("no idleness signal available on this platform ({})".format(signals.get("platform")))
     if signals.get("gpu_signal_available") and signals.get("gpu_busy") is False:
         reasons.append("GPU currently idle")
+    _note_unchecked_gpu(signals, reasons)
     if signals.get("power_signal_available") and signals.get("on_battery") is False:
         reasons.append("on AC power")
     return STATE_UNKNOWN, "low", reasons
@@ -658,6 +720,7 @@ def probe(policy=None):
         "gpu_util_percent": gpu_util,
         "gpu_other_mem_percent": gpu_other_mem_pct,
         "gpu_signal_available": gpu_available,
+        "gpu_signal_note": _gpu_signal_note(gpu_available),
         "fullscreen_foreground": fullscreen,
         "fullscreen_signal_available": fullscreen_available,
         "on_battery": on_battery,
@@ -800,6 +863,7 @@ def _make_raw(state, confidence="high", reason="synthetic", **signal_overrides):
         "gpu_util_percent": None,
         "gpu_other_mem_percent": None,
         "gpu_signal_available": False,
+        "gpu_signal_note": "",
         "fullscreen_foreground": None,
         "fullscreen_signal_available": False,
         "on_battery": None,
@@ -879,7 +943,14 @@ def _self_test():
     # so it is deterministic on a machine with neither.
     old_run_bounded = globals()["_run_bounded"]
     old_own_resident = globals()["_own_resident_vram_bytes"]
+    old_nvidia_smi = globals()["_nvidia_smi"]
     try:
+        # Pretend nvidia-smi exists. Without this every fixture below is dead
+        # code on a machine that has no NVIDIA card: _gpu_contention returned
+        # at the lookup before the stubbed _run_bounded was ever called, so
+        # the whole block asserted nothing there and the two shipped bugs it
+        # pins were unguarded on exactly the hardware most laptops have.
+        globals()["_nvidia_smi"] = lambda: "nvidia-smi"
         # Regression fixture for finding 1: a genuinely idle Windows
         # desktop - 0% utilization, ~10% VRAM resident from the compositor's
         # framebuffer alone. This is the exact reading a coordinator review
@@ -1018,9 +1089,48 @@ def _self_test():
 
         assert _own_resident_vram_bytes(
             dataclasses.replace(DEFAULT_POLICY, backend=_WeirdBackend())) == (None, False)
+        # No queryable GPU: unavailable, and specifically NOT reported as an
+        # idle GPU. Absence of the signal must not become evidence in either
+        # direction, and the verdict must say the GPU was not checked instead
+        # of leaving a reader to assume it was.
+        globals()["_nvidia_smi"] = lambda: None
+        assert _gpu_contention(DEFAULT_POLICY) == (None, None, None, False), \
+            _gpu_contention(DEFAULT_POLICY)
+        no_gpu_note = _gpu_signal_note(False)
+        assert no_gpu_note and "not checked" in no_gpu_note, no_gpu_note
+        assert _gpu_signal_note(True) == "", _gpu_signal_note(True)
+
+        idle_no_gpu = {
+            "fullscreen_foreground": False, "on_battery": False, "gpu_busy": None,
+            "gpu_signal_available": False, "gpu_signal_note": no_gpu_note,
+            "input_idle_available": True, "input_idle_seconds": 600.0,
+            "platform": "Windows",
+        }
+        s, c, r = _classify(idle_no_gpu, DEFAULT_POLICY)
+        assert s == STATE_IDLE, (s, c, r)
+        assert any("not checked" in x for x in r), r
+        assert not any("GPU currently idle" in x for x in r), r
+
+        nothing_at_all = {
+            "fullscreen_foreground": None, "on_battery": None, "gpu_busy": None,
+            "input_idle_available": False, "gpu_signal_available": False,
+            "gpu_signal_note": no_gpu_note, "power_signal_available": False,
+            "platform": "Linux",
+        }
+        s, c, r = _classify(nothing_at_all, DEFAULT_POLICY)
+        assert s == STATE_UNKNOWN and c == "low", (s, c, r)
+        assert any("not checked" in x for x in r), r
+
+        # A busy verdict does not collect the note: something else already
+        # said no, and a missing signal cannot argue with it.
+        s, c, r = _classify(
+            dict(idle_no_gpu, fullscreen_foreground=True), DEFAULT_POLICY)
+        assert s == STATE_BUSY, (s, c, r)
+        assert not any("not checked" in x for x in r), r
     finally:
         globals()["_run_bounded"] = old_run_bounded
         globals()["_own_resident_vram_bytes"] = old_own_resident
+        globals()["_nvidia_smi"] = old_nvidia_smi
 
     # -- IdleTracker: fake clock, synthetic raw samples only -----------------
     clock = {"t": 0.0}
@@ -1116,6 +1226,9 @@ def _self_test():
     assert real["confidence"] in ("high", "medium", "low"), real
     assert isinstance(real["reason"], str) and real["reason"], real
     assert isinstance(real["signals"], dict), real
+    assert isinstance(real["signals"]["gpu_signal_note"], str), real
+    assert bool(real["signals"]["gpu_signal_note"]) is not bool(
+        real["signals"]["gpu_signal_available"]), real
     encoded = json.dumps(real)
     assert json.loads(encoded) == real
 
