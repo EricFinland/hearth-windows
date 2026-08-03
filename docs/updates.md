@@ -17,11 +17,21 @@ cannot produce a signature.
 That is the whole of the trust model, and it is deliberately independent of
 code signing, which does not exist yet.
 
-## Why not electron-updater
+## Why not an off-the-shelf updater
 
-electron-builder ships `electron-updater`, with `latest.yml` and publish
-providers, and it is the obvious choice. It was read and rejected, for reasons
-specific to where Hearth actually is:
+Every desktop toolchain ships one. electron-builder had `electron-updater`,
+with `latest.yml` and publish providers; Tauri has `tauri-plugin-updater`,
+with its own signing key and its own endpoint list. Both were read and
+neither is used. The Electron one is set out below because it is the one that
+was evaluated in depth, and the Tauri plugin lands in the same place for the
+first reason and adds a second: it is a plugin, and a plugin is a thing the
+renderer can be granted permission to call. The whole design here is that the
+code which decides whether bytes are trustworthy is not the code that can act
+on it, and a capability entry away from being callable from the page is too
+close.
+
+electron-updater was rejected for reasons specific to where Hearth actually
+is:
 
 * **Its integrity check is self-referential on an unsigned app.** On Windows it
   compares the downloaded installer against a `sha512` it read out of
@@ -83,8 +93,8 @@ evaluation, and its own self-test scans its source to keep it that way.
 
 ## Who runs the installer
 
-The desktop shell (`desktop/shell/main.js`), and only after three checks of its
-own:
+The desktop shell (`desktop/tauri/src/update.rs`), and only after three checks
+of its own:
 
 * the path must be inside the staging directory, which the shell derives itself
   from the same rule `agent/hearth_paths.py` uses rather than believing the path
@@ -94,10 +104,13 @@ own:
   the user takes to click, and any process running as that user can overwrite it
   in that window. Hashing immediately before the spawn narrows the window to one
   syscall;
-* the version must be strictly greater than `app.getVersion()`, which comes out
-  of the asar, which `EnableEmbeddedAsarIntegrityValidation` makes
-  tamper-evident. Downgrade protection that only lived in the sidecar could be
-  undone by editing a file next to it.
+* the version must be strictly greater than the running one, which comes out
+  of the executable's own resource block, written there by `tauri-build` at
+  compile time. Under Electron that value came out of the asar and a fuse made
+  the asar tamper-evident; this is the stronger form of the same answer,
+  because there is no separate archive beside the binary to edit at all.
+  Downgrade protection that only lived in the sidecar could be undone by
+  editing a file next to it.
 
 Then the user is shown the version and the full SHA-256 in a native dialog and
 asked. Only a yes spawns the installer, detached, with NSIS's `/S`; Hearth quits
@@ -152,9 +165,13 @@ Authenticode protects the *execution*. They fail differently and that is the
 point of having both.
 
 One thing that must not be forgotten when the certificate arrives:
-`desktop/shell/verify-fuses.js` explains why a build with `RunAsNode` enabled
-must never be signed. The fuse check is a hard build failure and it applies to
-every build the updater ships, not only the first one.
+`scripts/verify_binary.py` sets out what a build must not have in it before it
+is signed. Under Electron that was seven fuses, five of which restrained a
+JavaScript runtime this binary no longer contains. What remains is smaller and
+still real: no inspector compiled in, no interpretable code on disk beside the
+executable, and the code that disowns WebView2's environment present in the
+shipped bytes. It is a hard build failure and it applies to every build the
+updater ships, not only the first one.
 
 ## Nothing has been published
 
@@ -233,7 +250,7 @@ contains no signing code and no path to a key.
 | `agent/hearth_ed25519.py` | Ed25519, standard library only. Checked against the RFC 8032 vectors and against OpenSSL. |
 | `agent/hearth_update.py` | fetch, verify, refuse, stage. Cannot execute anything. |
 | `scripts/release_manifest.py` | the operator's tool. Not shipped. |
-| `desktop/shell/main.js` | the only code that runs an installer. |
+| `desktop/tauri/src/update.rs` | the only code that runs an installer. |
 | `desktop/ui/js/update.js` | the Updates panel. |
 | `GET /update`, `POST /update`, `GET /update/events` | the sidecar's surface. |
 | `%LOCALAPPDATA%\Hearth\update\` | the persisted floor, the settings, and staged installers. |

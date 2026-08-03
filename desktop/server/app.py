@@ -1323,7 +1323,7 @@ class SidecarHandler(BaseHTTPRequestHandler):
         agent/hearth_update.py is that the code which decides whether bytes
         are trustworthy cannot also run them. The shell reads the verified
         receipt off GET /update, re-hashes the file itself, and spawns it --
-        see desktop/shell/main.js.
+        see desktop/tauri/src/update.rs.
 
         Every action returns immediately with the current snapshot. A check
         and a download both happen on the updater's own thread, so neither
@@ -3575,19 +3575,23 @@ def _self_test():
             shutil.rmtree(loop_tmp, ignore_errors=True)
 
         # === the four route allowlists agree ==========================
-        # This router's table is duplicated, by necessity, in three
-        # JavaScript files: the client (desktop/ui/js/api.js) and two
-        # same-origin proxies (desktop/ui/dev-host.mjs and the packaged
-        # shell's desktop/shell/origin.js), each of which refuses anything
-        # not on its list so that a typo cannot become an open forwarder.
+        # This router's table is duplicated, by necessity, in three other
+        # places: the client (desktop/ui/js/api.js), the browser dev host
+        # (desktop/ui/dev-host.mjs) and the packaged shell's reverse proxy
+        # (desktop/tauri/src/origin.rs), each of which refuses anything not
+        # on its list so that a typo cannot become an open forwarder.
         # A route added here and missed there is invisible in every Python
         # test and produces a 404 only in the packaged application. Caught
         # exactly that way once, with GET /engine, which is why this exists.
+        #
+        # The shell's copy is Rust rather than JavaScript since the Tauri
+        # port, so the reader below takes the marker as an argument. The
+        # cost of getting this wrong did not change with the language.
         import re as _re
 
         here = os.path.dirname(os.path.abspath(__file__))
         ui_dir = os.path.join(os.path.dirname(here), "ui")
-        shell_dir = os.path.join(os.path.dirname(here), "shell")
+        shell_dir = os.path.join(os.path.dirname(here), "tauri", "src")
         # Read out of the routing methods themselves, so a route that is
         # added and not listed cannot be missed by a stale literal here.
         # Both dispatch spellings count: `path == "/x"` and `path in (...)`.
@@ -3599,18 +3603,20 @@ def _self_test():
         served = set(_re.findall(r'"(/[a-z/]+)"', _dispatch))
         assert {"/engine", "/engine/events", "/setup", "/downloads/cancel"} <= served, served
 
-        def _js_routes(path):
+        def _listed_routes(path, marker, closer):
             text = open(path, encoding="utf-8").read()
-            marker = "SIDECAR_ROUTES = new Set(["
             start = text.index(marker) + len(marker)
-            return set(_re.findall(r'"([^"]+)"', text[start:text.index("]);", start)]))
+            return set(_re.findall(r'"([^"]+)"', text[start:text.index(closer, start)]))
 
-        for rel in (os.path.join(ui_dir, "js", "api.js"),
-                    os.path.join(ui_dir, "dev-host.mjs"),
-                    os.path.join(shell_dir, "origin.js")):
+        _JS = ("SIDECAR_ROUTES = new Set([", "]);")
+        _RUST = ("SIDECAR_ROUTES: &[&str] = &[", "];")
+        for rel, (marker, closer) in (
+                (os.path.join(ui_dir, "js", "api.js"), _JS),
+                (os.path.join(ui_dir, "dev-host.mjs"), _JS),
+                (os.path.join(shell_dir, "origin.rs"), _RUST)):
             if not os.path.isfile(rel):
                 continue  # a packaged payload does not carry the dev host
-            listed = _js_routes(rel)
+            listed = _listed_routes(rel, marker, closer)
             missing = served - listed
             extra = listed - served
             assert not missing, ("{} does not allow {}, so the packaged app "

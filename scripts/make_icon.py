@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Draw Hearth's application icon and write desktop/shell/build/icon.ico.
+"""Draw Hearth's application icon and write desktop/tauri/icons/icon.ico.
 
 The .ico is committed, because a build should not depend on regenerating
 artwork. This script is committed with it so the artwork is source rather
@@ -18,7 +18,7 @@ rendered separately at its own resolution rather than scaled from one
 bitmap. Each is drawn at 4x and box-filtered down, which is what keeps the
 16 px version from turning into four brown pixels.
 
-    python scripts/make_icon.py            write desktop/shell/build/icon.ico
+    python scripts/make_icon.py            write desktop/tauri/icons/icon.ico
     python scripts/make_icon.py --self-test
 """
 
@@ -30,7 +30,7 @@ import sys
 import zlib
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ICON_PATH = os.path.join(REPO_ROOT, "desktop", "shell", "build", "icon.ico")
+ICON_PATH = os.path.join(REPO_ROOT, "desktop", "tauri", "icons", "icon.ico")
 
 #: Sizes Windows actually asks for. 256 is the one the installer and the
 #: Alt-Tab switcher use, and it is stored as a PNG inside the ICO (the

@@ -39,8 +39,8 @@ referenced because they are the whole design.
      _self_test asserts it by scanning this file's own source for the names
      that would allow any of those, so the property survives an edit by
      somebody who did not read this paragraph. Launching the verified installer is the
-     desktop shell's job (desktop/shell/main.js), which re-hashes the file
-     immediately before spawning it -- see "the handoff" below.
+     desktop shell's job (desktop/tauri/src/update.rs), which re-hashes the
+     file immediately before spawning it -- see "the handoff" below.
 
   4. DOWNGRADE IS AN ATTACK, NOT AN EDGE CASE. An attacker who can serve
      files can serve a genuinely, validly signed OLD release with a known
@@ -187,13 +187,14 @@ import hearth_paths  # noqa: E402
 # --------------------------------------------------------------------------
 
 #: The installed application root. agent/ sits directly under it in both a
-#: checkout and the packaged payload (see desktop/shell/main.js's layout
+#: checkout and the packaged payload (see desktop/tauri/src/main.rs's layout
 #: note), so this resolves the same way in both.
 ENV_APP_ROOT = "HEARTH_APP_ROOT"
 
 #: The running application's version, handed down by the shell, which reads
-#: it from the asar. Authoritative when present precisely because the asar is
-#: integrity-checked and a file in the payload is not.
+#: it out of its own executable's resource block. Authoritative when present
+#: precisely because that value was written into the binary at compile time
+#: and a file in the payload is not.
 ENV_VERSION = "HEARTH_APP_VERSION"
 
 #: Point the updater at a different feed. For the local test harness, and for
@@ -374,15 +375,17 @@ def current_version(env=None):
 
     Three sources, most trustworthy first:
 
-      1. HEARTH_APP_VERSION, set by the shell from app.getVersion(). That
-         value comes out of the asar, whose contents Electron's embedded
-         integrity validation makes tamper-evident.
+      1. HEARTH_APP_VERSION, set by the shell from its own package info.
+         That value is compiled into the executable by tauri-build, so unlike
+         a file in the install directory there is nothing beside the binary
+         to edit.
       2. release/version.json in the payload, written at build time. A plain
          file in the install directory, so a local attacker who can write
          there can lower it -- which is exactly why the persisted floor below
          exists and why the shell checks the version again before spawning.
-      3. desktop/shell/package.json, so a development checkout that was never
-         packaged still reports the truth.
+      3. desktop/tauri/tauri.conf.json, so a development checkout that was
+         never packaged still reports the truth. It is also the file the
+         other two are generated from, which is why there is no fourth.
 
     None means "unknown", and unknown disables updating rather than defaulting
     to 0.0.0. A default of zero would make every release look like an upgrade,
@@ -393,8 +396,8 @@ def current_version(env=None):
     if parse_version(raw):
         return raw
     for path, key in ((os.path.join(app_root(env), VERSION_SUBPATH), "version"),
-                      (os.path.join(app_root(env), "desktop", "shell",
-                                    "package.json"), "version")):
+                      (os.path.join(app_root(env), "desktop", "tauri",
+                                    "tauri.conf.json"), "version")):
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)

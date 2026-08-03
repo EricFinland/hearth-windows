@@ -185,7 +185,7 @@ export class Sidecar {
    *
    *  There is deliberately no install() here. Nothing in this UI, and nothing
    *  in the sidecar, launches an installer: the shell does that, after
-   *  re-hashing the staged file itself. See desktop/shell/main.js. */
+   *  re-hashing the staged file itself. See desktop/tauri/src/update.rs. */
   update()                 { return this.request("GET", "/update"); }
   checkForUpdate(force = true) { return this.request("POST", "/update", { action: "check", force }); }
   downloadUpdate()         { return this.request("POST", "/update", { action: "download" }); }

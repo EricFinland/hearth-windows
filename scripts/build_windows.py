@@ -4,20 +4,29 @@ r"""Build the Hearth Windows installer from a clean checkout.
     python scripts/build_windows.py
 
 That is the whole command. It fetches and verifies everything the installer
-needs, stages the payload, installs the packaging toolchain, runs
-electron-builder, and prints a size breakdown. From a fresh clone on a
-machine with Node and Python it needs nothing else.
+needs, regenerates and checks the third-party notices, stages the payload,
+compiles the shell, runs the bundler, reads the result back out of the
+executable, and prints a size breakdown. From a fresh clone on a machine
+with Rust and Python it needs nothing else.
 
 What it needs on the build machine
 ----------------------------------
-    Node.js and npm      only to run electron-builder and to be the shell
+    Rust (cargo) 1.82+   to compile the shell
+    cargo-tauri          the bundler; `cargo install tauri-cli --locked`
     Python 3.11+         to run this script and the two vendor scripts
-    network              first run only, to fetch llama-server, CPython and
-                         the Electron runtime; --offline afterwards
+    network              first run only, to fetch llama-server and CPython;
+                         --offline afterwards
 
-Nothing on the TARGET machine. That is the point of the exercise: the
-installer carries its own Python, its own inference engine and its own
-browser runtime.
+Nothing on the TARGET machine except the WebView2 runtime, which every
+supported Windows already ships and which the installer fetches if a machine
+somehow does not have it. That is the point of the exercise: the installer
+carries its own Python and its own inference engine, and borrows the browser
+engine that is already there.
+
+Node is no longer required, on either machine. The shell was Electron until
+this port, and an Electron runtime is 364 MB of Chromium, Node and V8 next
+to a 70 MB payload -- 84% of an install, to draw a window and start a
+subprocess. See docs/packaging-windows.md for the measurements.
 
 The steps, and why each one is here
 -----------------------------------
@@ -29,18 +38,25 @@ The steps, and why each one is here
   2. vendor CPython        scripts/vendor_python.py, same discipline, from
                            vendor/python_manifest.json. See that file for
                            why the embeddable package rather than a freezer.
-  3. stage the payload     build/stage/, laid out so that
+  3. check the notices     scripts/third_party_notices.py --check, run here
+                           because this is the moment the versions it
+                           describes are on disk and about to be packaged.
+  4. stage the payload     build/stage/, laid out so that
                            agent/hearth_llama.app_root() finds
                            vendor/llama/llama-server.exe with no
-                           packaging-specific code in the agent.
-  4. npm install           the packaging layer, and only the packaging
-                           layer: electron and electron-builder. desktop/ui/
-                           has no dependencies and no build step, and step 3
-                           copies it verbatim.
-  5. electron-builder      produces build/dist/Hearth-Setup-<version>.exe
+                           packaging-specific code in the agent, and
+                           carrying the licence texts the installed
+                           application has to be able to show.
+  5. build                 cargo tauri build, from desktop/tauri/. Compiles
+                           the shell, links desktop/ui/ into it, and produces
+                           an NSIS installer, which is copied to
+                           build/dist/Hearth-Setup-<version>.exe
+  6. verify the binary     scripts/verify_binary.py, which reads back out of
+                           the shipped executable the things step 5 asked
+                           for. Replaces desktop/shell/verify-fuses.js.
 
 Nothing under build/ is committed, and neither is anything under vendor/
-except the two manifests.
+except the two manifests and vendor/licenses/.
 
 The installer is UNSIGNED. See docs/packaging-windows.md for exactly what a
 user sees the first time they run it, which is a full-screen SmartScreen
@@ -61,25 +77,54 @@ sys.path.insert(0, SCRIPTS_DIR)
 
 import vendor_llama  # noqa: E402
 import vendor_python  # noqa: E402
+import verify_binary  # noqa: E402
 
 BUILD_DIR = os.path.join(REPO_ROOT, "build")
 STAGE_DIR = os.path.join(BUILD_DIR, "stage")
 DIST_DIR = os.path.join(BUILD_DIR, "dist")
-SHELL_DIR = os.path.join(REPO_ROOT, "desktop", "shell")
+TAURI_DIR = os.path.join(REPO_ROOT, "desktop", "tauri")
+TAURI_CONFIG = os.path.join(TAURI_DIR, "tauri.conf.json")
+
+#: Out of the crate directory, so a `cargo clean` in a checkout does not have
+#: to know about it and nothing a build writes lands under desktop/.
+#: desktop/tauri/tauri.conf.json's frontendDist points into build/ for the
+#: same reason.
+CARGO_TARGET_DIR = os.path.join(BUILD_DIR, "cargo-target")
+RELEASE_DIR = os.path.join(CARGO_TARGET_DIR, "release")
+BUNDLE_DIR = os.path.join(RELEASE_DIR, "bundle", "nsis")
+
+#: The UI tree that gets linked INTO the executable. Assembled by
+#: desktop/tauri/build.rs and named by frontendDist in tauri.conf.json; the
+#: three of them have to agree.
+UI_EMBED = os.path.join(BUILD_DIR, "ui-embed")
 
 #: Copied into the payload verbatim. Source path relative to the repo root,
 #: destination relative to build/stage/hearth.
+#:
+#: desktop/ui is deliberately NOT here. It used to be, because Electron's
+#: main process read index.html off disk; the Tauri shell has it linked into
+#: the executable instead, and staging a second copy next to the executable
+#: would put the application's own code back on disk where anything running
+#: as the user could rewrite it. scripts/verify_binary.py fails the build if
+#: it reappears.
 PAYLOAD_TREES = (
     ("agent", "agent"),
     (os.path.join("desktop", "server"), os.path.join("desktop", "server")),
-    (os.path.join("desktop", "ui"), "ui"),
 )
+
+#: The licence texts the installed application has to carry, copied into the
+#: payload so they land inside the install rather than only in the repo.
+#: See docs/licensing.md. verify_stage() refuses to build without them.
+LICENCE_FILES = ("LICENSE", "NOTICE", "THIRD-PARTY-NOTICES.md")
+LICENCE_TREE = os.path.join("vendor", "licenses")
 
 #: Never staged. __pycache__ is build residue from whatever interpreter last
 #: ran here and would ship stale bytecode compiled by a different Python.
 #: dev-host.mjs and the xss-check pages are development tools: the shell
 #: replaces the first and the second is a test harness, and neither belongs
-#: in an installed application.
+#: in an installed application. Kept in step with excluded() in
+#: desktop/tauri/build.rs, which applies the same rule to the UI tree that
+#: gets linked into the executable.
 EXCLUDE_NAMES = frozenset({"__pycache__", "dev-host.mjs"})
 EXCLUDE_PREFIXES = ("xss-check.",)
 
@@ -108,12 +153,24 @@ def mb(n):
     return "{:7.1f} MB".format(n / 1e6)
 
 
-def run(argv, cwd, label):
+def app_version():
+    """The version this build is, read from the one place that decides it.
+
+    tauri-build compiles this value into the executable's resource block and
+    app.package_info().version reads it back, which is what the updater's
+    downgrade check compares against. There is no second copy to drift.
+    """
+    with open(TAURI_CONFIG, "r", encoding="utf-8") as fh:
+        return json.load(fh)["version"]
+
+
+def run(argv, cwd, label, env=None):
     """Run a build command, streaming its output. Raises on failure."""
     print("\n$ {}  (in {})".format(" ".join(argv), os.path.relpath(cwd, REPO_ROOT) or "."))
     started = time.monotonic()
-    # shell=True on Windows so npm/npx resolve through their .cmd shims.
-    completed = subprocess.run(argv, cwd=cwd, shell=(os.name == "nt"))
+    # shell=True on Windows so cargo's shims resolve the same way they do at
+    # a prompt.
+    completed = subprocess.run(argv, cwd=cwd, shell=(os.name == "nt"), env=env)
     if completed.returncode != 0:
         raise SystemExit("{} failed with exit code {}".format(label, completed.returncode))
     print("  {} took {:.1f}s".format(label, time.monotonic() - started))
@@ -128,23 +185,45 @@ def tool_version(argv):
 
 
 def preflight():
-    node = tool_version(["node", "--version"])
-    npm = tool_version(["npm", "--version"])
+    cargo = tool_version(["cargo", "--version"])
+    tauri = tool_version(["cargo", "tauri", "--version"])
     missing = []
-    if not node:
-        missing.append("node")
-    if not npm:
-        missing.append("npm")
+    if not cargo:
+        missing.append("cargo (install Rust from https://rustup.rs)")
+    if not tauri:
+        missing.append("cargo-tauri (cargo install tauri-cli --locked)")
     if missing:
         raise SystemExit(
-            "missing build tools: {}\nInstall Node.js (which brings npm) and try "
-            "again. Nothing else is needed; the installer ships its own "
-            "Python.".format(", ".join(missing)))
-    print("node {}   npm {}   python {}".format(node, npm, sys.version.split()[0]))
+            "missing build tools:\n  {}\nNothing else is needed; the installer "
+            "ships its own Python and borrows the WebView2 runtime Windows "
+            "already has.".format("\n  ".join(missing)))
+    print("{}   cargo-tauri {}   python {}".format(
+        cargo, tauri, sys.version.split()[0]))
     if os.name != "nt":
         print("warning: this produces a Windows installer and has only been run on "
-              "Windows. electron-builder can cross-build, but the vendored binaries "
-              "are Windows x64 and nothing here is tested off Windows.")
+              "Windows. The vendored binaries are Windows x64, the shell links "
+              "against WebView2, and nothing here is tested off Windows.")
+
+
+def check_notices():
+    """Fail the build when THIRD-PARTY-NOTICES.md no longer describes what is
+    about to be packaged.
+
+    Run here, between vendoring and staging, because this is the one moment
+    when the versions the notices claim are on disk and have not yet been
+    wrapped in an installer. A version bump that slips past this ships an
+    installer whose compliance paperwork is about a different program.
+    See docs/licensing.md.
+    """
+    print("\n== checking third-party notices ==")
+    out = subprocess.run([sys.executable, os.path.join(SCRIPTS_DIR, "third_party_notices.py"),
+                          "--check"], capture_output=True, text=True, cwd=REPO_ROOT)
+    sys.stdout.write(out.stdout)
+    if out.returncode != 0:
+        sys.stderr.write(out.stderr)
+        raise SystemExit(
+            "THIRD-PARTY-NOTICES.md is stale. Regenerate it with:\n"
+            "    python scripts/third_party_notices.py")
 
 
 def stage(offline=False):
@@ -153,6 +232,8 @@ def stage(offline=False):
     llama = vendor_llama.vendor(offline=offline, log=lambda m: print("  " + m))
     print("\n== vendoring CPython ==")
     python = vendor_python.vendor(offline=offline, log=lambda m: print("  " + m))
+
+    check_notices()
 
     print("\n== staging the payload ==")
     vendor_python._rmtree_with_retries(STAGE_DIR)
@@ -190,6 +271,25 @@ def stage(offline=False):
     print("  scripts/vendor_llama.py  -> hearth/scripts/vendor_llama.py")
     print("  vendor/llama_manifest    -> hearth/vendor/llama_manifest.json")
 
+    # The licence texts. Every one of the licences Hearth redistributes under
+    # requires that its notice travel with the binary, and a notice that only
+    # exists in a git repository has not travelled anywhere. These land beside
+    # the code they describe, inside the install. The bundler additionally
+    # puts the first three at the application root, where somebody looking for
+    # them would look first; this copy is the one that is guaranteed to be
+    # next to the thing it is about. See docs/licensing.md.
+    for name in LICENCE_FILES:
+        src = os.path.join(REPO_ROOT, name)
+        if not os.path.isfile(src):
+            raise SystemExit(
+                "{} is missing from the checkout. The installer may not ship "
+                "without it; see docs/licensing.md.".format(name))
+        shutil.copy2(src, os.path.join(payload, name))
+        print("  {:<24} -> hearth/{}".format(name, name))
+    shutil.copytree(os.path.join(REPO_ROOT, LICENCE_TREE),
+                    os.path.join(payload, LICENCE_TREE), ignore=_ignore)
+    print("  vendor/licenses          -> hearth/vendor/licenses")
+
     # The update trust anchor. release/trust.json holds the Ed25519 PUBLIC key
     # that agent/hearth_update.py checks every release manifest against, and it
     # has to travel inside the application: a key fetched at update time from
@@ -197,12 +297,13 @@ def stage(offline=False):
     # the single most important file in the payload after the code itself,
     # which is why verify_stage() below refuses to build without it.
     #
-    # version.json is written FROM desktop/shell/package.json rather than kept
-    # as a second committed copy, so the two cannot drift and the updater
+    # version.json is written FROM desktop/tauri/tauri.conf.json rather than
+    # kept as a second committed copy, so the two cannot drift and the updater
     # cannot be told it is running a version that was never built. The shell
-    # additionally passes app.getVersion() down in HEARTH_APP_VERSION, which
-    # the updater prefers because it comes out of the integrity-checked asar;
-    # this file is the fallback for a payload run without the shell.
+    # additionally passes its own version down in HEARTH_APP_VERSION, which the
+    # updater prefers because it comes out of the executable's resource block
+    # rather than off disk; this file is the fallback for a payload run without
+    # the shell.
     release_dest = os.path.join(payload, "release")
     os.makedirs(release_dest, exist_ok=True)
     trust_src = os.path.join(REPO_ROOT, "release", "trust.json")
@@ -212,14 +313,13 @@ def stage(offline=False):
             "application that cannot verify its own updates. Generate a signing "
             "key with:\n    python scripts/release_manifest.py keygen --key-id <id>")
     shutil.copy2(trust_src, os.path.join(release_dest, "trust.json"))
-    with open(os.path.join(SHELL_DIR, "package.json"), "r", encoding="utf-8") as fh:
-        app_version = json.load(fh)["version"]
+    version = app_version()
     with open(os.path.join(release_dest, "version.json"), "w", encoding="utf-8") as fh:
-        json.dump({"version": app_version, "app_id": "com.hearthlocal.hearth"},
+        json.dump({"version": version, "app_id": "com.hearthlocal.hearth"},
                   fh, indent=2, sort_keys=True)
         fh.write("\n")
     print("  release/trust.json       -> hearth/release/trust.json")
-    print("  version {:<16} -> hearth/release/version.json".format(app_version))
+    print("  version {:<16} -> hearth/release/version.json".format(version))
 
     shutil.copytree(vendor_python.install_dir(), os.path.join(STAGE_DIR, "python"))
     print("  vendor/python            -> python")
@@ -233,14 +333,16 @@ def stage(offline=False):
     return {
         "llama_variant": llama.get("variant"),
         "python_version": python["pinned_version"],
+        "version": version,
     }
 
 
 def verify_stage():
     """Prove the staged payload works before wrapping it in an installer.
 
-    Three checks, each covering a failure that would otherwise only appear
-    on a user's machine, at launch, as a dialog with a traceback in it.
+    Five checks, each covering a failure that would otherwise only appear
+    on a user's machine, at launch, as a dialog with a traceback in it --
+    or, for the last one, never appear at all.
     """
     exe = os.path.join(STAGE_DIR, "python", "python.exe")
     server_dir = os.path.join(STAGE_DIR, "hearth", "desktop", "server")
@@ -354,63 +456,96 @@ def verify_stage():
         print("  NOTE: this build's update feed is {}, a resolvable host. Make "
               "sure that is deliberate.".format(updater["feed"]))
 
+    # 5. The licence texts are in the payload. A build that silently drops
+    #    them ships an installer that is out of compliance and looks
+    #    identical to one that is not, which is the whole reason this is a
+    #    build gate rather than a checklist. See docs/licensing.md.
+    payload = os.path.join(STAGE_DIR, "hearth")
+    for name in LICENCE_FILES:
+        if not os.path.isfile(os.path.join(payload, name)):
+            raise SystemExit(
+                "{} did not reach the payload. Hearth may not be distributed "
+                "without it; see docs/licensing.md.".format(name))
+    licences = os.path.join(payload, LICENCE_TREE)
+    texts = [n for n in os.listdir(licences)] if os.path.isdir(licences) else []
+    if "MANIFEST.json" not in texts or len(texts) < 2:
+        raise SystemExit(
+            "hearth/vendor/licenses is empty or has no MANIFEST.json. "
+            "THIRD-PARTY-NOTICES.md quotes those texts, so the installed "
+            "application has to carry them; see docs/licensing.md.")
+
     print("  staged payload verified: sidecar self-test green under python {}, "
           "bundled engine found, GPU fetch would install {} from {}".format(
               result["python"], engine["variant"], engine["tag"]))
     print("  update trust anchor: version {}, active key(s) {}, feed {}{}".format(
         updater["version"], ", ".join(updater["keys"]), updater["feed"],
         "" if updater["configured"] else "  (unresolvable: nothing published)"))
+    print("  licence texts staged: {}, and {} file(s) under vendor/licenses".format(
+        ", ".join(LICENCE_FILES), len(texts)))
+
+
+def cargo_env():
+    """Keep every byte cargo writes under build/.
+
+    A checkout should be able to run this and then `git status` and see
+    nothing, which a target/ directory inside desktop/tauri/ would break.
+    """
+    return dict(os.environ, CARGO_TARGET_DIR=CARGO_TARGET_DIR)
 
 
 def build_installer(unpacked_only=False):
-    print("\n== installing the packaging toolchain ==")
-    lock = os.path.join(SHELL_DIR, "package-lock.json")
-    install = ["npm", "ci"] if os.path.isfile(lock) else ["npm", "install"]
-    run(install + ["--no-audit", "--no-fund"], SHELL_DIR, "npm install")
+    version = app_version()
 
-    # electron's own binary arrives through a postinstall script, and a npm
-    # configured with ignore-scripts, or a postinstall that was skipped
-    # because the package was already in the cache, leaves the package
-    # present and the runtime absent. Observed on this machine. Checking is
-    # cheaper than the confusing electron-builder failure it otherwise
-    # causes an hour later.
-    runtime = os.path.join(SHELL_DIR, "node_modules", "electron", "dist", "electron.exe")
-    if not os.path.isfile(runtime):
-        print("  electron's runtime is missing; fetching it")
-        run(["node", os.path.join("node_modules", "electron", "install.js")],
-            SHELL_DIR, "electron runtime download")
-        if not os.path.isfile(runtime):
-            raise SystemExit("electron's runtime is still missing at {}".format(runtime))
+    # cargo-tauri refuses to start when frontendDist does not exist, and
+    # frontendDist is assembled by desktop/tauri/build.rs, which only runs
+    # once cargo-tauri has started. The directory is created here to break
+    # that circle; build.rs empties and refills it a moment later, so what
+    # ends up linked into the executable is still build.rs's answer and there
+    # is no second copy of the exclusion rules to keep in step.
+    os.makedirs(UI_EMBED, exist_ok=True)
 
-    print("\n== packaging ==")
-    run(["npm", "run", "pack" if unpacked_only else "dist"], SHELL_DIR, "electron-builder")
-    verify_fuses()
+    print("\n== compiling and bundling the shell ==")
+    argv = ["cargo", "tauri", "build"]
+    argv += ["--no-bundle"] if unpacked_only else ["--bundles", "nsis"]
+    run(argv, TAURI_DIR, "cargo tauri build", env=cargo_env())
+    verify_built(RELEASE_DIR)
+
+    if unpacked_only:
+        return version
+
+    # The bundler names its output Hearth_<version>_x64-setup.exe. Everything
+    # downstream -- scripts/release_manifest.py, the update feed, the artifact
+    # name agent/hearth_update.py will accept -- was written around
+    # Hearth-Setup-<version>.exe, and a rename here is cheaper than a new
+    # convention everywhere else.
+    os.makedirs(DIST_DIR, exist_ok=True)
+    produced = [n for n in os.listdir(BUNDLE_DIR) if n.lower().endswith(".exe")] \
+        if os.path.isdir(BUNDLE_DIR) else []
+    if not produced:
+        raise SystemExit("the bundler produced no installer in {}".format(BUNDLE_DIR))
+    newest = max(produced, key=lambda n: os.path.getmtime(os.path.join(BUNDLE_DIR, n)))
+    target = os.path.join(DIST_DIR, "Hearth-Setup-{}.exe".format(version))
+    shutil.copy2(os.path.join(BUNDLE_DIR, newest), target)
+    print("  {} -> {}".format(newest, os.path.relpath(target, REPO_ROOT)))
+    return version
 
 
-def verify_fuses():
-    """Read the Electron fuse wire back out of the packed executable.
+def verify_built(release_dir):
+    """Read the built application back and refuse a build that is not what
+    was asked for.
 
-    The fuses are requested in desktop/shell/package.json and applied by
-    electron-builder deep inside packaging, by rewriting a sentinel in the
-    executable after the runtime is copied. A silent no-op there -- a
-    renamed option, a skipped step -- produces a build that looks entirely
-    normal and ships an executable that runs arbitrary JavaScript out of an
-    ELECTRON_RUN_AS_NODE environment variable. See desktop/shell/verify-fuses.js
-    for why that must never be signed. Checking here is the only place the
-    result of the request can actually be observed.
-
-    verify-fuses.js keeps its own copy of the required wire rather than
-    reading package.json, so this step fails the build both when a fuse was
-    not applied AND when someone quietly relaxes what is asked for. All
-    seven fuses this build sets are covered, including
-    GrantFileProtocolExtraPrivileges, which is disabled because Hearth serves
-    its UI from a loopback HTTP origin and never loads a file:// page.
+    The successor to desktop/shell/verify-fuses.js. See scripts/verify_binary.py
+    for what carries over from the seven Electron fuses, what does not, and
+    why the one check with no Electron ancestor -- WebView2's environment --
+    is the one that matters most here.
     """
-    print("\n== verifying electron fuses ==")
-    exe = os.path.join(DIST_DIR, "win-unpacked", "Hearth.exe")
-    if not os.path.isfile(exe):
-        raise SystemExit("expected a packed executable at {}".format(exe))
-    run(["node", "verify-fuses.js", exe], SHELL_DIR, "fuse verification")
+    print("\n== verifying the built shell ==")
+    try:
+        notes = verify_binary.verify(release_dir)
+    except verify_binary.Complaint as err:
+        raise SystemExit("verify_binary: {}".format(err))
+    for note in notes:
+        print("  {}".format(note))
 
 
 def report(info, unpacked_only=False):
@@ -422,21 +557,23 @@ def report(info, unpacked_only=False):
         ("llama.cpp engine", os.path.join(STAGE_DIR, "hearth", "vendor", "llama")),
         ("agent modules", os.path.join(STAGE_DIR, "hearth", "agent")),
         ("sidecar", os.path.join(STAGE_DIR, "hearth", "desktop", "server")),
-        ("user interface", os.path.join(STAGE_DIR, "hearth", "ui")),
+        ("licence texts", os.path.join(STAGE_DIR, "hearth", "vendor", "licenses")),
     ]
-    unpacked = os.path.join(DIST_DIR, "win-unpacked")
     payload_total = sum(dir_size(p) for _, p in rows)
     for label, path in rows:
         print("  {:<28}{}".format(label, mb(dir_size(path))))
     print("  {:<28}{}".format("payload total", mb(payload_total)))
-    if os.path.isdir(unpacked):
-        total = dir_size(unpacked)
-        print("  {:<28}{}   (Chromium, Node, V8)".format(
-            "Electron runtime", mb(max(0, total - payload_total))))
-        print("  {:<28}{}".format("installed, on disk", mb(total)))
+
+    exe = os.path.join(RELEASE_DIR, "hearth.exe")
+    if os.path.isfile(exe):
+        print("  {:<28}{}   (UI linked in; WebView2 is the OS's)".format(
+            "shell executable", mb(os.path.getsize(exe))))
+        print("  {:<28}{}".format(
+            "installed, on disk", mb(payload_total + os.path.getsize(exe))))
 
     if unpacked_only:
-        print("\nunpacked build in {}".format(os.path.relpath(unpacked, REPO_ROOT)))
+        print("\ncompiled but not bundled. Executable in {}".format(
+            os.path.relpath(RELEASE_DIR, REPO_ROOT)))
         return
     installers = sorted(
         (os.path.join(DIST_DIR, n) for n in os.listdir(DIST_DIR)
@@ -458,7 +595,7 @@ def main(argv=None):
     p.add_argument("--offline", action="store_true",
                    help="use only already-downloaded archives; never fetch")
     p.add_argument("--dir", dest="unpacked_only", action="store_true",
-                   help="produce the unpacked app but not the installer")
+                   help="compile the shell but do not bundle an installer")
     p.add_argument("--skip-build", action="store_true",
                    help="stage and verify the payload, then stop")
     args = p.parse_args(sys.argv[1:] if argv is None else argv)

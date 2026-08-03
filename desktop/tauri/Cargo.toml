@@ -1,0 +1,53 @@
+[package]
+name = "hearth"
+version = "0.1.0"
+description = "Run local LLMs. One install, no terminal."
+authors = ["Eric Catalano"]
+license = "Apache-2.0"
+edition = "2021"
+rust-version = "1.82"
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# The shell itself. default-features carries the wry/WebView2 backend and the
+# tray-less desktop runtime; nothing here asks for the updater, the http
+# client, or any of the plugins that would widen what the binary can do.
+tauri = { version = "2", default-features = false, features = ["wry", "common-controls-v6"] }
+# Used from Rust only. The webview is granted no permission to call it, so a
+# page cannot open a dialog; only the three commands in main.rs can.
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Recomputing the staged installer's digest immediately before running it.
+sha2 = "0.10"
+# Job objects, and nothing else. See sidecar.rs.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[features]
+# Tauri's devtools are a compile-time feature, not a runtime flag. Shipping
+# without it means the released binary has no inspector to open at all, by
+# any key combination, environment variable or automation. See
+# scripts/verify_binary.py, which fails the build if the shipped executable
+# links WebView2's devtools surface.
+devtools = ["tauri/devtools"]
+
+[profile.release]
+# The whole reason this shell exists is size. opt-level "s", one codegen unit,
+# fat LTO, no unwind tables and a stripped image produce the 4.3 MB
+# Hearth.exe that replaced 364 MB of Chromium, Node and V8. That figure
+# includes desktop/ui/, which is linked in rather than shipped beside it.
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

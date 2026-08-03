@@ -18,6 +18,62 @@
       "sha256": "528c29f424e6304e1dbda234067aa77d51c01202b1987d2cc2160473442f6035",
       "source": "https://raw.githubusercontent.com/ggml-org/llama.cpp/e6dd0e29a6751d4859abaa8899959f5ddf756f4e/tools/ui/src/lib/vendors/decimal.js/LICENCE.md"
     },
+    "licence-0BSD.txt": {
+      "bytes": 665,
+      "component": "0BSD",
+      "crate": "adler2 2.0.1",
+      "extracted": "LICENSE-0BSD file of that crate's published archive",
+      "sha256": "861399f8c21c042b110517e76dc6b63a2b334276c8cf17412fc3c8908ca8dc17",
+      "source": "https://crates.io/api/v1/crates/adler2/2.0.1/download"
+    },
+    "licence-CC0-1.0.txt": {
+      "bytes": 7048,
+      "component": "CC0-1.0",
+      "crate": "dunce 1.0.5",
+      "extracted": "LICENSE file of that crate's published archive",
+      "sha256": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499",
+      "source": "https://crates.io/api/v1/crates/dunce/1.0.5/download"
+    },
+    "licence-MIT.txt": {
+      "bytes": 1023,
+      "component": "MIT",
+      "crate": "serde 1.0.229",
+      "extracted": "LICENSE-MIT file of that crate's published archive",
+      "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+      "source": "https://crates.io/api/v1/crates/serde/1.0.229/download"
+    },
+    "licence-MPL-2.0.txt": {
+      "bytes": 16726,
+      "component": "MPL-2.0",
+      "crate": "cssparser 0.36.0",
+      "extracted": "LICENSE file of that crate's published archive",
+      "sha256": "fab3dd6bdab226f1c08630b1dd917e11fcb4ec5e1e020e2c16f83a0a13863e85",
+      "source": "https://crates.io/api/v1/crates/cssparser/0.36.0/download"
+    },
+    "licence-Unicode-3.0.txt": {
+      "bytes": 2195,
+      "component": "Unicode-3.0",
+      "crate": "icu_collections 2.2.0",
+      "extracted": "LICENSE file of that crate's published archive",
+      "sha256": "f367c1b8e1aa262435251e442901da4607b4650e0e63a026f5044473ecfb90f2",
+      "source": "https://crates.io/api/v1/crates/icu_collections/2.2.0/download"
+    },
+    "licence-Unlicense.txt": {
+      "bytes": 1211,
+      "component": "Unlicense",
+      "crate": "aho-corasick 1.1.4",
+      "extracted": "UNLICENSE file of that crate's published archive",
+      "sha256": "7e12e5df4bae12cb21581ba157ced20e1986a0508dd10d0e8a4ab9a4cf94e85c",
+      "source": "https://crates.io/api/v1/crates/aho-corasick/1.1.4/download"
+    },
+    "licence-Zlib.txt": {
+      "bytes": 856,
+      "component": "Zlib",
+      "crate": "foldhash 0.2.0",
+      "extracted": "LICENSE file of that crate's published archive",
+      "sha256": "b1181a40b2a7b25cf66fd01481713bc1005df082c53ef73e851e55071b102744",
+      "source": "https://crates.io/api/v1/crates/foldhash/0.2.0/download"
+    },
     "llama.cpp.txt": {
       "bytes": 1078,
       "component": "llama.cpp",

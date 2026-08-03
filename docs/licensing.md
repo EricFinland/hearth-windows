@@ -2,9 +2,10 @@
 
 Hearth is Apache-2.0. That is the whole of the interesting part for anyone
 reading the source. The rest of this document is about the part that actually
-constrains shipping: Hearth redistributes an Electron runtime, a CPython
-interpreter and a llama.cpp inference engine, and every one of those carries
-licence terms that require their notices to travel with the binary.
+constrains shipping: Hearth redistributes a Tauri shell statically linked from a
+couple of hundred Rust crates, a CPython interpreter and a llama.cpp inference
+engine, and every one of those carries licence terms that require their notices
+to travel with the binary.
 
 ## The three files at the repository root
 
@@ -39,6 +40,10 @@ Relicensing was possible because the copyright is held by one person and the
 project had never been published, so there were no external contributions to
 obtain permission for.
 
+`desktop/tauri/Cargo.toml` declares `license = "Apache-2.0"`, which is what ends
+up in the crate metadata and, through `tauri-winres`, in the executable's own
+version resource.
+
 ### Why there are no per-file licence headers
 
 Apache's own guidance suggests attaching the boilerplate notice to each source
@@ -72,15 +77,37 @@ generator derives everything it can from the vendored trees on disk:
 | the engine files that will ship | `vendor/llama/` |
 | CPython version and digest | `vendor/python_manifest.json` |
 | CPython's own licence file, and that it ships | `vendor/python/LICENSE.txt` |
-| Electron version | `desktop/shell/package.json` |
-| the Chromium, Node and V8 inventory, plus a copyleft scan | `desktop/shell/node_modules/electron/dist/LICENSES.chromium.html` |
+| Hearth's version, every Rust crate in the executable, its SPDX expression, the licence files it ships, the copyright notices in them, and a copyleft scan | `cargo metadata --locked --filter-platform x86_64-pc-windows-msvc`, run in `desktop/tauri` |
+| where the notices land in an install, and whether WebView2 is redistributed | `desktop/tauri/tauri.conf.json` |
 | the licence texts Hearth has to supply | `vendor/licenses/` |
 
 It refuses to run when a source is missing rather than emitting a notices file
 with holes in it, because a file that looks complete and is not is worse than no
 file.
 
+### The crate inventory
+
+`cargo metadata` is a subprocess, not an import, so the "standard library only"
+rule in `scripts/` still holds. The inventory is the root package's closure over
+**normal dependency edges only**, walked from `resolve.root`. Build-dependencies
+are excluded on purpose and named in the notices file so the exclusion is on the
+record: they run on the build machine and no byte of them enters the executable,
+exactly as electron-builder and its two hundred transitive packages never
+entered the asar.
+
+`--locked` means the answer is `Cargo.lock`'s rather than whatever cargo felt
+like resolving today. `--filter-platform` means a crate reachable only through a
+unix `cfg` does not appear in the inventory of a Windows installer.
+
+Each crate's `.crate` archive is unpacked into the cargo registry source cache
+beside the `Cargo.toml` that `cargo metadata` reports, so the licence files a
+crate publishes are right there to read. The generator lists them, reads the
+copyright notices out of them, and says plainly which crates ship none rather
+than inventing a notice for them.
+
 ### vendor/licenses/
+
+Two different problems land in the same directory.
 
 The llama.cpp Windows release archive contains **no licence file of any kind**.
 Its build embeds licence strings into the executables through a CMake helper but
@@ -88,10 +115,27 @@ exposes no flag that prints them, so a user who installed Hearth would receive
 MIT-licensed software with no MIT notice anywhere on their disk. That is a
 compliance gap that only Hearth can close.
 
-`vendor/licenses/` holds those texts, taken once from the pinned upstream
-sources, committed, and recorded in `MANIFEST.json` with the URL each came from
-and the sha256 of the bytes written. The generator verifies every digest on
-every run, so a licence text cannot be quietly edited.
+The Rust crates have the opposite problem: too many copies. Reproducing every
+crate's own licence file would produce a document nobody reads and would say the
+same thing dozens of times over, because the crates share a handful of texts
+byte for byte. So the notices file carries a complete inventory table and one
+copy of each distinct licence, taken from a crate that actually ships it. The
+mapping from a licence to the crate it came from is asserted in
+`LICENCE_TEXTS`; everything else is checked. The crate has to still be in the
+inventory, its file on disk has to still hash to the recorded digest, and the
+committed copy has to hash to the same thing, so an upstream edit to a licence
+text fails the run instead of drifting.
+
+Two licences named by the crates are deliberately not reproduced there.
+Apache-2.0 is `LICENSE` itself, which already ships twice in an install; a
+second copy would be a second source of truth. MIT-0 is offered by one crate,
+`dunce`, which ships the CC0-1.0 text and no MIT-0 text, so CC0-1.0 is the
+option taken. Any other identifier that turns up without a text fails the run,
+which is what keeps the set complete rather than merely long.
+
+`MANIFEST.json` records the URL each text came from and the sha256 of the bytes
+written. The generator verifies every digest on every run, so a licence text
+cannot be quietly edited.
 
 This directory is committed on purpose, unlike the rest of `vendor/`. The
 binaries under `vendor/llama/` and `vendor/python/` are reproducible from their
@@ -101,104 +145,99 @@ into a compliance failure.
 
 ## Copyleft, and where it actually bites
 
-Two components inside the Electron runtime are LGPL:
+Nothing in the installer is GPL, LGPL, AGPL or SSPL. The Electron shell had two
+LGPL components, FFmpeg and Blink, and the notices file had to explain how four
+separate obligations were met for them. The Tauri shell has neither, because it
+has no browser engine in it: the renderer is Microsoft's WebView2, already on
+the machine and not redistributed.
 
-- **FFmpeg** (`ffmpeg.dll`), LGPL-2.1-or-later. Electron builds it without
-  `--enable-gpl`, so the GPL-only parts are absent.
-- **Blink**, which descends from WebKit and KHTML, is LGPL-2.0-or-later and
-  LGPL-2.1-or-later in part, statically linked into `Hearth.exe`.
+The tripwire that was a text search over Chromium's `LICENSES.chromium.html` is
+now a split of every crate's SPDX expression into identifiers. GPL, LGPL, AGPL
+and SSPL fail the run outright, so a dependency bump that pulls one in stops the
+build rather than shipping. This check is exact rather than a search for a
+phrasing that could be worded a new way.
 
-Neither is combined with Hearth's own code at the source level. Hearth is Python
-and JavaScript running on top of a runtime it did not build, so the aggregate is
-an application plus a separately licensed runtime, not a derivative work of
-either library. Apache-2.0 for Hearth's own code is unaffected.
+Five crates are MPL-2.0: `cssparser`, `cssparser-macros`, `selectors`,
+`dtoa-short` and `option-ext`. That is reported, not fatal, because it is real
+and it is different from the rest. MPL-2.0 is weak copyleft at file granularity:
+section 3.3 says outright that a Larger Work may be distributed under other
+terms, so Hearth's own Apache-2.0 code and the other crates are unaffected, and
+the obligation that does bite is section 3.2(a), which is source availability
+for those specific files. Hearth links the crates exactly as published, so their
+Source Code Form is the published crate, and naming the exact version is what
+makes it obtainable: crates.io serves the archive for a name and a version
+indefinitely, and a yanked version stays downloadable. `THIRD-PARTY-NOTICES.md`
+names all five with versions and links.
 
-The redistribution obligations are real regardless, and
-`THIRD-PARTY-NOTICES.md` spells out how each is met: the notice, the licence
-texts (which ship in `LICENSES.chromium.html`), the source availability, and the
-right to relink. The one that needs a human to keep a promise is source
-availability: anyone entitled to the corresponding source under the LGPL can ask
-through the contact route in `SECURITY.md` and must be given it.
+Two things there need a human rather than a script. If Hearth ever vendors a
+patched copy of one of those crates, the patched files are Modifications and
+have to be published under MPL-2.0. And if crates.io ever stops serving those
+archives, the obligation falls back on Hearth to supply the source on request,
+through the contact route in `SECURITY.md`.
 
-The generator records which of the components in `LICENSES.chromium.html` grant
-a GNU licence for themselves. That list is a tripwire, not an analysis: when an
-Electron bump adds a genuinely new copyleft dependency, the list changes,
-`--check` goes red, and somebody looks. Without it, a new GPL dependency would
-arrive silently inside a 20 MB HTML file that nobody reads.
+## Where the notices land in an install
 
-## Where the notices have to land in an install
+Under Tauri the resources sit **beside** the executable rather than under a
+`resources\` subdirectory, which is the opposite of where electron-builder put
+them. Two mechanisms put the licence files there, and both are deliberate.
 
-`LICENSE.electron.txt` and `LICENSES.chromium.html` already reach the
-application root: electron-builder copies both out of the Electron runtime and
-renames the first. CPython's `LICENSE.txt` already reaches
-`resources\python\LICENSE.txt`, because the whole vendored interpreter directory
-is copied verbatim. Those three cover Electron, Chromium, Node, V8 and every
-component CPython bundles.
+`desktop/tauri/tauri.conf.json` lists three of them under `bundle.resources`,
+which lands them at the application root, where somebody looking for them would
+look first:
 
-**Nothing else does.** Hearth's own licence, the notices file, and the llama.cpp
-licence texts are not in the installer today.
+    %LOCALAPPDATA%\Programs\Hearth\LICENSE.hearth.txt
+    %LOCALAPPDATA%\Programs\Hearth\NOTICE.txt
+    %LOCALAPPDATA%\Programs\Hearth\THIRD-PARTY-NOTICES.md
 
-### Required build change
+`scripts/build_windows.py`, in `stage()`, copies the same three plus the licence
+texts into the payload, which lands them next to the code they describe:
 
-`scripts/build_windows.py`, in `stage()`, after the payload trees are copied and
-before `verify_stage()` runs, must copy four things into `build/stage/hearth`:
+    %LOCALAPPDATA%\Programs\Hearth\hearth\LICENSE
+    %LOCALAPPDATA%\Programs\Hearth\hearth\NOTICE
+    %LOCALAPPDATA%\Programs\Hearth\hearth\THIRD-PARTY-NOTICES.md
+    %LOCALAPPDATA%\Programs\Hearth\hearth\vendor\licenses\*
 
-    LICENSE                  ->  build/stage/hearth/LICENSE
-    NOTICE                   ->  build/stage/hearth/NOTICE
-    THIRD-PARTY-NOTICES.md   ->  build/stage/hearth/THIRD-PARTY-NOTICES.md
-    vendor/licenses/         ->  build/stage/hearth/vendor/licenses/
+`vendor/licenses/` travels because `THIRD-PARTY-NOTICES.md` quotes those texts
+inline; shipping the directory as well costs about 60 KB and means the texts
+exist as their own files rather than only as quotations.
 
-which lands them at, respectively:
+CPython's own `LICENSE.txt` reaches `%LOCALAPPDATA%\Programs\Hearth\python\`,
+because the whole vendored interpreter directory is copied verbatim. It covers
+the PSF licence and every licence CPython's bundled components carry.
+`LICENSE.electron.txt` and `LICENSES.chromium.html` used to sit at the
+application root and no longer exist, because nothing they described is in the
+installer any more.
 
-    %LOCALAPPDATA%\Programs\Hearth\resources\hearth\LICENSE
-    %LOCALAPPDATA%\Programs\Hearth\resources\hearth\NOTICE
-    %LOCALAPPDATA%\Programs\Hearth\resources\hearth\THIRD-PARTY-NOTICES.md
-    %LOCALAPPDATA%\Programs\Hearth\resources\hearth\vendor\licenses\*
+`verify_stage()` asserts that the three files and a non-empty `vendor/licenses/`
+are present, for the same reason it already asserts the update trust anchor is:
+a build that silently drops them ships an installer that is out of compliance
+and looks identical to one that is not.
 
-`vendor/licenses/` has to travel because `THIRD-PARTY-NOTICES.md` quotes those
-texts inline; shipping the directory as well costs about 20 KB and means the
-texts exist as their own files rather than only as quotations.
-
-`verify_stage()` should then assert the four are present, for the same reason it
-already asserts the update trust anchor is present: a build that silently drops
-them ships an installer that is out of compliance and looks identical to one
-that is not.
-
-The generator should also be run as a gate. Immediately after the two vendor
-steps, and before staging:
+The generator is a build gate too. `scripts/build_windows.py` runs
 
     python scripts/third_party_notices.py --check
 
-fails the build when the notices no longer describe what is about to be
-packaged, which is exactly the moment a version bump would otherwise slip
-through.
-
-### Optional, and better if the shell owner wants it
-
-Putting the notices at the **application root**, next to
-`LICENSE.electron.txt`, is more discoverable than burying them under
-`resources\hearth`. That needs an `extraFiles` entry in
-`desktop/shell/package.json` rather than a change to the build script:
-
-```json
-"extraFiles": [
-  { "from": "../../LICENSE", "to": "LICENSE.hearth.txt" },
-  { "from": "../../NOTICE", "to": "NOTICE.txt" },
-  { "from": "../../THIRD-PARTY-NOTICES.md", "to": "THIRD-PARTY-NOTICES.md" }
-]
-```
-
-Separately, `desktop/shell/package.json` still declares `"license": "MIT"`. That
-field ends up in the packaged `app.asar` and is now wrong; it should read
-`"Apache-2.0"`.
+between vendoring and staging, because that is the one moment when the versions
+the notices claim are on disk and have not yet been wrapped in an installer. A
+version bump that slips past it ships an installer whose compliance paperwork is
+about a different program.
 
 ## What is not redistributed
 
-`desktop/shell/node_modules` is packaging tooling. `desktop/shell/package.json`
-lists exactly five files under `files`, and none of them is a dependency, so
-electron-builder and its two hundred transitive packages never enter the asar or
-the resources directory. `site/node_modules` builds the documentation site.
-Neither needs a notice.
+**The Microsoft Edge WebView2 Runtime.** It renders the entire user interface
+and it is not Hearth's to license. It is already present on supported Windows
+installs, and `tauri.conf.json` sets `webviewInstallMode` to
+`downloadBootstrapper`, so if it is missing the installer downloads Microsoft's
+own bootstrapper from Microsoft and runs it. Nothing of WebView2 is inside the
+installer, and Microsoft's terms apply to what that bootstrapper installs. The
+notices file says so under its own heading, because a network fetch during
+install is something a user is entitled to know about.
+
+**cargo's build-dependencies.** `tauri-build` and the crates it pulls in run at
+compile time to generate the asset embedding and the Windows resource block.
+None of them is linked into the executable. They are named in the notices file
+so that excluding them is a decision on the record rather than an omission.
+`site/node_modules` builds the documentation site. Neither needs a notice.
 
 The GPU engines, the CUDA runtime and the model weights are fetched after
 installation, at the user's request, and are listed in the notices file under a
@@ -225,7 +264,7 @@ where Hearth stands:
 | Origin verification enabled, restricted to release branches | not yet |
 | Every signing request approved by a human | process, not code |
 | MFA on SignPath and on the source repository | outside this repository |
-| Product name and version metadata enforced | met, electron-builder sets both |
+| Product name and version metadata enforced | met, `tauri.conf.json` sets both and `tauri-winres` writes them into the executable |
 | A page headed "Code signing policy" on the project site | not yet |
 | Privacy statement, or a statement that nothing is transferred | not yet, and Hearth is well placed to make the strong version of this claim |
 | Uninstall facility | met, NSIS registers one |
@@ -234,14 +273,16 @@ Two things deserve attention before applying rather than after:
 
 **Proprietary components.** The conditions say a project "may not contain any
 proprietary, non open-source component," with a carve-out for system libraries.
-The installer contains `vcruntime140.dll` and `vcruntime140_1.dll` from the
-Microsoft Visual C++ runtime, redistributed by python.org inside the embeddable
-package, and `dxil.dll` and `d3dcompiler_47.dll` from the Electron runtime.
-These are Microsoft system libraries in the ordinary sense of the term and are
-the obvious intended carve-out, but it is worth asking rather than assuming. The
-NVIDIA CUDA redistributables are unambiguously proprietary and are **not** in
-the installer; they are fetched later, only on explicit request. Keeping it that
-way keeps the signed package clean.
+The move off Electron shrank this to one item: `vcruntime140.dll` and
+`vcruntime140_1.dll` from the Microsoft Visual C++ runtime, redistributed by
+python.org inside the embeddable package. `dxil.dll` and `d3dcompiler_47.dll`
+came from the Electron runtime and are gone. These are Microsoft system
+libraries in the ordinary sense of the term and are the obvious intended
+carve-out, but it is worth asking rather than assuming. WebView2 is proprietary
+and is **not** in the installer at all. The NVIDIA CUDA redistributables are
+unambiguously proprietary and are also not in the installer; they are fetched
+later, only on explicit request. Keeping it that way keeps the signed package
+clean.
 
 **GitHub-hosted runners.** For the free tier, every job in the workflow leading
 to the signing request must run on GitHub-hosted agents. The Windows build

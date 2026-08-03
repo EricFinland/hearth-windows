@@ -365,7 +365,7 @@ and withholds trademark rights: fork the code freely, do not ship the fork as
 Hearth.
 
 Hearth bundles other people's software, including a llama.cpp inference engine,
-a CPython interpreter and an Electron runtime.
+a CPython interpreter and the Rust crates the desktop shell is built from.
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) lists every component, its
 version and its licence, and a copy ships inside the installed application. It
 is generated from what is actually vendored by
