@@ -1451,17 +1451,64 @@ TOOLS = [
 _BY_NAME = {t["name"]: t for t in TOOLS}
 
 
+def mcp_tools():
+    """The tools contributed by configured MCP servers, in TOOLS shape.
+
+    Empty, and free, when no MCP server is configured: hearth_mcp.descriptors()
+    reads its config file first and returns [] without starting anything. The
+    import is deliberately inside the function so a hearth with no mcp.json
+    never even loads the module, and so a broken MCP setup degrades to "no MCP
+    tools" rather than an import error in the tool layer.
+    """
+    try:
+        import hearth_mcp  # noqa: PLC0415 - lazy: MCP is optional
+        return hearth_mcp.descriptors()
+    except Exception as exc:  # noqa: BLE001 - MCP must never break the tool layer
+        print("[hearth-tools] MCP tools unavailable: {}".format(exc), file=sys.stderr)
+        return []
+
+
+def all_tools():
+    """Every callable tool: the built-ins plus whatever MCP contributes.
+
+    MCP names carry hearth_mcp's `mcp__` prefix, which no built-in uses (that
+    module's self-test asserts it against this list), so the two namespaces
+    cannot collide and a built-in always wins a lookup by construction.
+    """
+    return list(TOOLS) + mcp_tools()
+
+
+def windows_manifest():
+    """The Windows sidecar's capability manifest: the ten built-ins it ships
+    with, plus every configured MCP tool.
+
+    A tuple, like WINDOWS_TOOLS itself, so a caller cannot accidentally mutate
+    the manifest a permission decision is about to be made against. Identical
+    to WINDOWS_TOOLS when no MCP server is configured.
+    """
+    return WINDOWS_TOOLS + tuple(t["name"] for t in mcp_tools())
+
+
 def ollama_tool_specs(allowed=None):
     """The tools in Ollama's chat tool format. When allowed (a collection of tool
     names, the run's capability manifest) is given, only those tools are
     advertised so the model never sees what it cannot use."""
     return [{"type": "function", "function": {
         "name": t["name"], "description": t["description"], "parameters": t["parameters"]}}
-        for t in TOOLS if allowed is None or t["name"] in allowed]
+        for t in all_tools() if allowed is None or t["name"] in allowed]
 
 
 def execute_tool(name, args, workspace):
     tool = _BY_NAME.get(name)
+    if tool is None:
+        # Not a built-in. It may still be an MCP tool, whose result is
+        # untrusted text from another process: it is returned as an ordinary
+        # tool-result string so it travels the same path (injection scan,
+        # transcript, `neutralize` in the UI) as every other result.
+        for candidate in mcp_tools():
+            if candidate["name"] == name:
+                tool = candidate
+                break
     if tool is None:
         return "error: unknown tool {}".format(name)
     try:
@@ -1473,6 +1520,18 @@ def execute_tool(name, args, workspace):
 def _self_test():
     import tempfile
     ws = tempfile.mkdtemp(prefix="hearth-tools-")
+    # Pin the MCP config somewhere that does not exist, so this test measures
+    # the tool layer and not whatever MCP servers the host happens to have
+    # configured. Without this, running the suite on a machine with a real
+    # mcp.json would start those servers as a side effect of a unit test.
+    _old_mcp_cfg = os.environ.get("HEARTH_MCP_CONFIG")
+    os.environ["HEARTH_MCP_CONFIG"] = os.path.join(ws, "no-such-mcp.json")
+    assert mcp_tools() == [], "no MCP config must contribute no tools"
+    assert all_tools() == TOOLS
+    assert windows_manifest() == WINDOWS_TOOLS
+    # An MCP-shaped name that no server registered is an unknown tool, not a
+    # crash and not a silent success.
+    assert execute_tool("mcp__nothing__here", {}, ws).startswith("error: unknown tool")
     assert "wrote" in execute_tool("write_file", {"path": "a/b.txt", "content": "hi"}, ws)
     assert execute_tool("read_file", {"path": "a/b.txt"}, ws) == "hi"
     assert "b.txt" in execute_tool("list_files", {"path": "a"}, ws)
@@ -2419,6 +2478,42 @@ def _self_test():
         assert open(_hi_path, encoding="utf-8").read() == _hi_before + "more/\n"
     finally:
         _shutil.rmtree(_wsp, ignore_errors=True)
+
+    # --- MCP tools reach the model, the manifest, and execute_tool ---------
+    # Exercised with a stub descriptor rather than a real server: hearth_mcp's
+    # own self-test proves the protocol against a real process, and what this
+    # module owns is only the wiring. The stub carries the same shape a real
+    # descriptor does, so a change to that shape breaks here too.
+    _stub = {"name": "mcp__stub__peek", "description": "a stub MCP tool",
+             "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+             "fn": lambda args, _ws: "stub saw {}".format((args or {}).get("q")),
+             "mcp": True}
+    _g = globals()
+    _real_mcp_tools = _g["mcp_tools"]
+    try:
+        _g["mcp_tools"] = lambda: [_stub]
+        assert "mcp__stub__peek" in [t["name"] for t in all_tools()]
+        assert "mcp__stub__peek" in windows_manifest()
+        # The built-ins are still all there and still come first, so an MCP
+        # server cannot displace one by any ordering trick.
+        assert [t["name"] for t in all_tools()][:len(TOOLS)] == [t["name"] for t in TOOLS]
+        assert windows_manifest()[:len(WINDOWS_TOOLS)] == WINDOWS_TOOLS
+        # ... and the model is offered its real schema
+        _specs = ollama_tool_specs(allowed=windows_manifest())
+        _spec = [s for s in _specs if s["function"]["name"] == "mcp__stub__peek"]
+        assert len(_spec) == 1 and _spec[0]["function"]["parameters"]["type"] == "object"
+        # ... but only when the manifest allows it, one tool at a time
+        assert not [s for s in ollama_tool_specs(allowed=WINDOWS_TOOLS)
+                    if s["function"]["name"].startswith("mcp__")]
+        # ... and it dispatches
+        assert execute_tool("mcp__stub__peek", {"q": "hi"}, ws) == "stub saw hi"
+        assert execute_tool("mcp__stub__absent", {}, ws).startswith("error: unknown tool")
+    finally:
+        _g["mcp_tools"] = _real_mcp_tools
+        if _old_mcp_cfg is None:
+            os.environ.pop("HEARTH_MCP_CONFIG", None)
+        else:
+            os.environ["HEARTH_MCP_CONFIG"] = _old_mcp_cfg
 
     print("hearth-tools self-test OK")
     return 0

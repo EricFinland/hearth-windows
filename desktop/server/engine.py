@@ -396,11 +396,15 @@ _POSIX_OS_LINE = "You are running on Linux. run_command uses /bin/sh."
 # Deliberately its own text, not hearth_loop.SYSTEM_PROMPT verbatim. That
 # shared prompt tells the model it "can make HTTP requests" -- true for
 # hearth_loop's own callers, but not for this sidecar: RealEngine._chat
-# advertises only hearth_tools.WINDOWS_TOOLS (file read/write/edit/list/
+# advertises only hearth_tools.windows_manifest() (file read/write/edit/list/
 # search/replace, run_command, git status/diff -- no http_request, no
 # web_fetch, no web_search, no fetch_to_kb), and permissions.decide is
-# called here with allowed_tools=hearth_tools.WINDOWS_TOOLS, which denies
-# every network tool outright regardless of mode. A weak local model that
+# called here with allowed_tools=hearth_tools.windows_manifest(), which denies
+# every network tool outright regardless of mode. That manifest is
+# WINDOWS_TOOLS plus whatever MCP servers the user configured, and it is
+# nothing but WINDOWS_TOOLS when none are, which is the default; MCP tools
+# describe themselves to the model through their own schemas, so this prompt
+# does not enumerate them. A weak local model that
 # believes the old prompt's claim will burn a turn calling a network tool
 # and get an automatic "not in this run's capability manifest" denial every
 # time. This prompt states the manifest the sidecar actually enforces.
@@ -1001,7 +1005,7 @@ class RealEngine:
             if on_token is not None and self._chat_fn_streams:
                 return self._chat_fn(messages, on_token=on_token)
             return self._chat_fn(messages)
-        tools = hearth_tools.ollama_tool_specs(hearth_tools.WINDOWS_TOOLS)
+        tools = hearth_tools.ollama_tool_specs(hearth_tools.windows_manifest())
         return hearth_loop.chat(self.ollama_url, model, messages, tools,
                                 on_token=on_token)
 
@@ -1336,7 +1340,8 @@ class RealEngine:
 
                 calls = msg.get("tool_calls") or []
                 if not calls:
-                    parsed = hearth_loop.parse_content_tool_calls(content, allowed=hearth_tools.WINDOWS_TOOLS)
+                    parsed = hearth_loop.parse_content_tool_calls(
+                        content, allowed=hearth_tools.windows_manifest())
                     if parsed:
                         calls = [{"function": c} for c in parsed]
                     else:
@@ -1379,10 +1384,10 @@ class RealEngine:
                     display_args = cargs
 
                     verdict = permissions.decide(ctx.mode, name, cargs, self.auto_allow,
-                                                  allowed_tools=hearth_tools.WINDOWS_TOOLS)
+                                                  allowed_tools=hearth_tools.windows_manifest())
 
                     if verdict == "deny":
-                        if name not in hearth_tools.WINDOWS_TOOLS:
+                        if name not in hearth_tools.windows_manifest():
                             result_text = ("denied: {} is not in this run's capability manifest; "
                                            "use only the tools you were given".format(name))
                         else:

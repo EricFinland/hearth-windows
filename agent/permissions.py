@@ -23,6 +23,14 @@ MODES = ("plan", "edit", "auto", "bypass")
 
 # Risk class per tool: "safe" (reads), "edit" (file writes), "dangerous"
 # (shell, network, sudo). Unknown tools are treated as dangerous (fail closed).
+#
+# Tools from configured MCP servers are added to this dict at run time by
+# hearth_mcp.Registry, under names prefixed "mcp__". They are written in here
+# rather than resolved through a callback so `decide` below stays the pure,
+# I/O-free function this module's docstring promises. The consequence of the
+# ordering is the safe one: an MCP tool that has not been registered yet is
+# simply absent, and risk_of already fails closed on absence, so a decision
+# taken before registration can only ever be too strict.
 RISK = {
     "read_file": "safe",
     "list_files": "safe",
@@ -227,6 +235,42 @@ def _self_test():
     assert decide("edit", "run_command") == "gate"
     assert decide("edit", "mystery") == "gate"
     assert decide("edit", "write_file", allowed_tools={"read_file"}) == "deny"
+
+    # --- MCP tools ------------------------------------------------------
+    # An MCP tool nobody registered is an unknown tool, and unknown is
+    # dangerous. This is what makes the registration ordering safe.
+    assert risk_of("mcp__roblox__execute_luau") == "dangerous"
+    assert decide("plan", "mcp__roblox__execute_luau") == "deny"
+    assert decide("auto", "mcp__roblox__execute_luau") == "gate"
+    assert decide("edit", "mcp__roblox__execute_luau") == "gate"
+    # auto_allow is a run_command allowlist and never reaches another tool, so
+    # it cannot be used to wave an MCP tool through.
+    assert decide("auto", "mcp__roblox__execute_luau",
+                  {"command": "git status"}, auto_allow={"git"}) == "gate"
+    # The manifest allows and denies MCP tools individually, in every mode,
+    # bypass included: there is no mode that reaches a tool the manifest
+    # left out.
+    _mcp_manifest = {"read_file", "mcp__roblox__get_studio_state"}
+    assert decide("auto", "mcp__roblox__get_studio_state",
+                  allowed_tools=_mcp_manifest) == "gate"  # unregistered: still dangerous
+    assert decide("auto", "mcp__roblox__execute_luau",
+                  allowed_tools=_mcp_manifest) == "deny"
+    assert decide("bypass", "mcp__roblox__execute_luau",
+                  allowed_tools=_mcp_manifest) == "deny"
+    # Once hearth_mcp registers a genuinely read-only tool, it reads like any
+    # other read. Registered here directly rather than by importing hearth_mcp,
+    # so this module keeps no dependency on it.
+    RISK["mcp__roblox__get_studio_state"] = "safe"
+    try:
+        assert decide("plan", "mcp__roblox__get_studio_state") == "allow"
+        assert decide("auto", "mcp__roblox__get_studio_state") == "allow"
+        assert decide("auto", "mcp__roblox__get_studio_state",
+                      allowed_tools=_mcp_manifest) == "allow"
+        assert decide("plan", "mcp__roblox__get_studio_state",
+                      allowed_tools={"read_file"}) == "deny"
+    finally:
+        RISK.pop("mcp__roblox__get_studio_state", None)
+
     print("hearth-permissions self-test OK")
     return 0
 
