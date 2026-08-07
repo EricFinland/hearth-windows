@@ -5,13 +5,14 @@ sidecar, packaged and run as a normal application on someone's own machine.
 Nothing about this build is published yet, so this is written to shape the
 design, not to explain a decision already made or respond to an incident.
 
-Read `SECURITY.md` first. That document describes hearth on NixOS, where the
-containment is systemd unit isolation, a bwrap sandbox, and a per-run
-nftables egress wall enforced by the kernel. **None of that exists on
-Windows.** There is no mandatory access control, no syscall filtering, and no
-kernel-level egress wall. The Windows build runs as an ordinary user process
-on a machine full of the user's real files, and the mitigations below have to
-carry weight that used to sit in the OS.
+Read `SECURITY.md` first for the summary; this is the analysis behind it.
+
+The single fact that shapes everything below: **there is no OS sandbox here.**
+No mandatory access control, no syscall filtering, no kernel-level egress
+wall. The Windows build runs as an ordinary user process on a machine full of
+the user's real files, so every mitigation named here is enforced by Hearth's
+own code inside Hearth's own process, and has to carry weight that on other
+platforms would sit in the operating system.
 
 ## 1. Assets
 
