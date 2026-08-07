@@ -1,5 +1,4 @@
 *.sh text eol=lf
-*.nix text eol=lf
 
 # Licence texts are checked by digest, not by eye. LICENSE must hash to the
 # canonical Apache-2.0 value and vendor/licenses/ must hash to the values

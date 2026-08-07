@@ -1,24 +1,15 @@
-result
-result-*
-.direnv
 .env
-secrets/*.age
-secrets/*.yaml
-!secrets/example.yaml
 *.key
 .DS_Store
-
-# docs site build artifacts
-site/node_modules/
-site/dist/
-site/.astro/
+Thumbs.db
 
 # python bytecode
 __pycache__/
 *.pyc
 
-# agent worktrees and session scratch
-.claude/
+# editor and local tooling scratch directories
+.vscode/
+.idea/
 
 # vendored llama.cpp binaries. Fetched by scripts/vendor_llama.py from the
 # release pinned in vendor/llama_manifest.json, which IS committed. Native
@@ -26,7 +17,6 @@ __pycache__/
 # the pin, so the manifest is the thing worth reviewing in a diff.
 vendor/llama/
 vendor/cache/
-.gstack/
 
 # vendored CPython, same reasoning as the llama binaries above. Fetched by
 # scripts/vendor_python.py from the release pinned in
@@ -57,3 +47,10 @@ desktop/tauri/target/
 # and must never be in a repository. *.key above already covers it; this entry
 # is here so the intent is visible in the ignore file rather than inferred.
 release/keys/
+
+# The scripts that produced this repository from the private development
+# repository, and the audit that checks the result. They live here so they sit
+# beside the thing they build and can be re-run when the source moves on, but
+# they are not part of the application and they describe the layout of a
+# repository that is not public, so they are not published with it.
+/tooling/

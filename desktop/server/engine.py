@@ -2140,8 +2140,7 @@ def _self_test():
     # dict literal here that names "skipped_gitlinks" must also name
     # "excluded_changed" in the same literal, so the two can never again
     # drift apart the way a forwarded field has already gone missing twice
-    # on this branch (sub_repos_truncated from the checkpoint event; see the
-    # iteration history in .superpowers/sdd/loop/).
+    # on this branch (sub_repos_truncated from the checkpoint event).
     with open(os.path.abspath(__file__), "r", encoding="utf-8") as fh:
         _engine_src_for_restore_check = fh.read()
     for _match in _re.finditer(r'\{[^{}]*"skipped_gitlinks"[^{}]*\}', _engine_src_for_restore_check, _re.DOTALL):

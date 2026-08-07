@@ -161,8 +161,8 @@ Standard library only. Every network or subprocess call in this module is
 optional in the sense that its failure degrades to a clear "could not
 measure" result, never a raised exception reaching the caller.
 
-Real-world calibration this module was checked against (see the project's
-docs and CLAUDE.md): a Linux host with an RTX 2060 (6GB VRAM) running
+Real-world calibration this module was checked against: a Linux host with
+an RTX 2060 (6GB VRAM) running
 qwen2.5-coder (4.75GB) fully resident at a 16384-token context, and a
 Windows machine with an RTX 5080 (~16GB VRAM). compare() is expected to
 rank sensibly differently on those two boxes; neither figure is hardcoded
