@@ -24,9 +24,10 @@ discussions, and to anyone representing the project in public.
 
 ## Enforcement
 
-Report unacceptable behavior through the contact form at
-https://ericcatalano.dev/#contact. Reports will be reviewed and handled
-confidentially. The maintainer may remove comments, commits, or contributors
-that violate this code.
+Report unacceptable behavior privately through GitHub Security Advisories on
+this repository (the Security tab, "Report a vulnerability"), which is a
+private channel between you and the maintainer. Reports will be reviewed and
+handled confidentially. The maintainer may remove comments, commits, or
+contributors that violate this code.
 
 This is a lightweight adaptation of the spirit of the Contributor Covenant.

@@ -7,24 +7,22 @@
 
 [![build](https://img.shields.io/github/actions/workflow/status/EricFinland/hearth/build.yml?style=flat-square&logo=githubactions&logoColor=white&label=build&labelColor=211c16&color=cc785c)](https://github.com/EricFinland/hearth/actions/workflows/build.yml)
 ![Windows](https://img.shields.io/badge/Windows-in%20development-cc785c?style=flat-square&logo=windows&logoColor=white&labelColor=211c16)
-![NixOS](https://img.shields.io/badge/NixOS-flake-cc785c?style=flat-square&logo=nixos&logoColor=white&labelColor=211c16)
-![Ollama](https://img.shields.io/badge/LLMs-Ollama-cc785c?style=flat-square&logo=ollama&logoColor=white&labelColor=211c16)
-![Sandboxed](https://img.shields.io/badge/agents-sandboxed-cc785c?style=flat-square&logo=linux&logoColor=white&labelColor=211c16)
-![Audited](https://img.shields.io/badge/every%20run-audited-cc785c?style=flat-square&logo=sqlite&logoColor=white&labelColor=211c16)
+![llama.cpp](https://img.shields.io/badge/inference-llama.cpp-cc785c?style=flat-square&labelColor=211c16)
+![Bundled](https://img.shields.io/badge/brings%20its%20own-Python%20%2B%20engine-cc785c?style=flat-square&logo=python&logoColor=white&labelColor=211c16)
+![Contained](https://img.shields.io/badge/tools-workspace%20contained-cc785c?style=flat-square&labelColor=211c16)
+![Unsigned](https://img.shields.io/badge/installer-unsigned-cc785c?style=flat-square&labelColor=211c16)
 ![License](https://img.shields.io/badge/license-Apache--2.0-cc785c?style=flat-square&labelColor=211c16)
-[![release](https://img.shields.io/github/v/release/EricFinland/hearth?style=flat-square&labelColor=211c16&color=cc785c)](https://github.com/EricFinland/hearth/releases)
 
-### Local LLMs and autonomous coding agents on your own hardware, at zero cost.
+### Local LLMs and an autonomous coding agent on your own Windows machine, at zero cost.
 
-[**📖 Documentation**](https://ericfinland.github.io/hearth/) &nbsp;·&nbsp; [**🪟 Hearth for Windows**](docs/windows.md) &nbsp;·&nbsp; [**🐧 NixOS quickstart**](#the-nixos-system) &nbsp;·&nbsp; [**🧠 Architecture**](https://ericfinland.github.io/hearth/concepts/architecture/)
+[**Hearth for Windows**](docs/windows.md) &nbsp;·&nbsp; [**The model shop**](docs/model-shop.md) &nbsp;·&nbsp; [**Packaging**](docs/packaging-windows.md) &nbsp;·&nbsp; [**Threat model**](docs/security/windows-threat-model.md) &nbsp;·&nbsp; [**Limitations**](docs/limitations.md)
 
 </div>
 
 ---
 
 Hearth runs local models on your own machine and gives them tools: files, a
-shell, an agent loop that can be turned loose on a task. It comes in two
-forms today.
+shell, an agent loop that can be turned loose on a task.
 
 **Hearth is a Windows desktop application in development. There is no
 download yet.** The engine underneath it (permissions, containment,
@@ -44,42 +42,25 @@ commands, and can be handed a task to work on while you do something else.
 Two names, used consistently throughout this repo: Hearth is the
 application, Hearth Code is the coding agent inside it.
 
-**Hearth is also a fully declarative NixOS system.** The same agent engine
-runs as sandboxed systemd units on a machine defined entirely by one
-`flake.nix`, with every run audited to a local database and the whole OS
-reproducible and reversible with a single command.
-
-Windows is the newer, larger surface, and the one most people will meet
-first. NixOS users, skip ahead to [the NixOS system](#the-nixos-system).
-
-> **NixOS system: v1.6, stable.** The whole stack runs on real hardware:
-> sandboxed agents, the audit log, the reproducible flake, the web cockpit,
-> an OpenAI-compatible API, a local knowledge base, a standing-missions
-> scheduler, a declarative model router, a natural-language audit query, and
-> a self-improvement loop that only ever produces reviewable, gated
-> branches, never auto-changing a running system. Local model quality is the
-> honest ceiling. See the [CHANGELOG](CHANGELOG.md).
-
-> **Windows desktop app: in development, nothing published yet.** The agent
-> engine underneath Hearth Code, hardware detection, the model shop's fit
-> calculator, workspace containment, git-backed checkpoint/undo, model
-> downloads with honest progress, a prompt-injection scanner, an outbound
-> secret scanner, task-aware model routing, idle-aware compute, and
-> first-run setup diagnosis are all built and self-tested on Windows. So are
-> the desktop shell, the interface, and a Windows installer that carries its
-> own inference engine and its own Python: `python
+> **Status: in development, nothing published.** The agent engine, hardware
+> detection, the model shop's fit calculator, workspace containment, git-backed
+> checkpoint and undo, model downloads with honest progress, a prompt-injection
+> scanner, an outbound secret scanner, task-aware model routing, idle-aware
+> compute, and first-run setup diagnosis are all built and self-tested on
+> Windows. So are the desktop shell, the interface, and a Windows installer
+> that carries its own inference engine and its own Python: `python
 > scripts/build_windows.py` produces it, and
 > [docs/packaging-windows.md](docs/packaging-windows.md) documents it. The
 > installer ships llama.cpp's CPU build, which is the only one that cannot
-> fail to start on an unknown machine, and Hearth fetches the right GPU
-> build for the card it finds on first launch, verifies that it actually
-> runs there, and falls back to the CPU build if it does not. On an RTX
-> 5080 that is 13.8 tokens per second before and 169 after. That
-> installer is **unsigned**, which means the first person to run it meets a
-> full-screen SmartScreen warning whose only visible button is "Don't run".
-> Until there is a code-signing certificate there is no download and nothing
-> to hand to a stranger. [Hearth for Windows](docs/windows.md) says exactly
-> what exists today; [the Windows threat
+> fail to start on an unknown machine, and Hearth fetches the right GPU build
+> for the card it finds on first launch, verifies that it actually runs there,
+> and falls back to the CPU build if it does not. On an RTX 5080 that is 13.8
+> tokens per second before and 169 after. That installer is **unsigned**,
+> which means the first person to run it meets a full-screen SmartScreen
+> warning whose only visible button is "Don't run". Until there is a
+> code-signing certificate there is no download and nothing to hand to a
+> stranger. [Hearth for Windows](docs/windows.md) says exactly what exists
+> today; [the Windows threat
 > model](docs/security/windows-threat-model.md) says exactly what does not.
 
 ## Hearth for Windows
@@ -223,140 +204,41 @@ the desktop app uses. Every turn is journalled, so a machine that loses power
 mid-run comes back knowing which turn was interrupted and refusing to resume
 it: `--resume` continues from the last turn that actually completed.
 
-## The NixOS system
-
-Most people run local agents with full system privileges and no record of
-what they did. **hearth flips that.** Agents are contained at the
-operating-system level, every run records its tokens, cost, latency, and
-errors to a local database, and the entire system is defined in one
-`flake.nix` you can rebuild identically and roll back in a single command.
-
-> It is not a custom kernel or a remastered distro. It is a declarative
-> NixOS system you `nixos-rebuild switch` into existence.
-
-### What makes it different
-
-|  |  |
-| --- | --- |
-| 🛡️ **Sandboxed by default** | Agents run as ephemeral, isolated systemd units. No host secrets, no writes outside their own workspace, no privilege escalation. |
-| 🧾 **Every run audited** | Tokens, cost, latency, and errors land in local SQLite. One command shows the last 20 runs. A failed run still leaves a trail. |
-| ♻️ **Reproducible from boot** | One flake builds the whole OS. Atomic, bootloader-level rollback. Two builds from the same lock are identical. |
-| 🧠 **Local and private** | Ollama on your own GPU, agents that actually use tools, a web command center. Zero cloud, nothing leaves the box. |
-
-### Architecture
-
-```mermaid
-flowchart LR
-  Dev["💻 Your laptop<br/>edit · git push"] --> GH["GitHub"]
-  GH -->|"nixos-rebuild --flake"| Host
-
-  subgraph Host["🔥 hearth host"]
-    direction TB
-    LLM["Ollama + CUDA"]
-    AG["Sandboxed agents"]
-    DB[("SQLite audit")]
-    MAP["Web command center"]
-    LLM --> AG
-    AG --> DB
-    AG --> MAP
-  end
-```
-
-### See it run
-
-```console
-$ hearth-status
-● ollama       active (running)   llama3.2:3b, mistral:7b
-● tailscale    connected
-● recent runs  3 in the last hour
-
-$ hearth-runs
-AGENT   MODEL          TOKENS   LATENCY   COST
-demo    llama3.2:3b      142     0.9s     $0.00
-build   qwen2.5-coder    2.1k    14s      $0.00
-chat    mistral:7b       430     3.2s     $0.00
-```
-
-### How a run stays contained
-
-```mermaid
-sequenceDiagram
-  actor You
-  participant Agent as Agent (sandboxed)
-  participant Model as Local model
-  participant Tools as Tools (workspace only)
-  participant Audit as Audit log
-
-  You->>Agent: goal
-  loop until done
-    Agent->>Model: think
-    Model-->>Agent: tool call
-    Agent->>Tools: run · no escape · secrets by name only
-    Tools-->>Agent: result
-  end
-  Agent->>Audit: tokens · cost · latency
-  Agent-->>You: result + receipt
-```
-
-### NixOS quickstart
-
-```sh
-git clone https://github.com/EricFinland/hearth
-cd hearth
-
-nix flake check               # validate the whole system
-bash scripts/build-image.sh   # build a bootable image
-```
-
-Full install paths (existing NixOS host, fresh VM, or a Linux primer) live in the docs:
-
-#### → **[ericfinland.github.io/hearth](https://ericfinland.github.io/hearth/)**
-
-#### Use it
-
-```sh
-# Point any OpenAI client at your local models (audited):
-curl http://your-hearth:8770/v1/chat/completions \
-  -d '{"model":"llama3.2:3b","messages":[{"role":"user","content":"hello"}],"stream":true}'
-
-# Check the install is healthy:
-hearth-doctor
-
-# Watch activity in Grafana, etc:
-curl http://your-hearth:8770/metrics
-```
-
-<details>
-<summary><b>The full NixOS feature set</b></summary>
-
-<br/>
-
-- **Declarative NixOS system.** The entire OS is one flake; `nixos-rebuild switch` applies changes atomically.
-- **Ollama on boot** with a declarative model manifest pulled on activation, CUDA-accelerated.
-- **Tool-using agent loop** (`hearth-loop`): a model gets a goal and tools (run commands, read and write files, HTTP), runs in a per-run workspace, and is audited.
-- **Least-privilege sandbox** with a written threat model: `ProtectSystem=strict`, `ProtectHome`, `NoNewPrivileges`, empty capabilities, a syscall filter, and per-run private temp.
-- **Per-run audit log** in SQLite, queryable with `hearth-runs`.
-- **Web command center:** chat with a local model and launch sandboxed agents from the browser, with permission modes, an approvals queue, and a kill switch.
-- **OpenAI-compatible API** (`/v1/chat/completions` with real token streaming, `/v1/models`): any OpenAI client uses your local models, every call audited.
-- **Knowledge base (RAG):** ingest docs or a whole repo (`index_dir`), semantic retrieval via local embeddings with lexical fallback, auto-recalled into agent context.
-- **Standing missions:** a scheduler that runs missions on a cadence (the works-while-you-sleep layer).
-- **Self-improvement loop:** an always-on daemon proposes changes to hearth's own config, validates them with `nix flake check`, compounds and learns, and produces reviewable branches with one-click promote-to-live and an auto-rollback watchdog.
-- **OS-level egress enforcement:** when a run declares its allowed hosts, hearth programs per-run nftables walls that drop everything else at the kernel, so a run cannot slip the tool-layer allowlist by shelling out to `curl`.
-- **Flight recorder and replay viewer:** every run records a structured per-step event stream; a scrubber replays it step by step, with each tool call's args, output, duration, and permission verdict inspectable.
-- **Run diff:** `POST /diff` runs the same prompt against two local models and returns tokens, latency, and output side by side, so "which model for this?" is a live test, not a guess.
-- **Spend circuit breaker:** a hard daily token budget across all runs; at the cap, running agents halt gracefully and new runs refuse to start until local midnight.
-- **Unified alerting:** one fan-out pushes every alert to Telegram and ntfy, firing on errors, tripwire trips, and budget breaches so the box can reach your phone.
-- **Declarative missions:** scheduled cron-as-flake missions you define in the flake, rendered read-only and merged with cockpit-created ones, each launch carrying its capability manifest and egress allowlist.
-- **Declarative model router:** `hearth.router` in the flake picks the right model per launch from keyword and tool-based rules, with the decision recorded in the flight recorder.
-- **Natural-language audit query:** ask the audit database a question in plain English; a local model translates it to a validated, read-only `SELECT` and summarizes the result.
-- **Observability:** a Prometheus `/metrics` endpoint, a usage-over-time stats view, and `hearth-doctor` for a one-command health check.
-- **Agent credentials by name:** keys are substituted at request time via systemd credentials, so the model never sees the secret value.
-- **More agent tools:** grep, multi-file edit, directory tree, web-to-knowledge, and more.
-- **Optional KDE Plasma desktop**, a Tailscale mesh with a tight firewall, secrets via sops-nix, and a boot dashboard.
-
-</details>
-
 ---
+
+## Repository layout
+
+| | |
+| --- | --- |
+| `agent/` | the engine: the agent loop, the permission gate, workspace containment, contained subprocesses, hardware detection, the model shop, checkpoint and undo, the injection and secret scanners, the signed updater |
+| `desktop/server/` | the sidecar: a localhost HTTP layer over the engine, token-authenticated, started and owned by the shell |
+| `desktop/shell/` | the Electron shell, its fuse configuration, and the electron-builder packaging |
+| `desktop/ui/` | the interface: plain HTML, CSS and modules, no framework and no build step |
+| `scripts/` | vendoring the pinned llama.cpp and CPython, building the installer, generating third-party notices, signing release manifests, benchmarks |
+| `vendor/` | the pins and the licence texts. The binaries themselves are fetched and checksummed, never committed |
+| `release/` | `trust.json`, the public update trust anchor that ships inside the installer |
+| `docs/` | the reference documentation |
+
+## Building it
+
+```sh
+python scripts/build_windows.py
+```
+
+That is the whole command, on Windows, from a clean checkout, with Node and
+Python 3.11 or newer on the machine. It fetches and checksums llama.cpp and
+CPython against the manifests in `vendor/`, stages the payload, proves the
+staged payload actually runs, installs the packaging layer, and produces
+`build/dist/Hearth-Setup-<version>.exe`. Nothing under `build/` or `vendor/`
+is committed. [docs/packaging-windows.md](docs/packaging-windows.md) explains
+what ends up inside the installer and what it does and does not do yet.
+
+Every module carries its own self-test and needs no test runner, no network
+and no model:
+
+```sh
+for m in agent/*.py desktop/server/*.py; do python "$m" --self-test; done
+```
 
 ## Licensing
 
@@ -373,23 +255,26 @@ is generated from what is actually vendored by
 [docs/licensing.md](docs/licensing.md) explains how that works, which components
 are copyleft and what that obliges, and where code signing stands.
 
-## Contributing & security
+## Contributing and security
 
 Contributions are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md) for the build
 and self-test workflow. Found a security issue? Please follow
 [SECURITY.md](SECURITY.md) rather than opening a public issue. The Windows
-build has its own threat model at
+build's threat model is at
 [docs/security/windows-threat-model.md](docs/security/windows-threat-model.md),
-since the containment story there is different from the NixOS system's.
+and [docs/limitations.md](docs/limitations.md) is the page worth reading before
+you point Hearth Code at anything you would mind losing.
 
-> **First-boot note (NixOS):** the config ships a default console password for the very
-> first local login (SSH is key-only). Change it immediately with `passwd`. See
-> [SECURITY.md](SECURITY.md).
+[docs/code-signing-policy.md](docs/code-signing-policy.md) covers what an
+unsigned installer costs a user today and what the publisher name will be once
+that changes. [docs/privacy.md](docs/privacy.md) lists every destination the
+shipped code can reach, which is a short list and contains no server this
+project operates.
 
 ---
 
 <div align="center">
 
-Built by <a href="https://github.com/EricFinland">Eric Catalano</a> &nbsp;·&nbsp; <a href="LICENSE">Apache-2.0</a> &nbsp;·&nbsp; <a href="THIRD-PARTY-NOTICES.md">Third-party notices</a> &nbsp;·&nbsp; <a href="https://ericfinland.github.io/hearth/">Docs</a> &nbsp;·&nbsp; <a href="CONTRIBUTING.md">Contribute</a> &nbsp;·&nbsp; <a href="SECURITY.md">Security</a>
+Built by <a href="https://github.com/EricFinland">Eric Catalano</a> &nbsp;·&nbsp; <a href="LICENSE">Apache-2.0</a> &nbsp;·&nbsp; <a href="THIRD-PARTY-NOTICES.md">Third-party notices</a> &nbsp;·&nbsp; <a href="CONTRIBUTING.md">Contribute</a> &nbsp;·&nbsp; <a href="SECURITY.md">Security</a>
 
 </div>

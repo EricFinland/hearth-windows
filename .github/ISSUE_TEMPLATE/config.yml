@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Documentation
-    url: https://ericfinland.github.io/hearth/
-    about: Install guides, concepts, and reference, start here.
+    url: https://github.com/EricFinland/hearth/tree/main/docs
+    about: What Hearth is, what it does today, and its limitations.
   - name: Report a security vulnerability
     url: https://github.com/EricFinland/hearth/security/advisories/new
     about: Please report security issues privately, not as a public issue.

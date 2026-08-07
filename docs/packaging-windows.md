@@ -426,9 +426,9 @@ on an unsigned build, and keeps protecting them after a certificate is bought.
 
 ## Versioning
 
-The desktop app carries its own version line, starting at 0.1.0. That is
-separate from the `CHANGELOG.md` line for the Linux daemon, which is at
-1.6.0. They are the same repository and not the same artifact.
+The desktop app carries its own version line, starting at 0.1.0. It is
+declared in `desktop/shell/package.json` and is what electron-builder stamps
+into the installer name and the uninstall entry.
 
 ## Development
 
