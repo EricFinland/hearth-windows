@@ -62,10 +62,10 @@ _KEEP_ENV = (
     "TEMP", "TMP", "HOME", "USERPROFILE", "LANG", "LC_ALL",
     "PROGRAMFILES", "ProgramFiles", "PROGRAMDATA", "APPDATA", "LOCALAPPDATA",
     "WINDIR", "PATHEXT", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
-    # NixOS runtime plumbing (measured against the real hearth-grow systemd
-    # unit on this host): without these a child cannot find locales, timezone
-    # data, or anything installed through the user's Nix profile, which is
-    # most of what a shell command on this host actually needs.
+    # NixOS runtime plumbing, measured against a real systemd unit: without
+    # these a child cannot find locales, timezone data, or anything installed
+    # through the user's Nix profile, which is most of what a shell command on
+    # such a host actually needs.
     "LOCALE_ARCHIVE", "TZDIR", "NIX_PATH", "NIX_PROFILES",
     "USER", "SHELL", "TERM", "XDG_RUNTIME_DIR",
 )
