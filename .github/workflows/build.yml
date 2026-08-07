@@ -1,0 +1,158 @@
+name: build
+
+# Everything here runs on a GitHub-hosted runner, on purpose.
+#
+# Hearth's installer is unsigned, and the route to signing it is SignPath
+# Foundation's free certificate for open-source projects. That programme has a
+# hard requirement: every job that touches the artifact must run on a
+# GitHub-hosted runner, so the binary SignPath signs is demonstrably the one
+# this public repository's source produced. A self-hosted runner, a locally
+# built installer uploaded by hand, or a job on any other provider all fail
+# that requirement. So the build lives here rather than on the maintainer's
+# desktop, even though the desktop is faster.
+#
+# See docs/code-signing-policy.md for what this workflow has to grow before
+# signing is switched on, and why the signing step is not in this file yet.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Windows runners default to a legacy code page. The engine writes and reads
+  # UTF-8 everywhere and asserts it in its own self-tests, so state it rather
+  # than inherit it.
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
+jobs:
+  # Fast gate. Every module under agent/ and desktop/server/ carries its own
+  # checks behind --self-test: standard library only, no network, no model, no
+  # test runner. This job needs nothing except Python, so it fails in about a
+  # minute when something is broken rather than after the installer build.
+  self-test:
+    name: self-tests (windows)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Pinned to the interpreter Hearth ships. vendor/python_manifest.json
+          # pins CPython 3.12.10 for the installer payload; testing on the same
+          # line is the point of pinning it at all.
+          python-version: "3.12"
+
+      - name: Report the toolchain
+        shell: bash
+        run: |
+          python --version
+          node --version
+          npm --version
+
+      - name: Engine and sidecar self-tests
+        shell: bash
+        run: |
+          set -u
+          failed=0
+          total=0
+          for m in agent/*.py desktop/server/*.py; do
+            total=$((total + 1))
+            echo "--- $m"
+            if ! python "$m" --self-test; then
+              echo "::error file=$m::self-test failed"
+              failed=$((failed + 1))
+            fi
+          done
+          echo "ran $total self-test(s), $failed failure(s)"
+          test "$failed" -eq 0
+
+      - name: Build-tooling self-tests
+        shell: bash
+        run: |
+          set -u
+          failed=0
+          # build_windows.py and e2e_live.py have no --self-test by design: the
+          # first IS the build and the second needs a real model. Every other
+          # script in scripts/ carries one.
+          for m in scripts/loop_bench.py scripts/make_icon.py \
+                   scripts/release_manifest.py scripts/third_party_notices.py \
+                   scripts/vendor_llama.py scripts/vendor_python.py; do
+            echo "--- $m"
+            if ! python "$m" --self-test; then
+              echo "::error file=$m::self-test failed"
+              failed=$((failed + 1))
+            fi
+          done
+          test "$failed" -eq 0
+
+  # The real build. Fetches and checksums the pinned llama.cpp and CPython,
+  # stages the payload, proves the staged payload runs under the staged
+  # interpreter, verifies the Electron fuses, and produces the installer.
+  installer:
+    name: windows installer
+    needs: self-test
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          # electron-builder 26 needs Node 18 or newer. 22 is the current LTS
+          # line and is what the maintainer builds against locally.
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/shell/package-lock.json
+
+      - name: Build the installer
+        shell: bash
+        # No token is mapped into this job, and that is deliberate rather than
+        # an omission: electron-builder publishes to a GitHub release on its
+        # own if it finds GH_TOKEN or GITHUB_TOKEN in the environment. This
+        # workflow builds and uploads an artifact and publishes nothing. Do
+        # not add a token here without also passing --publish never.
+        run: python scripts/build_windows.py
+
+      - name: Third-party notices are not stale
+        shell: bash
+        # Deliberately after the build. The notices describe the engine that
+        # actually ships, so --check cannot run until vendor/llama is on disk,
+        # which only the build step puts there.
+        run: python scripts/third_party_notices.py --check
+
+      - name: Record what was built
+        shell: bash
+        run: |
+          ls -la build/dist
+          # A digest in the log is the cheapest possible provenance: it lets
+          # anyone compare a downloaded artifact against the run that made it.
+          sha256sum build/dist/*.exe
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: hearth-windows-installer
+          path: build/dist/*.exe
+          if-no-files-found: error
+          retention-days: 30
