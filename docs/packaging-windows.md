@@ -427,8 +427,17 @@ on an unsigned build, and keeps protecting them after a certificate is bought.
 ## Versioning
 
 The desktop app carries its own version line, starting at 0.1.0. It is
-declared in `desktop/shell/package.json` and is what electron-builder stamps
-into the installer name and the uninstall entry.
+declared in `desktop/tauri/tauri.conf.json`, which is the single place that
+decides it: `scripts/build_windows.py` reads it from there to name the
+installer and to stamp the uninstall entry, and the running app reads the
+same value back through `app.package_info().version`, which is what the
+updater compares a release against.
+
+`desktop/tauri/Cargo.toml` carries a `version` too, so there are two copies
+that could drift. They are not left to agree by habit:
+`scripts/third_party_notices.py --check` fails the build when they differ,
+on the grounds that the installer would then carry one version and the
+notices the other. That check runs in CI on every push.
 
 ## Development
 

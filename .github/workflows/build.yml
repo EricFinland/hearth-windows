@@ -60,8 +60,8 @@ jobs:
         shell: bash
         run: |
           python --version
-          node --version
-          npm --version
+          rustc --version
+          cargo --version
 
       - name: Engine and sidecar self-tests
         shell: bash
@@ -101,7 +101,9 @@ jobs:
 
   # The real build. Fetches and checksums the pinned llama.cpp and CPython,
   # stages the payload, proves the staged payload runs under the staged
-  # interpreter, verifies the Electron fuses, and produces the installer.
+  # interpreter, compiles the Tauri shell, and produces the NSIS installer.
+  # scripts/verify_binary.py then reads the hardening back out of the built
+  # exe rather than trusting that the build asked for it.
   installer:
     name: windows installer
     needs: self-test
@@ -116,22 +118,52 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Set up Node
-        uses: actions/setup-node@v4
+      # Rust, not Node. The shell was Electron until the Tauri port; this job
+      # used to set up Node 22 and cache desktop/shell/package-lock.json, a
+      # file the port deleted. That is why this step is worth reading twice:
+      # the workflow had never run, so nothing ever reported that it pointed
+      # at a path which no longer exists.
+      #
+      # rustc and cargo are preinstalled on windows-latest, well past the
+      # 1.82 desktop/tauri/Cargo.toml asks for, so there is no toolchain
+      # action here. cargo-tauri is not preinstalled, and building it from
+      # source costs minutes on every run, so it is cached as a binary.
+      - name: Cache the Tauri bundler
+        id: tauri-cli
+        uses: actions/cache@v4
         with:
-          # electron-builder 26 needs Node 18 or newer. 22 is the current LTS
-          # line and is what the maintainer builds against locally.
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: desktop/shell/package-lock.json
+          path: ~/.cargo/bin/cargo-tauri.exe
+          key: cargo-tauri-v2-${{ runner.os }}
+
+      - name: Install the Tauri bundler
+        if: steps.tauri-cli.outputs.cache-hit != 'true'
+        shell: bash
+        # Pinned to the major that desktop/tauri/Cargo.toml depends on. --locked
+        # builds it from its own committed lockfile rather than resolving fresh
+        # dependencies at install time.
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Cache the crate registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('desktop/tauri/Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
 
       - name: Build the installer
         shell: bash
         # No token is mapped into this job, and that is deliberate rather than
-        # an omission: electron-builder publishes to a GitHub release on its
-        # own if it finds GH_TOKEN or GITHUB_TOKEN in the environment. This
-        # workflow builds and uploads an artifact and publishes nothing. Do
-        # not add a token here without also passing --publish never.
+        # an omission. It mattered sharply under electron-builder, which
+        # publishes a GitHub release by itself the moment it finds GH_TOKEN or
+        # GITHUB_TOKEN in the environment; `cargo tauri build` has no such
+        # behaviour, so the rule is now a boundary rather than a defusing.
+        # This job builds and uploads an artifact and publishes nothing.
+        # Releasing is a separate, deliberate act: see docs/updates.md, where
+        # what reaches users is decided by the signing key and not by whatever
+        # a build job happened to produce.
         run: python scripts/build_windows.py
 
       - name: Third-party notices are not stale
