@@ -5,7 +5,7 @@
 <br/>
 <br/>
 
-[![build](https://img.shields.io/github/actions/workflow/status/EricFinland/hearth/build.yml?style=flat-square&logo=githubactions&logoColor=white&label=build&labelColor=211c16&color=cc785c)](https://github.com/EricFinland/hearth/actions/workflows/build.yml)
+[![build](https://img.shields.io/github/actions/workflow/status/EricFinland/hearth-windows/build.yml?style=flat-square&logo=githubactions&logoColor=white&label=build&labelColor=211c16&color=cc785c)](https://github.com/EricFinland/hearth-windows/actions/workflows/build.yml)
 ![Windows](https://img.shields.io/badge/Windows-in%20development-cc785c?style=flat-square&logo=windows&logoColor=white&labelColor=211c16)
 ![llama.cpp](https://img.shields.io/badge/inference-llama.cpp-cc785c?style=flat-square&labelColor=211c16)
 ![Bundled](https://img.shields.io/badge/brings%20its%20own-Python%20%2B%20engine-cc785c?style=flat-square&logo=python&logoColor=white&labelColor=211c16)

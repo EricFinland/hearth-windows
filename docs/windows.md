@@ -1,8 +1,6 @@
 # Hearth for Windows
 
-This page assumes no Linux knowledge. If you already run the NixOS system,
-this is not for you; see the [main README](../README.md#the-nixos-system)
-instead.
+This page assumes no Linux knowledge and no command line.
 
 ## What Hearth is
 

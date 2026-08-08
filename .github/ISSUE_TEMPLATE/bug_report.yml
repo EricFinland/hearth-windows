@@ -33,10 +33,14 @@ body:
     id: env
     attributes:
       label: Environment
-      description: Host (bare metal or VM), GPU, NixOS version, and any relevant hearth.* toggles.
+      description: >-
+        Windows version (`winver`), GPU and driver version, how much RAM the
+        machine has, and which model you were running.
   - type: textarea
     id: logs
     attributes:
       label: Relevant logs
-      description: Output from journalctl, hearth-runs, or nix. Redact anything sensitive.
+      description: >-
+        Hearth writes to `%LOCALAPPDATA%\Hearth`. Redact anything sensitive:
+        paths under that directory can contain the names of files you opened.
       render: shell
