@@ -43,7 +43,7 @@ everything else on this page.
   calculator the model shop's verdicts are built on (`agent/hearth_hw.py`).
 - The model shop's live Hugging Face listings and per-quantisation fit
   logic (`agent/hearth_shop.py`, sourcing from `agent/hearth_hf.py`) - the
-  data and arithmetic, not a UI yet.
+  data and arithmetic, which `desktop/ui/js/shop.js` now puts a screen on.
 - Git-backed checkpoint and undo (`agent/hearth_checkpoint.py`).
 - The permission engine: `plan`, `edit`, `auto`, `bypass`, plus a
   capability manifest that hard-caps what tools a run may use, in every
@@ -107,30 +107,53 @@ everything else on this page.
   "Scoping what the file tools will touch" below for the full syntax
   reference and the exact limits.
 
-**Not built yet.** There is no Tauri desktop shell, no UI, no installer, no
-code signing, and nothing published anywhere. The model shop described below
-has no interface yet: it exists as data and logic today, callable, tested,
-and correct, but with nothing to click. There is no cloud API key support.
-**There is no download of Hearth itself.** The model-download engine above
-can pull an Ollama model when driven directly; there is no button, no app,
-and no installer around it yet. Everything on this page describes an engine
-that works when driven directly, not a finished application.
+Since that list was written, the parts it called missing were built: a Tauri
+shell in Rust (`desktop/tauri/`), the interface (`desktop/ui/`, plain HTML and
+ES modules, no framework and no build step), an installer that
+`scripts/build_windows.py` produces in one command, a bundled inference
+engine, an MCP client ([docs/mcp.md](mcp.md)), and a signed updater
+([docs/updates.md](updates.md)). The model shop has a screen now rather than
+only an API.
+
+**Still not done.** The installer is **not code signed**, so Windows shows a
+full-screen SmartScreen warning on first run;
+[docs/code-signing-policy.md](code-signing-policy.md) covers what signing
+would and would not prove. There is no cloud API key support. AMD and Intel
+GPU detection is incomplete: NVIDIA is detected, others fall back to CPU.
+
+**And nothing has been published.** There is no release, no download link, and
+`release/trust.json` points at `releases.hearth.invalid`, a name reserved so
+it cannot resolve. Building it yourself is the only way to run it today, and
+[docs/getting-started.md](getting-started.md) walks through that from an empty
+folder.
 
 ## What you need
 
-Once there is something to run, it needs [Ollama](https://ollama.com)
-installed with at least one model already pulled. Hearth does not fetch or
-manage models yet; that is the model shop's job, and it isn't built. Until
-then, whatever model you choose in Ollama is the trust decision, made
-outside Hearth.
+**Nothing but Windows.** Hearth bundles CPython and llama.cpp's
+`llama-server`, so an install carries its own interpreter and its own
+inference engine. The one thing it expects to find on the machine is the
+WebView2 runtime, which supported Windows versions already ship and which the
+installer fetches if a machine somehow lacks it. That is the whole point of
+the Tauri port: borrow the browser engine Windows already has rather than
+shipping a second copy of Chromium.
 
-The engine already knows how to tell you which of those things is missing.
-`hearth_setup.py` checks, in order, whether Ollama is installed, whether it
-is running, what version it reports, whether any model has been pulled, and
-whether that model actually fits your hardware, and stops at the first
-thing that is actually wrong rather than piling up downstream failures you
-cannot act on yet. It has no interface yet either; today it is a diagnosis
-you can call directly, not a message you will see on first launch.
+[Ollama](https://ollama.com) is **optional**. It used to be required, and this
+page used to say so. `agent/hearth_backend.py` now resolves a backend in this
+order: an explicit `HEARTH_BACKEND` override, then what the model name implies
+(a path to a GGUF file means llama.cpp, a registry tag means Ollama), then the
+bundled `llama-server`, then Ollama. So if you have Ollama and prefer it, it
+is used; if you have never heard of it, nothing asks you to install it.
+
+Enough RAM for the model you pick, which is the real constraint and the one
+worth thinking about. Hearth measures what you have and tells you which
+quantisations fit, including the KV cache at the context length you would
+actually use, rather than letting you choose something that will swap to disk
+and feel broken. See
+"How a model, and its context length, get chosen for your hardware" below.
+
+`agent/hearth_setup.py` checks what is present in dependency order and stops
+at the first thing genuinely wrong, so a new user gets one sentence they can
+act on instead of a connection error from deep inside the agent loop.
 
 ## How a model, and its context length, get chosen for your hardware
 

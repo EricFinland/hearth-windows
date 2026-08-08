@@ -13,11 +13,17 @@ or easier to install are especially welcome.
   vendored interpreter, and every dependency added there is another thing to
   vendor, licence, and keep in sync.
 - **Keep the interface dependency-free.** `desktop/ui/` is plain HTML, CSS and
-  ES modules with no framework and no build step. The packaging script copies
-  it verbatim.
-- **Node is the packaging layer, not the application.** `npm install` under
-  `desktop/shell/` exists to run electron-builder. Adding a runtime dependency
-  there changes what ships.
+  ES modules with no framework and no build step. `desktop/tauri/build.rs`
+  links it into the executable verbatim.
+- **There is no Node, on either machine.** The shell was Electron until the
+  Tauri port; it is now Rust, and `cargo tauri build` is the whole packaging
+  layer. If you find yourself wanting `npm install`, that is a sign the change
+  belongs somewhere else.
+- **Every crate you add ships, and has to be licensed.** `desktop/tauri/` is
+  the one place third-party code enters the application, and
+  `scripts/third_party_notices.py --check` fails the build when a crate's
+  licence has no text on disk. Adding a dependency there is a licensing
+  decision as much as a technical one.
 - **Match the surrounding style.** Clear names, comments that explain *why*, no
   needless cleverness.
 - **No em dashes in committed files**, including code, documentation and commit
@@ -44,8 +50,16 @@ or easier to install are especially welcome.
 
    This fetches and checksums the pinned llama.cpp and CPython, stages the
    payload, proves the staged payload runs under the staged interpreter,
-   verifies the Electron fuses, and produces the installer. It is also what CI
-   runs on every push, on a GitHub-hosted `windows-latest` runner.
+   compiles the Tauri shell, and produces the installer.
+   `scripts/verify_binary.py` then reads the hardening back out of the built
+   executable rather than trusting that the build asked for it. The same
+   command is what CI runs on every push, on a GitHub-hosted `windows-latest`
+   runner.
+
+   It needs Rust 1.82 or newer, `cargo install tauri-cli --locked`, and a
+   network connection the first time. See
+   [docs/getting-started.md](docs/getting-started.md) if you have not built it
+   before.
 
 3. **Regenerate the third-party notices if you changed what is vendored.**
 
@@ -67,7 +81,8 @@ or easier to install are especially welcome.
   containment, contained subprocesses, hardware detection, the model shop,
   checkpoint and undo, the injection and secret scanners, the signed updater.
 - `desktop/server/` ... the sidecar, a localhost HTTP layer over the engine.
-- `desktop/shell/` ... the Electron shell, its fuses, and packaging config.
+- `desktop/tauri/` ... the Rust shell: window, sidecar supervision, the
+  loopback origin check, the updater, and the installer configuration.
 - `desktop/ui/` ... the interface.
 - `scripts/` ... vendoring, packaging, notices, release manifests, benchmarks.
 - `vendor/` ... licence texts and the pinned manifests. Binaries are fetched

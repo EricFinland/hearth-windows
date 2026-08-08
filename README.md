@@ -15,7 +15,7 @@
 
 ### Local LLMs and an autonomous coding agent on your own Windows machine, at zero cost.
 
-[**Hearth for Windows**](docs/windows.md) &nbsp;·&nbsp; [**The model shop**](docs/model-shop.md) &nbsp;·&nbsp; [**Packaging**](docs/packaging-windows.md) &nbsp;·&nbsp; [**Threat model**](docs/security/windows-threat-model.md) &nbsp;·&nbsp; [**Limitations**](docs/limitations.md)
+[**Get started**](docs/getting-started.md) &nbsp;·&nbsp; [**Hearth for Windows**](docs/windows.md) &nbsp;·&nbsp; [**The model shop**](docs/model-shop.md) &nbsp;·&nbsp; [**Packaging**](docs/packaging-windows.md) &nbsp;·&nbsp; [**Threat model**](docs/security/windows-threat-model.md) &nbsp;·&nbsp; [**Limitations**](docs/limitations.md)
 
 </div>
 
@@ -65,9 +65,16 @@ application, Hearth Code is the coding agent inside it.
 
 ## Hearth for Windows
 
-Read the full page: **[docs/windows.md](docs/windows.md)**. It covers what
-Hearth and Hearth Code are, what you need today (Ollama, installed and with
-a model already pulled), how a model and a context length get chosen for
+**New here? [docs/getting-started.md](docs/getting-started.md)** goes from an
+empty folder to a running Hearth in order, and is the page to read first.
+Nothing has been released yet, so building it yourself is the only way to run
+it today, and that page walks through it.
+
+Then read the full reference: **[docs/windows.md](docs/windows.md)**. It
+covers what Hearth and Hearth Code are, what you need today (Windows, and
+that is close to all: the install carries its own interpreter and its own
+inference engine, and Ollama is optional rather than required), how a model
+and a context length get chosen for
 your specific GPU, how a model download reports honest progress, what the
 permission modes (`plan`, `edit`, `auto`, `bypass`) mean, how Hearth flags
 content that looks like it is trying to steer the model or a write that
