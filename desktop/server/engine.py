@@ -1601,7 +1601,23 @@ def _self_test():
 
     cp_event, _ = _wait_for_kind(sess, "checkpoint")
     assert cp_event["data"]["id"] == "deadbeef", cp_event
-    assert checkpoint_calls and checkpoint_calls[0][0] == os.path.realpath(ws), checkpoint_calls
+    # Resolve BOTH sides, the way app.py's same_workspace check does. The
+    # engine hands checkpoint_fn the Session's workspace unchanged; resolving
+    # it is hearth_checkpoint._validate_workspace's job, and _store_key
+    # normcases it on top so two spellings of one directory share one store.
+    # So the invariant worth pinning here is "the checkpoint was taken against
+    # this directory", not "the engine happened to spell it the way realpath
+    # would have".
+    #
+    # Comparing a raw path against a resolved one only passes on machines
+    # where those are the same string, which is not true of any path holding
+    # an 8.3-shortened component: that is every temp path under a username
+    # longer than eight characters. This assertion passed on both machines it
+    # was written on and failed on the first CI runner it ever met, under
+    # C:\Users\RUNNER~1\, having tested the filesystem's naming rather than
+    # the engine's behaviour.
+    assert checkpoint_calls, checkpoint_calls
+    assert os.path.realpath(checkpoint_calls[0][0]) == os.path.realpath(ws), checkpoint_calls
     # Minor: sub_repos_truncated must travel alongside warning, not be
     # dropped while warning survives -- a UI needs the machine-readable flag
     # as much as the prose.
