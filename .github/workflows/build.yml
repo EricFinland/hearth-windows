@@ -14,11 +14,34 @@ name: build
 # See docs/code-signing-policy.md for what this workflow has to grow before
 # signing is switched on, and why the signing step is not in this file yet.
 
+# The installer job downloads a pinned llama.cpp and CPython and compiles the
+# Rust shell, which is about half an hour of runner time. Prose cannot change
+# what that produces, so a change to the documentation site or to a markdown
+# file does not run it. Measured rather than assumed: the commit that added
+# site/ triggered a full thirty-minute installer build to package bytes it had
+# not touched.
+#
+# docs/ is ignored too. Checked rather than assumed: build_windows.py and
+# third_party_notices.py both mention docs/ paths, but only inside error
+# messages pointing a reader at an explanation. Neither opens a file there, so
+# nothing under docs/ can change what this workflow builds.
+#
+# A change under docs/ is not unchecked, it is checked elsewhere: deploy-docs.yml
+# triggers on docs/** and re-runs site/port_docs.py, failing if the published
+# pages no longer match. That is the gate a documentation change needs, and it
+# costs half a minute instead of half an hour.
 on:
   push:
     branches: [ main ]
+    paths-ignore: &prose
+      - 'site/**'
+      - 'docs/**'
+      - '*.md'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/workflows/deploy-docs.yml'
   pull_request:
     branches: [ main ]
+    paths-ignore: *prose
   workflow_dispatch: {}
 
 permissions:

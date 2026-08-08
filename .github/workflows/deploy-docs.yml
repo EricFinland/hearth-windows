@@ -10,6 +10,13 @@ on:
   push:
     branches: [main]
     paths:
+      # docs/ is here, not only site/, and that matters. build.yml ignores
+      # docs/ because nothing in the installer reads it, so if this workflow
+      # ignored it too, editing a page and forgetting to re-run the porter
+      # would trigger no workflow at all: the site would quietly keep serving
+      # the old text and nothing would say so. Triggering here means the
+      # drift check below runs on exactly the change that can cause drift.
+      - 'docs/**'
       - 'site/**'
       - '.github/workflows/deploy-docs.yml'
   workflow_dispatch:
