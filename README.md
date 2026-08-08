@@ -5,13 +5,13 @@
 <br/>
 <br/>
 
-[![build](https://img.shields.io/github/actions/workflow/status/EricFinland/hearth-windows/build.yml?style=flat-square&logo=githubactions&logoColor=white&label=build&labelColor=211c16&color=cc785c)](https://github.com/EricFinland/hearth-windows/actions/workflows/build.yml)
-![Windows](https://img.shields.io/badge/Windows-in%20development-cc785c?style=flat-square&logo=windows&logoColor=white&labelColor=211c16)
-![llama.cpp](https://img.shields.io/badge/inference-llama.cpp-cc785c?style=flat-square&labelColor=211c16)
-![Bundled](https://img.shields.io/badge/brings%20its%20own-Python%20%2B%20engine-cc785c?style=flat-square&logo=python&logoColor=white&labelColor=211c16)
-![Contained](https://img.shields.io/badge/tools-workspace%20contained-cc785c?style=flat-square&labelColor=211c16)
-![Unsigned](https://img.shields.io/badge/installer-unsigned-cc785c?style=flat-square&labelColor=211c16)
-![License](https://img.shields.io/badge/license-Apache--2.0-cc785c?style=flat-square&labelColor=211c16)
+[![build](https://img.shields.io/github/actions/workflow/status/EricFinland/hearth-windows/build.yml?style=flat-square&logo=githubactions&logoColor=white&label=build&labelColor=182029&color=4a9eff)](https://github.com/EricFinland/hearth-windows/actions/workflows/build.yml)
+![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-4a9eff?style=flat-square&logo=windows&logoColor=white&labelColor=182029)
+![llama.cpp](https://img.shields.io/badge/inference-llama.cpp-4a9eff?style=flat-square&labelColor=182029)
+![Bundled](https://img.shields.io/badge/brings%20its%20own-Python%20%2B%20engine-4a9eff?style=flat-square&logo=python&logoColor=white&labelColor=182029)
+![Contained](https://img.shields.io/badge/tools-workspace%20contained-4a9eff?style=flat-square&labelColor=182029)
+![Unsigned](https://img.shields.io/badge/installer-unsigned-4a9eff?style=flat-square&labelColor=182029)
+![License](https://img.shields.io/badge/license-Apache--2.0-4a9eff?style=flat-square&labelColor=182029)
 
 ### Local LLMs and an autonomous coding agent on your own Windows machine, at zero cost.
 
