@@ -37,6 +37,7 @@ on:
       - 'site/**'
       - 'docs/**'
       - '*.md'
+      - '.github/assets/**'
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/workflows/deploy-docs.yml'
   pull_request:
