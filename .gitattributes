@@ -8,3 +8,10 @@ LICENSE text eol=lf
 NOTICE text eol=lf
 THIRD-PARTY-NOTICES.md text eol=lf
 vendor/licenses/** text eol=lf
+
+# The generated docs pages. deploy-docs.yml re-runs site/port_docs.py on a
+# Linux runner and fails if the result differs from what is committed, so the
+# committed form has to be byte-identical to what the porter writes on any
+# platform. The porter writes LF; without this, a checkout on Windows would
+# store CRLF and that check would fail on line endings alone.
+site/src/content/docs/** text eol=lf

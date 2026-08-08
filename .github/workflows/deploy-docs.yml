@@ -1,0 +1,69 @@
+name: Deploy Docs
+
+# Publishes site/ to GitHub Pages at https://ericfinland.github.io/hearth-windows/
+#
+# The pages under site/src/content/docs/ are generated from the repository's
+# own docs/ by site/port_docs.py, so docs/ stays the source of truth and this
+# site republishes it. Edit docs/, re-run the porter, commit both.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - '.github/workflows/deploy-docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: The published pages match docs/
+        # port_docs.py is deterministic, so re-running it on a clean checkout
+        # must be a no-op. If it is not, someone edited docs/ and committed
+        # the site without regenerating it (or edited the generated copy
+        # directly), and the site is about to publish something the repository
+        # does not say. Cheaper to fail here than to let the two drift.
+        run: |
+          python site/port_docs.py
+          if ! git diff --quiet -- site/src/content/docs; then
+            echo "::error::site/src/content/docs is out of date with docs/."
+            echo "Run: python site/port_docs.py   and commit the result."
+            git diff --stat -- site/src/content/docs
+            exit 1
+          fi
+
+      - name: Build with Astro
+        uses: withastro/action@v3
+        with:
+          path: ./site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

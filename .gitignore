@@ -54,3 +54,10 @@ release/keys/
 # they are not part of the application and they describe the layout of a
 # repository that is not public, so they are not published with it.
 /tooling/
+
+# Docs site (site/): build output and dependencies. The generated pages under
+# site/src/content/docs/ ARE committed, because the Pages build checks them
+# against docs/ and a checkout should show what the site publishes.
+site/node_modules/
+site/dist/
+site/.astro/

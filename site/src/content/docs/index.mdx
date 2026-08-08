@@ -1,0 +1,115 @@
+---
+title: hearth for Windows
+description: Run local LLMs and an autonomous coding agent on your own Windows machine. One install, no terminal, no cloud.
+template: splash
+hero:
+  tagline: A desktop application that runs language models on your own GPU and an autonomous coding agent against your own files. No terminal, no account, no per-token bill, and nothing leaving the machine unless you approve it.
+  actions:
+    - text: Get started
+      link: /hearth-windows/getting-started/install/
+      icon: right-arrow
+      variant: primary
+    - text: View on GitHub
+      link: https://github.com/EricFinland/hearth-windows
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+:::caution[There is no download yet]
+Hearth has never been released. There is no installer to download and no
+signed binary anywhere: `release/trust.json` points at
+`releases.hearth.invalid`, a reserved name that cannot resolve, because an
+updater aimed at a real host nobody controls is worse than one aimed at a
+host that cannot exist.
+
+Building it yourself takes about twenty minutes, most of it waiting.
+[The install page](/hearth-windows/getting-started/install/) walks through it
+from an empty folder.
+:::
+
+## Start here
+
+<CardGrid>
+  <LinkCard
+    title="Install and first run"
+    description="Build tools, clone, build, run, pick a model, and a first task worth trying. In order, with no steps assumed."
+    href="/hearth-windows/getting-started/install/"
+  />
+  <LinkCard
+    title="The full guide"
+    description="What Hearth is, the four permission modes, the workspace boundary, .hearthignore, undo, and what survives a restart."
+    href="/hearth-windows/getting-started/guide/"
+  />
+  <LinkCard
+    title="Limitations"
+    description="The honest page. What a local model on your hardware will and will not do well, and where the boundaries are thinner than they look."
+    href="/hearth-windows/reference/limitations/"
+  />
+</CardGrid>
+
+## What it is
+
+<CardGrid>
+  <Card title="It brings its own engine" icon="rocket">
+    The installer carries a pinned CPython and llama.cpp's `llama-server`.
+    Nothing to install first, and no Ollama required. It borrows the WebView2
+    runtime Windows already ships rather than bundling a second browser.
+  </Card>
+  <Card title="It asks before it acts" icon="approve-check">
+    Four permission modes. The default reads freely and stops before every
+    file write and every shell command. Underneath, each run carries a fixed
+    list of tools it may touch at all, enforced even in bypass mode.
+  </Card>
+  <Card title="It knows what fits" icon="setting">
+    The model shop measures your RAM and VRAM and computes whether a given
+    quantisation actually fits, KV cache included, rather than recommending
+    something that will swap to disk and feel broken.
+  </Card>
+  <Card title="It stays inside the folder" icon="warning">
+    Every file tool passes a containment check: path traversal, absolute
+    paths, reserved device names, alternate data streams and NTFS junctions
+    are all rejected, so a confused agent cannot reach outside the directory
+    you named.
+  </Card>
+</CardGrid>
+
+## How it is built
+
+<CardGrid>
+  <LinkCard
+    title="Packaging and the installer"
+    description="One command builds it. Why the shell moved from Electron to Tauri, and the measurement that decided it: 364 MB of Chromium next to a 70 MB payload."
+    href="/hearth-windows/reference/packaging/"
+  />
+  <LinkCard
+    title="Threat model"
+    description="What the boundaries are on Windows, what they are not, and which protections are weaker here than on the NixOS system."
+    href="/hearth-windows/reference/threat-model/"
+  />
+  <LinkCard
+    title="Signed updates"
+    description="An Ed25519 key built into the application, which protects users on an unsigned build and keeps protecting them after a certificate is bought."
+    href="/hearth-windows/concepts/updates/"
+  />
+  <LinkCard
+    title="Privacy"
+    description="Every destination Hearth contacts, and why each one is on the list."
+    href="/hearth-windows/reference/privacy/"
+  />
+</CardGrid>
+
+:::note[Two projects, one name]
+This is Hearth for Windows: a desktop application, Apache-2.0, in
+[its own repository](https://github.com/EricFinland/hearth-windows).
+
+There is also [hearth](https://ericfinland.github.io/hearth/), a security-first
+NixOS system for running local LLMs and sandboxed agents. Same name, same
+author, different thing. That one is orange and this one is blue, which is
+the fastest way to tell which set of docs you are reading.
+:::
+
+Built by [Eric Catalano](https://github.com/EricFinland). See
+[About](/hearth-windows/project/about/) for the project, its licence, and how
+to report a problem.

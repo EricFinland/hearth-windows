@@ -1,0 +1,156 @@
+/* Hearth for Windows docs theme: cool palette, blue accent, serif display
+   headings. Editorial, the same as the Linux system's site.
+
+   Blue is this project's colour. The NixOS system at ericfinland.github.io/hearth
+   is orange. Two products sharing a name should not be told apart by reading
+   the URL, so the palette does that job instead. Everything else here is
+   deliberately identical to the other site: same type, same rhythm, same
+   layout, same structure. The colour is the only signal that differs, so the
+   two still read as one family rather than two unrelated projects. */
+
+:root {
+  --sl-font: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --sl-font-serif: 'Newsreader', Georgia, 'Times New Roman', serif;
+
+  /* Blue accent */
+  --sl-color-accent-low: #0b1d33;
+  --sl-color-accent: #4a9eff;
+  --sl-color-accent-high: #a8d0ff;
+
+  /* Dark mode (default): cool charcoal */
+  --sl-color-white: #f2f6fa;
+  --sl-color-gray-1: #e1e8f0;
+  --sl-color-gray-2: #b6c2d0;
+  --sl-color-gray-3: #82909f;
+  --sl-color-gray-4: #4f5b68;
+  --sl-color-gray-5: #2f3945;
+  --sl-color-gray-6: #212934;
+  --sl-color-black: #131922;
+
+  --sl-color-bg: #131922;
+  --sl-color-bg-nav: #182029;
+  --sl-color-bg-sidebar: #182029;
+}
+
+:root[data-theme='light'] {
+  /* Light mode: cool paper. The accent darkens rather than staying #4a9eff,
+     which is too pale to carry link text on a light background. */
+  --sl-color-accent-low: #d6e6fb;
+  --sl-color-accent: #0b62c4;
+  --sl-color-accent-high: #083a75;
+
+  --sl-color-white: #0f1620;
+  --sl-color-gray-1: #1a2330;
+  --sl-color-gray-2: #2f3b4a;
+  --sl-color-gray-3: #57657a;
+  --sl-color-gray-4: #8593a6;
+  --sl-color-gray-5: #ccd6e2;
+  --sl-color-gray-6: #e2e9f1;
+  --sl-color-gray-7: #eef3f8;
+  --sl-color-black: #f7fafc;
+
+  --sl-color-bg: #f7fafc;
+  --sl-color-bg-nav: #eef3f8;
+  --sl-color-bg-sidebar: #eef3f8;
+}
+
+/* Serif display headings, an editorial feel */
+.sl-markdown-content h1,
+.sl-markdown-content h2,
+.sl-markdown-content h3,
+.sl-markdown-content h4,
+h1#_top,
+.hero h1,
+.site-title {
+  font-family: var(--sl-font-serif);
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+
+/* Slightly calmer body rhythm */
+.sl-markdown-content {
+  --sl-content-width: 50rem;
+  line-height: 1.7;
+}
+
+/* Hero polish on the splash page */
+.hero {
+  padding-block: 2rem;
+}
+.hero .tagline {
+  font-size: var(--sl-text-lg);
+  color: var(--sl-color-gray-2);
+}
+
+/* Footer attribution */
+.hearth-footer {
+  margin-top: 1.5rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--sl-color-gray-5);
+  font-size: var(--sl-text-xs);
+  color: var(--sl-color-gray-3);
+  text-align: center;
+}
+.hearth-footer a {
+  color: var(--sl-color-gray-2);
+}
+
+/* Theme-aware inline SVG diagrams */
+.diagram {
+  width: 100%;
+  height: auto;
+  margin-block: 1.75rem;
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.75rem;
+  background: var(--sl-color-bg-sidebar);
+  padding: 0.5rem;
+}
+.diagram .d-box {
+  fill: var(--sl-color-gray-6);
+  stroke: var(--sl-color-gray-4);
+  stroke-width: 1.5;
+}
+.diagram .d-box-accent {
+  fill: var(--sl-color-accent-low);
+  stroke: var(--sl-color-accent);
+  stroke-width: 1.5;
+}
+.diagram .d-title {
+  fill: var(--sl-color-white);
+  font-family: var(--sl-font);
+  font-size: 15px;
+  font-weight: 600;
+}
+.diagram .d-label {
+  fill: var(--sl-color-white);
+  font-family: var(--sl-font);
+  font-size: 13px;
+  font-weight: 500;
+}
+.diagram .d-sub {
+  fill: var(--sl-color-gray-2);
+  font-family: var(--sl-font);
+  font-size: 11.5px;
+}
+.diagram .d-chip {
+  fill: var(--sl-color-gray-5);
+}
+.diagram .d-chip-text {
+  fill: var(--sl-color-gray-1);
+  font-family: var(--sl-font-mono, ui-monospace, monospace);
+  font-size: 11px;
+  font-weight: 500;
+}
+.diagram .d-arrow {
+  stroke: var(--sl-color-accent);
+  stroke-width: 2;
+  fill: none;
+}
+.diagram .d-arrow-head {
+  fill: var(--sl-color-accent);
+}
+.diagram .d-arrow-label {
+  fill: var(--sl-color-gray-3);
+  font-family: var(--sl-font);
+  font-size: 11px;
+}
