@@ -1004,6 +1004,30 @@ def _run_git_argv(argv, cwd, timeout=60):
     return proc.returncode, out, err
 
 
+def _git_failure(err, out):
+    """Turn a failed git invocation into one line the caller can act on.
+
+    git reports "not a git repository" from `diff` by also printing its whole
+    --no-index usage block: about twenty lines of option documentation that say
+    nothing about what went wrong. Two things follow, and both are why this
+    exists rather than a bare truncation.
+
+    A model reading tool output gets the answer to the question it asked
+    instead of a page of git's manual, which it then has to interpret.
+
+    And that block contains the literal `[<pathspec>...]`, so anything
+    downstream scanning git's output for `..` (the shape of a path leaving the
+    workspace) matches on text that names no path at all. Measured: this is
+    exactly what made git_diff's own containment check fail against git
+    2.54 in a workspace that was not a repository, reporting a traversal that
+    had not happened. The failure is real, the diagnosis it produced was not.
+    """
+    text = (err or out or "git failed").strip()
+    if "not a git repository" in text.lower():
+        return "error: this workspace is not a git repository"
+    return "error: {}".format(text[:500])
+
+
 def tool_git_status(args, workspace):
     """Show git status of the run workspace. Read-only.
 
@@ -1031,7 +1055,7 @@ def tool_git_status(args, workspace):
         # Return code is checked, not masked: a git failure (not a repo, a
         # corrupt index, etc.) is reported as an error rather than silently
         # printing "(clean)" as if status had actually succeeded.
-        return "error: {}".format((err or out or "git failed").strip()[:500])
+        return _git_failure(err, out)
     return out.strip() or "(clean)"
 
 
@@ -1055,7 +1079,7 @@ def tool_git_diff(args, workspace):
     if rc != 0:
         # Return code is checked, not masked: a git failure is reported as
         # an error rather than silently printing "(no changes)".
-        return "error: {}".format((err or out or "git failed").strip()[:500])
+        return _git_failure(err, out)
     return out.strip() or "(no changes)"
 
 
@@ -2066,6 +2090,13 @@ def _self_test():
             "git_status named a path outside the workspace", r)
         d = tool_git_diff({}, _ws6)
         assert "/home/operator" not in d, d
+        # git answers "not a git repository" from `diff` with its whole
+        # --no-index usage block. That block is not an answer, and the
+        # `[<pathspec>...]` in it reads as a traversal to the check below.
+        # Pinned as "no usage block" rather than as one exact string because
+        # a temp directory created inside someone's repository is a real
+        # configuration, and there git legitimately succeeds instead.
+        assert "usage:" not in d, ("git_diff returned git's usage block", d)
         assert ".." not in d, ("git_diff named a path outside the workspace", d)
     finally:
         _shutil.rmtree(_ws6, ignore_errors=True)
