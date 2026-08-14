@@ -143,6 +143,14 @@ jobs:
     needs: self-test
     runs-on: windows-latest
     timeout-minutes: 60
+    # Only what attestation needs, and nothing wider. id-token signs the
+    # provenance claim, attestations records it. contents stays read: this job
+    # publishes nothing, and the release workflow that does is a separate file
+    # with its own permissions.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -214,6 +222,27 @@ jobs:
           # A digest in the log is the cheapest possible provenance: it lets
           # anyone compare a downloaded artifact against the run that made it.
           sha256sum build/dist/*.exe
+
+      # The closest thing to a signature this project can offer for free, and
+      # the answer to the only question that matters about an unsigned build:
+      # where did this file come from?
+      #
+      # A code-signing certificate says an identity vouched for a binary. This
+      # says something narrower and, for an open-source project, arguably more
+      # useful: that GitHub itself watched this exact file come out of this
+      # repository, at this commit, from this workflow. Anyone can check it
+      # against the public transparency log without trusting us at all:
+      #
+      #     gh attestation verify Hearth-Setup-0.1.0.exe -R EricFinland/hearth-windows
+      #
+      # It does not stop SmartScreen, which is a reputation system and cares
+      # about certificates. It does mean a careful person has something to
+      # check instead of being asked to take our word for it, which is the
+      # whole posture of this project.
+      - name: Attest where this binary came from
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: build/dist/*.exe
 
       - name: Upload the installer
         uses: actions/upload-artifact@v4

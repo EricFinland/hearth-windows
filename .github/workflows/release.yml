@@ -117,7 +117,15 @@ jobs:
              $sha
              \`\`\`
 
-          2. Build it yourself. Every release is built by a public GitHub
+          2. Ask GitHub where the file came from. Every build is attested, so
+             you can check this binary really was produced by this repository's
+             workflow at a specific commit, without trusting us:
+
+             \`\`\`
+             gh attestation verify $exe -R ${{ github.repository }}
+             \`\`\`
+
+          3. Build it yourself. Every release is built by a public GitHub
              Actions workflow from this repository's source, on a GitHub-hosted
              runner, and [docs/getting-started.md](https://github.com/EricFinland/hearth-windows/blob/main/docs/getting-started.md)
              walks through doing the same build locally.
@@ -133,11 +141,17 @@ jobs:
 
           A GPU helps and is not required.
 
-          ### Updates do not work yet
+          ### Updates: signed, but no feed is published yet
 
-          This build cannot update itself. The update feed points at a reserved
-          address that cannot resolve, on purpose, so it fails loudly instead of
-          trusting whatever answers. Watch this repository for new releases.
+          The updater is built and works. It accepts a release only when an
+          Ed25519 key baked into the application signed it, which means a
+          compromised release host still cannot push code to you: it cannot
+          produce the signature.
+
+          What does not exist yet is somewhere to fetch from. The feed points at
+          \`releases.hearth.invalid\`, a reserved name that can never resolve, so
+          this build reports that plainly rather than claiming it is up to date.
+          Watch this repository for new releases in the meantime.
 
           ### Known gaps
 
