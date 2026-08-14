@@ -720,8 +720,15 @@ def _model_bytes(model_path):
         return None
 
 
+#: How much of system RAM an integrated GPU's offload may plan to occupy.
+#: An iGPU shares system memory, so this is not a second pool being spent; it
+#: is the same RAM the weights would sit in anyway. The fraction exists to
+#: leave the rest of the machine usable, not to protect a separate device.
+SHARED_MEMORY_FRACTION = 0.7
+
+
 def choose_gpu_layers(model_path, backend=None, vram_bytes=None,
-                      total_layers=ASSUMED_LAYERS, env=None):
+                      total_layers=ASSUMED_LAYERS, env=None, integrated=None):
     """How many layers to offload to the GPU, and why.
 
     Returns (n_gpu_layers, reason). n_gpu_layers is an int, or the string
@@ -763,7 +770,10 @@ def choose_gpu_layers(model_path, backend=None, vram_bytes=None,
             found = hearth_hw.gpus()
         except Exception:  # noqa: BLE001 - hardware probing must never break a launch
             found = []
-        vram_bytes = max((g.get("vram_bytes") or 0) for g in found) if found else 0
+        best = max(found, key=lambda g: g.get("vram_bytes") or 0) if found else None
+        vram_bytes = (best.get("vram_bytes") or 0) if best else 0
+        if integrated is None and best is not None:
+            integrated = bool(best.get("integrated"))
 
     if not vram_bytes or vram_bytes <= 0:
         return 0, "no GPU VRAM detected; running entirely on the CPU"
@@ -774,6 +784,57 @@ def choose_gpu_layers(model_path, backend=None, vram_bytes=None,
 
     if not total_layers or total_layers <= 0:
         total_layers = ASSUMED_LAYERS
+
+    # An integrated GPU has no memory of its own, so its reported VRAM is not
+    # a budget and must not be spent like one.
+    #
+    # Windows reports an iGPU's memory through Win32_VideoController.AdapterRAM,
+    # which is a signed 32-bit field describing a carve-out rather than a
+    # capacity: a Radeon 880M in a machine with 33 GiB of RAM reports 512 MiB.
+    # hearth_hw already says so, marking such readings integrated=True and
+    # approximate=True. This function used to ignore both and divide 512 MiB by
+    # the per-layer cost, which puts essentially the whole model on the CPU.
+    #
+    # The reason that is wrong is not that the number is small. It is that the
+    # number is not describing the constraint at all. Weights for an iGPU live
+    # in system RAM whichever processor reads them, so offloading a layer moves
+    # work across the die, it does not move bytes into a second pool. The
+    # question worth asking is whether the model fits in system RAM, which is
+    # the question asked below.
+    #
+    # Measured on a Radeon 880M running Dolphin 3.0 Llama 3.1 8B Q4_K_M through
+    # the Vulkan build: 9.7 tok/s with no layers offloaded against 17.1 with all
+    # of them. A 1.8x speedup declined on the strength of a number that never
+    # meant what it was read as meaning.
+    #
+    # Worth recording how that reading was obtained, because it is a second
+    # trap. That laptop also holds a discrete RTX 5070 Ti, and at the time of
+    # the measurement Windows was not enumerating it at all: nvidia-smi could
+    # not reach a driver and Win32_VideoController listed only the iGPU, because
+    # NVIDIA's dynamic switching had the card powered down. Every probe was
+    # telling the truth about what was visible, and what was visible was not the
+    # whole machine. So a GPU census taken while nothing is drawing on the GPU
+    # can be wrong in the direction of finding less, and the iGPU path here is
+    # what such a machine falls back to. It should be fast when it is used.
+    if integrated:
+        try:
+            ram = hearth_hw.system_ram_bytes()
+        except Exception:  # noqa: BLE001 - never break a launch over a probe
+            ram = 0
+        if ram > 0:
+            allowance = int(ram * SHARED_MEMORY_FRACTION)
+            if weights < allowance:
+                return "all", (
+                    "an integrated GPU shares system memory, so its reported "
+                    "{:.1f} GiB is a carve-out and not a limit; the {:,}-byte model "
+                    "fits inside {:.0f}% of {:.1f} GiB of system RAM, so every layer "
+                    "goes to the GPU".format(
+                        vram_bytes / 1024 ** 3, weights,
+                        SHARED_MEMORY_FRACTION * 100, ram / 1024 ** 3))
+            return 0, (
+                "an integrated GPU shares system memory and the {:,}-byte model does "
+                "not fit inside {:.0f}% of {:.1f} GiB of system RAM; staying on the "
+                "CPU".format(weights, SHARED_MEMORY_FRACTION * 100, ram / 1024 ** 3))
 
     margin = max(MIN_HEADROOM_BYTES, int(vram_bytes * MIN_HEADROOM_FRACTION))
     budget = vram_bytes - margin
@@ -2471,6 +2532,32 @@ def _self_test(live=False, model=None):
             n, why = choose_gpu_layers(model_file, backend=BACKEND_CUDA,
                                        vram_bytes=four_gib, total_layers=32)
             assert n != "all" and n < 32, (n, why)
+
+            # --- integrated GPUs: the reported VRAM is not a budget ---------
+            #
+            # The exact reading that prompted this: a Radeon 880M reports
+            # 512 MiB through Win32_VideoController.AdapterRAM while sitting in
+            # a machine with 33 GiB of RAM it shares. Judged as a discrete card
+            # that is zero layers, and measuring it cost 1.8x of throughput
+            # (9.7 tok/s against 17.1 on Dolphin 3.0 8B Q4_K_M). Judged as what
+            # it is, every layer goes over, because the weights occupy that
+            # same RAM either way.
+            #
+            # The discrete case above already pins that 256 MiB means zero, so
+            # these two assertions together are what stop the fix from being a
+            # blanket "small VRAM means offload anyway".
+            igpu_vram = 512 * 1024 ** 2
+            n, why = choose_gpu_layers(model_file, backend=BACKEND_VULKAN,
+                                       vram_bytes=igpu_vram, total_layers=32,
+                                       integrated=True)
+            assert n == "all", (n, why)
+            assert "shares system memory" in why, why
+            # Same reading, discrete: still zero. The flag is doing the work,
+            # not the number.
+            n, why = choose_gpu_layers(model_file, backend=BACKEND_VULKAN,
+                                       vram_bytes=igpu_vram, total_layers=32,
+                                       integrated=False)
+            assert n == 0, (n, why)
             # The override wins over every one of the above, including the
             # "this build cannot offload" case.
             n, why = choose_gpu_layers(model_file, backend=BACKEND_CPU, vram_bytes=0,
