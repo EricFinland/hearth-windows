@@ -1,0 +1,167 @@
+name: Release
+
+# Turns a tag into something you can send someone a link to.
+#
+#     git tag v0.1.0 && git push origin v0.1.0
+#
+# It does not build its own installer. It calls build.yml, the same workflow
+# that gates every push, so the file attached to a release is the file CI
+# tested rather than one produced by a recipe that only runs on release day.
+#
+# The release is created as a DRAFT and as a PRERELEASE. Draft because
+# publishing is a decision a person should make after looking at the artifact,
+# not a side effect of pushing a tag. Prerelease because the installer is
+# unsigned: see docs/code-signing-policy.md for what that costs the person who
+# downloads it, and why the release notes say so in the first paragraph rather
+# than in a footnote.
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build a release from (e.g. v0.1.0)
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download the installer CI built
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.installer-artifact }}
+          path: dist
+
+      - name: Work out what this release is
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          exe=$(find dist -name '*.exe' | head -1)
+          if [ -z "$exe" ]; then
+            echo "::error::no installer in the build artifact"
+            exit 1
+          fi
+          echo "exe=$exe" >> "$GITHUB_OUTPUT"
+          echo "exe_name=$(basename "$exe")" >> "$GITHUB_OUTPUT"
+
+          # The version the application actually reports is the one in
+          # tauri.conf.json, not the one in the tag. If a tag says v0.2.0 and
+          # the app says 0.1.0, the updater's downgrade check compares against
+          # the wrong number and the release lies about itself. Cheaper to
+          # refuse the release than to publish that.
+          conf=$(python -c "import json;print(json.load(open('desktop/tauri/tauri.conf.json'))['version'])")
+          echo "version=$conf" >> "$GITHUB_OUTPUT"
+          if [ "$tag" != "v$conf" ]; then
+            echo "::error::tag $tag does not match tauri.conf.json version $conf."
+            echo "Bump the version and re-tag, or tag v$conf."
+            exit 1
+          fi
+
+      - name: Checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum *.exe | tee SHA256SUMS.txt
+
+      - name: Release notes
+        shell: bash
+        run: |
+          exe="${{ steps.meta.outputs.exe_name }}"
+          sha=$(sha256sum "${{ steps.meta.outputs.exe }}" | cut -d' ' -f1)
+          cat > NOTES.md <<EOF
+          ## Hearth for Windows ${{ steps.meta.outputs.tag }}
+
+          Run local language models and an autonomous coding agent on your own
+          Windows machine. The installer carries its own Python and its own
+          inference engine, so nothing has to be installed first.
+
+          ### Read this before you install
+
+          **This installer is not code signed.** Windows will show a full-screen
+          blue SmartScreen panel saying the publisher is unknown, and the only
+          button you can see is **Don't run**. To continue you have to click
+          **More info** and then **Run anyway**.
+
+          You should be suspicious of a stranger telling you to click through a
+          security warning. Two things you can check instead of trusting us:
+
+          1. Verify the download. In PowerShell:
+
+             \`\`\`
+             Get-FileHash .\\$exe -Algorithm SHA256
+             \`\`\`
+
+             It should print:
+
+             \`\`\`
+             $sha
+             \`\`\`
+
+          2. Build it yourself. Every release is built by a public GitHub
+             Actions workflow from this repository's source, on a GitHub-hosted
+             runner, and [docs/getting-started.md](https://github.com/EricFinland/hearth-windows/blob/main/docs/getting-started.md)
+             walks through doing the same build locally.
+
+          Getting a certificate is in progress. See
+          [the code signing policy](https://github.com/EricFinland/hearth-windows/blob/main/docs/code-signing-policy.md).
+
+          ### What you need
+
+          Windows 10 or 11, and enough RAM for the model you pick. Hearth
+          measures your machine and tells you which models actually fit rather
+          than letting you choose one that will swap to disk.
+
+          A GPU helps and is not required.
+
+          ### Updates do not work yet
+
+          This build cannot update itself. The update feed points at a reserved
+          address that cannot resolve, on purpose, so it fails loudly instead of
+          trusting whatever answers. Watch this repository for new releases.
+
+          ### Known gaps
+
+          - AMD and Intel GPU memory is under-reported, so those machines
+            offload less than they could and run slower than they should.
+          - No cloud API keys. Local models only.
+
+          Built from \`${{ github.sha }}\`.
+          EOF
+          echo "--- notes ---"; cat NOTES.md
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.meta.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --title "Hearth for Windows ${{ steps.meta.outputs.tag }}" \
+            --notes-file NOTES.md \
+            --draft \
+            --prerelease \
+            dist/*.exe dist/SHA256SUMS.txt
+
+      - name: Where to look
+        run: |
+          echo "Draft release created. Review it, then publish:"
+          echo "  https://github.com/${{ github.repository }}/releases"

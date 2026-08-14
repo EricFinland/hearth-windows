@@ -31,6 +31,16 @@ name: build
 # pages no longer match. That is the gate a documentation change needs, and it
 # costs half a minute instead of half an hour.
 on:
+  # release.yml calls this workflow rather than repeating its steps. That is
+  # the point: the installer a release publishes is built by the same job that
+  # gates every push, so "it passed CI" and "it is what we shipped" cannot come
+  # apart. A release-only copy of the build would be a second recipe nobody
+  # runs until the day it matters.
+  workflow_call:
+    outputs:
+      installer-artifact:
+        description: The artifact name holding the built installer.
+        value: hearth-windows-installer
   push:
     branches: [ main ]
     paths-ignore: &prose
