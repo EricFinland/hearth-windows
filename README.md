@@ -262,6 +262,51 @@ is generated from what is actually vendored by
 [docs/licensing.md](docs/licensing.md) explains how that works, which components
 are copyleft and what that obliges, and where code signing stands.
 
+## Code signing policy
+
+Hearth's installer is **not code signed today**, and Windows SmartScreen will
+say so: a full-screen panel whose only visible button is "Don't run". Getting
+past it means clicking "More info", then "Run anyway".
+
+You should not have to take a stranger's word for a download, so there are two
+ways to check one instead. Every release carries a SHA-256 in
+`SHA256SUMS.txt`, and every installer is built by a public GitHub Actions
+workflow that attests where it came from:
+
+```
+gh attestation verify Hearth-Setup-0.1.0.exe -R EricFinland/hearth-windows
+```
+
+That proves the binary was produced by this repository's workflow at a specific
+commit, checked against a public transparency log, without trusting the person
+who published it.
+
+**How signing will work.** Release artifacts are built only by
+[`.github/workflows/build.yml`](.github/workflows/build.yml) on GitHub-hosted
+`windows-latest` runners, never on a maintainer's machine. Signing requests will
+cover the NSIS installer and the executables inside it. Every request requires
+approval by a human before a signature is issued.
+
+**Roles.** This is a single-maintainer project. Eric Catalano is Author,
+Reviewer and Approver. Multi-factor authentication is required on the source
+repository and on the signing account.
+
+**Privacy.** Hearth does not transfer information to other networked systems
+unless specifically requested by the user or the person installing or operating
+it. Model downloads and update checks are the only network destinations, both
+user-initiated, and [docs/privacy.md](docs/privacy.md) lists every one.
+
+**Uninstall.** The installer registers a standard Windows uninstall entry.
+Remove Hearth through Settings, Apps, Installed apps, or from Add/Remove
+Programs.
+
+Free code signing is provided by [SignPath.io](https://signpath.io), with a
+certificate by the [SignPath Foundation](https://signpath.org), once this
+project's application is accepted. The certificate is issued to SignPath
+Foundation, so that is the publisher Windows will name.
+[docs/code-signing-policy.md](docs/code-signing-policy.md) is the full version
+of this page.
+
 ## Contributing and security
 
 Contributions are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md) for the build
