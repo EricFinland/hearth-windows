@@ -255,19 +255,25 @@ where Hearth stands:
 | Requirement | Status |
 |-------------|--------|
 | OSI-approved licence, no commercial dual-licensing | met, Apache-2.0 |
-| Public repository | not yet, the repository is private |
+| Public repository | met, `EricFinland/hearth-windows` |
 | Actively maintained | met |
-| Already released in the form to be signed | not yet, nothing is published |
-| Functionality described on the download page | met by README, needs a release page |
+| Already released in the form to be signed | **blocked**, v0.1.0 exists as a draft release and has not been published |
+| Functionality described on the download page | met by README and `docs/getting-started.md`; the marketing site's download page will carry it too |
 | No malware, no security-circumvention features | needs a judgement call, see below |
-| Builds from a trusted CI, on GitHub-hosted runners | not yet, builds are local |
-| Origin verification enabled, restricted to release branches | not yet |
+| Builds from a trusted CI, on GitHub-hosted runners | met, `.github/workflows/build.yml` runs on `windows-latest` and `release.yml` calls it rather than building its own |
+| Origin verification enabled, restricted to release branches | **outstanding**, configured on the SignPath side once the project exists there |
 | Every signing request approved by a human | process, not code |
-| MFA on SignPath and on the source repository | outside this repository |
+| MFA on SignPath and on the source repository | **outstanding**, outside this repository |
 | Product name and version metadata enforced | met, `tauri.conf.json` sets both and `tauri-winres` writes them into the executable |
-| A page headed "Code signing policy" on the project site | not yet |
-| Privacy statement, or a statement that nothing is transferred | not yet, and Hearth is well placed to make the strong version of this claim |
+| A page headed "Code signing policy" on the project site | **outstanding**, `docs/code-signing-policy.md` has the content; it has to appear on the site's home and download pages |
+| Privacy statement, or a statement that nothing is transferred | met, `docs/privacy.md` |
 | Uninstall facility | met, NSIS registers one |
+
+Build provenance attestation is not one of their conditions, but it was added
+alongside this work and is worth noting when applying: every installer CI
+produces is attested, so `gh attestation verify` proves which commit and
+workflow built it. That is evidence of the same property origin verification
+is checking for.
 
 Two things deserve attention before applying rather than after:
 
@@ -285,11 +291,25 @@ later, only on explicit request. Keeping it that way keeps the signed package
 clean.
 
 **GitHub-hosted runners.** For the free tier, every job in the workflow leading
-to the signing request must run on GitHub-hosted agents. The Windows build
-currently runs locally. Moving it to `windows-latest` is the real work item, and
-it is worth doing on its own merits: it makes the build reproducible by someone
-other than its author, which is also what origin verification checks.
+to the signing request must run on GitHub-hosted agents. This is now done: the
+Windows build runs on `windows-latest`, and the release workflow calls that same
+workflow rather than building its own copy, so the artifact that would be signed
+is the artifact CI tested.
 
 Note also that the certificate is issued to SignPath Foundation, so the
 publisher shown by SmartScreen and UAC is "SignPath Foundation", not "Hearth"
 and not "Eric Catalano".
+
+**And signing does not switch SmartScreen off on day one.** This is the part
+worth understanding before the certificate arrives, because expecting otherwise
+turns a success into a disappointment. SmartScreen is a reputation system: it
+warns about files it has not seen enough of, and a signed file from a publisher
+with no history still has no history. What signing changes is that reputation
+begins to accumulate against the certificate rather than against each individual
+binary, so it builds across releases instead of resetting with every new hash.
+The warning fades with downloads and time.
+
+The exception is an EV certificate, which carries immediate reputation. EV
+certificates require hardware token issuance and cost real money every year, and
+SignPath Foundation's free tier is not one. So the honest sequence is: signed
+first, quiet later.
