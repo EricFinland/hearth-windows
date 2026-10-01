@@ -4,9 +4,11 @@ description: The Ed25519 trust anchor, what it protects, and what it deliberatel
 ---
 
 How Hearth decides whether to replace itself, what it verifies before it does,
-and what an operator would have to do to publish a release. Nothing has been
-published. There is no release server, no download page and no remote; this
-document describes a mechanism, not an operation.
+and what an operator would have to do to publish an update feed. Installers
+are published by hand on the
+[GitHub releases page](https://github.com/EricFinland/hearth-windows/releases),
+but there is no update feed yet, so the in-app updater has nothing to fetch;
+this document describes a mechanism, not an operation.
 
 ## The short version
 
@@ -176,13 +178,15 @@ executable, and the code that disowns WebView2's environment present in the
 shipped bytes. It is a hard build failure and it applies to every build the
 updater ships, not only the first one.
 
-## Nothing has been published
+## No update feed has been published
 
 `release/trust.json` pins the feed at `releases.hearth.invalid`. `.invalid` is
 reserved by RFC 2606 and can never resolve, so a shipped Hearth cannot fetch an
-update from anywhere at all. The Updates panel says exactly that: *"This build
-of Hearth carries no release feed, so it cannot check for updates. Nothing has
-been published yet."* It does not say "up to date", because "we did not look"
+update from anywhere at all. Installers are published by hand on the GitHub
+releases page instead, and the Updates panel says exactly that: *"This build
+of Hearth carries no release feed, so it cannot check for updates
+automatically. New versions are posted at
+github.com/EricFinland/hearth-windows/releases."* It does not say "up to date", because "we did not look"
 and "we looked and there is nothing" are different facts, and reporting the
 first as the second is the most common way an updater lies to people.
 

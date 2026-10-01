@@ -15,7 +15,7 @@
 
 ### Local LLMs and an autonomous coding agent on your own Windows machine, at zero cost.
 
-[**Get started**](docs/getting-started.md) &nbsp;·&nbsp; [**Hearth for Windows**](docs/windows.md) &nbsp;·&nbsp; [**The model shop**](docs/model-shop.md) &nbsp;·&nbsp; [**Packaging**](docs/packaging-windows.md) &nbsp;·&nbsp; [**Threat model**](docs/security/windows-threat-model.md) &nbsp;·&nbsp; [**Limitations**](docs/limitations.md)
+[**⬇ Download for Windows**](https://github.com/EricFinland/hearth-windows/releases/latest) &nbsp;·&nbsp; [**Install guide**](docs/download.md) &nbsp;·&nbsp; [**Build from source**](docs/getting-started.md) &nbsp;·&nbsp; [**Hearth for Windows**](docs/windows.md) &nbsp;·&nbsp; [**The model shop**](docs/model-shop.md) &nbsp;·&nbsp; [**Packaging**](docs/packaging-windows.md) &nbsp;·&nbsp; [**Threat model**](docs/security/windows-threat-model.md) &nbsp;·&nbsp; [**Limitations**](docs/limitations.md)
 
 </div>
 
@@ -24,11 +24,13 @@
 Hearth runs local models on your own machine and gives them tools: files, a
 shell, an agent loop that can be turned loose on a task.
 
-**Hearth is a Windows desktop application in development. There is no
-download yet.** The engine underneath it (permissions, containment,
-checkpoint/undo, model downloads, the sidecar HTTP layer), the desktop
-shell, the interface and the installer are all built; the installer is
-unsigned, so it is not something to hand to a stranger yet. Hearth brings
+**Hearth is a Windows desktop application, and you can
+[download it](https://github.com/EricFinland/hearth-windows/releases/latest)
+today.** The installer is free, open source and built in public by GitHub
+Actions, but it is not code signed, so Windows will show a warning the first
+time you run it. **[docs/download.md](docs/download.md)** walks through the
+whole install, including exactly which buttons to press, with no programming
+knowledge needed. Hearth brings
 its own inference engine and its own Python, so nothing else has to be
 installed first. The pitch is simple: it works the way a hosted AI assistant
 does, except every token comes from your own GPU at no cost, it tells you
@@ -42,33 +44,48 @@ commands, and can be handed a task to work on while you do something else.
 Two names, used consistently throughout this repo: Hearth is the
 application, Hearth Code is the coding agent inside it.
 
-> **Status: in development, nothing published.** The agent engine, hardware
+> **Status: early release, unsigned.** The agent engine, hardware
 > detection, the model shop's fit calculator, workspace containment, git-backed
 > checkpoint and undo, model downloads with honest progress, a prompt-injection
 > scanner, an outbound secret scanner, task-aware model routing, idle-aware
 > compute, and first-run setup diagnosis are all built and self-tested on
 > Windows. So are the desktop shell, the interface, and a Windows installer
-> that carries its own inference engine and its own Python: `python
-> scripts/build_windows.py` produces it, and
-> [docs/packaging-windows.md](docs/packaging-windows.md) documents it. The
-> installer ships llama.cpp's CPU build, which is the only one that cannot
-> fail to start on an unknown machine, and Hearth fetches the right GPU build
-> for the card it finds on first launch, verifies that it actually runs there,
-> and falls back to the CPU build if it does not. On an RTX 5080 that is 13.8
-> tokens per second before and 169 after. That installer is **unsigned**,
-> which means the first person to run it meets a full-screen SmartScreen
-> warning whose only visible button is "Don't run". Until there is a
-> code-signing certificate there is no download and nothing to hand to a
-> stranger. [Hearth for Windows](docs/windows.md) says exactly what exists
-> today; [the Windows threat
-> model](docs/security/windows-threat-model.md) says exactly what does not.
+> that carries its own inference engine and its own Python. The installer
+> ships llama.cpp's CPU build, which is the only one that cannot fail to start
+> on an unknown machine, and Hearth fetches the right GPU build for the card
+> it finds on first launch, verifies that it actually runs there, and falls
+> back to the CPU build if it does not. On an RTX 5080 that is 13.8 tokens per
+> second before and 169 after. The installer is **unsigned**: there is no
+> code-signing certificate, so Windows SmartScreen shows a blue "Windows
+> protected your PC" screen on first run. Click **More info**, then **Run
+> anyway**. [The install guide](docs/download.md) explains why that is safe
+> here and how to check the download yourself;
+> [Hearth for Windows](docs/windows.md) says exactly what exists today; [the
+> Windows threat model](docs/security/windows-threat-model.md) says exactly
+> what does not.
+
+## Download and install
+
+1. Download **`Hearth-Setup-<version>.exe`** from the
+   [latest release](https://github.com/EricFinland/hearth-windows/releases/latest)
+   (under **Assets**).
+2. Double-click it. When Windows shows **"Windows protected your PC"**, click
+   **More info**, then **Run anyway**. This appears because the installer is
+   not code signed, not because anything is wrong with it.
+3. Click through the installer. It does not need administrator rights.
+4. Open **Hearth** from the Start menu and pick a model that fits your
+   machine in the model shop.
+
+That is all. **[docs/download.md](docs/download.md)** has the same steps in
+more detail, with what to do about browser download warnings, antivirus, and
+how to confirm the file is genuine before running it.
 
 ## Hearth for Windows
 
-**New here? [docs/getting-started.md](docs/getting-started.md)** goes from an
-empty folder to a running Hearth in order, and is the page to read first.
-Nothing has been released yet, so building it yourself is the only way to run
-it today, and that page walks through it.
+**Just want to use it? [docs/download.md](docs/download.md).** Want to
+build it from source or change the code?
+**[docs/getting-started.md](docs/getting-started.md)** goes from an empty
+folder to a running Hearth in order.
 
 Then read the full reference: **[docs/windows.md](docs/windows.md)**. It
 covers what Hearth and Hearth Code are, what you need today (Windows, and
@@ -264,12 +281,13 @@ are copyleft and what that obliges, and where code signing stands.
 
 ## Code signing policy
 
-Hearth's installer is **not code signed today**, and Windows SmartScreen will
-say so: a full-screen panel whose only visible button is "Don't run". Getting
-past it means clicking "More info", then "Run anyway".
+Hearth's installer is **not code signed**, and Windows SmartScreen will say
+so: a full-screen panel whose only visible button is "Don't run". Getting past
+it means clicking "More info", then "Run anyway".
+[docs/download.md](docs/download.md) walks through it.
 
-You should not have to take a stranger's word for a download, so there are two
-ways to check one instead. Every release carries a SHA-256 in
+Hearth is 100% open source, so you do not have to take anyone's word for a
+download. There are two ways to check one. Every release carries a SHA-256 in
 `SHA256SUMS.txt`, and every installer is built by a public GitHub Actions
 workflow that attests where it came from:
 
@@ -281,15 +299,14 @@ That proves the binary was produced by this repository's workflow at a specific
 commit, checked against a public transparency log, without trusting the person
 who published it.
 
-**How signing will work.** Release artifacts are built only by
+**How releases are built.** Release artifacts are built only by
 [`.github/workflows/build.yml`](.github/workflows/build.yml) on GitHub-hosted
-`windows-latest` runners, never on a maintainer's machine. Signing requests will
-cover the NSIS installer and the executables inside it. Every request requires
-approval by a human before a signature is issued.
+`windows-latest` runners, never on a maintainer's machine, and every installer
+carries a GitHub build attestation tying it to the commit it was built from.
 
 **Roles.** This is a single-maintainer project. Eric Catalano is Author,
 Reviewer and Approver. Multi-factor authentication is required on the source
-repository and on the signing account.
+repository.
 
 **Privacy.** Hearth does not transfer information to other networked systems
 unless specifically requested by the user or the person installing or operating
@@ -300,10 +317,10 @@ user-initiated, and [docs/privacy.md](docs/privacy.md) lists every one.
 Remove Hearth through Settings, Apps, Installed apps, or from Add/Remove
 Programs.
 
-Free code signing is provided by [SignPath.io](https://signpath.io), with a
-certificate by the [SignPath Foundation](https://signpath.org), once this
-project's application is accepted. The certificate is issued to SignPath
-Foundation, so that is the publisher Windows will name.
+There is no code-signing certificate today. If one is obtained later (for
+example through [SignPath Foundation](https://signpath.org)'s free programme
+for open-source projects), releases will be signed by the same workflow and
+this section will say so.
 [docs/code-signing-policy.md](docs/code-signing-policy.md) is the full version
 of this page.
 
@@ -318,7 +335,7 @@ and [docs/limitations.md](docs/limitations.md) is the page worth reading before
 you point Hearth Code at anything you would mind losing.
 
 [docs/code-signing-policy.md](docs/code-signing-policy.md) covers what an
-unsigned installer costs a user today and what the publisher name will be once
+unsigned installer costs a user today and what the publisher name would be if
 that changes. [docs/privacy.md](docs/privacy.md) lists every destination the
 shipped code can reach, which is a short list and contains no server this
 project operates.

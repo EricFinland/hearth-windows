@@ -1,26 +1,23 @@
 ---
-title: Install and first run
-description: From an empty folder to a working Hearth, in order, with no steps assumed.
+title: Build from source
+description: From an empty folder to a Hearth you built yourself, in order, with no steps assumed.
 ---
 
 This page takes you from nothing to a working Hearth, in order, with no steps
 assumed. The other pages in `docs/` are reference: they answer "how does X
 work" well and "what do I do first" badly. This one is the walkthrough.
 
-## Read this first: there is no download yet
+## Read this first: you probably want the download instead
 
-Hearth has never been released. There is no installer to download, no release
-page, and no signed binary anywhere. `release/trust.json` points at
-`releases.hearth.invalid`, which is a reserved name that cannot resolve, on
-purpose: an updater pointed at a real host that nobody controls is worse than
-one pointed at a host that cannot exist.
+**If you just want to use Hearth, you do not need this page.** Download the
+ready-made installer from the
+[releases page](https://github.com/EricFinland/hearth-windows/releases/latest)
+and follow **[docs/download.md](/hearth-windows/getting-started/download/)**, which walks through it step by
+step with no programming tools at all.
 
-So the only way to run Hearth today is to build it. That is what this page
-walks through. It takes about twenty minutes, most of it waiting.
-
-If you were looking for a finished product to install and use, this is not
-that yet, and [docs/limitations.md](/hearth-windows/reference/limitations/) is the honest page about
-what else is missing.
+This page is for building Hearth from source: if you want to change the code,
+or you would rather compile it yourself than run an installer someone else
+built. It takes about twenty minutes, most of it waiting.
 
 ## What you need
 
@@ -125,11 +122,10 @@ Run the installer, or run `cargo run --release` as above.
 
 **Windows will warn you.** A full-screen blue SmartScreen panel saying the
 publisher is unknown. That is correct and expected: the installer is not code
-signed, because a certificate costs money and the free path for open-source
-projects (SignPath Foundation) requires a public repository with a green CI
-build first. Click "More info", then "Run anyway".
+signed, because Hearth does not have a code-signing certificate. Click "More
+info", then "Run anyway". [docs/download.md](/hearth-windows/getting-started/download/#step-3-run-the-installer-and-get-past-smartscreen)
+shows every warning you may meet and what to click.
 
-You should be suspicious of that instruction from a stranger on the internet.
 [docs/code-signing-policy.md](/hearth-windows/reference/code-signing/) explains exactly what
 signing would and would not prove, and
 [docs/updates.md](/hearth-windows/concepts/updates/) explains the Ed25519 key that protects updates

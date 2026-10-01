@@ -21,8 +21,8 @@
  * are four different things this panel can be looking at and they must never
  * be confused with each other:
  *
- *   * "this build has no release feed"  -- nothing has been published, so
- *     Hearth cannot check. It says so.
+ *   * "this build has no release feed"  -- no update feed is published, so
+ *     Hearth cannot check. It says so, and where to look instead.
  *   * "the check failed"                -- the feed was unreachable, or the
  *     manifest was refused. It says which, and it says what version is
  *     running, because a failed check is not evidence of being up to date.

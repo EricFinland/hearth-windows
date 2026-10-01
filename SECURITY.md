@@ -21,9 +21,9 @@ at once.
 
 ## Supported versions
 
-Hearth is in development and nothing has been published. There is no released
-version to support yet. Security fixes land on `main`. When releases begin,
-this section will name the supported line.
+Hearth is in early release. Only the latest release on the
+[releases page](https://github.com/EricFinland/hearth-windows/releases/latest)
+is supported; security fixes land on `main` and ship in the next release.
 
 ## What Hearth defends
 
@@ -79,10 +79,12 @@ is marketing.
   reasoning is written at the top of each module: a heuristic that silently
   mangled a real write would corrupt the user's own files, which is worse than
   a missed detection.
-- **The installer is unsigned.** Until code signing is in place, a downloaded
-  installer triggers a full-screen SmartScreen warning, and there is no way for
-  a user to tell a real Hearth installer from a forged one by inspection. This
-  is why nothing is published. See
+- **The installer is unsigned.** There is no code-signing certificate, so a
+  downloaded installer triggers a full-screen SmartScreen warning, and Windows
+  cannot tell a real Hearth installer from a forged one. Users can: every
+  release publishes the installer's SHA-256 and a GitHub build attestation,
+  and the only official source is this repository's releases page. See
+  [docs/download.md](docs/download.md) and
   [docs/code-signing-policy.md](docs/code-signing-policy.md).
 - **Local model quality is a real limit.** A small local model is more easily
   talked into something than a large hosted one. The permission modes exist

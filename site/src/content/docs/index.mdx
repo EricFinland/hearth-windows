@@ -5,10 +5,14 @@ template: splash
 hero:
   tagline: A desktop application that runs language models on your own GPU and an autonomous coding agent against your own files. No terminal, no account, no per-token bill, and nothing leaving the machine unless you approve it.
   actions:
-    - text: Get started
-      link: /hearth-windows/getting-started/install/
-      icon: right-arrow
+    - text: Download for Windows
+      link: https://github.com/EricFinland/hearth-windows/releases/latest
+      icon: download
       variant: primary
+    - text: Install guide
+      link: /hearth-windows/getting-started/download/
+      icon: right-arrow
+      variant: secondary
     - text: View on GitHub
       link: https://github.com/EricFinland/hearth-windows
       icon: external
@@ -17,24 +21,26 @@ hero:
 
 import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
-:::caution[There is no download yet]
-Hearth has never been released. There is no installer to download and no
-signed binary anywhere: `release/trust.json` points at
-`releases.hearth.invalid`, a reserved name that cannot resolve, because an
-updater aimed at a real host nobody controls is worse than one aimed at a
-host that cannot exist.
-
-Building it yourself takes about twenty minutes, most of it waiting.
-[The install page](/hearth-windows/getting-started/install/) walks through it
-from an empty folder.
+:::note[Windows will warn you the first time, and that is expected]
+Hearth is free and fully open source, but it has no paid code-signing
+certificate, so Windows shows a blue **"Windows protected your PC"** screen
+when you run the installer. Click **More info**, then **Run anyway**.
+[The install guide](/hearth-windows/getting-started/download/) walks through
+every step, explains why that is safe here, and shows how to check the
+download is genuine.
 :::
 
 ## Start here
 
 <CardGrid>
   <LinkCard
-    title="Install and first run"
-    description="Build tools, clone, build, run, pick a model, and a first task worth trying. In order, with no steps assumed."
+    title="Download and install"
+    description="Download the installer, get past the Windows warning, pick a model, and try a first task. No technical knowledge needed."
+    href="/hearth-windows/getting-started/download/"
+  />
+  <LinkCard
+    title="Build from source"
+    description="Build tools, clone, build, run. For changing the code or compiling it yourself."
     href="/hearth-windows/getting-started/install/"
   />
   <LinkCard

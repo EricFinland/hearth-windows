@@ -146,14 +146,15 @@ and can be turned off. Downloading 117 MB unprompted onto a metered
 connection is rude, and a staged installer sitting on disk is one more thing
 for a local attacker to race, so neither happens without an explicit action.
 
-Nothing has been published
---------------------------
-There is no release server. The feed in release/trust.json points at
+No update feed has been published
+---------------------------------
+Installers are posted by hand on the GitHub releases page; there is no
+update feed. The feed in release/trust.json points at
 `releases.hearth.invalid`, which is an RFC 2606 reserved name that can never
 resolve, so a shipped Hearth cannot fetch an update from anywhere at all
 until an operator puts a real host in the trust file and rebuilds. The UI says
 so in those words rather than pretending to be up to date. docs/updates.md has
-the steps an operator would follow to actually publish; none of them have been
+the steps an operator would follow to publish a feed; none of them have been
 performed.
 
 Standard library only. Every network call is bounded by a timeout.
@@ -1323,7 +1324,8 @@ class Updater:
             data["state"] = STATE_UNCONFIGURED
             data["message"] = data["message"] or (
                 "This build of Hearth carries no release feed, so it cannot "
-                "check for updates. Nothing has been published yet.")
+                "check for updates automatically. New versions are posted at "
+                "github.com/EricFinland/hearth-windows/releases.")
         return data
 
     def snapshot(self):
@@ -1409,8 +1411,9 @@ class Updater:
         if not configured(trust, self._env):
             self._set(state=STATE_UNCONFIGURED, error=None, available=None,
                       message="This build of Hearth carries no release feed, so "
-                              "it cannot check for updates. Nothing has been "
-                              "published yet.")
+                              "it cannot check for updates automatically. New "
+                              "versions are posted at "
+                              "github.com/EricFinland/hearth-windows/releases.")
             return self.snapshot()
 
         installed = self._version_fn()
@@ -2169,7 +2172,8 @@ def _self_test():
                      now_fn=lambda: now)
         snap = u6.check_once()
         assert snap["state"] == STATE_UNCONFIGURED, snap
-        assert "nothing has been published" in snap["message"].lower(), snap["message"]
+        assert "no release feed" in snap["message"].lower(), snap["message"]
+        assert "/releases" in snap["message"], snap["message"]
         assert not feed.opened or base + "stable/manifest.json" in feed.opened
 
         # -- the threaded surface -------------------------------------------

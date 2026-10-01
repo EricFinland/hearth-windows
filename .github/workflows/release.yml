@@ -8,12 +8,15 @@ name: Release
 # that gates every push, so the file attached to a release is the file CI
 # tested rather than one produced by a recipe that only runs on release day.
 #
-# The release is created as a DRAFT and as a PRERELEASE. Draft because
-# publishing is a decision a person should make after looking at the artifact,
-# not a side effect of pushing a tag. Prerelease because the installer is
-# unsigned: see docs/code-signing-policy.md for what that costs the person who
-# downloads it, and why the release notes say so in the first paragraph rather
-# than in a footnote.
+# The release is published straight away and marked as the latest one, so
+# the "Download" link in the README (releases/latest) points at it. Pushing a
+# version tag is the decision to publish. To review first, run this workflow
+# by hand with "draft" ticked and publish the draft from the releases page.
+#
+# The installer is unsigned (there is no code-signing certificate). The
+# release notes say so in the first paragraph, tell a non-technical user
+# exactly which buttons to press, and give them the hash to check: see
+# docs/download.md and docs/code-signing-policy.md.
 
 on:
   push:
@@ -23,6 +26,10 @@ on:
       tag:
         description: Existing tag to build a release from (e.g. v0.1.0)
         required: true
+      draft:
+        description: Create as a draft to review before publishing
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -91,67 +98,73 @@ jobs:
           cat > NOTES.md <<EOF
           ## Hearth for Windows ${{ steps.meta.outputs.tag }}
 
-          Run local language models and an autonomous coding agent on your own
-          Windows machine. The installer carries its own Python and its own
-          inference engine, so nothing has to be installed first.
+          Run local AI models and an autonomous coding agent on your own
+          Windows computer, for free. The installer carries everything it
+          needs, so nothing else has to be installed first.
 
-          ### Read this before you install
+          ### How to install (no technical knowledge needed)
 
-          **This installer is not code signed.** Windows will show a full-screen
-          blue SmartScreen panel saying the publisher is unknown, and the only
-          button you can see is **Don't run**. To continue you have to click
-          **More info** and then **Run anyway**.
+          1. Under **Assets** below, click **\`$exe\`** to download it.
+             If your browser says the file "isn't commonly downloaded", choose
+             **Keep** (in Edge: **...** then **Keep**, then **Keep anyway**).
+          2. Double-click the downloaded file.
+          3. Windows shows a blue screen saying **"Windows protected your PC"**.
+             Click **More info**, then click **Run anyway**.
+          4. Click through the installer. It does not need administrator rights.
+          5. Open **Hearth** from the Start menu, then pick a model that fits
+             your computer in the model shop.
 
-          You should be suspicious of a stranger telling you to click through a
-          security warning. Two things you can check instead of trusting us:
+          Full step-by-step guide, including antivirus and work computers:
+          [docs/download.md](https://github.com/EricFinland/hearth-windows/blob/main/docs/download.md)
 
-          1. Verify the download. In PowerShell:
+          ### Why does Windows warn me?
 
-             \`\`\`
-             Get-FileHash .\\$exe -Algorithm SHA256
-             \`\`\`
+          Hearth is free and 100% open source, but it does not have a paid
+          code-signing certificate, so Windows calls the publisher "unknown".
+          The warning is about the missing certificate, not about anything
+          found in the file. You do not have to take our word for it:
 
-             It should print:
+          - **Check the file.** In PowerShell, in your Downloads folder:
 
-             \`\`\`
-             $sha
-             \`\`\`
+            \`\`\`
+            Get-FileHash .\\$exe
+            \`\`\`
 
-          2. Ask GitHub where the file came from. Every build is attested, so
-             you can check this binary really was produced by this repository's
-             workflow at a specific commit, without trusting us:
+            The hash it prints should be (PowerShell shows it in capitals;
+            that is the same hash):
 
-             \`\`\`
-             gh attestation verify $exe -R ${{ github.repository }}
-             \`\`\`
+            \`\`\`
+            $sha
+            \`\`\`
 
-          3. Build it yourself. Every release is built by a public GitHub
-             Actions workflow from this repository's source, on a GitHub-hosted
-             runner, and [docs/getting-started.md](https://github.com/EricFinland/hearth-windows/blob/main/docs/getting-started.md)
-             walks through doing the same build locally.
+          - **Check where it came from.** This installer was built by GitHub
+            Actions from this repository's public source, and GitHub attests
+            to that:
 
-          Getting a certificate is in progress. See
-          [the code signing policy](https://github.com/EricFinland/hearth-windows/blob/main/docs/code-signing-policy.md).
+            \`\`\`
+            gh attestation verify $exe -R ${{ github.repository }}
+            \`\`\`
+
+          - **Build it yourself.**
+            [docs/getting-started.md](https://github.com/EricFinland/hearth-windows/blob/main/docs/getting-started.md)
+            walks through it.
+
+          Only download Hearth from this releases page. A copy from anywhere
+          else is not an official release.
 
           ### What you need
 
-          Windows 10 or 11, and enough RAM for the model you pick. Hearth
-          measures your machine and tells you which models actually fit rather
-          than letting you choose one that will swap to disk.
+          Windows 10 or 11, and enough RAM for the model you pick (about 8 GB
+          free for a small one). Hearth measures your machine and tells you
+          which models actually fit. A graphics card helps and is not required.
 
-          A GPU helps and is not required.
+          ### Updating
 
-          ### Updates: signed, but no feed is published yet
-
-          The updater is built and works. It accepts a release only when an
-          Ed25519 key baked into the application signed it, which means a
-          compromised release host still cannot push code to you: it cannot
-          produce the signature.
-
-          What does not exist yet is somewhere to fetch from. The feed points at
-          \`releases.hearth.invalid\`, a reserved name that can never resolve, so
-          this build reports that plainly rather than claiming it is up to date.
-          Watch this repository for new releases in the meantime.
+          There is no automatic update feed yet. To update, download the
+          newest installer from the
+          [releases page](https://github.com/${{ github.repository }}/releases)
+          and run it; your models and settings are kept. Click **Watch**,
+          **Custom**, **Releases** on the repository to be told when one is out.
 
           ### Known gaps
 
@@ -163,7 +176,7 @@ jobs:
           EOF
           echo "--- notes ---"; cat NOTES.md
 
-      - name: Create the draft release
+      - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -171,11 +184,10 @@ jobs:
             --repo "${{ github.repository }}" \
             --title "Hearth for Windows ${{ steps.meta.outputs.tag }}" \
             --notes-file NOTES.md \
-            --draft \
-            --prerelease \
+            $([ "${{ github.event.inputs.draft }}" = "true" ] && echo --draft || echo --latest) \
             dist/*.exe dist/SHA256SUMS.txt
 
       - name: Where to look
         run: |
-          echo "Draft release created. Review it, then publish:"
+          echo "Release created:"
           echo "  https://github.com/${{ github.repository }}/releases"

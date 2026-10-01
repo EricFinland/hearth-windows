@@ -38,9 +38,12 @@ BLOB = "https://github.com/EricFinland/hearth-windows/blob/main/"
 
 #: source path -> (site path under content/docs, title, description)
 PAGES = [
+    ("docs/download.md", "getting-started/download.md",
+     "Download and install",
+     "Download the Windows installer and get past the SmartScreen warning, step by step, no technical knowledge needed."),
     ("docs/getting-started.md", "getting-started/install.md",
-     "Install and first run",
-     "From an empty folder to a working Hearth, in order, with no steps assumed."),
+     "Build from source",
+     "From an empty folder to a Hearth you built yourself, in order, with no steps assumed."),
     ("docs/windows.md", "getting-started/guide.md",
      "The full guide",
      "What Hearth is, what it does today, the permission modes, containment, and what survives a restart."),

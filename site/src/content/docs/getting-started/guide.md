@@ -124,11 +124,15 @@ full-screen SmartScreen warning on first run;
 would and would not prove. There is no cloud API key support. AMD and Intel
 GPU detection is incomplete: NVIDIA is detected, others fall back to CPU.
 
-**And nothing has been published.** There is no release, no download link, and
-`release/trust.json` points at `releases.hearth.invalid`, a name reserved so
-it cannot resolve. Building it yourself is the only way to run it today, and
+**Downloading it.** Installers are published on the
+[GitHub releases page](https://github.com/EricFinland/hearth-windows/releases/latest),
+built by GitHub Actions from this repository. [docs/download.md](/hearth-windows/getting-started/download/)
+walks through installing one, including getting past the SmartScreen warning,
+with no programming knowledge needed. To build it yourself instead,
 [docs/getting-started.md](/hearth-windows/getting-started/install/) walks through that from an empty
-folder.
+folder. There is no automatic update feed yet: `release/trust.json` points at
+`releases.hearth.invalid`, a name reserved so it cannot resolve, so updating
+means downloading the next installer from the releases page.
 
 ## What you need
 

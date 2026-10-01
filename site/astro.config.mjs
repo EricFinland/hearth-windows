@@ -41,7 +41,8 @@ export default defineConfig({
           label: 'Getting Started',
           items: [
             { label: 'Overview', link: '/' },
-            { label: 'Install and first run', link: '/getting-started/install/' },
+            { label: 'Download and install', link: '/getting-started/download/' },
+            { label: 'Build from source', link: '/getting-started/install/' },
             { label: 'The full guide', link: '/getting-started/guide/' },
           ],
         },

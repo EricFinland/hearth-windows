@@ -479,7 +479,7 @@ def verify_stage():
               result["python"], engine["variant"], engine["tag"]))
     print("  update trust anchor: version {}, active key(s) {}, feed {}{}".format(
         updater["version"], ", ".join(updater["keys"]), updater["feed"],
-        "" if updater["configured"] else "  (unresolvable: nothing published)"))
+        "" if updater["configured"] else "  (unresolvable: no update feed)"))
     print("  licence texts staged: {}, and {} file(s) under vendor/licenses".format(
         ", ".join(LICENCE_FILES), len(texts)))
 
@@ -585,7 +585,7 @@ def report(info, unpacked_only=False):
             os.path.relpath(installers[0], REPO_ROOT)))
     print("\nThe installer is unsigned. The first person to run it gets a "
           "SmartScreen warning\nthat hides the Run button behind \"More info\". "
-          "See docs/packaging-windows.md.")
+          "docs/download.md walks users through it.")
 
 
 def main(argv=None):

@@ -247,6 +247,10 @@ GPU fetch is Vulkan, which pulls nothing proprietary.
 
 ## SignPath Foundation readiness
 
+*No certificate has been obtained, and releases are currently published
+unsigned (see [code-signing-policy.md](code-signing-policy.md)). This section
+is kept as the checklist for a future application.*
+
 SignPath Foundation signs open-source projects for free, which is the route out
 of the SmartScreen warning described in
 [packaging-windows.md](packaging-windows.md). Their published conditions and

@@ -395,8 +395,8 @@ shutdown code. In every case `tasklist` showed `Hearth.exe`, `python.exe` and
 ## SmartScreen: what a user actually sees
 
 **The installer is not signed.** There is no code-signing certificate for
-this project yet. Do not describe this build as ready to hand to anyone
-without saying what follows.
+this project. Releases are published anyway, with
+[download.md](/hearth-windows/getting-started/download/) telling users exactly what follows.
 
 Downloading and running `Hearth-Setup-0.1.0.exe` on a machine that has not
 seen it before produces a blue full-screen dialog:
@@ -419,8 +419,9 @@ removes the warning. It is a purchase and an identity-verification process
 with a lead time measured in days to weeks. Nothing in this build can
 substitute for it, and no build flag turns it off.
 
-Until then, this installer is for people who have been told directly what to
-expect.
+So every release points at [download.md](/hearth-windows/getting-started/download/), which tells people
+directly what to expect, which buttons to press, and how to check the file
+against the published SHA-256 before running it.
 
 Hearth's own updater does not depend on any of this. It verifies each release
 against an Ed25519 key built into the application, which protects users today,
