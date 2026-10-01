@@ -28,7 +28,7 @@ those paths has `resources\` in it.
 
 | Component | Version                      | Licence           |
 |-----------|------------------------------|-------------------|
-| Hearth    | 0.1.0                        | Apache-2.0        |
+| Hearth    | 0.1.1                        | Apache-2.0        |
 | Tauri     | 2.11.5                       | Apache-2.0 OR MIT |
 | llama.cpp | b10105 (win-cpu-x64)         | MIT               |
 | CPython   | 3.12.10 (windows-embeddable) | PSF License 2.0   |
