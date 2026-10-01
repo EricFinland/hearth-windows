@@ -1,0 +1,87 @@
+---
+// Total installer downloads across every release, read from GitHub's public
+// release API in the visitor's browser. GitHub counts each asset download
+// itself, so this needs no server and the site still collects nothing. Only
+// .exe assets are summed: SHA256SUMS.txt downloads are not installs.
+//
+// GitHub allows 60 anonymous requests an hour per IP, which a shared VPN or
+// office network can use up. When that happens it falls back to shields.io,
+// which caches the same count server side; that figure is rounded ("1.2k")
+// and includes checksum downloads, so the exact GitHub sum is preferred. If
+// both fail the line stays hidden rather than showing a wrong number.
+---
+
+<p class="hearth-downloads" hidden>
+  <span class="hearth-downloads-n"></span>
+</p>
+
+<script>
+  const REPO = 'EricFinland/hearth-windows';
+  const CACHE_KEY = 'hearth-downloads';
+  const CACHE_MS = 10 * 60 * 1000;
+
+  async function total(): Promise<number> {
+    try {
+      const hit = JSON.parse(sessionStorage.getItem(CACHE_KEY) || 'null');
+      if (hit && Date.now() - hit.at < CACHE_MS) return hit.n;
+    } catch {}
+
+    let n = 0;
+    for (let page = 1; ; page++) {
+      const res = await fetch(
+        `https://api.github.com/repos/${REPO}/releases?per_page=100&page=${page}`,
+        { headers: { Accept: 'application/vnd.github+json' } },
+      );
+      if (!res.ok) throw new Error(String(res.status));
+      const releases = await res.json();
+      for (const r of releases) {
+        if (r.draft) continue;
+        for (const a of r.assets) if (/\.exe$/i.test(a.name)) n += a.download_count;
+      }
+      if (releases.length < 100) break;
+    }
+
+    try {
+      sessionStorage.setItem(CACHE_KEY, JSON.stringify({ n, at: Date.now() }));
+    } catch {}
+    return n;
+  }
+
+  async function shields(): Promise<string> {
+    const res = await fetch(`https://img.shields.io/github/downloads/${REPO}/total.json`);
+    if (!res.ok) throw new Error(String(res.status));
+    const { value } = await res.json();
+    if (!/^\d[\d.,]*[kMB]?$/.test(value)) throw new Error(value);
+    return value;
+  }
+
+  function show(label: string, one: boolean) {
+    for (const el of document.querySelectorAll<HTMLElement>('.hearth-downloads')) {
+      el.querySelector('.hearth-downloads-n')!.textContent =
+        `${label} ${one ? 'download' : 'downloads'} so far`;
+      el.hidden = false;
+    }
+  }
+
+  total()
+    .then((n) => {
+      if (n > 0) show(n.toLocaleString('en-US'), n === 1);
+    })
+    .catch(() =>
+      shields().then((v) => {
+        if (v !== '0') show(v, v === '1');
+      }),
+    )
+    .catch(() => {});
+</script>
+
+<style>
+  .hearth-downloads {
+    margin: 0;
+    font-size: var(--sl-text-sm);
+    color: var(--sl-color-gray-3);
+  }
+  .hearth-downloads-n {
+    font-variant-numeric: tabular-nums;
+  }
+</style>
