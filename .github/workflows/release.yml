@@ -41,6 +41,13 @@ concurrency:
 jobs:
   build:
     uses: ./.github/workflows/build.yml
+    # A called workflow can only use permissions its caller grants. build.yml's
+    # installer job attests the binary, which needs these two; without them
+    # GitHub rejects this whole file before any job runs.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
 
   publish:
     needs: build
