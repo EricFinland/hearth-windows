@@ -392,6 +392,14 @@ async fn install_update(
         Err(message) => return Ok(update_error(message)),
     };
 
+    // Work still running is cut short by the quit below; say so before the
+    // user answers rather than after. See update::busy_note.
+    let busy = update::sidecar_get(port, &token, "/model")
+        .ok()
+        .and_then(|model| update::busy_note(&model))
+        .map(|note| format!("{}\n\n", note))
+        .unwrap_or_default();
+
     // Everything the user needs in order to answer, in front of them: which
     // version, who signed it, how big it is, and the digest this process just
     // recomputed from the bytes on disk.
@@ -399,10 +407,11 @@ async fn install_update(
         "Install Hearth {}?\n\n\
          Hearth {} will close, the installer will run, and Hearth will open \
          again when it is done. Your models, chats and settings are kept.\n\n\
-         This installer was signed by {} and its contents match that signature.\n\n\
+         {}This installer was signed by {} and its contents match that signature.\n\n\
          {:.1} MB\nSHA-256: {}",
         staged.version,
         running,
+        busy,
         staged.signed_by,
         staged.size_bytes as f64 / 1e6,
         staged.sha256

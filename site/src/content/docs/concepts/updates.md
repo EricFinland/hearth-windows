@@ -14,7 +14,9 @@ and Hearth checks for it once each time it starts.
 says so at the top of the window. Click **Install now**. Hearth downloads it,
 checks it, asks once more with the version and its fingerprint in front of
 you, then closes, updates and opens again. Your models, chats and settings are
-kept. **Later** hides the banner until the next launch; the Updates panel in
+kept. If a turn, the work loop or a swarm is still running (in any chat),
+that last question says so first, because installing stops that work
+partway. **Later** hides the banner until the next launch; the Updates panel in
 the sidebar always has the full picture and a **Check for updates** button.
 
 Hearth 0.1.1 and older cannot do this: they were built with a placeholder feed

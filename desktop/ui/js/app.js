@@ -552,26 +552,47 @@ function renderUpdatePanel() {
  *  snapshot says the installer is verified and staged. */
 let updateInstallPending = false;
 
+/** True from the moment an install is asked for until the shell answers,
+ *  and for good once it has started the installer (this window is about to
+ *  close). The shell's dialog is not modal to this page, and every redraw
+ *  while it is open puts a fresh, enabled Install button in the banner and
+ *  the panel, so without this a second click opened a second dialog and, if
+ *  both were accepted, started the installer twice. */
+let updateInstallRunning = false;
+
 /** Ask the shell to run the staged installer. Returns true when the user
  *  said "Not now" in the shell's own dialog. */
 async function runUpdateInstall() {
+  if (updateInstallRunning) return false;
+  updateInstallRunning = true;
+  let outcome = "failed";
+  try {
+    outcome = await askShellToInstall();
+  } finally {
+    if (outcome !== "started") updateInstallRunning = false;
+  }
+  return outcome === "cancelled";
+}
+
+/** One install_update call: "started", "cancelled" or "failed". */
+async function askShellToInstall() {
   const result = await installUpdate();
   if (result && result.error) {
     updateSnapshot = { ...(updateSnapshot ?? {}), state: "failed", failure: "error",
       error: result.error };
     renderUpdatePanel();
-    return false;
+    return "failed";
   }
   if (result && result.cancelled) {
     renderUpdatePanel();
-    return true;
+    return "cancelled";
   }
   // Success means this window is about to close. Say so rather than
   // leaving a dead button behind.
   updateSnapshot = { ...(updateSnapshot ?? {}), state: "ready",
     message: "Closing Hearth and starting the installer…" };
   renderUpdatePanel();
-  return false;
+  return "started";
 }
 
 /** The banner's "Install now": install a staged update at once, or download
