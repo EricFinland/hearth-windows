@@ -86,6 +86,11 @@ Standard library only. Every external command is optional: a missing tool,
 a timeout, or a nonzero exit degrades to "no data", never a raised exception.
 Pure detection: no writes, no network.
 
+display_adapters() is cached for ADAPTER_CACHE_TTL_S per process. Without
+it every shop listing, every quant table and every engine launch spawned
+PowerShell again to ask a question whose answer does not change while the
+app is open. System RAM and the CPU count are not cached: each is one
+cheap in-process call.
 """
 
 import json
@@ -95,6 +100,8 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 
 try:
     import winreg  # Windows only; the registry read below is skipped elsewhere.
@@ -770,6 +777,17 @@ def _gpus_linux_lspci():
     return gpus
 
 
+#: How long one display adapter reading is reused, in seconds. Hardware
+#: does not change while the app is open (a driver update that changes the
+#: memory figure needs a reboot anyway), and the reading this saves costs a
+#: PowerShell launch on every machine without nvidia-smi.
+ADAPTER_CACHE_TTL_S = 600
+
+_adapter_cache_lock = threading.Lock()
+_adapter_cache = None  # (monotonic time read, [adapter dicts]) or None
+_clock = time.monotonic  # injection seam for the self-test
+
+
 def display_adapters():
     """Every display adapter this machine reports, virtual ones included.
 
@@ -782,8 +800,29 @@ def display_adapters():
     "there is a Parsec adapter here and it is not a GPU" can be reported
     rather than silently dropped.
 
+    Cached for ADAPTER_CACHE_TTL_S. The lock is held across detection on
+    purpose: two shop requests arriving together should share one
+    PowerShell launch, not start two. An empty result is never cached,
+    since on Windows (where there is always at least a basic display
+    adapter) it means a probe timed out or failed, and the next caller
+    deserves a fresh try rather than ten minutes of "no GPU". Every caller
+    gets its own copies, so one that edits an entry cannot change what the
+    next one is told.
+
     Empty list when nothing could be detected; never raises.
     """
+    global _adapter_cache
+    with _adapter_cache_lock:
+        cached = _adapter_cache
+        if cached is not None and 0 <= _clock() - cached[0] < ADAPTER_CACHE_TTL_S:
+            return [dict(a) for a in cached[1]]
+        found = _detect_display_adapters()
+        _adapter_cache = (_clock(), [dict(a) for a in found]) if found else None
+        return [dict(a) for a in found]
+
+
+def _detect_display_adapters():
+    """display_adapters() without the cache: one full detection pass."""
     system = platform.system()
     found = _gpus_nvidia_smi()
     if found:
@@ -1501,6 +1540,74 @@ def _self_test():
     # The real registry, where there is one: never raises, and a device that
     # does not exist gets no figure.
     assert _registry_vram(r"PCI\VEN_FFFF&DEV_FFFF\0", "No Such Card Anywhere") == (0, False)
+
+    # -- display_adapters() caches, per process, for ADAPTER_CACHE_TTL_S -----
+    old_cache = (globals()["_adapter_cache"], globals()["_clock"],
+                 globals()["_detect_display_adapters"])
+    try:
+        calls = []
+        now = [1000.0]
+        answer = [[{"name": "AMD Radeon RX 7900 XTX", "vram_bytes": 24 * gib,
+                    "vendor": VENDOR_AMD, "approximate": False, "virtual": False,
+                    "integrated": False}]]
+
+        def _counting_detect():
+            calls.append(now[0])
+            return [dict(a) for a in answer[0]]
+        globals()["_detect_display_adapters"] = _counting_detect
+        globals()["_clock"] = lambda: now[0]
+        globals()["_adapter_cache"] = None
+
+        first = display_adapters()
+        assert len(calls) == 1 and first[0]["vram_bytes"] == 24 * gib, (calls, first)
+        # A caller editing its copy cannot change what the next one is told.
+        first[0]["vram_bytes"] = 1
+        now[0] += ADAPTER_CACHE_TTL_S - 1
+        again = display_adapters()
+        assert len(calls) == 1, calls
+        assert again[0]["vram_bytes"] == 24 * gib, again
+        # gpus() and probe() ride on the same cache.
+        assert gpus()[0]["name"] == "AMD Radeon RX 7900 XTX"
+        assert probe()["gpus"][0]["vram_bytes"] == 24 * gib
+        assert len(calls) == 1, calls
+        # Past the TTL it asks again.
+        now[0] += 2
+        display_adapters()
+        assert len(calls) == 2, calls
+        # A clock that went backwards is not trusted to mean "fresh".
+        now[0] -= 50
+        display_adapters()
+        assert len(calls) == 3, calls
+        # An empty reading (a timed-out probe) is never cached.
+        answer[0] = []
+        globals()["_adapter_cache"] = None
+        assert display_adapters() == [] and display_adapters() == []
+        assert len(calls) == 5, calls
+
+        # Concurrent first callers share ONE detection rather than each
+        # launching their own PowerShell.
+        answer[0] = [{"name": "x", "vram_bytes": 1, "vendor": VENDOR_UNKNOWN,
+                      "approximate": True, "virtual": False, "integrated": None}]
+        globals()["_adapter_cache"] = None
+        gate = threading.Event()
+
+        def _slow_detect():
+            calls.append(now[0])
+            gate.wait(5)
+            return [dict(a) for a in answer[0]]
+        globals()["_detect_display_adapters"] = _slow_detect
+        before = len(calls)
+        threads = [threading.Thread(target=display_adapters) for _ in range(4)]
+        for t in threads:
+            t.start()
+        time.sleep(0.05)
+        gate.set()
+        for t in threads:
+            t.join(5)
+        assert len(calls) - before == 1, calls
+    finally:
+        (globals()["_adapter_cache"], globals()["_clock"],
+         globals()["_detect_display_adapters"]) = old_cache
 
     # -- Windows WMI/CIM parsers: exercised with canned fixtures so the ------
     # -- self-test does not depend on this host's specific hardware ---------

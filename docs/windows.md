@@ -207,6 +207,9 @@ the 512MB slice of system RAM its driver reserves. Hearth knows that slice
 is not dedicated VRAM and grades it as shared memory, whichever way it was
 read.
 
+The hardware reading is taken once and reused for ten minutes, so browsing
+the shop does not launch PowerShell on every search.
+
 ## Getting a model onto your machine
 
 A multi-gigabyte download with a progress bar that lies, freezes, or jumps
