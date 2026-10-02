@@ -53,9 +53,12 @@ event log, and into session state. So:
     its PEM detector needs a key's BEGIN and END markers both inside what it
     reads. So, independent of that window, one linear pass over the WHOLE of
     each side finds every private-key block (BEGIN through the matching END,
-    or through the run of key material after a BEGIN that has no END) and
-    redacts every line of base64 key material in it, wherever the file's
-    size puts it. See _pem_block_findings.
+    or through the run of key material after a BEGIN that has no END, and
+    then on past it) and redacts the base64 key material in it, wherever the
+    file's size puts it and however its rows are written (bare, as string
+    literals, commented out, joined on one line). See _pem_block_findings.
+    The private rows of an inline PuTTY key are found the same way; see
+    _putty_findings.
   - The lines of each hunk are then scanned again, cut to about the length
     they will be shown at (later, for a shown line whose token crosses the
     display cut), in windows small enough that scan() reads every character
@@ -156,9 +159,20 @@ RESCAN_LONG_LINE = 20_000      # how far past the display cut a shown line is re
 # size (see _pem_block_findings). Any label naming a PRIVATE KEY: RSA, EC, DSA,
 # OPENSSH, ENCRYPTED, PGP ... BLOCK, and the four-dash SSH2 form.
 _PEM_BEGIN_RE = re.compile(r"-{4,5} ?BEGIN ((?:[A-Z0-9]+ )*?PRIVATE KEY(?: [A-Z0-9]+)*) ?-{4,5}")
+_PEM_END_RE = re.compile(
+    r"(?=(-{4,5} ?END ((?:[A-Z0-9]+ )*?PRIVATE KEY(?: [A-Z0-9]+)*) ?-{4,5}))")
 _PEM_B64_RE = re.compile(r"[A-Za-z0-9+/=]+")
-_PEM_ESCAPED_EOL_RE = re.compile(r"\\+[nr]")  # a key kept on one line, as JSON does
-_PEM_HEADER_RE = re.compile(r"(?:Proc-Type|DEK-Info|Comment): ")
+# A key kept on one line, as JSON does ("\n" escapes between rows), and the
+# "\/" JSON may write for "/": the backslashes are dropped before judging.
+_PEM_ESCAPED_EOL_RE = re.compile(r"\\+(?:[nr]|(?=/))")
+_PEM_HEADER_RE = re.compile(r"(?:Proc-Type|DEK-Info|Comment|Version|Hash|Charset|MessageID): ")
+# One line of a block, read as escapes and base64 runs; see _pem_line.
+_PEM_TOKEN_RE = re.compile(r"(?P<esc>\\+[nrt])|(?P<run>(?:[A-Za-z0-9+/=]|\\+/)+)")
+_PEM_WORD_RE = re.compile(r"\w")
+_PEM_ALNUM_RE = re.compile(r"[A-Za-z0-9]")
+_PEM_LONG_RUN = 40  # a run this long inside a block is key material, never a word
+_PUTTY_PRIVATE_RE = re.compile(r"(?<![\w-])Private-Lines: *(\d{1,6})[ \t\r]*$", re.M)
+_PUTTY_MAX_ROWS = 10_000
 _NON_SPACE_RUN_RE = re.compile(r"\S*")
 
 HIDDEN_SECRET_FILE = ("this looks like a secrets file (.env, a key, credentials), "
@@ -336,9 +350,119 @@ def _redact_keep_lines(norm, findings, line_count):
     return lines, touched
 
 
+def _pem_line(piece, base):
+    """Judge one line of a private-key block (or the part of the line inside
+    it) for key material. `base` is where `piece` starts in the file.
+
+    Returns (kind, spans, long_run). `spans` are the (start, end) runs to
+    redact; `long_run` says a run of _PEM_LONG_RUN or more characters is in
+    the line. A "run" is base64 that holds a letter or digit. Escapes
+    (\\n, \\r, \\t) and anything that is not a word character (quotes,
+    commas, "#", "//", spaces of any kind, a lone CR, U+2028) only separate
+    runs, and a "\\/" counts as part of one, as JSON may write a "/".
+      "blank"      no run and nothing readable: empty, or only decoration
+      "pure"       base64 alone once trimmed, escapes dropped (the whole line)
+      "decorated"  every run is redacted and nothing readable is left: key
+                   rows written as string literals, comments, one line
+                   joined with spaces, ...
+      "lone"       one short run and nothing readable; key material only as
+                   the last row after a long one (the caller decides)
+      "other"      anything else; its long runs are still in `spans`
+    Only runs are ever covered, so the quotes, comment marks and spaces
+    around them stay visible and no readable word is hidden by a long run."""
+    stripped = piece.strip()
+    if not stripped:
+        return "blank", [], False
+    material = _PEM_ESCAPED_EOL_RE.sub("", stripped)
+    if _PEM_B64_RE.fullmatch(material):
+        lead = len(piece) - len(piece.lstrip())
+        return ("pure", [(base + lead, base + lead + len(stripped))],
+                len(material) >= _PEM_LONG_RUN)
+    runs = []          # (start, end) of each run, in `piece`
+    word_before = []   # readable text between the previous run and this one
+    gap_from = 0
+    word = False
+    for m in _PEM_TOKEN_RE.finditer(piece):
+        if _PEM_WORD_RE.search(piece, gap_from, m.start()):
+            word = True
+        gap_from = m.end()
+        if m.group("run") and _PEM_ALNUM_RE.search(m.group("run")):
+            runs.append((m.start(), m.end()))
+            word_before.append(word)
+            word = False
+    word_after = bool(_PEM_WORD_RE.search(piece, gap_from)) or word
+    if not runs:
+        return ("other" if word_after else "blank"), [], False
+    long_flags = [end - start >= _PEM_LONG_RUN for start, end in runs]
+    take = [r for r, is_long in zip(runs, long_flags) if is_long]
+    # The last row of a key flattened onto one line is usually short: it is
+    # taken when a long run comes just before it with nothing readable
+    # between them or after it.
+    if (len(runs) >= 2 and not long_flags[-1] and long_flags[-2]
+            and not word_before[-1] and not word_after):
+        take.append(runs[-1])
+    readable = word_after or any(word_before)
+    spans = [(base + s, base + e) for s, e in take]
+    if not readable and len(take) == len(runs):
+        return "decorated", spans, True
+    if not readable and len(runs) == 1:
+        return "lone", [(base + runs[0][0], base + runs[0][1])], False
+    return "other", spans, any(long_flags)
+
+
+def _pem_body(norm, start, stop, terminated, kind, findings):
+    """Add a finding for each run of key material in norm[start:stop], the
+    body of one block, judged line by line with _pem_line. Returns where the
+    body was left: `stop`, or for an unterminated block the start of the
+    line that ended its run (that line may hold the next BEGIN marker).
+
+    Inside a terminated block every pure, decorated and long run is taken,
+    and a lone short run when the line before it held a long one (the last
+    row). Nothing else is touched, so a command written between the markers
+    stays on the card.
+
+    A block with no END has no edge but its content, so it covers only the
+    run of material after its BEGIN, and stops at the first line that is not
+    part of one. Blank and decoration-only lines and the armor headers
+    (Proc-Type, DEK-Info, Comment, Version, Hash, Charset, MessageID) do not
+    end the run. A short pure line ends it until a long one has been seen,
+    so a source file that only quotes a BEGIN marker does not lose the short
+    words after it ("pass", "return") to redaction."""
+    cursor = start
+    prev_long = False
+    seen_long = False
+    while cursor <= stop:
+        newline = norm.find("\n", cursor, stop)
+        seg_end = stop if newline == -1 else newline
+        piece = norm[cursor:seg_end]
+        line_kind, spans, long_run = _pem_line(piece, cursor)
+        if line_kind == "lone" and not prev_long:
+            spans = []
+        if not terminated:
+            if line_kind == "blank" or (
+                    line_kind == "other" and not long_run
+                    and _PEM_HEADER_RE.match(piece.strip())):
+                spans = []
+            elif line_kind == "pure" and (long_run or seen_long):
+                pass
+            elif line_kind == "decorated" or (line_kind == "lone" and spans):
+                pass
+            else:
+                return cursor
+        for s, e in spans:
+            findings.append({"start": s, "end": e, "kind": kind, "uncapped": True})
+        if line_kind != "blank":
+            prev_long = long_run
+        seen_long = seen_long or long_run
+        if newline == -1:
+            break
+        cursor = newline + 1
+    return stop
+
+
 def _pem_block_findings(norm):
-    """Findings for every line of key material inside a private-key block
-    anywhere in `norm`, read in one linear pass over the whole text.
+    """Findings for the key material inside every private-key block anywhere
+    in `norm`, read in one linear pass over the whole text.
 
     hearth_secrets.scan() reads only a head and a tail of a large text, and
     its PEM detector needs both the BEGIN and the END marker inside what it
@@ -347,65 +471,71 @@ def _pem_block_findings(norm):
     line sits outside the hunk being shown, so an edit next to one marker
     would show half the key and two edits either side of it all of it. This
     pass does not depend on either window: it finds each BEGIN marker whose
-    label names a PRIVATE KEY, the END marker with the same label after it,
-    and marks every line between them that is key material.
+    label names a PRIVATE KEY and the first END marker with the same label
+    after it, and judges every line between them with _pem_line (see
+    _pem_body for what is taken). The markers stay visible.
 
-    Key material means what hearth_secrets means by it: a line that is pure
-    base64 once trimmed (a key kept on one line with escaped "\\n" between
-    its rows, as JSON stores one, counts too). The markers stay visible, as
-    does any line holding anything else, so a block cannot be used to hide a
-    command or a sentence from the approval card; only base64 is ever
-    covered. The text after a BEGIN marker on its own line and before an END
-    marker on its own line is judged the same way.
+    A BEGIN with no matching END covers only the run of key material after
+    it (see _pem_body), and the pass then carries on past that run: a file
+    that quotes a BEGIN marker of one label (a docstring, an error message)
+    and later holds a real key of another must still have that key found.
 
-    A BEGIN with no matching END covers the contiguous run of key material
-    after it (blank lines and Proc-Type / DEK-Info / Comment headers do not
-    end the run), up to the end of the file. It stops at the first other
-    line, so a source file that only quotes a BEGIN marker does not lose
-    every short word after it to redaction.
-
-    Each finding is one line's material and is marked "uncapped"; see
-    _redact_keep_lines. Linear in len(norm): substring and regex searches
-    that only move forward, plus one look at each line inside a block."""
+    Each finding is one run of material and is marked "uncapped"; see
+    _redact_keep_lines. Linear in len(norm): the BEGIN markers, and the END
+    markers indexed by label, are each found in one forward pass first, so a
+    BEGIN with no END costs a lookup, not a search to the end of the file,
+    and the body walks never overlap (an unterminated one stops at the next
+    BEGIN at the latest)."""
     if "PRIVATE KEY" not in norm:
         return []
     kind = hearth_secrets.KIND_PRIVATE_KEY_PEM
+    ends = {}  # label -> ([start, ...], [end, ...]) of its END markers, in order
+    for m in _PEM_END_RE.finditer(norm):
+        starts, stops = ends.setdefault(m.group(2), ([], []))
+        starts.append(m.start())
+        stops.append(m.end(1))
+    begins = list(_PEM_BEGIN_RE.finditer(norm))
     findings = []
-    end_res = {}
-    n = len(norm)
     pos = 0
-    while True:
-        begin = _PEM_BEGIN_RE.search(norm, pos)
-        if begin is None:
-            break
-        label = begin.group(1)
-        end_re = end_res.get(label)
-        if end_re is None:
-            end_re = end_res[label] = re.compile(
-                r"-{4,5} ?END " + re.escape(label) + r" ?-{4,5}")
-        end = end_re.search(norm, begin.end())
-        body_end = end.start() if end is not None else n
-        cursor = begin.end()
-        while cursor <= body_end:
-            newline = norm.find("\n", cursor, body_end)
-            seg_end = body_end if newline == -1 else newline
-            piece = norm[cursor:seg_end]
-            stripped = piece.strip()
-            material = _PEM_ESCAPED_EOL_RE.sub("", stripped)
-            if material and _PEM_B64_RE.fullmatch(material):
-                lead = len(piece) - len(piece.lstrip())
-                findings.append({"start": cursor + lead, "end": cursor + lead + len(stripped),
-                                 "kind": kind, "uncapped": True})
-            elif end is None and stripped and not _PEM_HEADER_RE.match(stripped):
-                # An unterminated block's run of key material is over (or,
-                # on the BEGIN line itself, the marker is only quoted).
-                break
+    for index, begin in enumerate(begins):
+        if begin.start() < pos:
+            continue  # inside a block already read
+        starts, stops = ends.get(begin.group(1), ((), ()))
+        i = bisect.bisect_left(starts, begin.end())
+        if i < len(starts):
+            _pem_body(norm, begin.end(), starts[i], True, kind, findings)
+            pos = stops[i]
+        else:
+            # The run ends at the next BEGIN at the latest, so many markers
+            # on one line are each read up to the next, not to the line end.
+            stop = begins[index + 1].start() if index + 1 < len(begins) else len(norm)
+            pos = _pem_body(norm, begin.end(), stop, False, kind, findings)
+    return findings
+
+
+def _putty_findings(norm):
+    """Findings for the private rows of a PuTTY key (.ppk) kept inline in
+    another file: the pure base64 lines, up to the count its
+    "Private-Lines: N" header gives, right after that header. A .ppk has no
+    PEM markers, so no other pass sees it. Only base64 rows are covered."""
+    if "Private-Lines:" not in norm:
+        return []
+    kind = hearth_secrets.KIND_PRIVATE_KEY_PEM
+    findings = []
+    for m in _PUTTY_PRIVATE_RE.finditer(norm):
+        newline = norm.find("\n", m.end())
+        for _ in range(min(int(m.group(1)), _PUTTY_MAX_ROWS)):
             if newline == -1:
                 break
             cursor = newline + 1
-        if end is None:
-            break
-        pos = end.end()
+            newline = norm.find("\n", cursor)
+            piece = norm[cursor:len(norm) if newline == -1 else newline]
+            stripped = piece.strip()
+            if not stripped or not _PEM_B64_RE.fullmatch(stripped):
+                break
+            lead = len(piece) - len(piece.lstrip())
+            findings.append({"start": cursor + lead, "end": cursor + lead + len(stripped),
+                             "kind": kind, "uncapped": True})
     return findings
 
 
@@ -448,10 +578,11 @@ def _long_token_findings(text):
 
 
 def _redacted_lines(norm, line_count):
-    """_redact_keep_lines over hearth_secrets.scan(norm)'s findings and
-    _pem_block_findings(norm)'s. Returns (None, set()) when there is nothing
+    """_redact_keep_lines over hearth_secrets.scan(norm)'s findings,
+    _pem_block_findings(norm)'s and _putty_findings(norm)'s. Returns (None, set()) when there is nothing
     to redact, so the caller can keep using the lines it already has."""
-    findings = hearth_secrets.scan(norm)["findings"] + _pem_block_findings(norm)
+    findings = (hearth_secrets.scan(norm)["findings"] + _pem_block_findings(norm)
+                + _putty_findings(norm))
     if not findings:
         return None, set()
     return _redact_keep_lines(norm, findings, line_count)
@@ -1486,6 +1617,72 @@ def _self_test():
         hk = file_diff("huge.key.txt", huge_key, huge_key.replace(begin, begin + "\nx"))
         assert time.monotonic() - started < 5.0, time.monotonic() - started
         assert huge_key.split("\n")[5] not in json.dumps(hk) and hk["hunks"], hk.get("hidden_reason")
+        # (9f) a file that only quotes a BEGIN marker of another label (no
+        #     END for it anywhere) above a real key in the middle of a large
+        #     file: the pass must carry on past the quoted marker, not stop
+        #     there. Through file_diff and through an edit_file preview.
+        quoted_ec = 'DOC = "use -----BEGIN EC ' + 'PRIVATE KEY----- blocks"\n'
+        q_key = quoted_ec + mid_key
+        for name, new_t in (("next to BEGIN", q_key.replace("a = 1", "a = 2")),
+                            ("two edits", q_key.replace("a = 1", "a = 2").replace("b = 1", "b = 2"))):
+            qd = json.dumps(file_diff("deploy.py", q_key, new_t))
+            assert not any(r[:24] in qd for r in rows), "quoted marker first, {}: key shown".format(name)
+        write("deploy.py", q_key)
+        qe = json.dumps(preview_tool_call("edit_file", {"path": "deploy.py", "find": "a = 1",
+                                                        "replace": "a = 2"}, ws))
+        assert "[REDACTED:" in qe and not any(r[:24] in qe for r in rows), "edit_file showed the key"
+        # A quoted BEGIN of the SAME label is closed by the real key's END.
+        same = 'DOC = "' + begin + '"\n' + mid_key
+        sd = json.dumps(file_diff("same.py", same, same.replace("b = 1", "b = 2")))
+        assert not any(r[:24] in sd for r in rows), "same-label quoted marker: key shown"
+        # (9g) key rows that are not pure base64, inside a terminated block:
+        #     string literals, JSON with "\/", one line joined with spaces, a
+        #     commented-out key, lone-CR and U+2028 line breaks. Only the
+        #     base64 runs go; the quotes and comment marks around them stay,
+        #     as does a command written between the markers.
+        slashed = [hearth_secrets._rand_alnum(30) + "/" + hearth_secrets._rand_alnum(33)
+                   for _ in range(6)] + ["Xy0z=="]
+        def shown_rows(text, path="k.txt"):
+            # Written over a one-line file, so every line of it is shown.
+            out = json.dumps(file_diff(path, "keep = 0\n", text))
+            return out, [r for r in slashed if r[:12] in out or r[-12:] in out]
+        lit = ('KEY = ("' + begin + '\\n"\n' + "".join('       "{}\\n"\n'.format(r) for r in slashed)
+               + '       "' + end + '\\n")\nrm -rf /tmp/victim\nkeep = 1\n')
+        out, leaked = shown_rows(lit, "k.py")
+        assert not leaked and '"[REDACTED:' in out and "rm -rf /tmp/victim" in out, (leaked, out[:300])
+        esc = ('{"private_key": "' + begin + "\\n" + "\\n".join(r.replace("/", "\\/") for r in slashed)
+               + "\\n" + end + '\\n",\n"keep = 1": 0}\n')
+        assert not shown_rows(esc, "sa.json")[1], "JSON key with \\/ shown"
+        flat = 'PEM="' + begin + " " + " ".join(slashed) + " " + end + '"\nkeep = 1\n'
+        out, leaked = shown_rows(flat, "s.conf")
+        assert not leaked and begin in out and end in out, leaked
+        hashed = ("# " + begin + "\n" + "".join("# " + r + "\n" for r in slashed) + "# " + end
+                  + "\nkeep = 1\n")
+        out, leaked = shown_rows(hashed, "c.toml")
+        assert not leaked and "# [REDACTED:" in out, leaked
+        for sep in ("\r", "\u2028"):
+            odd = "a = 1" + sep + begin + sep + sep.join(slashed) + sep + end + sep + "keep = 1\n"
+            assert not shown_rows(odd)[1], "rows split by {!r} shown".format(sep)
+        # (9h) an unterminated PGP block with armor headers above its body.
+        pgp_b = "-----BEGIN PGP " + "PRIVATE KEY BLOCK-----"
+        pgp = (pad + "a = 1\n" + pgp_b + "\nVersion: GnuPG v2\nHash: SHA256\n\n" + "\n".join(rows)
+               + "\nb = 1\n" + pad)
+        pd = json.dumps(file_diff("pgp.txt", pgp, pgp.replace("Hash: SHA256", "Hash: SHA512")))
+        assert not any(r[:24] in pd for r in rows) and "Version: GnuPG v2" in pd, "PGP body shown"
+        # (9i) a PuTTY key kept inline in another file: no PEM markers, but
+        #     its Private-Lines rows are key material all the same.
+        ppk = (pad + "a = 1\nPuTTY-User-Key-File-3: ssh-rsa\nEncryption: none\nPublic-Lines: 1\n"
+               + hearth_secrets._rand_alnum(64) + "\nPrivate-Lines: " + str(len(rows)) + "\n"
+               + "\n".join(rows) + "\nPrivate-MAC: 00ff\nb = 1\n" + pad)
+        kd = json.dumps(file_diff("notes.txt", ppk, ppk.replace("b = 1", "b = 2")))
+        assert not any(r[:24] in kd for r in rows) and "Private-MAC: 00ff" in kd, "PuTTY rows shown"
+        # (9j) still linear: thousands of markers, quoted and unterminated,
+        #     several to a line, with no END anywhere.
+        crowd = ("x = '" + begin + "' + '-----BEGIN DSA " + "PRIVATE KEY-----'\n") * 25000
+        assert len(crowd) < MAX_INPUT_CHARS
+        started = time.monotonic()
+        assert _pem_block_findings(crowd) == []
+        assert time.monotonic() - started < 2.0, time.monotonic() - started
 
         # (10) a long token starting just before the display cut, in the
         #     middle of a large file: scanned cut at the usual length it would
