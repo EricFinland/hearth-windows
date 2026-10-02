@@ -189,6 +189,12 @@ STATUS_RUNNING = "running"
 EVENTS_CAP = 500  # bounded ring for Session._events; see module docstring
 APPROVALS_CAP = 200  # bounded dict for Session._approvals; see module docstring
 USER_PROMPT_ECHO_CHARS = 32 * 1024  # see submit_prompt's `echo`
+# The files attached to an echoed prompt (attachments.PromptText's
+# attachment_meta), so a replay draws the same chips under the user's words
+# that the page drew when it sent them. Only what those chips show is kept,
+# each string bounded, so a pasted-in name cannot crowd the saved tail.
+ECHO_ATTACHMENTS_MAX = 16
+ECHO_ATTACHMENT_FIELD_CHARS = 512
 
 
 class Approval:
@@ -235,6 +241,30 @@ class NullEngine:
     def run(self, ctx):
         ctx.emit("error", {"message": "no engine configured"})
 
+
+
+def _echo_attachments(meta):
+    """The JSON-safe part of a prompt's attachment_meta that a replay needs
+    to draw its chips: name, path, size, kind and how it was inlined
+    ("full", "excerpt" or "none"). Anything that is not a list of dicts, as
+    a plain str prompt has, gives an empty list."""
+    if not isinstance(meta, (list, tuple)):
+        return []
+    out = []
+    for item in meta[:ECHO_ATTACHMENTS_MAX]:
+        if not isinstance(item, dict):
+            continue
+        kept = {}
+        for key in ("name", "path", "kind", "inlined"):
+            value = item.get(key)
+            if isinstance(value, str):
+                kept[key] = value[:ECHO_ATTACHMENT_FIELD_CHARS]
+        size = item.get("size")
+        if type(size) is int and size >= 0:  # noqa: E721 - not bool
+            kept["size"] = size
+        if kept.get("name") or kept.get("path"):
+            out.append(kept)
+    return out
 
 class Session:
     """One live agent session: workspace + model + permission mode, plus the
@@ -444,6 +474,9 @@ class Session:
             echoed = {"text": text[:USER_PROMPT_ECHO_CHARS]}
             if len(text) > USER_PROMPT_ECHO_CHARS:
                 echoed["truncated"] = True
+            files = _echo_attachments(getattr(message, "attachment_meta", None))
+            if files:
+                echoed["attachments"] = files
             self._emit(turn_id, "user_prompt", echoed)
 
         def _run():
@@ -1440,6 +1473,33 @@ def _self_test():
     s_echo.submit_prompt("x" * (USER_PROMPT_ECHO_CHARS + 5), echo=True)
     big = [e for e in s_echo.events_after(0, timeout=2) if e["kind"] == "user_prompt"][-1]
     assert len(big["data"]["text"]) == USER_PROMPT_ECHO_CHARS and big["data"]["truncated"] is True
+
+    # A prompt carrying attached files (attachments.PromptText) echoes the
+    # typed words as its text, as before, plus what the chips under it show;
+    # never the files' content, and nothing that is not plain JSON.
+    class _Attached(str):
+        pass
+
+    with_files = _Attached("summarise these")
+    with_files.attachment_text = "<<<BEGIN ATTACHMENT secret body>>>"
+    with_files.attachment_meta = [
+        {"name": "notes.md", "path": "imports/notes.md", "size": 120, "kind": "text",
+         "inlined": "full", "note": None, "warnings": [{"type": "secret"}]},
+        {"name": "n" * 2000, "path": "imports/x.bin", "size": True, "inlined": "none"},
+        "not a dict",
+    ]
+    deadline = time.monotonic() + 5
+    while s_echo.to_dict()["status"] != STATUS_IDLE and time.monotonic() < deadline:
+        time.sleep(0.01)
+    s_echo.submit_prompt(with_files, echo=True)
+    got = [e for e in s_echo.events_after(0, timeout=2) if e["kind"] == "user_prompt"][-1]["data"]
+    assert got["text"] == "summarise these" and "BEGIN ATTACHMENT" not in repr(got), got
+    assert got["attachments"][0] == {"name": "notes.md", "path": "imports/notes.md",
+                                     "kind": "text", "inlined": "full", "size": 120}, got
+    assert len(got["attachments"]) == 2, got
+    assert len(got["attachments"][1]["name"]) == ECHO_ATTACHMENT_FIELD_CHARS, got
+    assert "size" not in got["attachments"][1], "a bool is not a size"
+    assert _echo_attachments(None) == [] and _echo_attachments("x") == []
 
     s_quiet = Session("/tmp/ws-echo-2", "m", "edit", engine=_SaysDone())
     s_quiet.submit_prompt("not echoed")

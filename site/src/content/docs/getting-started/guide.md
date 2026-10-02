@@ -622,7 +622,9 @@ the earlier files' text is replaced by a one-line note naming them and
 where they are in `imports`, so the agent can read them again with its own
 tools if it needs to. Your message itself stays
 exactly what you typed: the transcript shows your words with the attached
-files as chips underneath.
+files as chips underneath, and so does a saved chat when you reopen it (the
+chips name the files, which stay in `imports` for the agent to read
+again).
 
 **Formats it can read.** Plain text and source code of every common kind
 (markdown, CSV, JSON, logs, XML, HTML, YAML and so on), in UTF-8, UTF-16 or

@@ -1417,6 +1417,19 @@ function handleEvent(event) {
       transcript.addUser(data.truncated
         ? `${data.text || ""}\n\n(shortened: the full prompt was sent to the model)`
         : data.text || "");
+      // The files sent with it, as the chips send() drew. A saved chat is a
+      // file the agent's own commands can rewrite, so this is untrusted
+      // too: only strings go through, and addUserAttachments renders them
+      // as text.
+      if (Array.isArray(data.attachments)) {
+        transcript.addUserAttachments(data.attachments
+          .filter((f) => f && typeof f === "object")
+          .map((f) => ({
+            name: typeof f.name === "string" ? f.name : "attachment",
+            path: typeof f.path === "string" ? f.path : "",
+            plan: typeof f.inlined === "string" ? f.inlined : "none",
+          })));
+      }
       break;
 
     // A delta is a fragment of assistant text, emitted by engine.py as
