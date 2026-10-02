@@ -31,10 +31,17 @@ Detection preference order:
   Windows: nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,
            then PowerShell Get-CimInstance Win32_VideoController,
            then wmic path Win32_VideoController get Name,AdapterRAM.
-           Win32_VideoController.AdapterRAM is a signed 32-bit field: it
-           wraps for any card above ~4GB, so a 24GB card can report a small
-           or even negative number. Readings from this path are marked
-           "approximate": True and should be treated as a floor, not a truth.
+           Win32_VideoController.AdapterRAM is a 32-bit field: it tops out
+           just under 4GB (a 16GB RTX 5080 reads 4293918720) and on some
+           drivers wraps to a small or even negative number. So for each
+           adapter the WMI paths find, the display driver's own 64-bit
+           figure is read from the registry instead
+           (HardwareInformation.qwMemorySize under the adapter's driver
+           key, see _registry_vram). That figure is what Windows' own
+           Task Manager and dxdiag show, and it is exact for AMD, Intel
+           and NVIDIA alike. Only when it cannot be read does the entry
+           fall back to AdapterRAM and get marked "approximate": True,
+           to be treated as a floor, not a truth.
   Linux:   nvidia-smi first, then /sys/class/drm/*/device/mem_info_vram_total
            for AMD, then lspci for a name-only fallback with no VRAM figure.
            System RAM comes from /proc/meminfo.
@@ -78,6 +85,12 @@ read rather than guessed:
 Standard library only. Every external command is optional: a missing tool,
 a timeout, or a nonzero exit degrades to "no data", never a raised exception.
 Pure detection: no writes, no network.
+
+display_adapters() is cached for ADAPTER_CACHE_TTL_S per process. Without
+it every shop listing, every quant table and every engine launch spawned
+PowerShell again to ask a question whose answer does not change while the
+app is open. System RAM and the CPU count are not cached: each is one
+cheap in-process call.
 """
 
 import json
@@ -87,6 +100,13 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
+
+try:
+    import winreg  # Windows only; the registry read below is skipped elsewhere.
+except ImportError:  # pragma: no cover - every non-Windows platform
+    winreg = None
 
 SUBPROCESS_TIMEOUT = 5  # seconds; a hung driver query must never hang hearth.
 
@@ -391,6 +411,214 @@ def _gpus_nvidia_smi():
     return _parse_nvidia_smi(out)
 
 
+# --------------------------------------------------------------------------
+# The display driver's own memory figure, from the registry (Windows only)
+# --------------------------------------------------------------------------
+
+#: The display adapter device class. Every display driver ever installed on
+#: the machine has a numbered subkey under it (0000, 0001, ...), INCLUDING
+#: drivers for cards that have since been removed or for an older revision
+#: of the same chip. That is why an adapter is matched to its key through
+#: its own device instance first, and by hardware ID only as a fallback.
+_DISPLAY_CLASS_GUID = "{4d36e968-e325-11ce-bfc1-08002be10318}"
+_DISPLAY_CLASS_KEY = "SYSTEM\\CurrentControlSet\\Control\\Class\\" + _DISPLAY_CLASS_GUID
+_ENUM_KEY = "SYSTEM\\CurrentControlSet\\Enum"
+
+#: Registry value types, as the Windows API numbers them. Spelled out here
+#: rather than read from winreg so the decoding below, and its self-test,
+#: work on a machine that has no winreg module at all.
+_REG_BINARY = 3
+_REG_DWORD = 4
+_REG_QWORD = 11
+
+_SUBKEY_RE = re.compile(r"^\d{4}$")
+
+
+def _reg_value(path, name):
+    """One HKEY_LOCAL_MACHINE value as (data, type).
+
+    Raises OSError for anything that cannot be read, PermissionError
+    included (the class key's "Properties" subkey refuses a standard
+    user). Deliberately thin: this and _reg_subkeys are the only two
+    functions here that touch the real registry, so the self-test swaps
+    them for a dictionary and exercises everything above them on any
+    platform.
+    """
+    if winreg is None:
+        raise OSError("no registry on this platform")
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as key:
+        return winreg.QueryValueEx(key, name)
+
+
+def _reg_subkeys(path):
+    """Names of the subkeys of one HKEY_LOCAL_MACHINE key. Raises OSError."""
+    if winreg is None:
+        raise OSError("no registry on this platform")
+    names = []
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as key:
+        index = 0
+        while True:
+            try:
+                names.append(winreg.EnumKey(key, index))
+            except OSError:  # ERROR_NO_MORE_ITEMS ends the enumeration
+                return names
+            index += 1
+
+
+def _decode_memory_size(found):
+    """(bytes, is_64_bit) from a (data, type) registry pair; (0, False) if
+    the value is missing or is not a shape a memory size comes in.
+
+    is_64_bit is the whole point: a REG_QWORD, or an 8-byte REG_BINARY as
+    some older AMD drivers write HardwareInformation.MemorySize, cannot have
+    wrapped. A DWORD, or a 4-byte binary, is the same 32-bit ceiling
+    AdapterRAM has and earns no more trust than AdapterRAM does.
+    """
+    if not found:
+        return 0, False
+    data, kind = found
+    if kind == _REG_QWORD and isinstance(data, int):
+        return max(0, data), True
+    if kind == _REG_DWORD and isinstance(data, int):
+        return data & 0xFFFFFFFF, False
+    if kind == _REG_BINARY and isinstance(data, (bytes, bytearray)) and len(data) in (4, 8):
+        return int.from_bytes(bytes(data), "little"), len(data) == 8
+    return 0, False
+
+
+def _driver_key_memory(subkey):
+    """(bytes, is_64_bit) for one display class subkey such as "0005".
+
+    qwMemorySize first: it is the 64-bit value every WDDM 2.x driver
+    writes, and the one Task Manager reads. MemorySize is the older name,
+    which a driver may write as a DWORD (32-bit, so no better than
+    AdapterRAM) or as a little-endian binary blob of four or eight bytes.
+    """
+    path = _DISPLAY_CLASS_KEY + "\\" + subkey
+    for name in ("HardwareInformation.qwMemorySize", "HardwareInformation.MemorySize"):
+        try:
+            found = _reg_value(path, name)
+        except OSError:
+            continue
+        size, wide = _decode_memory_size(found)
+        if size > 0:
+            return size, wide
+    return 0, False
+
+
+def _hardware_id_parts(text):
+    """("PCI", {"VEN": "1002", "DEV": "13C0", ...}) from a device instance ID
+    or a hardware ID, upper-cased; (None, {}) when it is not that shape.
+
+    A device instance ID carries every component ("PCI\\VEN_1002&DEV_13C0&
+    SUBSYS_7E571462&REV_C2\\4&3055F162&0&0041"); a driver's MatchingDeviceId
+    is whichever hardware ID its INF matched on, which can be any subset
+    ("PCI\\VEN_1002&DEV_13C0&REV_C2"), so the two are compared component by
+    component and never as strings or prefixes.
+    """
+    pieces = (text or "").strip().upper().split("\\")
+    if len(pieces) < 2 or not pieces[0]:
+        return None, {}
+    parts = {}
+    for token in pieces[1].split("&"):
+        key, sep, value = token.partition("_")
+        if sep and key and value:
+            parts[key] = value
+    return pieces[0], parts
+
+
+def _hardware_id_matches(matching_id, pnp_id):
+    """Does a driver key's MatchingDeviceId describe this device instance?
+
+    Every component the hardware ID names must agree with the instance, and
+    it must name at least the vendor and the device. A class-code match
+    ("PCI\\CC_0300", which the Microsoft Basic Display driver uses) names
+    no device at all and so matches nothing here; the CC component never
+    appears in an instance ID anyway.
+    """
+    bus, want = _hardware_id_parts(matching_id)
+    have_bus, have = _hardware_id_parts(pnp_id)
+    if not bus or bus != have_bus or "VEN" not in want or "DEV" not in want:
+        return False
+    return all(have.get(key) == value for key, value in want.items())
+
+
+def _registry_vram(pnp_id, name):
+    """The display driver's memory figure for one adapter, as
+    (bytes, is_64_bit), or (0, False) when it cannot be read.
+
+    Three ways in, strongest first:
+
+      1. The device instance itself. HKLM\\...\\Enum\\<PNPDeviceID> has a
+         Driver value naming its exact class subkey ("{4d36e968-...}\\0005").
+         This is the only one that cannot pick the wrong key, and it is
+         readable by a standard user.
+      2. The hardware ID. Every class subkey whose MatchingDeviceId agrees
+         with the instance ID, component by component.
+      3. The name, only when no subkey matched by hardware ID: DriverDesc
+         is the same marketing string Win32_VideoController reports.
+
+    Routes 2 and 3 can find more than one key, because removed cards and
+    old driver installs leave theirs behind. Identical figures are fine
+    (two of the same card, or a reinstalled driver); different figures mean
+    this module cannot tell which key belongs to the card in the machine, so
+    it reports nothing rather than pick one. Never raises.
+    """
+    if pnp_id:
+        try:
+            driver, _kind = _reg_value(_ENUM_KEY + "\\" + pnp_id.strip(), "Driver")
+        except (OSError, TypeError, ValueError):
+            driver = None
+        if isinstance(driver, str):
+            guid, _, subkey = driver.strip().rpartition("\\")
+            if guid.lower() == _DISPLAY_CLASS_GUID and _SUBKEY_RE.match(subkey):
+                size, wide = _driver_key_memory(subkey)
+                if size > 0:
+                    return size, wide
+
+    try:
+        subkeys = [s for s in _reg_subkeys(_DISPLAY_CLASS_KEY) if _SUBKEY_RE.match(s)]
+    except OSError:
+        return 0, False
+    by_id, by_name = [], []
+    wanted_name = (name or "").strip().casefold()
+    for subkey in subkeys:
+        path = _DISPLAY_CLASS_KEY + "\\" + subkey
+        try:
+            matching = _reg_value(path, "MatchingDeviceId")[0]
+        except (OSError, TypeError, ValueError, IndexError):
+            matching = None
+        try:
+            desc = _reg_value(path, "DriverDesc")[0]
+        except (OSError, TypeError, ValueError, IndexError):
+            desc = None
+        if pnp_id and isinstance(matching, str) and _hardware_id_matches(matching, pnp_id):
+            by_id.append(subkey)
+        elif wanted_name and isinstance(desc, str) and desc.strip().casefold() == wanted_name:
+            by_name.append(subkey)
+    readings = {_driver_key_memory(s) for s in (by_id or by_name)}
+    readings.discard((0, False))
+    if len(readings) == 1:
+        return readings.pop()
+    return 0, False
+
+
+def _windows_vram(adapter_ram, pnp_id, name):
+    """(vram_bytes, approximate) for one Win32_VideoController row.
+
+    The registry's 64-bit figure wins outright and is the only thing that
+    makes a reading exact. A 32-bit registry figure is used only where
+    AdapterRAM gave nothing at all, and stays approximate, since it carries
+    the same ceiling AdapterRAM does.
+    """
+    reg_bytes, wide = _registry_vram(pnp_id, name)
+    if wide and reg_bytes > 0:
+        return reg_bytes, False
+    if not adapter_ram and reg_bytes > 0:
+        return reg_bytes, True
+    return adapter_ram, True
+
+
 def _gpus_windows_powershell():
     """The Windows GPU read: PowerShell Get-CimInstance Win32_VideoController.
 
@@ -404,9 +632,11 @@ def _gpus_windows_powershell():
       AdapterCompatibility  the driver's own statement of who wrote it
                             ("Advanced Micro Devices, Inc.").
 
-    AdapterRAM is signed 32-bit in this WMI class, so it wraps above ~4GB and
-    can even read negative for a large card. Treat this reading as a floor,
-    never a truth, hence approximate=True on every entry from this path.
+    AdapterRAM is 32-bit in this WMI class, so it tops out near 4GB and can
+    even read negative for a large card. Each row's figure is therefore
+    replaced with the driver's 64-bit one from the registry wherever that
+    can be read (_windows_vram), and approximate is True only on the rows
+    where it could not, which are to be treated as a floor, never a truth.
     """
     ps = shutil.which("powershell") or shutil.which("powershell.exe")
     if not ps:
@@ -433,13 +663,16 @@ def _gpus_windows_powershell():
             continue
         name = item.get("Name") or "Unknown GPU"
         ram = item.get("AdapterRAM")
+        pnp = item.get("PNPDeviceID")
+        pnp = pnp if isinstance(pnp, str) else None
         vram_bytes = int(ram) if isinstance(ram, (int, float)) and ram > 0 else 0
+        vram_bytes, approximate = _windows_vram(vram_bytes, pnp, name)
         entry = _classify_adapter(
             name, vram_bytes,
-            pnp_id=item.get("PNPDeviceID"),
+            pnp_id=pnp,
             compatibility=item.get("AdapterCompatibility"),
         )
-        entry["approximate"] = True
+        entry["approximate"] = approximate
         gpus.append(entry)
     return gpus
 
@@ -447,7 +680,8 @@ def _gpus_windows_powershell():
 def _gpus_windows_wmic():
     """Last-resort GPU read via the deprecated `wmic` CSV output.
 
-    Same AdapterRAM 32-bit-signed caveat as the PowerShell path applies here.
+    Same AdapterRAM 32-bit caveat as the PowerShell path, and the same
+    registry figure replacing it wherever that can be read.
 
     PNPDeviceID is asked for and AdapterCompatibility deliberately is not.
     This output is split on commas with no quoting, and every real
@@ -484,8 +718,9 @@ def _gpus_windows_wmic():
         ram_str = parts[ram_idx].strip()
         vram_bytes = int(ram_str) if ram_str.isdigit() else 0
         pnp = parts[pnp_idx].strip() if pnp_idx is not None and len(parts) > pnp_idx else None
+        vram_bytes, approximate = _windows_vram(vram_bytes, pnp, name)
         entry = _classify_adapter(name, vram_bytes, pnp_id=pnp)
-        entry["approximate"] = True
+        entry["approximate"] = approximate
         gpus.append(entry)
     return gpus
 
@@ -542,6 +777,17 @@ def _gpus_linux_lspci():
     return gpus
 
 
+#: How long one display adapter reading is reused, in seconds. Hardware
+#: does not change while the app is open (a driver update that changes the
+#: memory figure needs a reboot anyway), and the reading this saves costs a
+#: PowerShell launch on every machine without nvidia-smi.
+ADAPTER_CACHE_TTL_S = 600
+
+_adapter_cache_lock = threading.Lock()
+_adapter_cache = None  # (monotonic time read, [adapter dicts]) or None
+_clock = time.monotonic  # injection seam for the self-test
+
+
 def display_adapters():
     """Every display adapter this machine reports, virtual ones included.
 
@@ -554,8 +800,29 @@ def display_adapters():
     "there is a Parsec adapter here and it is not a GPU" can be reported
     rather than silently dropped.
 
+    Cached for ADAPTER_CACHE_TTL_S. The lock is held across detection on
+    purpose: two shop requests arriving together should share one
+    PowerShell launch, not start two. An empty result is never cached,
+    since on Windows (where there is always at least a basic display
+    adapter) it means a probe timed out or failed, and the next caller
+    deserves a fresh try rather than ten minutes of "no GPU". Every caller
+    gets its own copies, so one that edits an entry cannot change what the
+    next one is told.
+
     Empty list when nothing could be detected; never raises.
     """
+    global _adapter_cache
+    with _adapter_cache_lock:
+        cached = _adapter_cache
+        if cached is not None and 0 <= _clock() - cached[0] < ADAPTER_CACHE_TTL_S:
+            return [dict(a) for a in cached[1]]
+        found = _detect_display_adapters()
+        _adapter_cache = (_clock(), [dict(a) for a in found]) if found else None
+        return [dict(a) for a in found]
+
+
+def _detect_display_adapters():
+    """display_adapters() without the cache: one full detection pass."""
     system = platform.system()
     found = _gpus_nvidia_smi()
     if found:
@@ -1076,11 +1343,283 @@ def _self_test():
     encoded = json.dumps(p)
     assert json.loads(encoded) == p
 
+    # -- the driver's 64-bit memory figure, from a fake registry -------------
+    # Modelled on the registry of the machine this was written on (an RTX
+    # 5080 beside an AMD iGPU), stale keys and all: 0001 is a card that was
+    # swapped out, 0002 is the same AMD chip at an older revision, and 0000
+    # is Microsoft's fallback driver matching by class code. AdapterRAM
+    # reads 4293918720 for the 5080 there; the real figure is ~16GB.
+    cls, enum = _DISPLAY_CLASS_KEY, _ENUM_KEY
+    pnp_5080 = r"PCI\VEN_10DE&DEV_2C02&SUBSYS_53101462&REV_A1\03B6ED9B6B2DB04800"
+    pnp_igpu = r"PCI\VEN_1002&DEV_13C0&SUBSYS_7E571462&REV_C2\4&3055F162&0&0041"
+    gib = 1024 ** 3
+
+    def _fake_registry(values, denied=()):
+        def fake_value(path, name):
+            if path in denied:
+                raise PermissionError(5, "Access is denied")
+            try:
+                return values[path][name]
+            except KeyError:
+                raise FileNotFoundError(2, "The system cannot find the file specified")
+
+        def fake_subkeys(path):
+            if path in denied:
+                raise PermissionError(5, "Access is denied")
+            prefix = path + "\\"
+            return sorted({k[len(prefix):].split("\\")[0]
+                           for k in list(values) + list(denied) if k.startswith(prefix)})
+        return fake_value, fake_subkeys
+
+    machine = {
+        cls + r"\0000": {"DriverDesc": ("Microsoft Basic Display Adapter", 1),
+                         "MatchingDeviceId": (r"PCI\CC_0300", 1)},
+        cls + r"\0001": {"DriverDesc": ("NVIDIA GeForce RTX 5060", 1),
+                         "MatchingDeviceId": (r"pci\ven_10de&dev_2d05&subsys_53711462", 1),
+                         "HardwareInformation.qwMemorySize": (8546942976, _REG_QWORD)},
+        cls + r"\0002": {"DriverDesc": ("AMD Radeon(TM) Graphics", 1),
+                         "MatchingDeviceId": (r"PCI\VEN_1002&DEV_13C0&REV_CB", 1),
+                         "HardwareInformation.qwMemorySize": (2 * gib, _REG_QWORD)},
+        cls + r"\0004": {"DriverDesc": ("AMD Radeon(TM) Graphics", 1),
+                         "MatchingDeviceId": (r"PCI\VEN_1002&DEV_13C0&REV_C2", 1),
+                         "HardwareInformation.qwMemorySize": (536870912, _REG_QWORD),
+                         "HardwareInformation.MemorySize": (536870912, _REG_DWORD)},
+        cls + r"\0005": {"DriverDesc": ("NVIDIA GeForce RTX 5080", 1),
+                         "MatchingDeviceId": (r"pci\ven_10de&dev_2c02&subsys_53101462", 1),
+                         "HardwareInformation.qwMemorySize": (17094934528, _REG_QWORD),
+                         "HardwareInformation.MemorySize": (4293918720, _REG_DWORD)},
+        cls + r"\0006": {"DriverDesc": ("Parsec Virtual Display Adapter", 1),
+                         "MatchingDeviceId": (r"Root\Parsec\VDA", 1)},
+        # An older AMD driver that writes only the binary MemorySize, eight
+        # bytes little-endian.
+        cls + r"\0008": {"DriverDesc": ("Radeon RX 580 Series", 1),
+                         "MatchingDeviceId": (r"PCI\VEN_1002&DEV_67DF", 1),
+                         "HardwareInformation.MemorySize":
+                             ((8 * gib).to_bytes(8, "little"), _REG_BINARY)},
+        enum + "\\" + pnp_5080: {"Driver": (_DISPLAY_CLASS_GUID + r"\0005", 1)},
+    }
+    # 0007 refuses a standard user outright, and "Properties" always does.
+    denied = {cls + r"\0007", cls + r"\Properties"}
+
+    assert _hardware_id_matches(r"pci\ven_10de&dev_2c02&subsys_53101462", pnp_5080)
+    assert _hardware_id_matches(r"PCI\VEN_1002&DEV_13C0&REV_C2", pnp_igpu)
+    assert not _hardware_id_matches(r"PCI\VEN_1002&DEV_13C0&REV_CB", pnp_igpu)
+    assert not _hardware_id_matches(r"PCI\CC_0300", pnp_igpu)
+    assert not _hardware_id_matches(r"Root\Parsec\VDA", r"ROOT\DISPLAY\0000")
+    assert not _hardware_id_matches(r"PCI\VEN_1002&DEV_13C0", None)
+    # Never a prefix test: DEV_13C is not DEV_13C0.
+    assert not _hardware_id_matches(r"PCI\VEN_1002&DEV_13C", pnp_igpu)
+
+    assert _decode_memory_size((17094934528, _REG_QWORD)) == (17094934528, True)
+    assert _decode_memory_size((4293918720, _REG_DWORD)) == (4293918720, False)
+    assert _decode_memory_size(((8 * gib).to_bytes(8, "little"), _REG_BINARY)) == (8 * gib, True)
+    assert _decode_memory_size(((2 * gib).to_bytes(4, "little"), _REG_BINARY)) == (2 * gib, False)
+    assert _decode_memory_size((b"\x00\x01\x02", _REG_BINARY)) == (0, False)
+    assert _decode_memory_size(("16GB", 1)) == (0, False)
+    assert _decode_memory_size(None) == (0, False)
+
+    old_reg = (globals()["_reg_value"], globals()["_reg_subkeys"])
+    try:
+        globals()["_reg_value"], globals()["_reg_subkeys"] = _fake_registry(machine, denied)
+        # qwMemorySize reached through the device instance's own Driver link.
+        assert _registry_vram(pnp_5080, "NVIDIA GeForce RTX 5080") == (17094934528, True)
+        # No Enum entry: matched by hardware ID, and the stale REV_CB key
+        # with a different figure is not mistaken for this chip.
+        assert _registry_vram(pnp_igpu, "AMD Radeon(TM) Graphics") == (536870912, True)
+        # Binary MemorySize, matched by vendor and device alone.
+        pnp_580 = r"PCI\VEN_1002&DEV_67DF&SUBSYS_E3531DA2&REV_E7\4&1A2B3C4D&0&0008"
+        assert _registry_vram(pnp_580, "Radeon RX 580 Series") == (8 * gib, True)
+        # No PNPDeviceID at all: the name finds it.
+        assert _registry_vram(None, "NVIDIA GeForce RTX 5080") == (17094934528, True)
+        # Nothing matches: no figure, and no exception.
+        assert _registry_vram(r"PCI\VEN_8086&DEV_7D55\3&11583659&0&10",
+                              "Intel(R) Arc(TM) Graphics") == (0, False)
+        assert _registry_vram(None, None) == (0, False)
+        # The Basic Display driver matches by class code only, and has no
+        # memory figure: it can never lend one to a real card.
+        assert _registry_vram(r"PCI\VEN_1234&DEV_1111\0", "Some Card") == (0, False)
+
+        # Two identical cards with no Enum entries share one driver key:
+        # both get its figure.
+        twin = dict(machine)
+        twin_a = r"PCI\VEN_1002&DEV_744C&SUBSYS_0E3B1002&REV_C8\6&AAAA&0&00000019"
+        twin_b = r"PCI\VEN_1002&DEV_744C&SUBSYS_0E3B1002&REV_C8\6&BBBB&0&00000019"
+        twin[cls + r"\0009"] = {
+            "DriverDesc": ("AMD Radeon RX 7900 XTX", 1),
+            "MatchingDeviceId": (r"PCI\VEN_1002&DEV_744C&REV_C8", 1),
+            "HardwareInformation.qwMemorySize": (24 * gib, _REG_QWORD)}
+        globals()["_reg_value"], globals()["_reg_subkeys"] = _fake_registry(twin, denied)
+        assert _registry_vram(twin_a, "AMD Radeon RX 7900 XTX") == (24 * gib, True)
+        assert _registry_vram(twin_b, "AMD Radeon RX 7900 XTX") == (24 * gib, True)
+        # A reinstall left a second key with the SAME figure: still fine.
+        twin[cls + r"\0010"] = dict(twin[cls + r"\0009"])
+        assert _registry_vram(twin_a, "AMD Radeon RX 7900 XTX") == (24 * gib, True)
+        # Two keys that disagree cannot both describe this card, and this
+        # module cannot tell which one does, so it claims neither.
+        twin[cls + r"\0010"]["HardwareInformation.qwMemorySize"] = (20 * gib, _REG_QWORD)
+        assert _registry_vram(twin_a, "AMD Radeon RX 7900 XTX") == (0, False)
+
+        # An Enum Driver link into some other device class is ignored.
+        odd = dict(machine)
+        odd[enum + "\\" + pnp_igpu] = {
+            "Driver": (r"{36fc9e60-c465-11cf-8056-444553540000}\0005", 1)}
+        globals()["_reg_value"], globals()["_reg_subkeys"] = _fake_registry(odd, denied)
+        assert _registry_vram(pnp_igpu, "AMD Radeon(TM) Graphics") == (536870912, True)
+
+        # The whole class key refusing access degrades to "no figure".
+        globals()["_reg_value"], globals()["_reg_subkeys"] = _fake_registry({}, {cls})
+        assert _registry_vram(pnp_igpu, "AMD Radeon(TM) Graphics") == (0, False)
+
+        # _windows_vram: only a 64-bit figure makes a reading exact. A 32-bit
+        # one fills a blank AdapterRAM but stays approximate.
+        thirty_two = {
+            cls + r"\0000": {"DriverDesc": ("Old Card", 1),
+                             "MatchingDeviceId": (r"PCI\VEN_1002&DEV_6798", 1),
+                             "HardwareInformation.MemorySize": (3 * gib, _REG_DWORD)}}
+        globals()["_reg_value"], globals()["_reg_subkeys"] = _fake_registry(thirty_two)
+        pnp_old = r"PCI\VEN_1002&DEV_6798&SUBSYS_30001002&REV_00\4&1&0&0008"
+        assert _windows_vram(0, pnp_old, "Old Card") == (3 * gib, True)
+        assert _windows_vram(2 * gib, pnp_old, "Old Card") == (2 * gib, True)
+        globals()["_reg_value"], globals()["_reg_subkeys"] = _fake_registry(machine, denied)
+        assert _windows_vram(4293918720, pnp_5080, "NVIDIA GeForce RTX 5080") == (17094934528, False)
+        assert _windows_vram(0, None, "Unlisted Card") == (0, True)
+
+        # End to end through the PowerShell path, which is what the shop
+        # and the offload calculator actually read.
+        def _fake_ps_machine(cmd, timeout=SUBPROCESS_TIMEOUT):
+            return json.dumps([
+                {"Name": "Parsec Virtual Display Adapter", "AdapterRAM": None,
+                 "PNPDeviceID": "ROOT\\DISPLAY\\0000",
+                 "AdapterCompatibility": "Parsec Cloud, Inc."},
+                {"Name": "NVIDIA GeForce RTX 5080", "AdapterRAM": 4293918720,
+                 "PNPDeviceID": pnp_5080, "AdapterCompatibility": "NVIDIA"},
+                {"Name": "AMD Radeon(TM) Graphics", "AdapterRAM": 536870912,
+                 "PNPDeviceID": pnp_igpu,
+                 "AdapterCompatibility": "Advanced Micro Devices, Inc."},
+            ])
+        old_run_reg, old_which_reg = globals()["_run"], shutil.which
+        try:
+            globals()["_run"] = _fake_ps_machine
+            shutil.which = lambda n: "powershell.exe" if "powershell" in n else None
+            parsec, rtx, igpu = _gpus_windows_powershell()
+            assert parsec["virtual"] is True and parsec["approximate"] is True, parsec
+            assert rtx["vram_bytes"] == 17094934528 and rtx["approximate"] is False, rtx
+            assert rtx["integrated"] is False, rtx
+            # The iGPU's figure is exact AND still a carve-out: exactness must
+            # not turn integrated memory into dedicated VRAM.
+            assert igpu["vram_bytes"] == 536870912 and igpu["approximate"] is False, igpu
+            assert igpu["integrated"] is True, igpu
+
+            # A discrete AMD card read through a wrapped AdapterRAM: the
+            # registry's 24GB is what reaches the shop.
+            def _fake_ps_xtx(cmd, timeout=SUBPROCESS_TIMEOUT):
+                return json.dumps([{"Name": "AMD Radeon RX 7900 XTX",
+                                    "AdapterRAM": 4293918720, "PNPDeviceID": twin_a}])
+            globals()["_run"] = _fake_ps_xtx
+            globals()["_reg_value"], globals()["_reg_subkeys"] = _fake_registry(
+                {cls + r"\0009": twin[cls + r"\0009"]})
+            (xtx,) = _gpus_windows_powershell()
+            assert xtx["vram_bytes"] == 24 * gib and xtx["approximate"] is False, xtx
+            assert xtx["vendor"] == VENDOR_AMD and xtx["integrated"] is False, xtx
+
+            # And through wmic, which carries PNPDeviceID too.
+            def _fake_wmic_xtx(cmd, timeout=SUBPROCESS_TIMEOUT):
+                return ("Node,AdapterRAM,Name,PNPDeviceID\r\n"
+                        "HOST,4293918720,AMD Radeon RX 7900 XTX," + twin_a + "\r\n")
+            globals()["_run"] = _fake_wmic_xtx
+            shutil.which = lambda n: "wmic.exe" if n == "wmic" else None
+            (xtx_wmic,) = _gpus_windows_wmic()
+            assert xtx_wmic["vram_bytes"] == 24 * gib, xtx_wmic
+            assert xtx_wmic["approximate"] is False, xtx_wmic
+        finally:
+            globals()["_run"] = old_run_reg
+            shutil.which = old_which_reg
+    finally:
+        globals()["_reg_value"], globals()["_reg_subkeys"] = old_reg
+
+    # The real registry, where there is one: never raises, and a device that
+    # does not exist gets no figure.
+    assert _registry_vram(r"PCI\VEN_FFFF&DEV_FFFF\0", "No Such Card Anywhere") == (0, False)
+
+    # -- display_adapters() caches, per process, for ADAPTER_CACHE_TTL_S -----
+    old_cache = (globals()["_adapter_cache"], globals()["_clock"],
+                 globals()["_detect_display_adapters"])
+    try:
+        calls = []
+        now = [1000.0]
+        answer = [[{"name": "AMD Radeon RX 7900 XTX", "vram_bytes": 24 * gib,
+                    "vendor": VENDOR_AMD, "approximate": False, "virtual": False,
+                    "integrated": False}]]
+
+        def _counting_detect():
+            calls.append(now[0])
+            return [dict(a) for a in answer[0]]
+        globals()["_detect_display_adapters"] = _counting_detect
+        globals()["_clock"] = lambda: now[0]
+        globals()["_adapter_cache"] = None
+
+        first = display_adapters()
+        assert len(calls) == 1 and first[0]["vram_bytes"] == 24 * gib, (calls, first)
+        # A caller editing its copy cannot change what the next one is told.
+        first[0]["vram_bytes"] = 1
+        now[0] += ADAPTER_CACHE_TTL_S - 1
+        again = display_adapters()
+        assert len(calls) == 1, calls
+        assert again[0]["vram_bytes"] == 24 * gib, again
+        # gpus() and probe() ride on the same cache.
+        assert gpus()[0]["name"] == "AMD Radeon RX 7900 XTX"
+        assert probe()["gpus"][0]["vram_bytes"] == 24 * gib
+        assert len(calls) == 1, calls
+        # Past the TTL it asks again.
+        now[0] += 2
+        display_adapters()
+        assert len(calls) == 2, calls
+        # A clock that went backwards is not trusted to mean "fresh".
+        now[0] -= 50
+        display_adapters()
+        assert len(calls) == 3, calls
+        # An empty reading (a timed-out probe) is never cached.
+        answer[0] = []
+        globals()["_adapter_cache"] = None
+        assert display_adapters() == [] and display_adapters() == []
+        assert len(calls) == 5, calls
+
+        # Concurrent first callers share ONE detection rather than each
+        # launching their own PowerShell.
+        answer[0] = [{"name": "x", "vram_bytes": 1, "vendor": VENDOR_UNKNOWN,
+                      "approximate": True, "virtual": False, "integrated": None}]
+        globals()["_adapter_cache"] = None
+        gate = threading.Event()
+
+        def _slow_detect():
+            calls.append(now[0])
+            gate.wait(5)
+            return [dict(a) for a in answer[0]]
+        globals()["_detect_display_adapters"] = _slow_detect
+        before = len(calls)
+        threads = [threading.Thread(target=display_adapters) for _ in range(4)]
+        for t in threads:
+            t.start()
+        time.sleep(0.05)
+        gate.set()
+        for t in threads:
+            t.join(5)
+        assert len(calls) - before == 1, calls
+    finally:
+        (globals()["_adapter_cache"], globals()["_clock"],
+         globals()["_detect_display_adapters"]) = old_cache
+
     # -- Windows WMI/CIM parsers: exercised with canned fixtures so the ------
     # -- self-test does not depend on this host's specific hardware ---------
     # Simulate a large card the 32-bit-signed AdapterRAM field would wrap on.
+    # These fixtures pin the AdapterRAM fallback, so the registry is emptied
+    # for them: on a host whose real registry knows one of these cards (the
+    # G14 below is a real machine), the exact figure would rightly win.
     old_run = globals()["_run"]
+    old_reg_fixture = (globals()["_reg_value"], globals()["_reg_subkeys"])
     try:
+        globals()["_reg_value"], globals()["_reg_subkeys"] = _fake_registry({})
+
         def _fake_ps(cmd, timeout=SUBPROCESS_TIMEOUT):
             if cmd and "Win32_VideoController" in " ".join(cmd) and "ConvertTo-Json" in " ".join(cmd):
                 return json.dumps([{"Name": "NVIDIA GeForce RTX 4090", "AdapterRAM": -2147483648}])
@@ -1138,6 +1677,7 @@ def _self_test():
         assert _gpus_windows_wmic() == []
     finally:
         globals()["_run"] = old_run
+        globals()["_reg_value"], globals()["_reg_subkeys"] = old_reg_fixture
 
     # -- gpus() drops the shims; display_adapters() and probe() name them ---
     # Driven through a stubbed display_adapters so this holds on any host.
@@ -1168,7 +1708,10 @@ def _self_test():
     # -- wmic CSV parser fixture ---------------------------------------------
     wmic_csv = "Node,AdapterRAM,Name\r\nHOST,4294967296,NVIDIA GeForce RTX 3080\r\n"
     old_run2 = globals()["_run"]
+    old_reg_wmic = (globals()["_reg_value"], globals()["_reg_subkeys"])
     try:
+        globals()["_reg_value"], globals()["_reg_subkeys"] = _fake_registry({})
+
         def _fake_wmic(cmd, timeout=SUBPROCESS_TIMEOUT):
             return wmic_csv
         globals()["_run"] = _fake_wmic
@@ -1178,6 +1721,7 @@ def _self_test():
             assert wr[0]["vram_bytes"] == 4294967296, wr
     finally:
         globals()["_run"] = old_run2
+        globals()["_reg_value"], globals()["_reg_subkeys"] = old_reg_wmic
 
     # -- nvidia_detail: compute capability and the driver's CUDA ceiling -----
     # These two readings decide whether a CUDA build can load at all, so

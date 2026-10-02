@@ -788,11 +788,11 @@ def choose_gpu_layers(model_path, backend=None, vram_bytes=None,
     # An integrated GPU has no memory of its own, so its reported VRAM is not
     # a budget and must not be spent like one.
     #
-    # Windows reports an iGPU's memory through Win32_VideoController.AdapterRAM,
-    # which is a signed 32-bit field describing a carve-out rather than a
-    # capacity: a Radeon 880M in a machine with 33 GiB of RAM reports 512 MiB.
-    # hearth_hw already says so, marking such readings integrated=True and
-    # approximate=True. This function used to ignore both and divide 512 MiB by
+    # Windows reports an iGPU's memory as a carve-out rather than a capacity:
+    # a Radeon 880M in a machine with 33 GiB of RAM reports 512 MiB, both
+    # through Win32_VideoController.AdapterRAM and through the driver's own
+    # registry figure. hearth_hw already says so, marking such readings
+    # integrated=True. This function used to ignore that and divide 512 MiB by
     # the per-layer cost, which puts essentially the whole model on the CPU.
     #
     # The reason that is wrong is not that the number is small. It is that the
