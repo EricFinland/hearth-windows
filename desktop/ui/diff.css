@@ -1,0 +1,158 @@
+/* The diff component (js/diff.js): approval cards for file writes and the
+ * restore dialog's preview.
+ *
+ * Every rule is under the dv- prefix so where this file sits relative to
+ * styles.css in index.html never matters. Colours come only from the tokens
+ * styles.css defines on :root; the tinted line backgrounds are mixed from
+ * --ok and --danger here rather than written as fixed colours, so a light
+ * palette that redefines those tokens gets readable diffs for free.
+ *
+ * Line numbers and the +/- sign are pseudo-element content read from data
+ * attributes. That is deliberate, not decoration: generated content is not
+ * part of a selection, so copying lines out of a diff copies the code alone.
+ *
+ * Long lines wrap rather than scroll sideways. On an approval card, text
+ * pushed off the right edge by a run of spaces is text the user approves
+ * without seeing; wrapping keeps every character on screen, the same choice
+ * .blob makes in styles.css.
+ */
+
+.dv-root {
+  --dv-add-bg:   color-mix(in srgb, var(--ok) 12%, transparent);
+  --dv-del-bg:   color-mix(in srgb, var(--danger) 12%, transparent);
+  --dv-add-edge: color-mix(in srgb, var(--ok) 70%, transparent);
+  --dv-del-edge: color-mix(in srgb, var(--danger) 70%, transparent);
+  --dv-ln-w: 4ch;
+  margin-top: 8px;
+  font-size: 12.5px;
+  color: var(--fg);
+}
+.dv-root.dv-scroll { max-height: 540px; overflow: auto; }
+
+.dv-summary {
+  display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 10px;
+  margin: 2px 0 8px;
+  font-size: 12px; color: var(--fg-dim);
+}
+.dv-plus, .dv-minus { font-family: var(--font-mono); font-weight: 600; }
+.dv-plus  { color: var(--ok); }
+.dv-minus { color: var(--danger); }
+.dv-summary-warn { color: var(--warn); }
+
+.dv-file {
+  margin-top: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-raise);
+  overflow: hidden;
+}
+.dv-file-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px;
+  background: var(--panel-2);
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+}
+.dv-file-head::-webkit-details-marker { display: none; }
+.dv-file-head::before {
+  content: "\25B8"; flex: none; display: inline-block; width: 10px;
+  color: var(--fg-faint);
+  transition: transform .12s ease;
+}
+.dv-file[open] > .dv-file-head::before { transform: rotate(90deg); }
+.dv-file[open] > .dv-file-head { border-bottom: 1px solid var(--line-soft); }
+.dv-file-head:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+@media (prefers-reduced-motion: reduce) { .dv-file-head::before { transition: none; } }
+
+.dv-status {
+  flex: none;
+  padding: 1px 7px; border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 10px; font-weight: 620; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--fg-dim);
+}
+.dv-status-added    { color: var(--ok);     border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+.dv-status-deleted  { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, transparent); }
+.dv-status-modified { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, transparent); }
+
+.dv-path {
+  min-width: 0;
+  font-family: var(--font-mono); font-size: 12px;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+.dv-counts { margin-left: auto; flex: none; display: flex; gap: 7px; font-size: 11.5px; }
+
+.dv-note, .dv-hidden {
+  margin: 6px 10px;
+  font-size: 12px; line-height: 1.45;
+  color: var(--fg-dim);
+}
+.dv-hidden { color: var(--warn); }
+.dv-note-key { color: var(--gate); }
+.dv-root > .dv-note { margin: 4px 0; }
+
+.dv-body {
+  padding: 3px 0;
+  font-family: var(--font-mono); font-size: 12px; line-height: 1.5;
+}
+.dv-line {
+  display: grid;
+  grid-template-columns: var(--dv-ln-w) var(--dv-ln-w) 2ch minmax(0, 1fr);
+  border-left: 3px solid transparent;
+}
+.dv-line.dv-add { background: var(--dv-add-bg); border-left-color: var(--dv-add-edge); }
+.dv-line.dv-del { background: var(--dv-del-bg); border-left-color: var(--dv-del-edge); }
+
+.dv-ln {
+  padding-right: 6px;
+  text-align: right;
+  color: var(--fg-faint);
+  user-select: none;
+}
+.dv-ln::before { content: attr(data-ln); }
+.dv-sign { text-align: center; user-select: none; }
+.dv-add .dv-sign::before { content: "+"; color: var(--ok); }
+.dv-del .dv-sign::before { content: "-"; color: var(--danger); }
+
+.dv-text {
+  padding-right: 10px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  tab-size: 4;
+  color: var(--fg);
+}
+.dv-ctx .dv-text { color: var(--fg-dim); }
+.dv-cut {
+  grid-column: 4;
+  padding-right: 10px;
+  font-family: var(--font-ui); font-size: 11px;
+  color: var(--warn);
+}
+
+/* Same isolation every other untrusted-text sink in styles.css gets: the
+ * bidi algorithm still works inside each line, but a stray direction cannot
+ * leak out of one line into its neighbours or into the gutter. */
+.dv-text, .dv-path, .dv-note, .dv-hidden { unicode-bidi: isolate; }
+
+.dv-gap, .dv-fold, .dv-more {
+  display: block; width: 100%;
+  margin: 0;
+  padding: 2px 10px 2px calc(var(--dv-ln-w) * 2 + 2ch + 3px);
+  border: 0;
+  border-block: 1px dashed var(--line-soft);
+  background: transparent;
+  font-family: var(--font-ui); font-size: 11.5px; text-align: left;
+  color: var(--fg-faint);
+}
+.dv-fold, .dv-more { color: var(--accent); cursor: pointer; }
+.dv-fold:hover, .dv-more:hover { background: var(--panel-2); }
+.dv-fold:focus-visible, .dv-more:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.dv-more { border-bottom: 0; }
+
+/* The restore dialog is sized for a few sentences; a diff needs code width. */
+.modal:has(.dv-root) { width: min(860px, calc(100vw - 48px)); }
+
+/* The approval card's "exact arguments" fold, right under the diff. */
+.dv-root + details.fold { margin-top: 10px; }
