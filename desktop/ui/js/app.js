@@ -7,6 +7,7 @@
 
 import { Sidecar, HttpError, readHandshake, pickFolder, hasShellBridge, installUpdate } from "./api.js";
 import { Transcript } from "./transcript.js";
+import { HistoryPanel } from "./history.js";
 import { el, icon, appendAll, clear, setText, neutralize, $ } from "./dom.js";
 import { blob } from "./safe-text.js";
 import { renderDiff } from "./diff.js";
@@ -1049,10 +1050,59 @@ function applySession(session) {
 
   setText(ui.connect, "Restart session");
   ui.sessionNote.className = "panel-note";
-  setText(ui.sessionNote, "Restarting replaces the session and clears its transcript.");
+  setText(ui.sessionNote,
+    "Restarting starts a new chat with these settings. The current one stays under Chats.");
 
   updateTurnUi();
   if (isNew) refreshCheckpoints();
+}
+
+// The Chats sidebar (history.js). Built in boot(), once the sidecar answers.
+let historyPanel = null;
+
+/** Make `session` the one this page shows: a session just started from the
+ *  form, a new chat, or a saved conversation reopened from Chats. Every one
+ *  of those is a different session with its own event log, so the old stream
+ *  is torn down, the transcript cleared, and the new log replayed from its
+ *  first event. That replay is the whole transcript of a reopened chat. */
+function adoptSession(session, placeholderTitle, placeholderBody) {
+  stopEventStream();
+  state.lastEventId = 0;
+  state.accountShownFor = null;
+  state.swarmAccountShownFor = null;
+  localEchoes.length = 0;
+  transcript.reset();
+  transcript.showPlaceholder(placeholderTitle, placeholderBody);
+  // The form follows the open chat, so "Restart session" and the next "New
+  // chat" describe the session on screen rather than the one before it.
+  ui.workspace.value = session.workspace;
+  if ([...ui.model.options].some((option) => option.value === session.model)) {
+    ui.model.value = session.model;
+  }
+  // Treated as new even in the same workspace, so applySession re-reads the
+  // checkpoint list for it.
+  state.session = null;
+  applySession(session);
+  startEventStream();
+}
+
+/** The open conversation was deleted, which ended the session with it. */
+function clearSession() {
+  stopEventStream();
+  state.session = null;
+  state.running = false;
+  state.lastEventId = 0;
+  localEchoes.length = 0;
+  transcript.showPlaceholder("No chat open",
+    "Start a new chat, or open one from Chats. The chat you deleted is gone; "
+    + "the files in its workspace were not touched.");
+  setChip(ui.chipWorkspace, "no workspace", false);
+  setChip(ui.chipModel, "no model");
+  setText(ui.connect, "Start session");
+  ui.sessionNote.className = "panel-note";
+  setText(ui.sessionNote, "");
+  updateTurnUi();
+  refreshCheckpoints();
 }
 
 async function startSession() {
@@ -1111,21 +1161,16 @@ async function startSession() {
     if (engine === "loop") body.loop = loopConfigPanel.read();
     if (engine === "swarm") body.swarm = swarmConfigPanel.read();
     const session = await sidecar.createSession(body);
-    state.lastEventId = 0;
-    state.accountShownFor = null;
-    state.swarmAccountShownFor = null;
-    transcript.reset();
-    transcript.showPlaceholder(
+    // A new session is a new conversation; the one it replaced stays in Chats.
+    adoptSession(session,
       session.engine === "loop" ? "Work loop ready" : "Session ready",
       session.engine === "loop"
         ? `Give it one goal. It will keep working until it is done, hits a `
           + `ceiling, stops making progress, or you stop it. ${session.mode} mode `
           + `in ${session.workspace}.`
         : `${session.mode} mode in ${session.workspace}`);
-    applySession(session);
     rememberWorkspace(session.workspace);
-    startEventStream();
-    await refreshCheckpoints();
+    historyPanel?.refresh();
   } catch (err) {
     ui.sessionNote.className = "panel-note is-error";
     setText(ui.sessionNote, errorText(err));
@@ -1173,17 +1218,36 @@ function autosize() {
   ui.composer.style.height = Math.min(ui.composer.scrollHeight, 220) + "px";
 }
 
+/* Prompts this page has already drawn, waiting for the sidecar's own
+ * `user_prompt` echo of them. POST /prompt records every prompt in the event
+ * log so a replay (a reload, a restart, a reopened chat) shows both sides of
+ * the conversation; the page that sent it has drawn it already, so the echo
+ * of its own prompt is skipped exactly once. */
+const localEchoes = [];
+
+function takeLocalEcho(data) {
+  const text = typeof data.text === "string" ? data.text : "";
+  const i = localEchoes.findIndex((sent) => sent === text
+    || (data.truncated && sent.startsWith(text)));
+  if (i === -1) return false;
+  localEchoes.splice(i, 1);
+  return true;
+}
+
 async function send() {
   const message = ui.composer.value.trim();
   if (!message || !state.session || state.running) return;
   ui.composer.value = "";
   autosize();
   transcript.addUser(message);
+  localEchoes.push(message);
   state.running = true;
   updateTurnUi();
   try {
     await sidecar.prompt(message);
   } catch (err) {
+    const i = localEchoes.indexOf(message);
+    if (i !== -1) localEchoes.splice(i, 1);
     state.running = false;
     updateTurnUi();
     transcript.addNotice("error", "Could not submit that prompt.", errorText(err));
@@ -1270,6 +1334,17 @@ function startEventStream() {
 function handleEvent(event) {
   const data = event.data || {};
   switch (event.kind) {
+    // The user's own prompt, recorded by the sidecar. Drawn on replay; the
+    // live copy this page drew in send() is not drawn twice.
+    case "user_prompt":
+      // A first prompt is what names a chat in the sidebar.
+      historyPanel?.refreshSoon();
+      if (takeLocalEcho(data)) break;
+      transcript.addUser(data.truncated
+        ? `${data.text || ""}\n\n(shortened: the full prompt was sent to the model)`
+        : data.text || "");
+      break;
+
     // A delta is a fragment of assistant text, emitted by engine.py as
     // tokens arrive (coalesced on a short window, see its module docstring's
     // point 7). stream_id names which assistant message it belongs to and
@@ -1341,6 +1416,23 @@ function handleEvent(event) {
     }
 
     case "events_dropped":
+      // `restored` marks the front of a saved conversation's history: only
+      // its most recent part is kept on disk (session_state.persisted_tail),
+      // and a chat that starts mid-way must say so rather than pass for whole.
+      // `gap` marks a hole in the middle of one instead: a stretch between
+      // two saves that outran the live event buffer (session_state.merge_tail).
+      if (data.restored && data.gap) {
+        transcript.addNotice("quiet", "Part of this chat was not saved.",
+          "A long stretch of activity happened between two saves and only its end "
+          + "was kept. The model's own context was saved separately and is not affected.");
+        break;
+      }
+      if (data.restored) {
+        transcript.addNotice("quiet", "Earlier messages are not shown.",
+          "Only the most recent part of a saved conversation's activity is kept. "
+          + "The model's own context was saved separately and is not affected.");
+        break;
+      }
       transcript.addNotice("quiet", "Some earlier events were dropped.",
         "The session's event buffer wrapped while this window was disconnected.");
       break;
@@ -1701,6 +1793,19 @@ async function boot() {
       { label: "Open the model shop", onClick: () => setView("shop") },
     );
   }
+
+  // Saved conversations, in a sidebar on the Chat tab. Built after the
+  // session is read, so its first paint already knows which one is open.
+  historyPanel = new HistoryPanel($("#history"), {
+    sidecar,
+    openModal,
+    closeModal,
+    isRunning: () => state.running,
+    hasSession: () => Boolean(state.session),
+    onSwitched: adoptSession,
+    onCleared: clearSession,
+    startFromForm: startSession,
+  });
 
   // A light poll keeps `status` honest even if an event is missed: the sidecar
   // is the authority on whether a turn is running, not this page's bookkeeping.

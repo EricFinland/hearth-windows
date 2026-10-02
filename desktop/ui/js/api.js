@@ -28,6 +28,7 @@
 
 const SIDECAR_ROUTES = new Set([
   "/healthz", "/session", "/prompt", "/events", "/approve",
+  "/conversations", "/conversations/new", "/conversations/open", "/conversations/rename", "/conversations/delete",
   "/cancel", "/models", "/checkpoints", "/restore", "/setup", "/idle",
   "/shop", "/shop/quants",
   "/checkpoints/diff",
