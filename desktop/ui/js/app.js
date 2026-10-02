@@ -1323,6 +1323,13 @@ async function send() {
     if (i !== -1) localEchoes.splice(i, 1);
     state.running = false;
     updateTurnUi();
+    // Give the words back with the files, so a refusal (files that no
+    // longer fit the context, a 413) costs nothing to retry and the tray's
+    // hint can say what to change rather than asking for a message.
+    if (!ui.composer.value.trim()) {
+      ui.composer.value = message;
+      autosize();
+    }
     returnAttachments(attached);
     transcript.addNotice("error", "Could not submit that prompt.", errorText(err));
   }
