@@ -18,7 +18,14 @@ What is persisted, and why:
     history above against the same directory and model.
   - A bounded tail of recent events (see session.recent_events), so a UI
     reconnecting after a restart sees recent history without this file (or
-    the in-memory ring it mirrors) ever growing without bound.
+    the in-memory ring it mirrors) ever growing without bound. The tail is
+    compacted first (see compact_events: a streamed reply's many small
+    "delta" events fold into one), then capped twice, by count
+    (RECENT_EVENTS_LIMIT) and by serialised size (RECENT_EVENTS_BYTES). When
+    the cap or the live ring has cut anything off the front, restore_session
+    says so with an "events_dropped" marker flagged `restored`, so a UI
+    replaying a saved conversation never presents its visible tail as the
+    whole of it.
 
 What is deliberately NOT persisted:
 
@@ -78,6 +85,16 @@ data directory (with its own Linux root-vs-user-writable fallback probe)
 every other piece of Hearth state already uses, rather than a location this
 module invents on its own.
 
+One file per conversation: this module defines the FORMAT of a persisted
+session and the checks applied on the way back in; conversations.py (a
+sibling) decides WHERE each one lives, now that a user can keep several. A
+conversation file is exactly a snapshot() plus a small "conversation"
+metadata block, so every check below -- the bypass refusal, the
+system-prompt trust check, the re-validated loop and swarm config in main.py
+-- applies to each saved conversation exactly as it applied to the single
+file this module used to own. state_path() is still where that single
+legacy file lives, so conversations.py can migrate it.
+
 Standard library only.
 """
 
@@ -105,7 +122,17 @@ import session as session_mod  # noqa: E402 - desktop/server sibling module
 STATE_VERSION = 1
 STATE_SUBDIR = "desktop"
 STATE_FILENAME = "session_state.json"
-RECENT_EVENTS_LIMIT = 50  # bounded tail persisted alongside the conversation
+# The bounded tail persisted alongside the conversation, counted AFTER
+# compact_events has folded each streamed reply's deltas into one event. It
+# used to be 50 raw events, which a single streamed answer (ten deltas a
+# second, see engine.py's point 7) could fill on its own -- tolerable when
+# the tail only bridged a restart, not once a saved conversation is something
+# a user reopens to read. 400 compacted events is many turns of history.
+RECENT_EVENTS_LIMIT = 400
+# The same tail, bounded by size too: an approval_request carries its tool's
+# arguments, and for write_file that is a whole file body, so a count alone
+# does not bound the file. Measured as the json.dumps length of each event.
+RECENT_EVENTS_BYTES = 2 * 1024 * 1024
 
 # Never allowed to appear as a top-level key in a persisted snapshot. Defence
 # in depth for the "do not leak the token" requirement -- see the module
@@ -178,15 +205,26 @@ def _write_atomic(full, text):
     sidecar's own process dying, or the machine losing power) can never
     leave a truncated, unparseable state file behind. See the module
     docstring for why this is a small local twin of
-    hearth_tools._write_text_atomic rather than an import of it."""
+    hearth_tools._write_text_atomic rather than an import of it.
+
+    `text` may also be bytes, written exactly as given: conversations.py's
+    migration copies the legacy file byte for byte, and text mode on
+    Windows would turn every newline into CRLF on the way through."""
     parent = os.path.dirname(full) or "."
     os.makedirs(parent, exist_ok=True)
-    data = text.encode("utf-8")
+    data = text if isinstance(text, bytes) else text.encode("utf-8")
     tmp = os.path.join(parent, ".hearth-tmp-{}-{}".format(os.path.basename(full), uuid.uuid4().hex))
-    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if isinstance(text, bytes):
+        flags |= getattr(os, "O_BINARY", 0)  # Windows-only flag; no CRT newline translation
+    fd = os.open(tmp, flags, 0o666)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
+        if isinstance(text, bytes):
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(text)
         _retry_replace(tmp, full)
     except BaseException:
         try:
@@ -239,8 +277,90 @@ def snapshot(session):
         "engine_kind": getattr(session.engine, "ENGINE_KIND", "chat"),
         "engine_config": _engine_config(session.engine),
         "engine_state": engine_state,
-        "recent_events": session.recent_events(RECENT_EVENTS_LIMIT),
+        # Everything the live ring still holds, compacted and then bounded:
+        # see persisted_tail. Asked for with no count of its own, because the
+        # bound that matters is the one applied after compaction.
+        "recent_events": persisted_tail(session.recent_events(sys.maxsize)),
     }
+
+
+def _continues_delta(prev, ev):
+    """True when `ev` is the very next slice of the same streamed assistant
+    message `prev` already holds: same turn, same stream_id, and an index
+    that starts exactly where prev's text ends. Anything less (a delta from
+    an engine that sends no stream_id, a gap, an overlap from a replay) is
+    left as its own event, so compaction can only ever join text the UI
+    would have joined itself."""
+    if prev.get("kind") != "delta" or ev.get("kind") != "delta":
+        return False
+    if prev.get("turn_id") != ev.get("turn_id"):
+        return False
+    a, b = prev.get("data"), ev.get("data")
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    if a.get("stream_id") is None or a.get("stream_id") != b.get("stream_id"):
+        return False
+    ta, tb = a.get("text"), b.get("text")
+    ia, ib = a.get("index"), b.get("index")
+    if not isinstance(ta, str) or not isinstance(tb, str):
+        return False
+    if type(ia) is not int or type(ib) is not int:  # noqa: E721 - bool is an int and is not an index
+        return False
+    return ib == ia + len(ta)
+
+
+def compact_events(events):
+    """Fold each run of consecutive, contiguous "delta" events into one.
+
+    engine.py streams a reply as many small deltas (ten a second, see its
+    point 7), which is right for a live page and wasteful on disk: a saved
+    conversation's tail would otherwise spend its whole budget on one long
+    answer. The merged event keeps the FIRST piece's id and index and the
+    concatenated text, which is exactly what the UI renders from the pieces
+    (transcript.js places delta text by stream_id and index), so a replay of
+    the compacted tail draws the same transcript. Keeping the first id also
+    keeps ids strictly increasing, and keeps "the first id is 1" meaning
+    "nothing before this was lost" (see restore_session).
+
+    Never mutates its input: the live ring's own dicts are shared with every
+    SSE reader, so every event here is a shallow copy and a merge builds a
+    new data dict."""
+    out = []
+    for ev in events or []:
+        if not isinstance(ev, dict):
+            continue
+        prev = out[-1] if out else None
+        if prev is not None and _continues_delta(prev, ev):
+            prev["data"] = dict(prev["data"], text=prev["data"]["text"] + ev["data"]["text"])
+            if "ts" in ev:
+                prev["ts"] = ev["ts"]
+            continue
+        out.append(dict(ev))
+    return out
+
+
+def persisted_tail(events):
+    """The part of `events` a snapshot keeps: compacted, then the newest
+    RECENT_EVENTS_LIMIT of them, then as many of those (newest first) as fit
+    in RECENT_EVENTS_BYTES. The size cap stops at the first event that does
+    not fit rather than skipping it, so the tail is always a contiguous run
+    ending at the newest event -- a hole in the middle would be history
+    that silently lies, where a shorter tail is history that says it is
+    short (restore_session adds the marker)."""
+    tail = compact_events(events)[-RECENT_EVENTS_LIMIT:]
+    budget = RECENT_EVENTS_BYTES
+    kept = []
+    for ev in reversed(tail):
+        try:
+            size = len(json.dumps(ev))
+        except (TypeError, ValueError):
+            break  # not JSON-safe: save() would fail on it, so stop here
+        if size > budget:
+            break
+        budget -= size
+        kept.append(ev)
+    kept.reverse()
+    return kept
 
 
 def _engine_config(engine):
@@ -256,12 +376,13 @@ def _engine_config(engine):
         return None
 
 
-def save(state):
-    """Write a snapshot built by snapshot() to state_path(), atomically.
-    Best-effort: returns False and logs to stderr rather than raising, on
-    any failure -- see session.py's Session._persist(), the only production
-    caller, which already treats this as something that must never break a
-    live turn or an HTTP request.
+def save(state, path=None):
+    """Write a snapshot built by snapshot() to `path` (default state_path()),
+    atomically. Best-effort: returns False and logs to stderr rather than
+    raising, on any failure -- see session.py's Session._persist(), which
+    already treats persistence as something that must never break a live
+    turn or an HTTP request. conversations.py passes its own per-conversation
+    path; every guarantee here applies to it unchanged.
 
     Refuses (returns False, writes nothing) if `state` carries any of
     _FORBIDDEN_KEYS at its top level -- the token must never reach disk
@@ -274,7 +395,7 @@ def save(state):
         return False
     try:
         text = json.dumps(state, indent=2, sort_keys=True)
-        _write_atomic(state_path(), text)
+        _write_atomic(path or state_path(), text)
         return True
     except Exception as exc:  # noqa: BLE001 - persistence must never raise into a caller
         print("[hearth-session-state] failed to save session state: {}: {}".format(
@@ -282,20 +403,23 @@ def save(state):
         return False
 
 
-def load():
-    """Read and validate the persisted snapshot, or None if there isn't one
-    or it is unusable. Never raises: a missing file is the ordinary "never
-    persisted anything yet" case; a truncated or malformed file is
-    corruption, and this project has already been bitten once by a state
-    file that took the whole process down with it (see the module
-    docstring) -- so every failure mode here degrades to "start fresh",
-    with a one-line note on stderr saying which one it was."""
-    path = state_path()
+def load(path=None):
+    """Read and validate the persisted snapshot at `path` (default
+    state_path()), or None if there isn't one or it is unusable. Never
+    raises: a missing file is the ordinary "never persisted anything yet"
+    case; a truncated or malformed file is corruption, and this project has
+    already been bitten once by a state file that took the whole process
+    down with it (see the module docstring) -- so every failure mode here
+    degrades to "start fresh", with a one-line note on stderr saying which
+    one it was. conversations.py reads every saved conversation through
+    this same function, which is what lets one corrupt conversation be
+    skipped without hiding the others."""
+    path = path or state_path()
     try:
         with open(path, "r", encoding="utf-8") as fh:
             raw = fh.read()
-    except OSError:
-        return None  # nothing persisted yet -- not a failure
+    except (OSError, UnicodeDecodeError):
+        return None  # nothing persisted yet (or not text at all) -- not a crash
     try:
         data = json.loads(raw)
     except ValueError:
@@ -367,6 +491,39 @@ def _engine_state_is_trustworthy(engine_state, mode, engine):
     except Exception:  # noqa: BLE001 - a broken hook must not crash startup, and must not be trusted
         return False
     return isinstance(expected, str) and first.get("content") == expected
+
+
+def _restorable_events(recent):
+    """The persisted tail as seed_events() may take it, with an honest
+    marker in front when it is not the whole history.
+
+    Only dicts carrying an integer id survive: this file is writable by the
+    agent's own run_command, and seed_events reads ev.get("id") from every
+    entry, so a hand-edited tail must cost the history, not the restore.
+
+    A tail whose first id is above 1 has lost its beginning -- to the live
+    ring wrapping (EVENTS_CAP) or to persisted_tail's caps. Replaying it
+    as-is would show a conversation starting mid-way as if that were where
+    it started, so an "events_dropped" event flagged `restored` goes first,
+    the same kind the live ring already uses for a gap, which the UI turns
+    into an "earlier messages are not shown" note. Not added twice: a tail
+    that already opens with one (a conversation saved again after an
+    earlier restore) keeps the one it has."""
+    if not isinstance(recent, list):
+        return []
+    events = [ev for ev in recent
+              if isinstance(ev, dict) and type(ev.get("id")) is int]  # noqa: E721 - not bool
+    if not events:
+        return []
+    first = events[0]
+    if first["id"] > 1 and first.get("kind") != "events_dropped":
+        events.insert(0, {
+            "id": first["id"] - 1, "turn_id": None, "kind": "events_dropped",
+            "data": {"missed_at_least": first["id"] - 1, "resume_from_id": first["id"],
+                     "restored": True},
+            "ts": first.get("ts") if isinstance(first.get("ts"), (int, float)) else time.time(),
+        })
+    return events
 
 
 def restore_session(persisted, engine_factory, persist_hook=None):
@@ -460,8 +617,8 @@ def restore_session(persisted, engine_factory, persist_hook=None):
         print("[hearth-session-state] persisted session state is invalid ({}); "
               "starting a fresh session".format(exc), file=sys.stderr)
         return None
-    recent = persisted.get("recent_events")
-    if isinstance(recent, list) and recent:
+    recent = _restorable_events(persisted.get("recent_events"))
+    if recent:
         session.seed_events(recent)
     if persisted.get("status_at_save") == session_mod.STATUS_RUNNING:
         session.record_restart_interruption(
@@ -855,16 +1012,98 @@ def _self_test():
             server.shutdown()
             server.server_close()
 
-        with open(state_path(), "r", encoding="utf-8") as fh:
-            raw_on_disk = fh.read()
-        assert secret_token not in raw_on_disk, \
-            "the bearer token must NEVER appear in the persisted session state file"
-        parsed_on_disk = json.loads(raw_on_disk)
+        # Every file under the data directory, not one known path: since
+        # conversations.py keeps one file per conversation plus an index,
+        # "the token is not in the state file" has to mean "the token is in
+        # no file this process wrote at all", or a new file is a new leak.
+        written = []
+        for dirpath, _dirs, files in os.walk(scratch):
+            for name in files:
+                with open(os.path.join(dirpath, name), "r", encoding="utf-8",
+                          errors="replace") as fh:
+                    written.append((name, fh.read()))
+        assert written, "sanity: the server wrote nothing at all"
+        for name, raw_on_disk in written:
+            assert secret_token not in raw_on_disk, \
+                "the bearer token must NEVER appear on disk, found it in {}".format(name)
+        conv_files = [raw for name, raw in written
+                      if name.endswith(".json") and name != "index.json"]
+        assert conv_files, [name for name, _ in written]
+        parsed_on_disk = json.loads(conv_files[0])
         assert "token" not in parsed_on_disk and "bearer_token" not in parsed_on_disk, parsed_on_disk
         assert "hello there" in json.dumps(parsed_on_disk), \
             "sanity: the conversation itself DID get persisted (so the token's absence " \
             "above is meaningful, not just an empty file)"
-        os.remove(state_path())
+
+        # === the persisted tail: deltas compacted, both caps applied, ======
+        # === and a truncated tail announced rather than passed off as whole
+        def _delta(eid, text, index, stream=1, turn="t"):
+            return {"id": eid, "turn_id": turn, "kind": "delta", "ts": float(eid),
+                    "data": {"text": text, "stream_id": stream, "index": index}}
+
+        live = [
+            {"id": 1, "turn_id": "t", "kind": "user_prompt", "ts": 1.0, "data": {"text": "hi"}},
+            _delta(2, "Hel", 0), _delta(3, "lo, ", 3), _delta(4, "world", 7),
+            # a new stream inside the same turn must NOT be joined to the old one
+            _delta(5, "next", 0, stream=2),
+            # nor a piece that does not start where the last one ended (a replay)
+            _delta(6, "next", 0, stream=2),
+            {"id": 7, "turn_id": "t", "kind": "done", "ts": 7.0, "data": {}},
+        ]
+        before = json.dumps(live)
+        packed = compact_events(live)
+        assert json.dumps(live) == before, "compaction must never mutate the live ring's dicts"
+        assert [e["kind"] for e in packed] == ["user_prompt", "delta", "delta", "delta", "done"], packed
+        assert packed[1]["data"] == {"text": "Hello, world", "stream_id": 1, "index": 0}, packed[1]
+        assert packed[1]["id"] == 2, "a merged delta keeps its FIRST id"
+        assert packed[1]["ts"] == 4.0, "and its LAST timestamp"
+        # deltas with no stream_id (an engine that predates them) are left alone
+        bare = [{"id": 1, "turn_id": "t", "kind": "delta", "data": {"text": "a"}},
+                {"id": 2, "turn_id": "t", "kind": "delta", "data": {"text": "b"}}]
+        assert len(compact_events(bare)) == 2
+
+        global RECENT_EVENTS_LIMIT, RECENT_EVENTS_BYTES
+        old_limit, old_bytes = RECENT_EVENTS_LIMIT, RECENT_EVENTS_BYTES
+        try:
+            RECENT_EVENTS_LIMIT = 3
+            tail = persisted_tail(live)
+            assert [e["id"] for e in tail] == [5, 6, 7], tail
+            RECENT_EVENTS_LIMIT = 100
+            RECENT_EVENTS_BYTES = len(json.dumps(live[-1])) + 10
+            tail = persisted_tail(live)
+            assert [e["id"] for e in tail] == [7], "the size cap keeps the newest, contiguous end"
+        finally:
+            RECENT_EVENTS_LIMIT, RECENT_EVENTS_BYTES = old_limit, old_bytes
+
+        # A tail that starts at id 1 replays as-is; one that starts later is
+        # preceded by a restored "events_dropped" marker, exactly once.
+        whole = _restorable_events(packed)
+        assert whole[0]["kind"] == "user_prompt", whole
+        cut = _restorable_events(packed[2:])
+        assert cut[0]["kind"] == "events_dropped" and cut[0]["data"]["restored"] is True, cut
+        assert cut[0]["id"] == packed[2]["id"] - 1 and cut[1] is packed[2]
+        assert _restorable_events(cut)[0] is cut[0] and len(_restorable_events(cut)) == len(cut), \
+            "a tail that already opens with a marker must not get a second one"
+        # a hand-edited tail costs the history, never the restore
+        assert _restorable_events([1, "x", {"id": "7"}, {"id": True}]) == []
+        assert _restorable_events("nope") == []
+        junk_persisted = dict(genuine_persisted, recent_events=[None, {"kind": "x"}])
+        assert restore_session(junk_persisted, restore_engine_factory) is not None
+
+        # The marker reaches a restored session's ring, ahead of the tail.
+        cut_persisted = dict(genuine_persisted, recent_events=packed[2:])
+        cut_restored = restore_session(cut_persisted, restore_engine_factory)
+        cut_kinds = [e["kind"] for e in cut_restored.events_after(0, timeout=1)]
+        assert cut_kinds[0] == "events_dropped", cut_kinds
+
+        # load()/save() take an explicit path for a per-conversation file.
+        other = os.path.join(scratch, "elsewhere", "c.json")
+        assert save(dict(genuine_persisted, version=STATE_VERSION), path=other) is True
+        assert load(other)["workspace"] == "/tmp/ws-genuine"
+        assert load(os.path.join(scratch, "missing.json")) is None
+        with open(other, "wb") as fh:
+            fh.write(b"\xff\xfe not text")
+        assert load(other) is None, "undecodable bytes must degrade to None, not raise"
 
     finally:
         shutil.rmtree(scratch, ignore_errors=True)

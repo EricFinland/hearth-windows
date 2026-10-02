@@ -1112,17 +1112,36 @@ function autosize() {
   ui.composer.style.height = Math.min(ui.composer.scrollHeight, 220) + "px";
 }
 
+/* Prompts this page has already drawn, waiting for the sidecar's own
+ * `user_prompt` echo of them. POST /prompt records every prompt in the event
+ * log so a replay (a reload, a restart, a reopened chat) shows both sides of
+ * the conversation; the page that sent it has drawn it already, so the echo
+ * of its own prompt is skipped exactly once. */
+const localEchoes = [];
+
+function takeLocalEcho(data) {
+  const text = typeof data.text === "string" ? data.text : "";
+  const i = localEchoes.findIndex((sent) => sent === text
+    || (data.truncated && sent.startsWith(text)));
+  if (i === -1) return false;
+  localEchoes.splice(i, 1);
+  return true;
+}
+
 async function send() {
   const message = ui.composer.value.trim();
   if (!message || !state.session || state.running) return;
   ui.composer.value = "";
   autosize();
   transcript.addUser(message);
+  localEchoes.push(message);
   state.running = true;
   updateTurnUi();
   try {
     await sidecar.prompt(message);
   } catch (err) {
+    const i = localEchoes.indexOf(message);
+    if (i !== -1) localEchoes.splice(i, 1);
     state.running = false;
     updateTurnUi();
     transcript.addNotice("error", "Could not submit that prompt.", errorText(err));
@@ -1209,6 +1228,15 @@ function startEventStream() {
 function handleEvent(event) {
   const data = event.data || {};
   switch (event.kind) {
+    // The user's own prompt, recorded by the sidecar. Drawn on replay; the
+    // live copy this page drew in send() is not drawn twice.
+    case "user_prompt":
+      if (takeLocalEcho(data)) break;
+      transcript.addUser(data.truncated
+        ? `${data.text || ""}\n\n(shortened: the full prompt was sent to the model)`
+        : data.text || "");
+      break;
+
     // A delta is a fragment of assistant text, emitted by engine.py as
     // tokens arrive (coalesced on a short window, see its module docstring's
     // point 7). stream_id names which assistant message it belongs to and
@@ -1280,6 +1308,15 @@ function handleEvent(event) {
     }
 
     case "events_dropped":
+      // `restored` marks the front of a saved conversation's history: only
+      // its most recent part is kept on disk (session_state.persisted_tail),
+      // and a chat that starts mid-way must say so rather than pass for whole.
+      if (data.restored) {
+        transcript.addNotice("quiet", "Earlier messages are not shown.",
+          "Only the most recent part of a saved conversation's activity is kept. "
+          + "The model's own context was saved separately and is not affected.");
+        break;
+      }
       transcript.addNotice("quiet", "Some earlier events were dropped.",
         "The session's event buffer wrapped while this window was disconnected.");
       break;

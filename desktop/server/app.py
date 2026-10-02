@@ -999,7 +999,9 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "message is required"})
             return
         try:
-            turn_id = s.submit_prompt(message)
+            # echo: the prompt goes into the event log too, so a page that
+            # replays it (a reload, a reopened conversation) shows both sides.
+            turn_id = s.submit_prompt(message, echo=True)
         except RuntimeError as exc:
             self._send_json(409, {"error": str(exc)})
             return
