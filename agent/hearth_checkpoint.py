@@ -983,6 +983,9 @@ PREVIEW_LOCK_TIMEOUT_S = 5.0  # a preview is a convenience shown while a
                               # dialog is open; it waits a few seconds for a
                               # running checkpoint, not restore()'s full minute.
 PREVIEW_MAX_FILES = 50        # files given a full diff; the rest are named
+PREVIEW_MAX_TOTAL_BYTES = 16 * 1024 * 1024  # blob content read for one preview,
+                              # both sides of every file together; past it a
+                              # file is named as too large rather than read
 
 
 def _parse_raw_diff_z(raw):
@@ -1006,13 +1009,17 @@ def _parse_raw_diff_z(raw):
     return out
 
 
-def _cat_blobs(gitdir, ws, shas, max_bytes):
+def _cat_blobs(gitdir, ws, shas, max_bytes, max_total=PREVIEW_MAX_TOTAL_BYTES):
     """{sha: bytes or None} for every sha, via one `git cat-file --batch`.
     None for a blob larger than max_bytes (sized first with --batch-check, so
-    a huge blob is never read just to be thrown away) or one git could not
-    produce. The all-zero sha (the missing side of an add or delete) is
-    never asked for."""
-    wanted = sorted({s for s in shas if s and set(s) != {"0"}})
+    a huge blob is never read just to be thrown away), for one that would
+    take the running total past max_total, or for one git could not produce.
+    Blobs are taken in the order given, so the files listed first are the
+    ones read when the total runs out; without the total, fifty files of two
+    sides each just under max_bytes would be some 200 MB through one pipe.
+    The all-zero sha (the missing side of an add or delete) is never asked
+    for."""
+    wanted = list(dict.fromkeys(s for s in shas if s and set(s) != {"0"}))
     if not wanted:
         return {}
     exe = _find_git()
@@ -1028,7 +1035,12 @@ def _cat_blobs(gitdir, ws, shas, max_bytes):
         bits = line.split()
         if len(bits) == 3 and bits[1] == "blob" and bits[2].isdigit():
             sizes[bits[0]] = int(bits[2])
-    small = [s for s in wanted if s in sizes and sizes[s] <= max_bytes]
+    small = []
+    total = 0
+    for s in wanted:
+        if s in sizes and sizes[s] <= max_bytes and total + sizes[s] <= max_total:
+            small.append(s)
+            total += sizes[s]
     result = {s: None for s in wanted}
     if not small:
         return result
@@ -1864,6 +1876,20 @@ def _self_test():
         for name, data in before_bytes.items():
             assert _read_bytes(os.path.join(wsp, name)) == data, name
         assert not os.path.exists(os.path.join(wsp, "b.txt"))
+
+        # The blobs read for one preview are capped in total, not only one
+        # by one: past the running total a blob is not read at all (None,
+        # shown as too large), and the ones listed first are the ones read.
+        gitdir_p = _gitdir_for(os.path.realpath(wsp))
+        rc_b, out_b, _err_b = _git(gitdir_p, os.path.realpath(wsp),
+                                   ["rev-parse", cpp["id"] + ":a.txt", cpp["id"] + ":b.txt"])
+        assert rc_b == 0, _err_b
+        sha_a, sha_b = out_b.split()
+        both = _cat_blobs(gitdir_p, os.path.realpath(wsp), [sha_a, sha_b], 1024)
+        assert both == {sha_a: b"one\ntwo\nthree\n", sha_b: b"bee\n"}, both
+        first_only = _cat_blobs(gitdir_p, os.path.realpath(wsp), [sha_a, sha_b], 1024,
+                                max_total=len(b"one\ntwo\nthree\n"))
+        assert first_only == {sha_a: b"one\ntwo\nthree\n", sha_b: None}, first_only
 
         # A real restore afterwards still works and does what was previewed.
         done = restore(wsp, cpp["id"])
