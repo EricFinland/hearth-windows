@@ -122,6 +122,8 @@ HIDDEN_TOO_LARGE = "too large to preview line by line"
 HIDDEN_UNREADABLE = "the file on disk could not be read, so the change cannot be shown"
 HIDDEN_NOT_PREVIEWED = "not previewed: this change touches more files than one preview shows"
 HIDDEN_BUDGET = "not shown: the preview reached its size limit before this file"
+HIDDEN_UNSAFE = ("hidden: a credential was found and could not be redacted cleanly, "
+                 "so nothing from this file is shown")
 
 NOTE_FIND_MISSING = ("the find text does not appear in this file, so the edit will "
                      "fail and change nothing")
@@ -291,17 +293,22 @@ def file_diff(path, old, new, budget=None, context=CONTEXT_LINES, hidden_reason=
     be deleted). `hidden_reason` names the file without showing content.
 
     `path` is display text the caller has already made workspace-relative;
-    nothing here touches the filesystem."""
+    nothing here touches the filesystem. A caller that passes a reason has
+    usually not loaded the content either (a binary or ignored file), so no
+    line counts are claimed for it."""
     budget = budget if budget is not None else _Budget()
     entry = {"path": path, "status": _status(old, new), "added": None, "removed": None,
              "hunks": [], "truncated": False}
+    if hidden_reason is not None:
+        entry["hidden_reason"] = hidden_reason
+        return entry
     old_text = "" if old is None else old
     new_text = "" if new is None else new
 
     too_big = (len(old_text) > MAX_INPUT_CHARS or len(new_text) > MAX_INPUT_CHARS
                or old_text.count("\n") > MAX_INPUT_LINES or new_text.count("\n") > MAX_INPUT_LINES)
     if too_big:
-        entry["hidden_reason"] = hidden_reason or HIDDEN_TOO_LARGE
+        entry["hidden_reason"] = HIDDEN_TOO_LARGE
         return entry
 
     old_norm, a, old_final = _split(old_text)
@@ -313,10 +320,10 @@ def file_diff(path, old, new, budget=None, context=CONTEXT_LINES, hidden_reason=
     if notes:
         entry["notes"] = notes
 
-    if hidden_reason is None and is_secret_path(path):
-        hidden_reason = HIDDEN_SECRET_FILE
-    if hidden_reason is not None:
-        entry["hidden_reason"] = hidden_reason
+    if is_secret_path(path):
+        # Counted, never shown: "+1 -1 in .env" is worth knowing, and says
+        # nothing about what the lines hold.
+        entry["hidden_reason"] = HIDDEN_SECRET_FILE
         return entry
     if budget.exhausted:
         entry["truncated"] = True
@@ -326,7 +333,7 @@ def file_diff(path, old, new, budget=None, context=CONTEXT_LINES, hidden_reason=
     a_shown, a_touched = _redacted_lines(old_norm, len(a))
     b_shown, b_touched = _redacted_lines(new_norm, len(b))
     if a_touched is None or b_touched is None:
-        entry["hidden_reason"] = HIDDEN_SECRET_FILE
+        entry["hidden_reason"] = HIDDEN_UNSAFE
         return entry
     a_shown = a_shown if a_shown is not None else a
     b_shown = b_shown if b_shown is not None else b
@@ -663,6 +670,12 @@ def _self_test():
         same = preview_tool_call("write_file", {"path": "a.txt", "content": body}, ws)
         assert same["files"][0]["status"] == "unchanged", same
         assert NOTE_IDENTICAL in same["files"][0]["notes"], same
+        # ... and over a file that is not text: named, no fake line counts.
+        with open(os.path.join(ws, "blob.bin"), "wb") as fh:
+            fh.write(b"\xff\xfe\x00binary")
+        binp = preview_tool_call("write_file", {"path": "blob.bin", "content": "text\n"}, ws)
+        bin_entry = binp["files"][0]
+        assert bin_entry["hidden_reason"] == HIDDEN_BINARY and bin_entry["added"] is None, bin_entry
 
         # -- CRLF: the tool converts LF content to CRLF for a CRLF file, so
         #    the preview must not show every line changed; a real line-ending
