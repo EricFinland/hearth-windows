@@ -629,7 +629,8 @@ def save(body, busy=None):
                 400, "saving this lets {} run on this computer; it needs an explicit "
                      "acknowledgement".format(command),
                 needs_acknowledge=True, acknowledge=ACKNOWLEDGE, create=create,
-                command=command, args=_args_view(args), warnings=warnings)
+                command=command, args=_args_view(args), env_names=list(env),
+                warnings=warnings)
         live = _is_live(old_entry) or _is_live(new_entry)
         if live and busy is not None and busy():
             raise AdminError(409, BUSY_MESSAGE)
@@ -922,6 +923,7 @@ def _self_test():
                         "PLAIN": {"keep": True}}}
         exc = refused(save, edit, needle="acknowledgement")
         assert exc.extra["needs_acknowledge"] is True and exc.extra["command"] == exe
+        assert exc.extra["env_names"] == ["GITHUB_TOKEN", "LOG_LEVEL", "PLAIN"],             "the dialog names every variable it will set, and only names them"
         assert real_token not in json.dumps(exc.body()), "the refusal must not echo a secret"
         assert file_text() == before
         res = save(dict(edit, **ack))
