@@ -562,8 +562,12 @@ After a restart, whichever chat was open last is the one that reopens.
 Switching chats, starting a new one, and deleting the open one are refused
 while a turn is still running, because the turn and any tool call it
 started would otherwise carry on behind a session nothing can reach: stop
-it first (Esc). Deleting the open chat ends its session; deleting any chat
-never touches the files in its workspace or its checkpoints.
+it first (Esc). Restarting the session into a different folder is allowed
+mid-turn, and that turn keeps running in its own folder and is saved into
+its own chat when it ends; until then, that chat cannot be reopened and no
+new session can start in its folder, so two turns never work in one folder
+at once. Deleting the open chat ends its session; deleting any chat never
+touches the files in its workspace or its checkpoints.
 
 Where it lives: one file per conversation in
 `%LOCALAPPDATA%\Hearth\desktop\conversations\`, plus an `index.json` that

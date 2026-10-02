@@ -63,7 +63,9 @@ Endpoints:
                   same directory. A different workspace is always accepted
                   immediately; the old session (and its abandoned worker, if
                   any) simply keeps running against its own, different,
-                  workspace path, unaffected.
+                  workspace path, unaffected -- and until it is done, a new
+                  session in THAT workspace is refused with 409 the same
+                  way, however many sessions have been started since.
   GET  /session   the current session's state, or 404 if none exists yet.
   GET  /conversations  every saved conversation (conversations.py), newest
                   activity first, plus `active_id`: the one the live session
@@ -89,8 +91,12 @@ Endpoints:
                   is re-validated (main.py injects that loader). 409 while
                   the live session is running or still has an abandoned
                   worker (Session.is_workspace_busy), exactly as POST
-                  /restore is refused. Opening the already-open one is a
-                  no-op. Same answer shape as /new.
+                  /restore is refused, and also while a session replaced
+                  earlier is still running on that conversation or in its
+                  workspace (POST /session to another folder leaves such a
+                  turn running; it is saved into its own conversation when
+                  it ends). Opening the already-open one is a no-op. Same
+                  answer shape as /new.
   POST /conversations/rename  {"id", "title"}: cleaned and capped
                   (conversations.RENAME_MAX); 400 if nothing is left of it.
   POST /conversations/delete  {"id"}: permanent. Deleting the OPEN
@@ -501,6 +507,16 @@ class SidecarState:
         self._conversations = conversation_store
         self.conversation_loader = conversation_loader
         self.active_conversation_id = None
+        # Sessions this state replaced while something of theirs was still
+        # running (a turn on a different workspace, which create_session
+        # allows, or a cancelled turn's abandoned worker), by conversation
+        # id. Read and written under self._lock and pruned as each one
+        # settles (_prune_retired_locked). Two things need them: reopening
+        # that conversation, or starting anything in that workspace, must
+        # wait until they are done (_busy_elsewhere_locked), and the turn
+        # they were running still deserves to be saved into its own
+        # conversation when it ends (_persist_if_current).
+        self._retired = {}
 
     def get_session(self):
         with self._lock:
@@ -603,13 +619,79 @@ class SidecarState:
         crash, but a silent one. Comparing against self.session (read
         fresh, under lock, at the moment of the actual write, not captured
         once at hook-creation time) is what makes "current" mean the same
-        thing here as it does to GET /session or POST /cancel."""
+        thing here as it does to GET /session or POST /cancel.
+
+        With conversation history there is one exception, and it is the
+        reason the guard had to grow rather than go: a replaced session
+        that is still in self._retired may write into ITS OWN conversation
+        file, through the store directly. That file is no longer shared
+        with the live session, so the lost-update race above cannot happen
+        there, and without it the answer to a turn that was still running
+        when the user moved to another workspace was never saved at all.
+        self._retired holds a session only until it settles, and
+        open_conversation removes it before adopting that conversation, so
+        a session restored from the same file never races its predecessor;
+        a conversation deleted meanwhile stays deleted (the store refuses
+        to write it back)."""
         if self._raw_persist_hook is None:
             return
+        cid = getattr(session, "conversation_id", None)
         with self._lock:
             is_current = self.session is session
+            is_retired_own = (not is_current and self._conversations is not None
+                              and self._retired.get(cid) is session)
         if is_current:
             self._raw_persist_hook(session)
+        elif is_retired_own:
+            self._conversations.save_session(session)
+
+    @staticmethod
+    def _settled(session):
+        """True once nothing of `session`'s is running any more: no turn, no
+        abandoned worker, and its turn thread (whose last act is a persist)
+        has exited."""
+        if session.is_workspace_busy():
+            return False
+        thread = getattr(session, "_thread", None)
+        return thread is None or not thread.is_alive()
+
+    @staticmethod
+    def _unused(session):
+        """True if nothing ever happened in `session`: idle, and not one
+        event in its log. Decided from the live object, not from its file:
+        a turn that has just started may not have reached the disk yet."""
+        return not session.is_workspace_busy() and not session.recent_events(1)
+
+    @staticmethod
+    def _same_dir(a, b):
+        try:
+            return os.path.realpath(a) == os.path.realpath(b)
+        except (OSError, ValueError, TypeError):
+            return False
+
+    def _retire_locked(self, old):
+        """Remember `old`, which is being replaced, if anything of its is
+        still running. Called with self._lock held."""
+        cid = getattr(old, "conversation_id", None)
+        if conversations_mod.valid_id(cid) and not self._settled(old):
+            self._retired[cid] = old
+
+    def _prune_retired_locked(self):
+        for cid, old in list(self._retired.items()):
+            if self._settled(old):
+                del self._retired[cid]
+
+    def _busy_elsewhere_locked(self, workspace=None, cid=None):
+        """A replaced session still at work on conversation `cid` or in
+        `workspace`, or None. The current session is not considered: every
+        caller checks that one itself, with its own wording."""
+        self._prune_retired_locked()
+        for rcid, old in self._retired.items():
+            if cid is not None and rcid == cid:
+                return old
+            if workspace is not None and self._same_dir(workspace, old.workspace):
+                return old
+        return None
 
     def set_restored_session(self, session, conversation_id=None):
         """Adopt a session session_state.restore_session() rebuilt from a
@@ -737,9 +819,18 @@ class SidecarState:
         history list before its first prompt, and a restart reopens it),
         and becomes the open one. The conversation it replaces is left in
         the history -- unless nothing ever happened in it, in which case
-        it is tidied away rather than left as a blank entry."""
+        it is tidied away rather than left as a blank entry.
+
+        The same-workspace refusal also covers sessions replaced EARLIER and
+        still running (self._retired): a turn left running in this
+        workspace two switches ago is just as much a second writer as one
+        on the session being replaced now."""
         with self._lock:
             old = self.session
+            if self._busy_elsewhere_locked(workspace=workspace) is not None:
+                raise WorkspaceBusyError(
+                    "cannot start a session here: a turn from an earlier chat is still "
+                    "running in this workspace; wait for it to finish and try again")
             if old is not None:
                 try:
                     same_workspace = os.path.realpath(workspace) == os.path.realpath(old.workspace)
@@ -750,6 +841,11 @@ class SidecarState:
                         "cannot replace session: this workspace has running or abandoned "
                         "work in progress; wait for it to finish and try again")
                 old.cancel()
+                self._retire_locked(old)
+            # Whether the chat being left behind was ever used, judged from
+            # the live session now rather than from its file later: a turn
+            # that started a moment ago may not have been saved yet.
+            prune_previous = old is not None and self._unused(old)
             hook = self._persist_if_current if self._raw_persist_hook is not None else None
             factory = engine_factory or self.engine_factory
             s = session_mod.Session(workspace, model, mode, engine=factory(),
@@ -768,7 +864,8 @@ class SidecarState:
         # lock every request takes.
         self._persist_if_current(s)
         self._remember_active(s.conversation_id)
-        self._prune_conversation(previous_cid)
+        if prune_previous:
+            self._prune_conversation(previous_cid)
         return s
 
     # ---- conversation history (conversations.py) ----
@@ -822,7 +919,11 @@ class SidecarState:
         Refused while the live session is busy, for the reason POST
         /restore is: an abandoned worker can still be writing to the
         workspace, and it would keep doing so behind a session nothing can
-        reach any more. The rebuild goes through the injected loader (main.py:
+        reach any more. Refused too while a session replaced earlier is
+        still running on THIS conversation or in its workspace (a turn the
+        user walked away from by restarting into another folder): reopening
+        it then would put a second worker in that folder, on the same
+        conversation. The rebuild goes through the injected loader (main.py:
         session_state.restore_session with its restore_engine_factory), so a
         conversation file gets every check a restart gives it -- this
         directory is writable by the agent's own run_command."""
@@ -837,6 +938,12 @@ class SidecarState:
             raise ConversationRefused(
                 409, "a turn is still running in this chat; stop it or let it finish "
                      "before switching")
+        with self._lock:
+            still_running = self._busy_elsewhere_locked(cid=cid)
+        if still_running is not None:
+            raise ConversationRefused(
+                409, "this chat's last turn is still running in the background; wait for "
+                     "it to finish before reopening it")
         if store.get(cid) is None:
             raise ConversationRefused(404, "no such conversation")
         persisted = store.load(cid)
@@ -861,8 +968,17 @@ class SidecarState:
             if old is not None and old.is_workspace_busy():
                 raise ConversationRefused(
                     409, "a turn started in this chat while switching; stop it first")
+            if self._busy_elsewhere_locked(workspace=restored.workspace, cid=cid) is not None:
+                raise ConversationRefused(
+                    409, "a turn from an earlier chat is still running in this chat's "
+                         "workspace; wait for it to finish before reopening it")
             if old is not None:
                 old.cancel()
+                self._retire_locked(old)
+            prune_previous = old is not None and self._unused(old)
+            # Whatever was retired under this id has settled (checked just
+            # above); from here on the restored session is its only writer.
+            self._retired.pop(cid, None)
             previous_cid = self.active_conversation_id
             self.session = restored
             self.active_conversation_id = cid
@@ -881,7 +997,7 @@ class SidecarState:
             except Exception as exc:  # noqa: BLE001 - never fail a switch over the gauge
                 print("[hearth-app] could not read the run journal: {}: {}".format(
                     type(exc).__name__, exc), file=sys.stderr)
-        if previous_cid != cid:
+        if previous_cid != cid and prune_previous:
             self._prune_conversation(previous_cid)
         return restored
 
@@ -2750,6 +2866,7 @@ def _self_test():
 
         conv_tmp = tempfile.mkdtemp(prefix="hearth-app-conversations-")
         conv_gate = threading.Event()
+        conv_gate2 = threading.Event()  # "hold2": a turn left running across a switch
 
         class _ConvEngine:
             """Remembers its conversation like RealEngine does, and blocks on
@@ -2773,6 +2890,8 @@ def _self_test():
                     {"role": "user", "content": ctx.message}]
                 if ctx.message == "hold":
                     conv_gate.wait(timeout=10)
+                if ctx.message == "hold2":
+                    conv_gate2.wait(timeout=10)
                 ctx.emit("delta", {"text": "ok", "stream_id": 1, "index": 0})
                 ctx.emit("done", {})
 
@@ -2945,6 +3064,49 @@ def _self_test():
                 i["id"] for i in listing["items"]}, listing
             assert not os.path.exists(os.path.join(conv_store.root(), first_id + ".json"))
 
+            # A turn left running by restarting into ANOTHER workspace (which
+            # is allowed) keeps its chat and its folder off limits until it
+            # is done: reopening that chat, or starting a session in that
+            # folder, would put a second worker there.
+            st, _ = _c("POST", "/session", {"workspace": "/tmp/ws-left", "model": "m"})
+            left = conv_state.get_session()
+            left_id = left.conversation_id
+            st, _ = _c("POST", "/prompt", {"message": "hold2"})
+            assert st == 200
+            st, _ = _c("POST", "/session", {"workspace": "/tmp/ws-elsewhere", "model": "m"})
+            assert st == 200, "a different workspace may still be started"
+            elsewhere = conv_state.get_session()
+            assert left.is_workspace_busy(), "sanity: the left-behind turn is still running"
+            assert conv_store.get(left_id) is not None, "a chat with a running turn is not pruned"
+            st, body = _c("POST", "/conversations/open", {"id": left_id})
+            assert st == 409, ("reopening a chat whose turn still runs", st, body)
+            st, body = _c("POST", "/session", {"workspace": "/tmp/ws-left", "model": "m"})
+            assert st == 409, ("a new session in that turn's workspace", st, body)
+            assert conv_state.get_session() is elsewhere
+            # It finishes on its own, and its answer is saved into ITS chat
+            # even though it is no longer the live session.
+            conv_gate2.set()
+            deadline = time.monotonic() + 5
+            while not SidecarState._settled(left) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            saved_left = conv_store.load(left_id)
+            assert saved_left["status_at_save"] == "idle", saved_left["status_at_save"]
+            assert [e["kind"] for e in saved_left["recent_events"]][-2:] == ["delta", "done"],                 saved_left["recent_events"]
+            st, body = _c("POST", "/conversations/open", {"id": left_id})
+            assert st == 200, (st, body)
+            replayed = [e["kind"] for e in conv_state.get_session().events_after(0, timeout=1)]
+            assert "done" in replayed and "turn_interrupted" not in replayed, replayed
+            assert conv_store.get(elsewhere.conversation_id) is None,                 "the unused chat it switched away from is still tidied away"
+
+            # Pruning is decided from the live session, not its file: a turn
+            # whose first event exists but has not been saved yet still
+            # counts as something having happened.
+            st, _ = _c("POST", "/session", {"workspace": "/tmp/ws-fresh", "model": "m"})
+            fresh = conv_state.get_session()
+            fresh._emit("t", "user_prompt", {"text": "just sent"})  # not persisted yet
+            st, _ = _c("POST", "/session", {"workspace": "/tmp/ws-next", "model": "m"})
+            assert st == 200 and conv_store.get(fresh.conversation_id) is not None
+
             # Malformed JSON, and history-off states answer cleanly.
             st, _ = _raw_request(cport, "POST", "/conversations/open", headers=ch, body="{nope")
             assert st == 400, st
@@ -2955,6 +3117,7 @@ def _self_test():
             assert st == 409, (st, body)
         finally:
             conv_gate.set()
+            conv_gate2.set()
             conv_server.shutdown()
             conv_server.server_close()
             shutil.rmtree(conv_tmp, ignore_errors=True)
