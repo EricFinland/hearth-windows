@@ -753,6 +753,19 @@ class SidecarState:
                 return old
         return None
 
+    def any_turn_running(self):
+        """True while any session in this process may be partway through a
+        tool call: the current one, or one it replaced whose turn (or
+        abandoned worker) has not finished yet. The MCP registry is shared
+        by all of them, so restarting it has to wait for every one, not only
+        the session on screen."""
+        with self._lock:
+            self._prune_retired_locked()
+            if self._retired:
+                return True
+            current = self.session
+        return current is not None and current.is_workspace_busy()
+
     def set_restored_session(self, session, conversation_id=None):
         """Adopt a session session_state.restore_session() rebuilt from a
         prior process's disk snapshot as the live one -- main.py's startup
@@ -2168,9 +2181,10 @@ class SidecarHandler(BaseHTTPRequestHandler):
     def _mcp_busy(self):
         """Busy in the sense POST /restore uses: a turn running, or a
         cancelled turn's abandoned worker still executing, either of which
-        may be partway through an MCP tool call."""
-        s = self.state.get_session()
-        return s is not None and s.is_workspace_busy()
+        may be partway through an MCP tool call. That includes a session
+        the Chats list switched away from while its turn was still going,
+        because it keeps using the same shared registry until it ends."""
+        return self.state.any_turn_running()
 
     def _write_sse(self, ev):
         payload = json.dumps({"turn_id": ev["turn_id"], "kind": ev["kind"],
@@ -3328,12 +3342,18 @@ def _self_test():
             st, body = _c("POST", "/session", {"workspace": "/tmp/ws-left", "model": "m"})
             assert st == 409, ("a new session in that turn's workspace", st, body)
             assert conv_state.get_session() is elsewhere
+            # The left-behind turn still shares the MCP registry, so it counts
+            # as busy for restarting it even though the session on screen is
+            # idle.
+            assert not elsewhere.is_workspace_busy()
+            assert conv_state.any_turn_running(), "a replaced session's turn is still running"
             # It finishes on its own, and its answer is saved into ITS chat
             # even though it is no longer the live session.
             conv_gate2.set()
             deadline = time.monotonic() + 5
             while not SidecarState._settled(left) and time.monotonic() < deadline:
                 time.sleep(0.01)
+            assert not conv_state.any_turn_running(), "nothing runs once it settles"
             saved_left = conv_store.load(left_id)
             assert saved_left["status_at_save"] == "idle", saved_left["status_at_save"]
             assert [e["kind"] for e in saved_left["recent_events"]][-2:] == ["delta", "done"],                 saved_left["recent_events"]
