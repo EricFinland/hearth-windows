@@ -512,9 +512,12 @@ class ConversationStore:
         once. Returns the new conversation's id, or None if there was
         nothing to do.
 
-        Runs only while the store holds no conversation at all, which is
+        Runs only while the store lists no conversation at all, which is
         what makes it idempotent: after a migration the store is never
-        empty again, and the legacy file has been renamed anyway. The copy
+        empty again, and the legacy file has been renamed anyway. "Lists"
+        means readable: a store holding nothing but files that fail
+        validation is empty as far as the user can see, and must not keep
+        a perfectly good legacy session from being migrated. The copy
         is the file's exact bytes, never a re-serialisation, and the
         original is renamed to session_state.json.migrated rather than
         deleted -- if anything here is wrong, the user's last session is
@@ -523,7 +526,7 @@ class ConversationStore:
         still renamed aside, so it stops shadowing the store."""
         with self._lock:
             legacy = self.legacy_path()
-            if not os.path.isfile(legacy) or self._ids_on_disk():
+            if not os.path.isfile(legacy) or self._read_index()["items"]:
                 return None
             data = session_state.load(legacy)
             cid = None
@@ -814,6 +817,22 @@ def _self_test_body(scratch):
     assert cstore.list()["items"] == []
     with open(cstore.legacy_path() + MIGRATED_SUFFIX, encoding="utf-8") as fh:
         assert fh.read() == "{truncated"
+    # A store holding only unreadable files is empty as far as the user can
+    # see: a good legacy session is still migrated, and the unreadable file
+    # is left where it was.
+    uroot = os.path.join(scratch, "migrate-unreadable", "desktop", STORE_DIRNAME)
+    ustore = ConversationStore(root=uroot)
+    os.makedirs(uroot)
+    junk_id = new_id()
+    with open(os.path.join(uroot, junk_id + ".json"), "w", encoding="utf-8") as fh:
+        fh.write("{half a file")
+    with open(ustore.legacy_path(), "wb") as fh:
+        fh.write(legacy_bytes)
+    ucid = ustore.migrate_legacy()
+    assert valid_id(ucid) and ustore.active_id() == ucid
+    assert [i["id"] for i in ustore.list()["items"]] == [ucid]
+    assert os.path.exists(os.path.join(uroot, junk_id + ".json"))
+    assert ustore.migrate_legacy() is None, "and it is still a one-off"
     # No legacy file at all: nothing happens, nothing is created.
     nroot = os.path.join(scratch, "fresh", "desktop", STORE_DIRNAME)
     assert ConversationStore(root=nroot).migrate_legacy() is None
