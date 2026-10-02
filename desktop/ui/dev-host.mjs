@@ -72,6 +72,7 @@ const SIDECAR_ROUTES = new Set([
   "/model", "/model/unload", "/model/autounload",
   "/loop", "/loop/events",
   "/swarm", "/swarm/events",
+  "/attach", "/attach/chunk", "/attach/finish", "/attach/cancel",
   "/update", "/update/events",
   "/mcp", "/mcp/save", "/mcp/toggle", "/mcp/remove", "/mcp/test",
 ]);

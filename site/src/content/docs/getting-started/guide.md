@@ -567,6 +567,92 @@ directly in the module's own tests, not just asserted here. If you edit
 that reads it (it is cached per workspace, keyed on the file's own
 modification time), not on a delay or a restart.
 
+## Attaching files to a message
+
+In a chat session you can hand the model files to read: click the paperclip
+beside the message box, drop files anywhere on the chat, or paste a file
+(a copied file or a screenshot) into the message box. Each file shows as a
+chip above the box with its size and status while it imports, then says
+how it will reach the model. Files go with the next message you send; one
+that is still importing waits for the message after. Attaching is for chat
+sessions only: a work loop or a swarm reads your message as its goal, so
+the paperclip is hidden there.
+
+**Where the files go.** Each file is copied into an `imports` folder at the
+top of the session's workspace (`<workspace>\imports\`), created when
+first needed. Names are cleaned up for Windows on the way in: folder parts,
+control and invisible characters, `:` (alternate data streams), trailing
+dots and spaces, and reserved device names such as `CON` or `NUL.txt` are
+removed or prefixed with `_`, square brackets become parentheses (the model's
+prompt uses brackets for its own notes), and very long names are shortened
+to 120 characters. A name that is already taken gets ` (2)`, ` (3)` and so on;
+nothing already in `imports` is ever overwritten. While a file uploads its
+bytes are staged in Hearth's own data folder, not the workspace, so the
+agent never sees a half-written file. This copy is your action, so it does
+not ask for the write approval the agent's own writes do, but it is held to
+the same workspace boundary: if `imports` is a file, a symbolic link or a
+junction, attaching is refused rather than written through.
+
+**The limits.** 20 MB per file, 10 files and 50 MB in total per message.
+
+**What the model is shown.** Text is read out of each file and placed
+after your message, fenced with markers that say it is the content of a
+file you attached and is untrusted data, not instructions. File names are
+shown to the model in quotes, as data, never as part of the prompt's own
+wording. All the files on one message share a budget of about 40% of the
+model's context window, less if the conversation so far (or the message you
+type with them) already fills much of it, so there is room left for the
+conversation and the reply. Everything Hearth adds counts against that
+budget, the files' names and notes included. With the
+model set to `auto` the router can pick a different model for each step, so
+the budget assumes the smallest context any of them runs with (4096
+tokens). A file that fits is
+included whole; one that does not is included as an excerpt from its start,
+with a note telling the agent the full file is at `imports\<name>` so it
+can read the rest with its own tools. The chip says which you will get
+(`full text` or `excerpt`) before you send. With many files, long names or
+a small context there may be room only for a list of the files' paths: the
+chips then say `too big to inline` and the agent reads the files with its
+own tools. When not even that list fits, Hearth refuses to send: the files
+go back to the tray, and the hint above them asks you to remove some,
+shorten the message, or start a new chat. Only your newest message keeps
+its files in the conversation: when you send another message with files,
+the earlier files' text is replaced by a one-line note naming them and
+where they are in `imports`, so the agent can read them again with its own
+tools if it needs to. Your message itself stays
+exactly what you typed: the transcript shows your words with the attached
+files as chips underneath.
+
+**Formats it can read.** Plain text and source code of every common kind
+(markdown, CSV, JSON, logs, XML, HTML, YAML and so on), in UTF-8, UTF-16 or
+UTF-32 with a byte order mark, or the older Windows cp1252 encoding; Word
+`.docx` documents (the text of every paragraph); and PDFs, best effort.
+PDF text is pulled from the page content directly, which works for most
+documents exported from a word processor and fails for scanned pages and
+for PDFs whose fonts store glyph numbers instead of letters. When that
+happens the chip says "no text found" and the model is told the same,
+rather than being handed noise. Encrypted PDFs and password-protected Word
+documents are named as such. Images and other binary files are stored and
+the model is told where they are, but their contents are not shown: there
+is no vision support yet.
+
+**Warnings before you send.** Attached text is treated like any other
+content the agent reads from outside: its text and its name are scanned
+for prompt injection, and if they score high the chip warns you. The
+finding is also carried into the turn the same way a suspicious tool
+result's is, so the approval card shows it if the agent's first gated
+action comes before it reads anything else; once another tool result
+arrives, the card shows that result's scan instead. It is also scanned for credentials (API keys, private keys,
+passwords in connection strings), and the chip warns you if it finds one,
+showing a masked preview, never the value. Neither scan removes or blocks
+anything; they tell you, and you decide whether to remove the file.
+
+**Two things to know.** Imported files are ordinary workspace files, so the
+checkpoint taken at the start of each turn captures them like anything
+else, large ones included. And if your `.hearthignore` covers `imports/`,
+whatever fits in the message is still sent, but the agent's file tools
+will refuse to open the full file; the chip says so.
+
 ## How undo works
 
 Local models get things wrong often enough that cheap, reliable recovery is

@@ -1241,7 +1241,31 @@ class RealEngine:
             ctx.emit("cancelled", {})
             return
 
-        self._messages.append({"role": "user", "content": ctx.message})
+        # Attached files (desktop/server/attachments.py) ride on the message
+        # as attributes of a str subclass whose value is only the typed
+        # words; this is the one place they are joined to what the model
+        # sees. Their injection scan is surfaced exactly as a suspicious tool
+        # result's is: kept as self._last_scan, so the next gated approval
+        # carries the finding (module docstring, point 3). Only the newest
+        # message's files stay inline: their budget assumed earlier ones were
+        # collapsed to a one-line summary (attachments.collapse_history),
+        # which is done here, or every attached message would stack up in
+        # the history until the context window overflowed.
+        content = str(ctx.message)
+        extra = getattr(ctx.message, "attachment_text", None)
+        if extra:
+            collapse = getattr(ctx.message, "collapse_history", None)
+            if callable(collapse):
+                for earlier in self._messages:
+                    if (isinstance(earlier, dict) and earlier.get("role") == "user"
+                            and isinstance(earlier.get("content"), str)):
+                        earlier["content"] = collapse(earlier["content"])
+            content += "\n\n" + extra
+        attached_scan = getattr(ctx.message, "attachment_scan", None)
+        if attached_scan is not None and hearth_injection.meets_threshold(
+                attached_scan, INJECTION_SURFACE_THRESHOLD):
+            self._last_scan = attached_scan
+        self._messages.append({"role": "user", "content": content})
         self._turn_starts.append(len(self._messages) - 1)
         self._trim_messages()
 
@@ -3238,6 +3262,102 @@ def _self_test():
     assert _accepts_on_token(hearth_loop.chat) is True, \
         "the real chat function must be recognised as streaming"
     assert _accepts_on_token(len) is False, "an unreadable signature must not stream"
+
+    # --- S: attached files reach the model, and only the model ----------
+    # attachments.PromptText is the user's words as a str, with the file
+    # blocks carried as attributes. The model must get both; everything
+    # that reads the message as the user's words (the event log, the router)
+    # must still get only the words; and an attachment that scans as an
+    # injection must surface on the next gated approval, exactly as a
+    # poisoned tool result does in section L.
+    import attachments as attachments_mod
+
+    seenS = []
+
+    def _recording_chat(script):
+        inner = _scripted_chat(script)
+
+        def _fn(messages):
+            seenS.append([dict(m) for m in messages])
+            return inner(messages)
+        return _fn
+
+    attached_scan = hearth_injection.scan(real_payload, source="attachment:readme.txt")
+    assert hearth_injection.meets_threshold(attached_scan, INJECTION_SURFACE_THRESHOLD), attached_scan
+    words = "what does the attached readme ask for?"
+    promptS = attachments_mod.PromptText(
+        words, attachment_text="<<<BEGIN ATTACHMENT n0nce: readme.txt>>>\n" + real_payload
+        + "\n<<<END ATTACHMENT n0nce>>>", attachment_meta=[{"name": "readme.txt"}],
+        attachment_scan=attached_scan)
+    scriptS = [
+        ({"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": "write_file", "arguments": {"path": "out.txt", "content": "x"}}}]}, 1, 1),
+        ({"role": "assistant", "content": "done", "tool_calls": []}, 1, 1),
+    ]
+    engineS = RealEngine(chat_fn=_recording_chat(scriptS), execute_tool_fn=fake_execute_tool,
+                         checkpoint_fn=fake_checkpoint)
+    sessS = session_mod.Session(ws, "fake-model", "edit", engine=engineS)
+    sessS.submit_prompt(promptS)
+    apprS, _ = _wait_for_kind(sessS, "approval_request")
+    findingS = apprS["data"].get("injection_finding")
+    assert findingS is not None and findingS["source"] == "attachment:readme.txt", apprS
+    sessS.resolve_approval(apprS["data"]["id"], True)
+    _wait_for_kind(sessS, "done")
+    _wait_idle(sessS)
+    user_msgs = [m for m in seenS[0] if m["role"] == "user"]
+    assert user_msgs[-1]["content"].startswith(words + "\n\n<<<BEGIN ATTACHMENT n0nce"), user_msgs[-1]
+    assert real_payload in user_msgs[-1]["content"]
+    assert type(user_msgs[-1]["content"]) is str, "the wire message is a plain str"
+    # A plain str prompt is untouched by the attachment path.
+    seenS.clear()
+    engineS2 = RealEngine(chat_fn=_recording_chat([({"role": "assistant", "content": "ok",
+                                                      "tool_calls": []}, 1, 1)]),
+                          execute_tool_fn=fake_execute_tool, checkpoint_fn=fake_checkpoint)
+    sessS2 = session_mod.Session(ws, "fake-model", "edit", engine=engineS2)
+    sessS2.submit_prompt("just words")
+    _wait_for_kind(sessS2, "done")
+    _wait_idle(sessS2)
+    assert [m for m in seenS[0] if m["role"] == "user"][-1]["content"] == "just words"
+    assert engineS2._last_scan is None, "no attachment, no scan"
+
+    # Three back-to-back messages, each attaching a 100 KB log, at the
+    # 4096-token fallback context: the history sent must stay inside the
+    # window every time. Only the newest message keeps its file inline; the
+    # earlier ones are collapsed to their one-line summary, and each budget
+    # allows for the conversation already there.
+    import shutil as _shutilS
+    import tempfile as _tempfileS
+    wsS3 = _tempfileS.mkdtemp(prefix="hearth-engine-attach-")
+    try:
+        os.makedirs(os.path.join(wsS3, "imports"))
+        with open(os.path.join(wsS3, "imports", "big.log"), "w", encoding="utf-8") as fh:
+            fh.write("".join("{:06d} service started, all checks passed\n".format(i)
+                             for i in range(2300)))
+        seenS.clear()
+        engineS3 = RealEngine(chat_fn=_recording_chat([
+            ({"role": "assistant", "content": "read it", "tool_calls": []}, 1, 1)] * 3),
+            execute_tool_fn=fake_execute_tool, checkpoint_fn=fake_checkpoint)
+        sessS3 = session_mod.Session(wsS3, "fake-model", "edit", engine=engineS3)
+        window = 4096 * attachments_mod.CHARS_PER_TOKEN
+        for n in range(3):
+            used = attachments_mod.engine_history_chars(engineS3)
+            promptS3 = attachments_mod.compose("look at the log, round {}".format(n), ["imports/big.log"],
+                                               wsS3, ctx_fn=lambda m: 4096, used_chars=used)
+            sessS3.submit_prompt(promptS3)
+            deadlineS3 = time.monotonic() + 5
+            while len(seenS) < n + 1 and time.monotonic() < deadlineS3:
+                time.sleep(0.01)
+            _wait_idle(sessS3)
+            sent = sum(len(m.get("content") or "") for m in seenS[n])
+            assert sent <= window * attachments_mod.HISTORY_CEILING + 200, (n, sent, window)
+            users = [m["content"] for m in seenS[n] if m["role"] == "user"]
+            assert len(users) == n + 1, users
+            assert users[-1].count("<<<BEGIN ATTACHMENT ") == 1, "the newest keeps its file inline"
+            for older in users[:-1]:
+                assert "BEGIN ATTACHMENT" not in older and '"imports/big.log"' in older, older
+        assert len(seenS) == 3, len(seenS)
+    finally:
+        _shutilS.rmtree(wsS3, ignore_errors=True)
 
     print("hearth-desktop-engine self-test OK")
     return 0
