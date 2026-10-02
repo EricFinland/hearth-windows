@@ -102,6 +102,7 @@ Standard library only.
 import json
 import os
 import sys
+import threading
 import time
 import uuid
 
@@ -287,11 +288,75 @@ def snapshot(session):
         "engine_kind": getattr(session.engine, "ENGINE_KIND", "chat"),
         "engine_config": _engine_config(session.engine),
         "engine_state": engine_state,
-        # Everything the live ring still holds, compacted and then bounded:
-        # see persisted_tail. Asked for with no count of its own, because the
-        # bound that matters is the one applied after compaction.
-        "recent_events": persisted_tail(session.recent_events(sys.maxsize)),
+        # The tail this session last saved, extended with everything the
+        # live ring has gained since, compacted and then bounded: see
+        # _tail_for and persisted_tail.
+        "recent_events": _tail_for(session),
     }
+
+
+# Guards each session's saved-tail bookkeeping (_tail_for). One lock for all
+# of them: a snapshot is a few milliseconds of list work, and the persist
+# hook fires a handful of times per turn, so there is nothing to contend over.
+_TAIL_LOCK = threading.Lock()
+
+
+def _tail_for(session):
+    """The event tail a snapshot of `session` keeps.
+
+    The live ring (session.EVENTS_CAP raw events) is far smaller than what a
+    saved conversation is allowed to keep once compacted, and a streamed
+    reply is ten raw events a second: one long answer wraps the ring on its
+    own. Building every snapshot from the ring alone therefore threw away
+    whatever the ring had already dropped, even though the previous snapshot
+    had it. So the tail this session last saved is remembered on the session
+    (with the newest raw id it covered), and each new snapshot is that tail
+    plus only the events newer than it -- see merge_tail -- before the usual
+    caps apply. A restored session starts from the tail it was restored
+    with (restore_session)."""
+    live = session.recent_events(sys.maxsize)
+    with _TAIL_LOCK:
+        saved = getattr(session, "_saved_tail", None)
+        through = getattr(session, "_saved_through", 0)
+        tail = persisted_tail(merge_tail(saved, through, live))
+        newest = live[-1].get("id") if live and isinstance(live[-1], dict) else None
+        # Two snapshots can race (a turn's worker and an HTTP request); the
+        # bookkeeping only ever moves forward, so the slower one cannot
+        # hand the next snapshot an older starting point.
+        if type(newest) is int and newest >= through:  # noqa: E721 - not bool
+            session._saved_tail, session._saved_through = tail, newest
+    return tail
+
+
+def merge_tail(saved, saved_through, live):
+    """`saved` (a tail an earlier snapshot kept, covering raw event ids up to
+    `saved_through`) followed by every event in `live` newer than that.
+
+    The live ring's ids are consecutive, so if its oldest event newer than
+    `saved_through` is not saved_through + 1, the events in between left the
+    ring before anything saved them. That hole is not papered over: an
+    "events_dropped" marker flagged `restored` and `gap` goes in its place,
+    which the UI shows as "part of this chat was not saved" at that point in
+    the transcript. It happens only when one stretch between two saves
+    emitted more than the whole ring holds (a turn with no approval in it
+    that streams for over a minute), and the model's own context, saved
+    separately, is unaffected either way."""
+    if not saved:
+        return list(live or [])
+    fresh = [ev for ev in live or []
+             if isinstance(ev, dict) and type(ev.get("id")) is int  # noqa: E721 - not bool
+             and ev["id"] > saved_through]
+    out = list(saved)
+    if fresh and fresh[0]["id"] > saved_through + 1:
+        first = fresh[0]
+        out.append({
+            "id": first["id"] - 1, "turn_id": None, "kind": "events_dropped",
+            "data": {"missed_at_least": first["id"] - 1 - saved_through,
+                     "resume_from_id": first["id"], "restored": True, "gap": True},
+            "ts": first.get("ts") if isinstance(first.get("ts"), (int, float)) else time.time(),
+        })
+    out.extend(fresh)
+    return out
 
 
 def _continues_delta(prev, ev):
@@ -654,6 +719,12 @@ def restore_session(persisted, engine_factory, persist_hook=None):
     recent = _restorable_events(persisted.get("recent_events"))
     if recent:
         session.seed_events(recent)
+        # The restored tail is this session's starting point for its own
+        # snapshots (see _tail_for), so history that later scrolls out of the
+        # live ring is still carried forward rather than dropped at the next
+        # save.
+        session._saved_tail = list(recent)
+        session._saved_through = max(ev["id"] for ev in recent)
     if persisted.get("status_at_save") == session_mod.STATUS_RUNNING:
         session.record_restart_interruption(
             persisted.get("turn_id_at_save"), pending_tool=persisted.get("pending_approval_tool"))
@@ -1131,6 +1202,52 @@ def _self_test():
         cut_restored = restore_session(cut_persisted, restore_engine_factory)
         cut_kinds = [e["kind"] for e in cut_restored.events_after(0, timeout=1)]
         assert cut_kinds[0] == "events_dropped", cut_kinds
+
+        # === the saved tail outlives the live ring: each snapshot extends ===
+        # === the previous one, and a hole it cannot fill is marked =========
+        small = session_mod.Session("/tmp/ws-ring", "m", "edit", events_cap=5)
+        small._emit("t1", "user_prompt", {"text": "first question"})
+        for i in range(3):
+            small._emit("t1", "delta", {"text": "ab", "stream_id": 1, "index": 2 * i})
+        first_tail = snapshot(small)["recent_events"]
+        assert [e["kind"] for e in first_tail] == ["user_prompt", "delta"], first_tail
+        # Three more pieces of the same reply, plus its end: the ring (5) has
+        # now dropped the user's prompt, but the saved tail still has it, and
+        # the reply's pieces on both sides of the save join into one.
+        for i in range(3, 6):
+            small._emit("t1", "delta", {"text": "ab", "stream_id": 1, "index": 2 * i})
+        small._emit("t1", "done", {})
+        assert small.recent_events(100)[0]["kind"] != "user_prompt", "sanity: the ring wrapped"
+        second_tail = snapshot(small)["recent_events"]
+        assert [e["kind"] for e in second_tail] == ["user_prompt", "delta", "done"], second_tail
+        assert second_tail[1]["data"]["text"] == "ab" * 6, second_tail[1]
+        assert [e["id"] for e in second_tail] == sorted({e["id"] for e in second_tail})
+        # More than a whole ring between two saves: what was lost is marked
+        # where it was lost, not silently skipped and not blamed on the front.
+        for i in range(12):
+            small._emit("t2", "tool_call", {"name": "read_file", "n": i})
+        gapped = snapshot(small)["recent_events"]
+        kinds = [e["kind"] for e in gapped]
+        assert kinds[:3] == ["user_prompt", "delta", "done"], kinds
+        marker = gapped[3]
+        assert marker["kind"] == "events_dropped" and marker["data"]["gap"] is True, marker
+        assert marker["data"]["restored"] is True and marker["data"]["missed_at_least"] == 7, marker
+        assert marker["id"] == gapped[4]["id"] - 1 and gapped[4]["id"] == 16, gapped
+        assert len(gapped) == 4 + 5
+        # A restored session carries the tail it came back with forward, so
+        # it is not lost once the restored events scroll out of the ring.
+        ring_persisted = dict(genuine_persisted, recent_events=gapped, engine_state=None)
+        back = restore_session(ring_persisted, restore_engine_factory)
+        for i in range(10):
+            back._emit("t3", "tool_call", {"name": "list_dir", "n": i})
+        assert back._saved_through == 20, "the restored tail is the next snapshot's starting point"
+        carried = snapshot(back)["recent_events"]
+        assert carried[0]["kind"] == "user_prompt", carried[0]
+        assert carried[3]["data"].get("gap") is True and len(carried) == len(gapped) + 10
+        assert [e["id"] for e in carried] == sorted({e["id"] for e in carried}), carried
+        # merge_tail on its own: nothing saved yet is just the live ring.
+        assert merge_tail(None, 0, [{"id": 1}]) == [{"id": 1}]
+        assert merge_tail([{"id": 1}], 1, [{"id": 1}, {"id": 2}]) == [{"id": 1}, {"id": 2}]
 
         # === a file nested past the parser's limit is corrupt, not a crash =
         nested = os.path.join(scratch, "nested.json")

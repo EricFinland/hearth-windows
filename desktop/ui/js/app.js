@@ -1358,6 +1358,14 @@ function handleEvent(event) {
       // `restored` marks the front of a saved conversation's history: only
       // its most recent part is kept on disk (session_state.persisted_tail),
       // and a chat that starts mid-way must say so rather than pass for whole.
+      // `gap` marks a hole in the middle of one instead: a stretch between
+      // two saves that outran the live event buffer (session_state.merge_tail).
+      if (data.restored && data.gap) {
+        transcript.addNotice("quiet", "Part of this chat was not saved.",
+          "A long stretch of activity happened between two saves and only its end "
+          + "was kept. The model's own context was saved separately and is not affected.");
+        break;
+      }
       if (data.restored) {
         transcript.addNotice("quiet", "Earlier messages are not shown.",
           "Only the most recent part of a saved conversation's activity is kept. "

@@ -579,10 +579,16 @@ from its first prompt, with control characters and text-direction overrides
 removed, and that title is still treated as untrusted text by the UI.
 
 How much of a chat replays: the model's own context is saved whole, but
-the on-screen history is a bounded tail, roughly the last 400 entries and
-at most 2 MB, with each streamed reply stored as one entry. A long chat
-reopened from disk therefore starts with a note saying earlier messages
-are not shown, rather than looking like it began part way through.
+the on-screen history is a bounded tail, at most 400 entries and 2 MB,
+with each streamed reply stored as one entry. Each save extends the tail
+the previous save kept, so history is not lost just because the live
+event buffer (500 raw events, and a streamed reply produces about ten a
+second) has moved past it. A long chat reopened from disk starts with a
+note saying earlier messages are not shown, rather than looking like it
+began part way through. If one stretch between two saves outran the live
+buffer on its own (a turn that streams or runs tools for minutes without
+asking for an approval), the part that was never saved is marked in place
+with a note, not silently skipped.
 
 These files sit in a folder the agent's own `run_command` could write to,
 so reopening a chat is treated exactly like a restart: a saved session in
