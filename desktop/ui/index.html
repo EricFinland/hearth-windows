@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
+<link rel="stylesheet" href="./model-chip.css" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="referrer" content="no-referrer" />
 <title>hearth</title>
@@ -24,6 +25,7 @@
     <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M4.5 19.5l.7-3.7L15.6 5.4a2 2 0 0 1 2.8 0l.2.2a2 2 0 0 1 0 2.8L8.2 18.8z"/></symbol>
     <symbol id="i-terminal" viewBox="0 0 24 24"><path d="M5 7.5l4.5 4.5L5 16.5M12.5 17h6.5"/></symbol>
     <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.2"/><path d="M15.6 15.6L20 20"/></symbol>
+    <symbol id="i-eject" viewBox="0 0 24 24"><path d="M12 5.5l6.5 7.5h-13z"/><path d="M5.5 17.5h13"/></symbol>
     <symbol id="i-git" viewBox="0 0 24 24"><circle cx="7" cy="6.5" r="2.5"/><circle cx="7" cy="17.5" r="2.5"/><circle cx="17" cy="12" r="2.5"/><path d="M7 9v6M9.5 6.9h3A2 2 0 0 1 14.5 9v1"/></symbol>
     <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="2"/><path d="M9.5 3.5v3M14.5 3.5v3M9.5 17.5v3M14.5 17.5v3M3.5 9.5h3M3.5 14.5h3M17.5 9.5h3M17.5 14.5h3"/></symbol>
     <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4.5V10h-5.5"/></symbol>
@@ -56,6 +58,8 @@
       <span class="chip" id="chip-model" title="model"><svg class="i"><use href="#i-cpu"/></svg><span class="chip-text">no model</span></span>
       <span class="chip" id="chip-mode" title="permission mode"><svg class="i"><use href="#i-shield"/></svg><span class="chip-text">edit</span></span>
     </div>
+
+    <div class="mchip" id="model-chip" hidden></div>
 
     <div class="conn" id="conn" role="status" aria-live="polite">
       <span class="conn-dot" aria-hidden="true"></span>
