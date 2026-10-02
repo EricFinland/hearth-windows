@@ -40,7 +40,8 @@ const CHUNK_BYTES = 1024 * 1024;
 // arithmetic the sidecar will do at send time, so the label does not promise
 // something the prompt will not do. Each finish record carries its own
 // overhead_chars (the fence grows with the file's name); the constant is only
-// the fallback for a record without one.
+// the fallback for a record without one. The sidecar checks the rendered
+// length, so where this estimate is off it errs towards "too big to inline".
 const SET_OVERHEAD_CHARS = 400;
 const BLOCK_OVERHEAD_CHARS = 520;
 const MIN_EXCERPT_CHARS = 200;
@@ -57,17 +58,49 @@ export function formatBytes(n) {
   return `${(v / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/** Characters of attached text one message may carry, as compose() will
+ *  reckon it: each record's budget_chars, and what is left under the
+ *  conversation ceiling (ceiling_chars) once the typed words are counted,
+ *  since they share one user message with the files. */
+export function messageBudget(records, typedChars = 0) {
+  const list = Array.isArray(records) ? records : [];
+  if (!list.length) return 0;
+  const typed = Math.max(0, Number(typedChars) || 0);
+  let budget = Infinity;
+  for (const r of list) {
+    budget = Math.min(budget, Number(r && r.budget_chars) || 0);
+    const ceiling = Number(r && r.ceiling_chars);
+    if (Number.isFinite(ceiling)) budget = Math.min(budget, ceiling - typed);
+  }
+  return Math.max(0, budget);
+}
+
+/** False when even compose()'s compact layout (each file's path, size and
+ *  kind, no text) will not fit, so the sidecar would refuse the send with a
+ *  413. Uses each record's compact_chars and compact_overhead_chars. */
+export function fitsContext(records, typedChars = 0) {
+  const list = Array.isArray(records) ? records : [];
+  if (!list.length) return true;
+  let need = 0;
+  for (const r of list) {
+    need = Math.max(need, Number(r && r.compact_overhead_chars) || 0);
+  }
+  for (const r of list) need += Number(r && r.compact_chars) || 0;
+  return need <= messageBudget(list, typedChars);
+}
+
 /** How each file on one message will reach the model: "full", "excerpt" or
- *  "none". `records` are POST /attach/finish responses. Mirrors
- *  attachments.allocate(): the message budget is shared shortest file first,
- *  each taking at most an equal share of what is left. */
-export function planInline(records) {
+ *  "none". `records` are POST /attach/finish responses, `typedChars` the
+ *  length of the message typed with them. Mirrors compose() and
+ *  attachments.allocate(): what is left of the budget after every file's
+ *  framing is shared shortest file first, each taking at most an equal share
+ *  of what is left. */
+export function planInline(records, typedChars = 0) {
   const list = Array.isArray(records) ? records : [];
   if (!list.length) return [];
-  const budgets = list.map((r) => Number(r && r.budget_chars) || 0);
   const overhead = list.reduce(
     (sum, r) => sum + (Number(r && r.overhead_chars) || BLOCK_OVERHEAD_CHARS), SET_OVERHEAD_CHARS);
-  let remaining = Math.max(0, Math.min(...budgets) - overhead);
+  let remaining = Math.max(0, messageBudget(list, typedChars) - overhead);
   const plan = list.map(() => "none");
   const readable = list
     .map((r, i) => ({ i, len: r && r.readable ? Number(r.text_chars) || 0 : -1 }))
@@ -241,7 +274,12 @@ class AttachTray {
       this.addFiles(files);
     });
     this.composer.addEventListener("paste", (e) => this.onPaste(e));
-    this.composer.addEventListener("input", () => this.renderHint());
+    // What fits depends on the typed words too, so the chips' labels follow
+    // the typing; a full redraw only when a label would actually change.
+    this.composer.addEventListener("input", () => {
+      if (this.planKey() !== this.lastPlanKey) this.render();
+      else this.renderHint();
+    });
 
     // A file dropped anywhere else must not make the webview navigate to it.
     document.addEventListener("dragover", (e) => { if (hasFiles(e)) e.preventDefault(); });
@@ -430,7 +468,7 @@ class AttachTray {
     this.sync();
     if (!this.available) return [];
     const ready = this.items.filter((i) => i.status === "ready");
-    const plan = planInline(ready.map((i) => i.record));
+    const plan = planInline(ready.map((i) => i.record), this.typedChars());
     this.items = this.items.filter((i) => i.status === "queued" || i.status === "importing");
     this.render();
     return ready.map((i, n) => ({
@@ -467,11 +505,27 @@ class AttachTray {
     if (hint) setText(hint, this.hintText());
   }
 
+  typedChars() {
+    return this.composer ? this.composer.value.length : 0;
+  }
+
+  /** The ready files' plan plus whether they fit at all, as one string. */
+  planKey() {
+    const records = this.items.filter((i) => i.status === "ready").map((i) => i.record);
+    return planInline(records, this.typedChars()).join(",") + "|" +
+      fitsContext(records, this.typedChars());
+  }
+
   hintText() {
     if (this.notice) return this.notice;
     const ready = this.items.some((i) => i.status === "ready");
     const pending = this.items.some((i) => i.status === "queued" || i.status === "importing");
     if (ready && !this.composer.value.trim()) return "Type a message to send with these files.";
+    if (ready && !fitsContext(this.items.filter((i) => i.status === "ready").map((i) => i.record),
+      this.typedChars())) {
+      return "These files do not fit in what is left of the model's context window. " +
+        "Remove some, shorten the message, or start a new chat.";
+    }
     if (pending && ready) return "Files still importing go with the next message, not this one.";
     if (pending) return "Importing into imports/ in your workspace.";
     return "";
@@ -479,12 +533,13 @@ class AttachTray {
 
   render() {
     if (!this.root) return;
+    this.lastPlanKey = this.planKey();
     clear(this.root);
     const visible = (this.available && this.items.length > 0) || Boolean(this.notice);
     this.root.hidden = !visible;
     if (!visible) return;
     const ready = this.items.filter((i) => i.status === "ready");
-    const plan = planInline(ready.map((i) => i.record));
+    const plan = planInline(ready.map((i) => i.record), this.typedChars());
     const planOf = new Map(ready.map((i, n) => [i, plan[n]]));
     const row = el("div", { class: "att-row", role: "list", "aria-label": "files to attach" });
     for (const item of this.available ? this.items : []) {

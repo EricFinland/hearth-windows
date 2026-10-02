@@ -325,7 +325,8 @@ still come through with scrambled spacing, columns run together, or
 tables flattened into lines. Images are stored in `imports` and named to
 the model, never shown to it: Hearth has no vision support. Attached text
 is bounded by about 40% of the model's context window across one message
-(less when the conversation already fills the window), and only the newest
+(less when the conversation or the message typed with them already fills
+the window; too many files for what is left are refused), and only the newest
 message's files stay in the conversation, so a long document arrives as an
 excerpt, an earlier one is reduced to its name and path, and the agent has
 to read the rest with its own tools, which it may or may not decide to do.

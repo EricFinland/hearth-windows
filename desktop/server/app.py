@@ -1042,10 +1042,11 @@ class SidecarHandler(BaseHTTPRequestHandler):
             return None
         try:
             # The budget leaves room for the conversation already in the
-            # engine's history, so a long chat shrinks it rather than
-            # overflowing the model's context.
-            return attachments_mod.compose(message, paths, s.workspace, s.model,
-                                           used_chars=attachments_mod.engine_history_chars(s.engine))
+            # engine's history, and for the typed words, which share one user
+            # message with the files, so a long chat or a long pasted prompt
+            # shrinks it rather than overflowing the model's context.
+            used = attachments_mod.engine_history_chars(s.engine) + len(message)
+            return attachments_mod.compose(message, paths, s.workspace, s.model, used_chars=used)
         except attachments_mod.AttachError as exc:
             self._send_json(exc.status, exc.payload())
             return None
@@ -3809,6 +3810,15 @@ def _self_test():
             deadline_a = time.monotonic() + 5
             while state_a.get_session().status != "idle" and time.monotonic() < deadline_a:
                 time.sleep(0.02)
+            # The typed words share the user message with the files, so they
+            # count against the budget: a pasted prompt that already fills
+            # the ceiling leaves no room for even the compact listing.
+            long_words = "w" * (int(4096 * attachments_mod.CHARS_PER_TOKEN
+                                    * attachments_mod.HISTORY_CEILING) - 100)
+            status, out = _att("/prompt", {"message": long_words, "attachments": [rec["path"]]})
+            assert status == 413 and "attach fewer files" in out["error"], (status, out)
+            assert rec["ceiling_chars"] == int(4096 * attachments_mod.CHARS_PER_TOKEN
+                                               * attachments_mod.HISTORY_CEILING), rec
             # A path that is not an import, or escapes, is refused before a turn starts.
             for bad in (["../outside.txt"], ["imports/missing.txt"], "imports/_CON.txt",
                         ["imports/x"] * 11):

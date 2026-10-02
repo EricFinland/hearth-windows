@@ -495,15 +495,22 @@ after your message, fenced with markers that say it is the content of a
 file you attached and is untrusted data, not instructions. File names are
 shown to the model in quotes, as data, never as part of the prompt's own
 wording. All the files on one message share a budget of about 40% of the
-model's context window, less if the conversation so far already fills much
-of it, so there is room left for the conversation and the reply. With the
+model's context window, less if the conversation so far (or the message you
+type with them) already fills much of it, so there is room left for the
+conversation and the reply. Everything Hearth adds counts against that
+budget, the files' names and notes included. With the
 model set to `auto` the router can pick a different model for each step, so
 the budget assumes the smallest context any of them runs with (4096
 tokens). A file that fits is
 included whole; one that does not is included as an excerpt from its start,
 with a note telling the agent the full file is at `imports\<name>` so it
 can read the rest with its own tools. The chip says which you will get
-(`full text` or `excerpt`) before you send. Only your newest message keeps
+(`full text` or `excerpt`) before you send. With many files, long names or
+a small context there may be room only for a list of the files' paths: the
+chips then say `too big to inline` and the agent reads the files with its
+own tools. When not even that list fits, Hearth refuses to send: the files
+go back to the tray, and the hint above them asks you to remove some,
+shorten the message, or start a new chat. Only your newest message keeps
 its files in the conversation: when you send another message with files,
 the earlier files' text is replaced by a one-line note naming them and
 where they are in `imports`, so the agent can read them again with its own
