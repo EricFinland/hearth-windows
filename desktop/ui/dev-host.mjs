@@ -63,6 +63,7 @@ const SERVER_DIR = join(REPO_ROOT, "desktop", "server");
  * so a typo in the page cannot turn into an open forwarder. */
 const SIDECAR_ROUTES = new Set([
   "/healthz", "/session", "/prompt", "/events", "/approve",
+  "/conversations", "/conversations/new", "/conversations/open", "/conversations/rename", "/conversations/delete",
   "/cancel", "/models", "/checkpoints", "/restore", "/setup", "/idle",
   "/shop", "/shop/quants",
   "/downloads", "/downloads/events", "/downloads/cancel", "/downloads/dismiss",

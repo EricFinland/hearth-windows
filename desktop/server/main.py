@@ -48,14 +48,18 @@ deliberately is not, and why. Two things happen here, in this order, every
 time a server is built (unless a caller opts out, e.g. a test that does not
 want its own session state on disk):
 
-  1. A real persist hook (session_state.save(session_state.snapshot(...)))
-     is handed to SidecarState, which is what actually makes any of this
-     durable going forward -- see app.py's SidecarState._persist_if_current
-     for why the hook is threaded through app.py rather than called
-     directly here.
+  1. A real persist hook (conversations.ConversationStore.save_session,
+     which writes session_state.snapshot(...) into the session's own
+     conversation file) is handed to SidecarState, which is what actually
+     makes any of this durable going forward -- see app.py's
+     SidecarState._persist_if_current for why the hook is threaded through
+     app.py rather than called directly here. The same store backs the
+     history routes, and conversation_loader_for() is how app.py reopens a
+     saved conversation through the very restore path described next.
   2. Before this function returns -- so before the server has served a
-     single request -- whatever session_state.load() finds on disk from a
-     PRIOR process is rebuilt via session_state.restore_session() and
+     single request -- the conversation that was open in the PRIOR process
+     (after a one-time migration of an older build's single
+     session_state.json) is rebuilt via session_state.restore_session() and
      adopted as the live session (SidecarState.set_restored_session). A
      turn that was still running when that prior process stopped is never
      resumed; it is marked interrupted in the rebuilt session's own event
@@ -90,14 +94,27 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import app as app_mod  # noqa: E402
+import conversations
 import engine as engine_mod
 import loop_engine as loop_mod
 import session_state
 import swarm_engine as swarm_mod
 
 
-def _default_persist_hook(session):
-    session_state.save(session_state.snapshot(session))
+def conversation_loader_for(default_factory, state):
+    """The callable SidecarState uses to rebuild a saved conversation into a
+    live session on POST /conversations/open: session_state.restore_session,
+    with THIS module's restore_engine_factory choosing the engine. Injected
+    rather than imported by app.py because app.py cannot import this module
+    (this module imports it). Using the same two functions the startup
+    restore uses is the point: reopening a chat from the list is a restore,
+    and gets every check a restart gives a state file -- the bypass refusal,
+    the system-prompt trust check, a loop or swarm config re-validated and
+    its roles taken from this build rather than the file."""
+    def load(persisted):
+        return session_state.restore_session(
+            persisted, restore_engine_factory(persisted, default_factory, state))
+    return load
 
 
 def restore_engine_factory(persisted, default_factory, state):
@@ -191,53 +208,68 @@ def start_engine_acquisition(state, stream=None):
 
 def make_server(engine_factory=None, host="127.0.0.1", port=0, token=None,
                 models_fetcher=None, persist_hook=True, restore_state=True,
-                state_loader=None):
+                state_loader=None, conversation_store=None):
     """Build and bind a (server, state) pair. Defaults to an ephemeral port,
     a freshly generated token, and the real agent engine (engine.RealEngine);
     all overridable for tests. Does not start serving -- call
     server.serve_forever() (or use run_until_stop).
 
-    persist_hook: True (the default) wires up the real
-    session_state.save/snapshot pair; a callable overrides it (tests use
-    this to record calls instead of touching disk); None disables
-    persistence entirely (nothing is ever written, and restore_state below
-    is skipped) -- used by tests that want a plain in-memory server with no
-    session-state side effects at all.
+    persist_hook: True (the default) saves every session into its own
+    conversation in the conversation store (conversations.py); a callable
+    overrides it (tests use this to record calls instead of touching disk);
+    None disables persistence entirely (nothing is ever written, restore_state
+    below is skipped, and the history routes report history as off) -- used
+    by tests that want a plain in-memory server with no session-state side
+    effects at all.
 
-    restore_state: whether to look for and adopt a prior process's
-    persisted session before returning. state_loader overrides
-    session_state.load itself (tests point this at a fake or a
-    pre-populated scratch file); the default reads the real on-disk
-    location session_state.state_path() resolves via hearth_paths."""
+    conversation_store: the conversations.ConversationStore to use; by
+    default one rooted in hearth_paths.data_dir(), so HEARTH_DATA_DIR
+    redirects it. The SAME instance backs the persist hook and the history
+    routes, because it is also the lock that keeps their writes apart.
+
+    restore_state: whether to adopt a prior process's session before
+    returning. By default that is the conversation the store says was open
+    last, after folding an older build's single session_state.json into the
+    store (migrate_legacy, once). state_loader overrides where the snapshot
+    comes from (tests point this at a fake); a snapshot from there is
+    adopted as a new conversation."""
     token = token or secrets.token_urlsafe(32)
     engine_factory = engine_factory or (lambda: engine_mod.RealEngine())
-    if persist_hook is True:
-        persist_hook = _default_persist_hook
-    elif persist_hook is False:
+    if persist_hook is False:
         persist_hook = None
+    store = None
+    if persist_hook is not None:
+        store = conversation_store or conversations.ConversationStore()
+    if persist_hook is True:
+        persist_hook = store.save_session
     state = app_mod.SidecarState(token, engine_factory=engine_factory,
-                                 models_fetcher=models_fetcher, persist_hook=persist_hook)
+                                 models_fetcher=models_fetcher, persist_hook=persist_hook,
+                                 conversation_store=store)
+    state.conversation_loader = conversation_loader_for(engine_factory, state)
     server = ThreadingHTTPServer((host, port), app_mod.make_handler(state))
     state.port = server.server_address[1]
 
     if restore_state and persist_hook is not None:
-        loader = state_loader or session_state.load
-        persisted = None
+        persisted, conversation_id = None, None
         try:
-            persisted = loader()
+            if state_loader is not None:
+                persisted = state_loader()
+            else:
+                store.migrate_legacy()
+                conversation_id = store.active_id()
+                persisted = store.load(conversation_id) if conversation_id else None
         except Exception as exc:  # noqa: BLE001 - a broken loader must not crash startup
             print("[hearth-main] failed to read persisted session state: {}: {}; "
                   "starting with no session".format(type(exc).__name__, exc), file=sys.stderr)
         if persisted:
             try:
-                restored = session_state.restore_session(
-                    persisted, restore_engine_factory(persisted, engine_factory, state))
+                restored = state.conversation_loader(persisted)
             except Exception as exc:  # noqa: BLE001 - a broken restore must not crash startup
                 restored = None
                 print("[hearth-main] failed to restore persisted session state: {}: {}; "
                       "starting with no session".format(type(exc).__name__, exc), file=sys.stderr)
             if restored is not None:
-                state.set_restored_session(restored)
+                state.set_restored_session(restored, conversation_id)
                 # Put any inherited unfinished run on the gauge NOW, so the
                 # first GET /loop a restarted app makes already carries it.
                 # Without this the run is only discovered when the user
@@ -510,6 +542,133 @@ def _self_test_restore_engine_factory():
     assert sum(1 for r in roles if r["writes"]) == 1, roles
 
 
+def _self_test_conversations():
+    """The wiring only this module can do: an older build's single session
+    file is migrated and reopened at startup, and reopening a saved chat over
+    HTTP goes through THIS module's loader (so a loop comes back as a loop,
+    and a planted bypass-mode file is refused) rather than app.py's chat-only
+    default. Its own data directory, so the migration sees an empty store."""
+    import http.client
+    import shutil
+    import tempfile
+
+    class _ChatEngine:
+        def __init__(self):
+            self._messages = None
+
+        def get_state(self):
+            return None if self._messages is None else {"messages": self._messages,
+                                                        "turn_starts": [0]}
+
+        def load_state(self, state):
+            self._messages = state.get("messages")
+
+        def expected_system_prompt(self, mode):  # noqa: ARG002
+            return "sys"
+
+        def run(self, ctx):
+            self._messages = (self._messages or [{"role": "system", "content": "sys"}]) + [
+                {"role": "user", "content": ctx.message}]
+            ctx.emit("done", {})
+
+    prev = os.environ.get("HEARTH_DATA_DIR")
+    scratch = tempfile.mkdtemp(prefix="hearth-main-conversations-")
+    os.environ["HEARTH_DATA_DIR"] = scratch
+    try:
+        store = conversations.ConversationStore()
+        legacy = session_state.state_path()
+        os.makedirs(os.path.dirname(legacy), exist_ok=True)
+        legacy_doc = {
+            "version": session_state.STATE_VERSION, "saved_at": time.time(),
+            "workspace": "/tmp/ws-before-upgrade", "model": "m", "mode": "edit",
+            "status_at_save": "idle", "turn_id_at_save": None, "pending_approval_tool": None,
+            "engine_kind": "chat", "engine_config": None,
+            "engine_state": {"messages": [{"role": "system", "content": "sys"},
+                                          {"role": "user", "content": "what was I doing"}],
+                             "turn_starts": [0]},
+            "recent_events": [],
+        }
+        with open(legacy, "w", encoding="utf-8") as fh:
+            json.dump(legacy_doc, fh)
+
+        server, state = make_server(engine_factory=lambda: _ChatEngine(), token="conv-token")
+        t = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05},
+                             daemon=True)
+        t.start()
+
+        def _http(method, path, body=None):
+            conn = http.client.HTTPConnection("127.0.0.1", state.port, timeout=5)
+            try:
+                conn.request(method, path, body=None if body is None else json.dumps(body),
+                             headers={"Host": "127.0.0.1:{}".format(state.port),
+                                      "Authorization": "Bearer conv-token",
+                                      "Content-Type": "application/json"})
+                resp = conn.getresponse()
+                return resp.status, json.loads(resp.read() or b"null")
+            finally:
+                conn.close()
+
+        try:
+            # Migrated, renamed aside (not deleted), and reopened -- with the
+            # conversation itself intact.
+            assert not os.path.exists(legacy) and os.path.exists(
+                legacy + conversations.MIGRATED_SUFFIX)
+            migrated_id = store.active_id()
+            assert conversations.valid_id(migrated_id)
+            live = state.get_session()
+            assert live is not None and live.workspace == "/tmp/ws-before-upgrade"
+            assert live.conversation_id == migrated_id
+            assert live.engine.get_state()["messages"][1]["content"] == "what was I doing"
+            status, listing = _http("GET", "/conversations")
+            assert status == 200 and listing["active_id"] == migrated_id, listing
+            assert listing["items"][0]["title"] == "what was I doing", listing
+
+            # A saved work loop reopens AS a loop: main's loader was used.
+            loop_id = conversations.new_id()
+            assert store.save(loop_id, dict(legacy_doc, workspace="/tmp/ws-loop",
+                                            mode="auto", engine_kind="loop",
+                                            engine_config={"ceilings": {"max_turns": 7}},
+                                            engine_state=None))
+            status, opened = _http("POST", "/conversations/open", {"id": loop_id})
+            assert status == 200, (status, opened)
+            assert opened["session"]["engine"] == "loop", opened
+            assert opened["session"]["loop"]["ceilings"]["max_turns"] == 7, opened
+            assert opened["active_id"] == loop_id and store.active_id() == loop_id
+            # The migrated chat is still there: switching never deletes.
+            status, listing = _http("GET", "/conversations")
+            assert {i["id"] for i in listing["items"]} >= {migrated_id, loop_id}, listing
+
+            # A file planted with mode "bypass" is refused, and the live
+            # session is left exactly as it was.
+            planted = conversations.new_id()
+            assert store.save(planted, dict(legacy_doc, mode="bypass", workspace="C:\\"))
+            status, refused = _http("POST", "/conversations/open", {"id": planted})
+            assert status == 422, (status, refused)
+            assert state.get_session().conversation_id == loop_id
+            assert state.get_session().mode == "auto"
+
+            # And back to the chat, through the same path.
+            status, opened = _http("POST", "/conversations/open", {"id": migrated_id})
+            assert status == 200 and opened["session"]["engine"] == "chat", opened
+        finally:
+            server.shutdown()
+            server.server_close()
+            t.join(timeout=5)
+
+        # A restart reopens whichever conversation was open last.
+        server2, state2 = make_server(engine_factory=lambda: _ChatEngine(), token="conv-token-2")
+        try:
+            assert state2.get_session().conversation_id == migrated_id
+        finally:
+            server2.server_close()
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+        if prev is None:
+            os.environ.pop("HEARTH_DATA_DIR", None)
+        else:
+            os.environ["HEARTH_DATA_DIR"] = prev
+
+
 def _self_test_body():
     import io
     import http.client
@@ -518,6 +677,7 @@ def _self_test_body():
     import urllib.request
 
     _self_test_restore_engine_factory()
+    _self_test_conversations()
 
     # Binds 127.0.0.1 on an ephemeral (non-zero, non-fixed) port.
     server, state = make_server()
