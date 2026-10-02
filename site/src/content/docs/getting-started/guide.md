@@ -248,6 +248,53 @@ them:
 There is still no button for any of this. It is driven directly today, the
 same as the rest of the engine described on this page.
 
+## Freeing the memory a model holds
+
+A loaded model is the biggest thing Hearth keeps on your machine: a 7B
+model at a useful context holds several GB of graphics memory (or of RAM,
+on a machine without a usable GPU) for as long as it stays loaded. The
+first prompt loads it, and it used to stay loaded until you quit Hearth.
+
+The model chip in the title bar, next to the connection dot, says what is
+loaded right now: a green dot and "Loaded" with a rough memory figure, or
+"Not loaded". Click it for the details and two controls:
+
+- **Unload now** frees that memory immediately. Nothing else changes: your
+  session, transcript and settings stay as they are, and the next prompt
+  loads the model again. That reload takes a few seconds (longer for a big
+  model on a slow disk), and the message box says "Loading model..." while
+  it happens, so a reload does not look like a hang.
+- **Unload when idle for** frees it automatically after a stretch without
+  use: 5, 15, 30 or 60 minutes, or never. The default is 15 minutes. The
+  setting is saved in `model_residency.json` in Hearth's data folder and
+  survives a restart.
+
+Neither ever happens in the middle of work. While a turn, the work loop or
+an agent swarm is running, while a cancelled tool call is still finishing,
+or while the model is loading or answering, the Unload button is disabled
+(hover it to see why) and the idle timer waits. The idle clock starts again
+from the end of that work, so a model is not dropped a moment after a long
+tool call finishes.
+
+The memory figure is approximate and says which kind it is. On an NVIDIA
+card where `nvidia-smi` can see the engine it is graphics memory.
+Otherwise it is the RAM the engine process holds, which for a
+memory-mapped model moves with what Windows has paged in. The Vulkan build
+is often in this second group, because `nvidia-smi` does not always
+attribute its graphics memory to the process. Hearth asks `nvidia-smi` at
+most about once a minute, and stops asking for an engine it has already
+seen running without graphics memory, because on a laptop with two GPUs
+each query can wake the discrete one and cost battery.
+
+If you run models through Ollama instead of Hearth's own engine, the chip
+shows the Ollama model Hearth last used, and Unload asks Ollama to drop
+that one model (never any other model Ollama is holding). The idle timer
+does not apply there: Ollama unloads models on its own keep-alive schedule
+(five minutes by default), and the chip says so. If you have used both
+in one session, Unload frees only the one the chip is showing, and the
+idle timer only ever frees Hearth's own engine, so a long
+`OLLAMA_KEEP_ALIVE` you set yourself is left alone.
+
 ## What the permission modes mean
 
 Hearth Code never runs unattended by default. Four modes, in

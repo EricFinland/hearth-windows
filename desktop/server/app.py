@@ -133,6 +133,21 @@ Endpoints:
   GET  /engine/events  the same snapshot over SSE (event: "engine"), one
                   frame per change, ?since=<version>. Same bounded slot
                   pool as GET /events.
+  GET  /model     what model is resident and what it costs: backend, model
+                  name, status (loaded / loading / not_loaded / unknown), an
+                  approximate memory figure (VRAM when nvidia-smi answers,
+                  the process's resident RAM otherwise), whether anything is
+                  using it and why, the idle auto-unload delay, and when that
+                  timer would free it. Polled, never streamed: see
+                  model_residency.py. Never builds a backend or loads a model.
+  POST /model/unload  {} frees the model's memory now. 409 {"error": why}
+                  while a turn, the work loop or a swarm is running, or the
+                  model is loading or answering; 200 with the fresh GET
+                  /model body plus "unloaded" (and "reason" when nothing
+                  was loaded) otherwise. The next prompt reloads it.
+  POST /model/autounload  {"minutes": 5|15|30|60|null} sets the idle delay
+                  (null = never), persisted in <data>/model_residency.json.
+                  Anything else is a 400 naming the options, never clamped.
   GET  /loop      the work loop's RUN STATE: which turn it is on, what it has
                   spent against each ceiling, what it is allowed to do, how
                   much of the write budget is gone, whether a stop has been
@@ -257,6 +272,7 @@ import auth
 import downloads as downloads_mod
 import engine as engine_mod
 import loop_engine as loop_mod
+import model_residency as residency_mod
 import session as session_mod
 import swarm_engine as swarm_mod
 
@@ -391,6 +407,12 @@ class SidecarState:
         # trust file or the user's data directory.
         self._updater = updater
         self._update_lock = threading.Lock()
+        # The model residency manager (GET/POST /model*). Process-wide, like
+        # the three above: the resident model belongs to the process, not to
+        # a session. Lazy, and its idle watcher thread starts only on first
+        # use; a test injects a fake by assigning _residency before that.
+        self._residency = None
+        self._residency_lock = threading.Lock()
         # The work loop's gauge (GET /loop). Process-wide, like the download
         # queue and the engine acquirer, and for the same reason plus one
         # more: GET /loop/events must not have to chase a session being
@@ -464,6 +486,43 @@ class SidecarState:
             if self._updater is None:
                 self._updater = update_mod.Updater()
             return self._updater
+
+    def get_residency(self):
+        """The process-wide ResidencyManager, built (and its idle watcher
+        started) on first use. GET /model is that first use: the page asks
+        at boot."""
+        with self._residency_lock:
+            if self._residency is None:
+                self._residency = residency_mod.ResidencyManager(
+                    state_busy_fn=self.model_busy_reason)
+            manager = self._residency
+        manager.ensure_started()
+        return manager
+
+    def model_busy_reason(self):
+        """Why the model must stay loaded right now, as a sentence for the
+        Unload button's tooltip, or None. Reads the live session only; the
+        backend's own in-flight count covers model calls from anywhere else.
+
+        is_workspace_busy rather than status, for the reason its docstring
+        gives: a cancelled turn's abandoned call can still be running after
+        status has gone back to idle, and that call may be a model call."""
+        session = self.get_session()
+        if session is None:
+            return None
+        try:
+            if not session.is_workspace_busy():
+                return None
+        except Exception:  # noqa: BLE001 - unknown is busy, never permission
+            return "a turn may still be running"
+        if getattr(session, "status", None) != session_mod.STATUS_RUNNING:
+            return "a cancelled tool call is still finishing"
+        kind = _engine_kind(getattr(session, "engine", None))
+        if kind == "loop":
+            return "the work loop is running"
+        if kind == "swarm":
+            return "an agent swarm is running"
+        return "a turn is running"
 
     def get_loop_status(self):
         """The process-wide work-loop gauge."""
@@ -814,6 +873,8 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._send_json(200, self.state.get_engine().snapshot())
         elif path == "/engine/events":
             self._get_engine_events()
+        elif path == "/model":
+            self._get_model()
         elif path == "/loop":
             self._send_json(200, self.state.loop_snapshot())
         elif path == "/loop/events":
@@ -854,6 +915,8 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._post_download_action(path.rsplit("/", 1)[1])
         elif path == "/engine":
             self._post_engine()
+        elif path in ("/model/unload", "/model/autounload"):
+            self._post_model(path.rsplit("/", 1)[1])
         elif path == "/update":
             self._post_update()
         else:
@@ -1497,6 +1560,37 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 return
         finally:
             self.state.release_sse_slot()
+
+    def _get_model(self):
+        """GET /model. A snapshot, cheap enough to poll: the backend part
+        reads attribute snapshots under a short lock, and the memory figure
+        (nvidia-smi, or Ollama's /api/ps) is cached for a few seconds."""
+        self._send_json(200, self.state.get_residency().snapshot())
+
+    def _post_model(self, action):
+        """POST /model/unload and POST /model/autounload."""
+        body = self._read_json()
+        if body is None:
+            self._send_json(400, {"error": "invalid_json"})
+            return
+        manager = self.state.get_residency()
+        if action == "unload":
+            code, out = manager.unload()
+            self._send_json(code, out)
+            return
+        if "minutes" not in body:
+            self._send_json(400, {"error": "minutes is required: one of 5, 15, 30, 60 "
+                                           "or null (never)"})
+            return
+        try:
+            manager.set_minutes(body["minutes"])
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except OSError as exc:
+            self._send_json(500, {"error": "could not save the setting: {}".format(exc)})
+            return
+        self._send_json(200, manager.snapshot())
 
     def _get_checkpoints(self):
         s = self.state.get_session()
@@ -2936,6 +3030,209 @@ def _self_test():
         finally:
             server_eng.shutdown()
             server_eng.server_close()
+
+        # === GET /model, POST /model/unload, POST /model/autounload ======
+        # The model chip's surface, driven over real HTTP against a REAL
+        # ResidencyManager (real prefs file, real busy rule, real timer
+        # arithmetic) wired to a scripted backend and an injected clock, so
+        # nothing here loads a model or depends on what is installed.
+        mdl_tmp = tempfile.mkdtemp(prefix="hearth-app-model-")
+        mdl_prev_data = os.environ.get("HEARTH_DATA_DIR")
+        os.environ["HEARTH_DATA_DIR"] = mdl_tmp
+
+        class _MdlBackend:
+            def __init__(self):
+                self.state = {"backend": "llama", "managed_by": "hearth",
+                              "loaded": True, "loading": False,
+                              "ref": "gguf:C:/m/qwen.gguf", "model": "qwen.gguf",
+                              "inflight": 0, "inflight_total": 0,
+                              "last_used_at": 5000.0,
+                              "memory": {"vram_bytes": 4 * 1024 ** 3,
+                                         "rss_bytes": 512 * 1024 ** 2,
+                                         "approximate": True},
+                              "note": None}
+                self.unloads = 0
+
+            def residency_snapshot(self, probe=True):
+                return dict(self.state)
+
+            def unload_all(self, only_if_idle=True, backends=None):
+                # The sidecar always names its target (the chip's backend,
+                # or only the bundled engine for the timer); never all.
+                assert backends is not None, "unload_all must name its backends"
+                if self.state["backend"] not in backends:
+                    return {"unloaded": False, "busy": False,
+                            "reason": "nothing is loaded"}
+                if self.state["inflight_total"] or self.state["loading"]:
+                    return {"unloaded": False, "busy": True,
+                            "reason": "the model is answering a request"}
+                if not self.state["loaded"]:
+                    return {"unloaded": False, "busy": False,
+                            "reason": "nothing is loaded"}
+                self.unloads += 1
+                self.state["loaded"] = False
+                return {"unloaded": True, "busy": False, "reason": None}
+
+        class _MdlSession:
+            """Just enough of a Session for model_busy_reason."""
+
+            def __init__(self, busy, status, kind=None):
+                self._busy, self.status = busy, status
+                self.engine = type("E", (), {"ENGINE_KIND": kind})() if kind else object()
+
+            def is_workspace_busy(self):
+                return self._busy
+
+            def cancel(self):
+                pass
+
+        mdl_clock = {"now": 5000.0}
+        mdl_backend = _MdlBackend()
+        state_mdl = SidecarState("model-token")
+        state_mdl._residency = residency_mod.ResidencyManager(
+            state_busy_fn=state_mdl.model_busy_reason, backend=mdl_backend,
+            now_fn=lambda: mdl_clock["now"], poll_seconds=None)
+        server_mdl = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state_mdl))
+        state_mdl.port = server_mdl.server_address[1]
+        threading.Thread(target=server_mdl.serve_forever, kwargs={"poll_interval": 0.05},
+                         daemon=True).start()
+        port_m = state_mdl.port
+        headers_m = {"Host": "127.0.0.1:{}".format(port_m),
+                     "Authorization": "Bearer model-token",
+                     "Content-Type": "application/json"}
+        try:
+            # Every route is behind the same gate as everything else.
+            for method, route, body in (("GET", "/model", None),
+                                        ("POST", "/model/unload", "{}"),
+                                        ("POST", "/model/autounload", '{"minutes": 5}')):
+                status, _ = _raw_request(port_m, method, route, body=body, headers={
+                    "Host": "127.0.0.1:{}".format(port_m), "Authorization": "Bearer nope"})
+                assert status == 401, (route, status)
+                status, _ = _raw_request(port_m, method, route, body=body,
+                                         headers=dict(headers_m, Host="evil.example:1"))
+                assert status == 403, (route, status)
+            assert mdl_backend.unloads == 0 and not os.listdir(mdl_tmp), (
+                "a rejected request must not act")
+
+            # The status shape, with the default 15-minute delay.
+            status, data = _raw_request(port_m, "GET", "/model", headers=headers_m)
+            assert status == 200, (status, data)
+            snap = json.loads(data)
+            for key in ("backend", "model", "ref", "status", "loaded", "loading",
+                        "memory", "inflight", "busy", "busy_reason",
+                        "auto_unload_minutes", "auto_unload_options", "last_used_at",
+                        "unload_at", "managed_by"):
+                assert key in snap, (key, snap)
+            assert snap["status"] == "loaded" and snap["model"] == "qwen.gguf", snap
+            assert snap["memory"] == {"vram_bytes": 4 * 1024 ** 3,
+                                      "rss_bytes": 512 * 1024 ** 2,
+                                      "approximate": True}, snap
+            assert snap["auto_unload_minutes"] == 15, snap
+            assert snap["auto_unload_options"] == [5, 15, 30, 60, None], snap
+            assert snap["unload_at"] == 5000.0 + 15 * 60, snap
+            assert snap["busy"] is False and snap["managed_by"] == "hearth", snap
+
+            # Busy: each kind of work names itself, and unload is a 409 that
+            # carries that reason. Nothing is stopped.
+            for session, reason in (
+                    (_MdlSession(True, session_mod.STATUS_RUNNING), "a turn is running"),
+                    (_MdlSession(True, session_mod.STATUS_RUNNING, "loop"),
+                     "the work loop is running"),
+                    (_MdlSession(True, session_mod.STATUS_RUNNING, "swarm"),
+                     "an agent swarm is running"),
+                    (_MdlSession(True, session_mod.STATUS_IDLE),
+                     "a cancelled tool call is still finishing")):
+                state_mdl.session = session
+                status, data = _raw_request(port_m, "POST", "/model/unload",
+                                            headers=headers_m, body="{}")
+                assert status == 409 and json.loads(data) == {"error": reason}, (status, data)
+                status, data = _raw_request(port_m, "GET", "/model", headers=headers_m)
+                got = json.loads(data)
+                assert got["busy"] is True and got["busy_reason"] == reason, got
+                assert got["unload_at"] is None, got
+            assert mdl_backend.unloads == 0, "an unload ran while busy"
+            # An idle session is not a reason.
+            state_mdl.session = _MdlSession(False, session_mod.STATUS_IDLE)
+            assert state_mdl.model_busy_reason() is None
+            # A model call in flight on the backend is, with no session busy.
+            mdl_backend.state["inflight_total"] = 1
+            status, data = _raw_request(port_m, "POST", "/model/unload",
+                                        headers=headers_m, body="{}")
+            assert status == 409 and "answering" in json.loads(data)["error"], data
+            mdl_backend.state["inflight_total"] = 0
+            mdl_backend.state["loading"] = True
+            status, data = _raw_request(port_m, "POST", "/model/unload",
+                                        headers=headers_m, body="{}")
+            assert status == 409 and "loading" in json.loads(data)["error"], data
+            mdl_backend.state["loading"] = False
+
+            # Unload when idle: 200, the fresh snapshot, and it happened.
+            status, data = _raw_request(port_m, "POST", "/model/unload",
+                                        headers=headers_m, body="{}")
+            got = json.loads(data)
+            assert status == 200 and got["unloaded"] is True, (status, got)
+            assert got["status"] == "not_loaded" and mdl_backend.unloads == 1, got
+            status, data = _raw_request(port_m, "POST", "/model/unload",
+                                        headers=headers_m, body="{}")
+            got = json.loads(data)
+            assert status == 200 and got["unloaded"] is False, got
+            assert got["reason"] == "nothing is loaded", got
+            status, _ = _raw_request(port_m, "POST", "/model/unload",
+                                     headers=headers_m, body="{not json")
+            assert status == 400, status
+
+            # Autounload: validated and named, never clamped; persisted.
+            for bad in ('{"minutes": 0}', '{"minutes": 45}', '{"minutes": "15"}',
+                        '{"minutes": true}', '{"minutes": 15.5}', "{}", '{"min": 5}',
+                        "{not json", "[5]"):
+                status, data = _raw_request(port_m, "POST", "/model/autounload",
+                                            headers=headers_m, body=bad)
+                assert status == 400, (bad, status, data)
+                if bad not in ("{not json", "[5]"):
+                    assert "5, 15, 30, 60" in json.loads(data)["error"], (bad, data)
+            for good in (5, 30, 60, None):
+                status, data = _raw_request(port_m, "POST", "/model/autounload",
+                                            headers=headers_m,
+                                            body=json.dumps({"minutes": good}))
+                assert status == 200, (good, status, data)
+                assert json.loads(data)["auto_unload_minutes"] == good, data
+            with open(os.path.join(mdl_tmp, residency_mod.PREFS_FILENAME),
+                      encoding="utf-8") as fh:
+                assert json.load(fh) == {"schema": 1, "auto_unload_minutes": None}
+            # A fresh manager (a restarted sidecar) reads it back.
+            assert residency_mod.ResidencyManager(
+                backend=mdl_backend, poll_seconds=None).get_minutes() is None
+
+            # The timer, with the injected clock: deferred while busy, then
+            # fires once the delay has passed with nothing running.
+            mdl_backend.state.update(loaded=True, last_used_at=5000.0)
+            status, _ = _raw_request(port_m, "POST", "/model/autounload",
+                                     headers=headers_m, body='{"minutes": 5}')
+            assert status == 200
+            manager = state_mdl.get_residency()
+            mdl_clock["now"] = 5000.0 + 4 * 60
+            assert manager.tick() == "waiting" and mdl_backend.unloads == 1
+            state_mdl.session = _MdlSession(True, session_mod.STATUS_RUNNING)
+            mdl_clock["now"] = 5000.0 + 6 * 60
+            assert manager.tick() == "busy" and mdl_backend.unloads == 1
+            state_mdl.session = _MdlSession(False, session_mod.STATUS_IDLE)
+            mdl_clock["now"] += 4 * 60
+            assert manager.tick() == "waiting", "the delay restarts after busy"
+            mdl_clock["now"] += 60 + 1
+            assert manager.tick() == "unloaded" and mdl_backend.unloads == 2
+            status, data = _raw_request(port_m, "GET", "/model", headers=headers_m)
+            assert json.loads(data)["status"] == "not_loaded", data
+            # The injected manager has no thread, and get_residency did not
+            # replace it with one that does.
+            assert manager._thread is None and state_mdl._residency is manager
+        finally:
+            server_mdl.shutdown()
+            server_mdl.server_close()
+            if mdl_prev_data is None:
+                os.environ.pop("HEARTH_DATA_DIR", None)
+            else:
+                os.environ["HEARTH_DATA_DIR"] = mdl_prev_data
+            shutil.rmtree(mdl_tmp, ignore_errors=True)
 
         # === GET/POST /update and GET /update/events ===================
         # The updater has its own surface for the same reasons the engine
