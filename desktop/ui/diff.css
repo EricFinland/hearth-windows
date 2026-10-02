@@ -156,3 +156,6 @@
 
 /* The approval card's "exact arguments" fold, right under the diff. */
 .dv-root + details.fold { margin-top: 10px; }
+
+/* In the restore dialog the diff sits between paragraphs; give it room. */
+.modal-body .dv-root { margin-bottom: 14px; }
