@@ -219,7 +219,11 @@ export class HistoryPanel {
       class: "input hist-query", type: "search", placeholder: "Search chats",
       "aria-label": "Search chats", spellcheck: "false", autocomplete: "off",
     });
-    this.list = el("div", { class: "hist-list" });
+    // Until the first GET /conversations answers, say so: an empty sidebar
+    // reads as "no saved chats", which may not be true.
+    this.list = el("div", { class: "hist-list", "aria-busy": "true" }, [
+      el("p", { class: "hist-empty", text: "Loading chats..." }),
+    ]);
     this.noteEl = el("p", { class: "hist-note", role: "status", "aria-live": "polite", hidden: true });
 
     appendAll(this.root, [
@@ -323,7 +327,12 @@ export class HistoryPanel {
       this.activeId = typeof body.active_id === "string" ? body.active_id : null;
       this.render();
     } catch (err) {
-      if (!this.items.length) this.note("Could not read saved chats: " + errorText(err), "error");
+      if (!this.items.length) {
+        if (this.list.getAttribute("aria-busy") === "true") clear(this.list);
+        this.note("Could not read saved chats: " + errorText(err), "error");
+      }
+    } finally {
+      this.list.removeAttribute("aria-busy");
     }
   }
 
