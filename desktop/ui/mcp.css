@@ -1,0 +1,341 @@
+/* The Tools screen (js/mcp.js): MCP servers managed from the app.
+ *
+ * Its own file and its own `mcp-` prefix, so nothing here depends on where it
+ * sits in the cascade relative to styles.css. Colours come only from the
+ * tokens styles.css defines on :root; tints are mixed from those tokens rather
+ * than written out, so a future light palette that redefines the tokens
+ * repaints this screen with no change here.
+ *
+ * The visual rule: risk wears the colour of what Hearth will DO with it. A
+ * "dangerous" tool is one Hearth asks about first, so it wears the approval
+ * card's --gate colour rather than an alarm red; red is kept for things that
+ * are actually wrong (a server that will not start, an entry Hearth ignores).
+ */
+
+main.tools { overflow-y: auto; min-width: 0; }
+
+.mcp-inner { max-width: 880px; margin: 0 auto; padding: 26px 28px 60px; }
+
+.mcp-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 18px;
+  margin-bottom: 12px;
+}
+.mcp-title { margin: 0 0 6px; font-size: 19px; font-weight: 620; }
+.mcp-lede { margin: 0; font-size: 13px; color: var(--fg-dim); max-width: 68ch; line-height: 1.6; }
+.mcp-head-actions { display: flex; gap: 6px; flex: none; }
+
+.mcp-path { margin: 0 0 12px; font-size: 12px; color: var(--fg-faint); overflow-wrap: anywhere; }
+.mcp-path code { font-family: var(--font-mono); font-size: 11.5px; color: var(--fg-dim); }
+
+.mcp-banner {
+  display: flex; align-items: flex-start; gap: 10px;
+  margin: 0 0 12px; padding: 11px 13px;
+  border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--warn) 7%, transparent);
+  font-size: 12.5px; color: var(--fg-dim);
+}
+.mcp-banner .i { margin-top: 2px; color: var(--warn); }
+.mcp-banner p { margin: 0 0 4px; overflow-wrap: anywhere; }
+.mcp-banner p:last-child { margin-bottom: 0; }
+.mcp-banner.is-error { border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+  background: color-mix(in srgb, var(--danger) 7%, transparent); }
+.mcp-banner.is-error .i { color: var(--danger); }
+
+.mcp-busy-note { margin: 0 0 12px; font-size: 12.5px; color: var(--warn); }
+
+.mcp-flash { margin: 0 0 12px; font-size: 12.5px; color: var(--fg-dim); overflow-wrap: anywhere; }
+.mcp-flash:empty { display: none; }
+.mcp-flash.is-ok { color: var(--ok); }
+.mcp-flash.is-error { color: var(--danger); }
+
+.mcp-list { display: grid; gap: 12px; }
+
+/* ---------- empty state ---------- */
+
+.mcp-empty {
+  padding: 30px 24px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+  text-align: center;
+  color: var(--fg-dim);
+}
+.mcp-empty h2 { margin: 0 0 8px; font-size: 15px; font-weight: 600; color: var(--fg); }
+.mcp-empty p { margin: 0 auto 16px; max-width: 60ch; font-size: 13px; line-height: 1.6; }
+.mcp-empty-note { margin: 0; font-size: 12.5px; color: var(--fg-faint); }
+
+/* ---------- a server ---------- */
+
+.mcp-card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+  overflow: hidden;
+}
+.mcp-card.is-invalid { border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
+
+.mcp-card-head {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 14px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--line-soft);
+}
+.mcp-card-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 12px; min-width: 0; flex: 1 1 auto; }
+.mcp-name {
+  margin: 0;
+  font-family: var(--font-mono); font-size: 13.5px; font-weight: 600;
+  color: var(--fg); overflow-wrap: anywhere;
+}
+.mcp-card.is-disabled .mcp-name { color: var(--fg-dim); }
+
+.mcp-status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--fg-dim); }
+.mcp-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--fg-faint); }
+.mcp-status.is-running .mcp-dot {
+  background: var(--ok);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--ok) 60%, transparent);
+}
+.mcp-status.is-running { color: var(--ok); }
+.mcp-status.is-busy .mcp-dot { background: var(--accent); animation: mcp-pulse 1.4s ease-in-out infinite; }
+/* Ready but not started: Hearth starts servers on the first turn that needs
+ * tools, so this is the normal resting state of an enabled server, drawn as
+ * an outline of the running colour rather than as a fault. */
+.mcp-status.is-idle .mcp-dot { background: transparent; box-shadow: inset 0 0 0 1.5px var(--ok); }
+.mcp-status.is-off .mcp-dot { background: var(--line); }
+.mcp-status.is-off { color: var(--fg-faint); }
+.mcp-status.is-error .mcp-dot { background: var(--danger); }
+.mcp-status.is-error { color: var(--danger); }
+
+@keyframes mcp-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+
+/* The enable switch. A real checkbox with role="switch" underneath, kept in
+ * the accessibility tree and focusable, so keyboard and screen readers get
+ * the native control and only its picture is custom. */
+.mcp-switch {
+  position: relative;
+  display: inline-flex; align-items: center; gap: 8px; flex: none;
+  font-size: 12px; color: var(--fg-dim);
+  cursor: pointer; user-select: none;
+}
+.mcp-switch-input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; }
+.mcp-switch-track {
+  position: relative;
+  width: 32px; height: 18px; flex: none;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--bg-raise);
+  transition: background .15s ease, border-color .15s ease;
+}
+.mcp-switch-track::after {
+  content: "";
+  position: absolute; top: 2px; left: 2px;
+  width: 12px; height: 12px; border-radius: 50%;
+  background: var(--fg-faint);
+  transition: transform .15s ease, background .15s ease;
+}
+.mcp-switch-input:checked + .mcp-switch-track {
+  border-color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 22%, transparent);
+}
+.mcp-switch-input:checked + .mcp-switch-track::after { transform: translateX(14px); background: var(--ok); }
+.mcp-switch-input:focus-visible + .mcp-switch-track {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
+  border-color: var(--accent);
+}
+.mcp-switch-input:disabled + .mcp-switch-track { opacity: .45; }
+.mcp-switch:has(.mcp-switch-input:disabled) { cursor: not-allowed; }
+.mcp-switch-label { min-width: 2em; }
+
+.mcp-card-body { display: grid; gap: 9px; padding: 12px 14px; min-width: 0; }
+
+.mcp-cmdline { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
+.mcp-pill {
+  max-width: 100%;
+  padding: 2px 7px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--bg-raise);
+  font-family: var(--font-mono); font-size: 11.5px; line-height: 1.5;
+  color: var(--fg);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.mcp-pill-cmd { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, transparent); }
+.mcp-pill.is-masked, .mcp-env-v.is-masked, .mcp-locked {
+  display: inline-flex; align-items: center; gap: 5px;
+  color: var(--fg-faint);
+}
+.mcp-pill .i, .mcp-env-v .i, .mcp-locked .i { width: 12px; height: 12px; }
+
+.mcp-env {
+  display: grid; grid-template-columns: minmax(80px, max-content) minmax(0, 1fr);
+  gap: 3px 12px; margin: 0;
+  font-family: var(--font-mono); font-size: 11.5px;
+}
+.mcp-env-k { color: var(--fg-dim); overflow-wrap: anywhere; }
+.mcp-env-v { margin: 0; color: var(--fg); overflow-wrap: anywhere; white-space: pre-wrap; }
+
+.mcp-meta { margin: 0; font-size: 11.5px; color: var(--fg-faint); overflow-wrap: anywhere; }
+
+.mcp-warning, .mcp-problem {
+  display: flex; align-items: flex-start; gap: 7px;
+  margin: 0; font-size: 12.5px; color: var(--warn); overflow-wrap: anywhere;
+}
+.mcp-warning .i, .mcp-problem .i { margin-top: 2px; width: 14px; height: 14px; }
+.mcp-problem { color: var(--danger); }
+
+.mcp-error {
+  margin: 0;
+  max-height: 160px; overflow: auto;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+  border-radius: var(--radius-sm);
+  background: var(--bg-raise);
+  font-family: var(--font-mono); font-size: 11.5px; line-height: 1.5;
+  color: var(--fg-dim);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+
+/* ---------- tools and their risk ---------- */
+
+.mcp-tool-list { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 6px; }
+.mcp-tool {
+  padding: 7px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  background: var(--bg-raise);
+  min-width: 0;
+}
+.mcp-tool-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.mcp-tool-name { font-family: var(--font-mono); font-size: 12px; color: var(--fg); overflow-wrap: anywhere; }
+.mcp-tool-note { font-size: 11px; color: var(--fg-faint); }
+.mcp-tool-desc { margin: 3px 0 0; font-size: 12px; color: var(--fg-dim); overflow-wrap: anywhere; }
+
+.mcp-risk {
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 10.5px; font-weight: 620; letter-spacing: .03em;
+  cursor: help;
+}
+.mcp-risk.is-safe {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 45%, transparent);
+  background: color-mix(in srgb, var(--ok) 10%, transparent);
+}
+.mcp-risk.is-edit {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 45%, transparent);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+.mcp-risk.is-danger {
+  color: var(--gate);
+  border-color: color-mix(in srgb, var(--gate) 45%, transparent);
+  background: color-mix(in srgb, var(--gate) 10%, transparent);
+}
+
+/* ---------- Test ---------- */
+
+.mcp-test {
+  padding: 9px 11px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  background: var(--bg-raise);
+  font-size: 12.5px; color: var(--fg-dim);
+  min-width: 0;
+}
+.mcp-test.is-running { display: flex; align-items: center; gap: 9px; }
+.mcp-test.is-ok { border-color: color-mix(in srgb, var(--ok) 38%, transparent); }
+.mcp-test.is-failed { border-color: color-mix(in srgb, var(--danger) 38%, transparent); }
+.mcp-test-head { display: flex; align-items: center; gap: 7px; margin: 0; font-weight: 560; overflow-wrap: anywhere; }
+.mcp-test.is-ok .mcp-test-head { color: var(--ok); }
+.mcp-test.is-failed .mcp-test-head { color: var(--danger); }
+.mcp-test-head .i { width: 14px; height: 14px; }
+.mcp-test-note { margin: 6px 0 0; font-size: 12px; overflow-wrap: anywhere; }
+.mcp-test-k { color: var(--fg-faint); }
+.mcp-test .mcp-error, .mcp-test .mcp-fold { margin-top: 7px; }
+
+.mcp-spin {
+  display: inline-block; flex: none;
+  width: 12px; height: 12px;
+  border: 2px solid color-mix(in srgb, currentColor 28%, transparent);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: mcp-spin .8s linear infinite;
+}
+@keyframes mcp-spin { to { transform: rotate(360deg); } }
+
+.mcp-card-actions {
+  display: flex; align-items: center; gap: 6px;
+  padding: 9px 14px;
+  border-top: 1px solid var(--line-soft);
+}
+.mcp-grow { flex: 1 1 auto; }
+.mcp-card-actions .mcp-remove:hover:not(:disabled) { color: var(--danger); }
+.mcp-card-note { margin: 0; padding: 0 14px 10px; font-size: 12px; color: var(--danger); overflow-wrap: anywhere; }
+.mcp-card-note:empty { display: none; }
+
+/* ---------- add / edit ---------- */
+
+.mcp-editor {
+  display: grid; gap: 14px;
+  margin: 0 0 14px;
+  padding: 16px 18px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+.mcp-editor-title { margin: 0; font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+.mcp-field { display: grid; gap: 5px; min-width: 0; }
+.mcp-field > .field-label { margin-bottom: 0; }
+.mcp-field > .btn { justify-self: start; }
+.mcp-hint { font-size: 11.5px; color: var(--fg-faint); line-height: 1.5; }
+.mcp-field.is-wrong > .field-label { color: var(--danger); }
+.mcp-field.is-wrong .input { border-color: var(--danger); }
+.mcp-editor .input[readonly] { color: var(--fg-dim); background: var(--bg-raise); }
+
+.mcp-rows { display: grid; gap: 6px; }
+.mcp-rows:empty { display: none; }
+.mcp-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.mcp-row .input { flex: 1 1 auto; min-width: 0; }
+.mcp-row-env .mcp-env-name { flex: 0 0 36%; }
+.mcp-row .mcp-row-remove { width: 28px; padding: 4px; }
+.mcp-locked {
+  flex: 1 1 auto; min-width: 0;
+  padding: 6px 9px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.mcp-form-error { margin: 0; font-size: 12.5px; color: var(--danger); overflow-wrap: anywhere; }
+.mcp-editor-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* ---------- the "this runs a program" dialog ---------- */
+
+.mcp-ack-cmd { font-family: var(--font-mono); font-weight: 560; overflow-wrap: anywhere; }
+.modal-body .mcp-cmdline { margin: 0 0 12px; }
+.modal-body .mcp-warning { margin: 0 0 10px; }
+.mcp-ack-note { font-size: 12.5px; }
+.mcp-ack-env-names { font-family: var(--font-mono); font-size: 12px; color: var(--fg); overflow-wrap: anywhere; }
+.mcp-ack-enable-row {
+  display: flex; align-items: flex-start; gap: 9px;
+  margin: 4px 0 8px; padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+  cursor: pointer;
+}
+.mcp-ack-enable { margin: 3px 0 0; flex: none; accent-color: var(--accent); }
+
+@media (max-width: 760px) {
+  .mcp-inner { padding: 18px 16px 48px; }
+  .mcp-head { flex-direction: column; }
+  .mcp-row-env { flex-wrap: wrap; }
+  .mcp-row-env .mcp-env-name { flex: 1 1 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mcp-spin { animation-duration: 2.4s; }
+  .mcp-status.is-busy .mcp-dot { animation: none; }
+  .mcp-switch-track, .mcp-switch-track::after { transition: none; }
+}
