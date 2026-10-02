@@ -172,6 +172,19 @@ Endpoints:
                   hearth_checkpoint.restore() reports, unmodified -- in
                   particular "skipped_gitlinks" is always passed through, so
                   a UI can never present a partial restore as a complete one.
+  GET  /checkpoints/diff  ?id=<7-64 hex chars>: what POST /restore would
+                  change, without changing it --
+                  hearth_checkpoint.preview_restore(), the same shape an
+                  approval card's `diff` uses (agent/hearth_diff.py), plus
+                  the excluded secrets files restore could not put back.
+                  400 for a malformed id (checked before git is run), 404
+                  with no session, 409 for an id the store does not know,
+                  503 while another checkpoint or restore holds the store.
+                  409 with "workspace_busy": true while work is live in the
+                  workspace, the same check POST /restore makes: the
+                  preview stages the whole workspace under the store lock,
+                  which would hold up that turn's own checkpoint, and a
+                  restore it previews would be refused anyway.
   GET  /setup     hearth_setup.diagnose(): can this machine even run a local
                   model right now, and if not, the one concrete next step.
                   Never requires a session to exist -- a UI needs this
@@ -798,6 +811,8 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._get_models()
         elif path == "/checkpoints":
             self._get_checkpoints()
+        elif path == "/checkpoints/diff":
+            self._get_checkpoint_diff()
         elif path == "/setup":
             self._get_setup()
         elif path == "/idle":
@@ -1537,6 +1552,46 @@ class SidecarHandler(BaseHTTPRequestHandler):
         # already reports "skipped_gitlinks" and, on failure, an "error" key.
         # This handler must never add a false note of completeness on top of
         # what hearth_checkpoint itself is willing to claim.
+        if "error" in result:
+            self._send_json(409, result)
+            return
+        self._send_json(200, result)
+
+    def _get_checkpoint_diff(self):
+        """GET /checkpoints/diff?id=<sha>: preview_restore() for the current
+        session's workspace. See the module docstring's entry.
+
+        The id is checked here, before anything reaches git, because it is
+        about to be interpolated into a revision expression: hex and a sane
+        length is all a checkpoint id can ever be, and refusing anything else
+        at the door means a value like "HEAD~1" or "--output=x" is never
+        given the chance to be interpreted as something cleverer."""
+        s = self.state.get_session()
+        if s is None:
+            self._send_json(404, {"error": "no_session"})
+            return
+        checkpoint_id = self._query().get("id", "")
+        if not (7 <= len(checkpoint_id) <= 64
+                and all(c in "0123456789abcdefABCDEF" for c in checkpoint_id)):
+            self._send_json(400, {"error": "id must be a checkpoint id: 7 to 64 hex characters"})
+            return
+        if s.is_workspace_busy():
+            # See the module docstring: refused for the same reason and on
+            # the same check as POST /restore, flagged so the page can say
+            # "wait for the turn" rather than "this checkpoint is unknown".
+            self._send_json(409, {
+                "error": "cannot preview a restore while the workspace has running or "
+                         "abandoned work in progress; wait for it to finish and try again",
+                "workspace_busy": True})
+            return
+        try:
+            result = engine_mod.hearth_checkpoint.preview_restore(s.workspace, checkpoint_id)
+        except Exception as exc:  # noqa: BLE001 - a preview bug must not break the route
+            self._send_json(500, {"error": "checkpoint_diff_failed: {}".format(exc)})
+            return
+        if result.get("busy"):
+            self._send_json(503, result)
+            return
         if "error" in result:
             self._send_json(409, result)
             return
@@ -2369,6 +2424,83 @@ def _self_test():
                     "POST /restore over HTTP did not actually restore the file"
         finally:
             _shutil.rmtree(ws_dir, ignore_errors=True)
+
+        # === GET /checkpoints/diff: a restore preview over HTTP, which ======
+        # === validates the id before git sees it and changes nothing ======
+        diff_tmp = _tempfile.mkdtemp(prefix="hearth-app-diff-selftest-")
+        diff_ws = os.path.join(diff_tmp, "ws")
+        os.makedirs(diff_ws)
+        prev_data_dir_diff = os.environ.get("HEARTH_DATA_DIR")
+        os.environ["HEARTH_DATA_DIR"] = os.path.join(diff_tmp, "data")
+        try:
+            status, data = _raw_request(port, "POST", "/session", headers=auth_headers,
+                                        body=json.dumps({"workspace": diff_ws, "model": "m"}))
+            assert status == 200, (status, data)
+            # Malformed ids are refused at the door, whatever they look like
+            # to git: too short, not hex, or a revision expression.
+            for bad_id in ("", "abc", "HEAD", "HEAD~1", "--output=x", "g" * 40, "a" * 65,
+                           "abcdef0%20HEAD"):
+                status, data = _raw_request(port, "GET", "/checkpoints/diff?id=" + bad_id,
+                                            headers=auth_headers)
+                assert status == 400, (bad_id, status, data)
+            # A well-formed id with no store behind it is a 409, not a 500.
+            status, data = _raw_request(port, "GET", "/checkpoints/diff?id=" + "d" * 40,
+                                        headers=auth_headers)
+            assert status == 409 and "error" in json.loads(data), (status, data)
+            # And it needs auth like every other route.
+            no_auth = {k: v for k, v in auth_headers.items() if k != "Authorization"}
+            status, _ = _raw_request(port, "GET", "/checkpoints/diff?id=" + "d" * 40,
+                                     headers=no_auth)
+            assert status == 401, status
+            # Live work in the workspace: refused like POST /restore, and
+            # flagged so the page can tell this apart from an unknown id.
+            busy_sess = state.get_session()
+            with busy_sess._lock:
+                busy_sess._live_workers += 1
+            try:
+                status, data = _raw_request(port, "GET", "/checkpoints/diff?id=" + "d" * 40,
+                                            headers=auth_headers)
+            finally:
+                with busy_sess._lock:
+                    busy_sess._live_workers -= 1
+            assert status == 409 and json.loads(data).get("workspace_busy") is True, (status, data)
+
+            if engine_mod.hearth_checkpoint.is_git_available():
+                note = os.path.join(diff_ws, "note.txt")
+                with open(note, "w", encoding="utf-8", newline="") as fh:
+                    fh.write("first\nsecond\n")
+                cp_d = engine_mod.hearth_checkpoint.checkpoint(diff_ws, label="diff selftest")
+                with open(note, "w", encoding="utf-8", newline="") as fh:
+                    fh.write("first\nSECOND\n")
+                status, data = _raw_request(port, "GET", "/checkpoints/diff?id=" + cp_d["id"][:12],
+                                            headers=auth_headers)
+                assert status == 200, (status, data)
+                body = json.loads(data)
+                assert body["checkpoint_id"] == cp_d["id"], body
+                lines = [ln for f in body["files"] for h in f["hunks"] for ln in h["lines"]]
+                assert ["-", "SECOND"] in lines and ["+", "second"] in lines, body
+                assert "excluded_changed" in body and "skipped_gitlinks" in body, body
+                with open(note, encoding="utf-8") as fh:
+                    assert fh.read() == "first\nSECOND\n", "a preview must not restore anything"
+
+                # The store held by another operation: 503, so the page can
+                # say "try again" rather than "broken".
+                store = engine_mod.hearth_checkpoint._store_root(os.path.realpath(diff_ws))
+                with engine_mod.hearth_checkpoint._StoreLock(store):
+                    real_timeout = engine_mod.hearth_checkpoint.PREVIEW_LOCK_TIMEOUT_S
+                    engine_mod.hearth_checkpoint.PREVIEW_LOCK_TIMEOUT_S = 0.2
+                    try:
+                        status, data = _raw_request(port, "GET", "/checkpoints/diff?id=" + cp_d["id"],
+                                                    headers=auth_headers)
+                    finally:
+                        engine_mod.hearth_checkpoint.PREVIEW_LOCK_TIMEOUT_S = real_timeout
+                assert status == 503 and json.loads(data).get("busy") is True, (status, data)
+        finally:
+            if prev_data_dir_diff is None:
+                os.environ.pop("HEARTH_DATA_DIR", None)
+            else:
+                os.environ["HEARTH_DATA_DIR"] = prev_data_dir_diff
+            _shutil.rmtree(diff_tmp, ignore_errors=True)
 
         # === Minor: SidecarState.create_session is atomic -- the read of ===
         # === the old session, the busy check, cancel(), and the new =======

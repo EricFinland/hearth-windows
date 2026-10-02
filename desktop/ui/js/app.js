@@ -9,6 +9,7 @@ import { Sidecar, HttpError, readHandshake, pickFolder, hasShellBridge, installU
 import { Transcript } from "./transcript.js";
 import { el, icon, appendAll, clear, setText, neutralize, $ } from "./dom.js";
 import { blob } from "./safe-text.js";
+import { renderDiff } from "./diff.js";
 import { ShopView } from "./shop.js";
 import { LoopConfigPanel, LoopRunBar, account as loopAccount } from "./loop.js";
 import { SwarmConfigPanel, SwarmRunBar, account as swarmAccount } from "./swarm.js";
@@ -735,19 +736,31 @@ async function refreshCheckpoints() {
 
 /** Show what a restore will do before doing it.
  *
- * The sidecar exposes no route that previews a checkpoint diff, so this does
- * not invent a per-file list it cannot know. It states the operation exactly
- * (hearth_checkpoint.restore resets the workspace's tracked content to this
- * snapshot), says how many later checkpoints it undoes, and warns about the
- * one gap that module documents: files matching its secret-exclusion patterns
- * were never captured, so they cannot be put back. The per-file list of what
- * actually changed comes back in the restore response and is rendered into the
- * transcript afterwards.
+ * The dialog states the operation (hearth_checkpoint.restore resets the
+ * workspace's tracked content to this snapshot), says how many later
+ * checkpoints it undoes, and shows the actual per-file diff from
+ * GET /checkpoints/diff, which runs the same comparison restore makes and
+ * stops before writing anything. The diff is drawn in restore's direction:
+ * "-" lines are what is on disk now and will go, "+" lines are what the
+ * checkpoint puts back. It also names any excluded secrets files (.env and
+ * similar) that changed since the checkpoint, the one gap restore documents:
+ * they were never captured, so they cannot be put back.
+ *
+ * The preview is fetched after the dialog opens and never gates it. Restore
+ * stays clickable while it loads and when it fails, because the preview is an
+ * aid to the decision, and the restore response still reports exactly what
+ * changed in the transcript afterwards. While a turn is live in the workspace
+ * the sidecar refuses the preview, as it refuses the restore itself, and the
+ * dialog says to wait rather than calling it a failure.
  */
 function confirmRestore(cp, index) {
   const when = formatTime(cp.timestamp ?? cp.commit_time);
+  const preview = el("div", {}, [
+    el("p", { class: "panel-note", text: "Working out what this restore would change..." }),
+  ]);
   const body = [
     el("p", { text: `Restore the workspace to "${cp.label || cp.id.slice(0, 12)}"${when ? ` from ${when}` : ""}.` }),
+    preview,
     el("p", { text: "Every tracked file in the workspace is reset to its contents at this checkpoint. Files created since then are removed. This is not itself undoable, though a fresh checkpoint is taken at the start of every turn." }),
     el("p", { text: index > 0
       ? `This undoes ${index} later checkpoint${index === 1 ? "" : "s"}.`
@@ -760,6 +773,53 @@ function confirmRestore(cp, index) {
     { label: "Cancel", variant: "btn-ghost" },
     { label: "Restore", variant: "btn-danger", run: () => doRestore(cp) },
   ]);
+  loadRestorePreview(cp, preview);
+}
+
+/** Fill `holder` with the restore preview, unless the dialog it lives in has
+ *  closed (or been replaced) by the time the answer arrives. */
+async function loadRestorePreview(cp, holder) {
+  let result;
+  try {
+    result = await sidecar.request("GET", "/checkpoints/diff?" + new URLSearchParams({ id: cp.id }));
+  } catch (err) {
+    if (!holder.isConnected) return;
+    clear(holder);
+    holder.appendChild(el("p", {
+      class: "panel-note is-error",
+      text: err instanceof HttpError && err.status === 503
+        ? "A checkpoint is being written right now, so the preview is not available. Reopen this in a moment to see it; Restore itself still works."
+        : err instanceof HttpError && err.body?.workspace_busy
+          ? "A turn is still working in this workspace, so there is nothing settled to preview yet. Restore waits for it too; reopen this once the turn has finished."
+          : "Could not preview this restore (" + errorText(err) + "). Restore itself still works, and its result lists every file it changed.",
+    }));
+    return;
+  }
+  if (!holder.isConnected) return;
+  clear(holder);
+  holder.appendChild(el("p", {
+    class: "panel-note",
+    text: "What restoring changes: lines marked - are on disk now and will go, lines marked + come back from the checkpoint.",
+  }));
+  holder.appendChild(renderDiff(result, {
+    emptyText: "No tracked file differs from this checkpoint, so restoring it would change nothing.",
+  }));
+  const excluded = Array.isArray(result?.excluded_changed) ? result.excluded_changed : [];
+  if (excluded.length) {
+    holder.appendChild(el("p", {
+      class: "panel-note is-warn",
+      text: "These files match the checkpoint's secret-exclusion patterns and changed since it was taken. They were never captured, so restore cannot put them back:",
+    }));
+    holder.appendChild(blob(excluded.map((e) => `${e.status}  ${e.path}`).join("\n")));
+  }
+  const skipped = Array.isArray(result?.skipped_gitlinks) ? result.skipped_gitlinks : [];
+  if (skipped.length) {
+    holder.appendChild(el("p", {
+      class: "panel-note",
+      text: "These are nested git repositories, which restore leaves alone:",
+    }));
+    holder.appendChild(blob(skipped.join("\n")));
+  }
 }
 
 async function doRestore(cp) {
