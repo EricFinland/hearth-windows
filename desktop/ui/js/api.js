@@ -30,6 +30,7 @@ const SIDECAR_ROUTES = new Set([
   "/healthz", "/session", "/prompt", "/events", "/approve",
   "/cancel", "/models", "/checkpoints", "/restore", "/setup", "/idle",
   "/shop", "/shop/quants",
+  "/checkpoints/diff",
   "/downloads", "/downloads/events", "/downloads/cancel", "/downloads/dismiss",
   "/engine", "/engine/events",
   "/loop", "/loop/events",

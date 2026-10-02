@@ -1069,7 +1069,7 @@ def _preview_text(blob, too_large, not_text):
 
 
 def preview_restore(workspace, checkpoint_id, max_files=PREVIEW_MAX_FILES,
-                    lock_timeout=PREVIEW_LOCK_TIMEOUT_S):
+                    lock_timeout=None):
     """What restore(workspace, checkpoint_id) would change, without changing
     anything in the workspace.
 
@@ -1100,7 +1100,8 @@ def preview_restore(workspace, checkpoint_id, max_files=PREVIEW_MAX_FILES,
     include it, and this preview is drawn in the same window).
 
     Errors come back as a dict with "error", like restore(). A store lock
-    that another checkpoint or restore holds past `lock_timeout` comes back
+    that another checkpoint or restore holds past `lock_timeout` (default
+    PREVIEW_LOCK_TIMEOUT_S, a few seconds rather than a minute) comes back
     with "busy": True as well, so a caller can say "try again" rather than
     "something is broken".
     """
@@ -1112,7 +1113,10 @@ def preview_restore(workspace, checkpoint_id, max_files=PREVIEW_MAX_FILES,
     if not os.path.isdir(os.path.join(gitdir, "objects")):
         return {"error": "no checkpoint store for this workspace"}
 
-    lock = _StoreLock(store_root, timeout=lock_timeout)
+    # Read at call time, not bound as a default, so a caller (or a test) can
+    # tune the module-wide wait.
+    lock = _StoreLock(store_root, timeout=PREVIEW_LOCK_TIMEOUT_S if lock_timeout is None
+                      else lock_timeout)
     try:
         lock.__enter__()
     except Exception as exc:  # noqa: BLE001 - any failure to take the lock is "not now"
