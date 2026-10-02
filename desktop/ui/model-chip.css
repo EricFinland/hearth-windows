@@ -53,10 +53,12 @@
 /* ---------- the panel ---------- */
 
 /* Below the modal scrim (z-index 50 in styles.css), so a confirmation dialog
- * opened from anywhere still sits on top of it. */
+ * opened from anywhere still sits on top of it, and above the update banner
+ * (40), which sits under the titlebar on the right: in a narrow window the
+ * two overlap, and the panel the person just opened is the one to read. */
 .mchip-pop {
   position: absolute; top: calc(100% + 9px); right: 0;
-  z-index: 40;
+  z-index: 45;
   width: 300px; max-width: calc(100vw - 24px);
   padding: 12px 14px 14px;
   background: var(--panel);
