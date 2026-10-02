@@ -13,7 +13,7 @@ is a TurnContext offering:
   ctx.workspace, ctx.model, ctx.mode, ctx.message   -- the turn's inputs
   ctx.emit(kind, data)                              -- push an SSE event
   ctx.request_approval(tool, args, injection_finding=None,
-                        secrets_finding=None) -> "allow"|"deny"
+                        secrets_finding=None, diff=None) -> "allow"|"deny"
                                                      -- gate a tool call,
                                                         blocking until
                                                         POST /approve
@@ -216,10 +216,10 @@ class TurnContext:
         self.session._emit(self.turn_id, kind, data or {})
 
     def request_approval(self, tool, args=None, injection_finding=None, secrets_finding=None,
-                         timeout=None):
+                         timeout=None, diff=None):
         return self.session._request_approval(self.turn_id, tool, args or {},
                                                injection_finding, secrets_finding,
-                                               timeout=timeout)
+                                               timeout=timeout, diff=diff)
 
     def cancelled(self):
         return self.session._is_cancelled(self.turn_id)
@@ -591,7 +591,7 @@ class Session:
                 del self._approvals[appr_id]
 
     def _request_approval(self, turn_id, tool, args, injection_finding=None, secrets_finding=None,
-                          timeout=None):
+                          timeout=None, diff=None):
         """Raise an approval card and block until it is answered.
 
         `timeout` (seconds, or None for the interactive default of "wait
@@ -643,6 +643,13 @@ class Session:
             event_data["injection_finding"] = injection_finding
         if secrets_finding is not None:
             event_data["secrets_finding"] = secrets_finding
+        # `diff` follows the same rule: present only when the engine computed
+        # a preview of a file write (agent/hearth_diff.py), so a gated
+        # run_command's event is shaped exactly as it always was. It is
+        # already capped and redacted by the time it gets here, which matters
+        # because this event is persisted below and replayed on reconnect.
+        if diff is not None:
+            event_data["diff"] = diff
         self._emit(turn_id, "approval_request", event_data)
         # Persist right here, before blocking on the wait below: this is
         # deliberately the exact moment a crash would otherwise strand an
@@ -943,6 +950,38 @@ def _self_test():
     appr_no_finding = next(e for e in no_finding_events if e["kind"] == "approval_request")
     assert "injection_finding" not in appr_no_finding["data"], appr_no_finding
     assert "secrets_finding" not in appr_no_finding["data"], appr_no_finding
+    assert "diff" not in appr_no_finding["data"], appr_no_finding
+
+    # a write preview rides through to the event untouched, under its own key.
+    sample_diff = {"files": [{"path": "d.txt", "status": "added", "added": 1, "removed": 0,
+                              "hunks": [{"old_start": 0, "old_count": 0, "new_start": 1,
+                                         "new_count": 1, "lines": [["+", "hello"]]}],
+                              "truncated": False}],
+                   "added": 1, "removed": 0, "truncated": False, "files_total": 1,
+                   "files_omitted": 0}
+
+    class DiffEngine:
+        def run(self, ctx):
+            decision = ctx.request_approval("write_file", {"path": "d.txt", "content": "hello\n"},
+                                             diff=sample_diff)
+            ctx.emit("tool_call", {"tool": "write_file", "decision": decision})
+
+    s_diff = Session("/tmp/ws-diff", "m", "edit", engine=DiffEngine())
+    s_diff.submit_prompt("write a file")
+    deadline = time.monotonic() + 5
+    appr_diff_data = None
+    while appr_diff_data is None and time.monotonic() < deadline:
+        for e in s_diff.events_after(0, timeout=1):
+            if e["kind"] == "approval_request":
+                appr_diff_data = e["data"]
+                break
+    assert appr_diff_data is not None, "approval_request never arrived"
+    assert appr_diff_data.get("diff") == sample_diff, appr_diff_data
+    assert "secrets_finding" not in appr_diff_data, appr_diff_data
+    s_diff.resolve_approval(appr_diff_data["id"], True)
+    deadline = time.monotonic() + 5
+    while s_diff.to_dict()["status"] != STATUS_IDLE and time.monotonic() < deadline:
+        time.sleep(0.01)
 
     # --- cancellation wakes a blocked approval and reports "deny" ---
     class WaitingEngine:
