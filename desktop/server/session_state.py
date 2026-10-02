@@ -59,8 +59,9 @@ to idle/None, so a UI sees a turn that was interrupted, not one that
 silently vanished or one still waiting on an answer nobody can give.
 
 Corruption degrades, never crashes: load() returns None -- start fresh,
-with a note on stderr -- for a missing file, an empty file, invalid JSON, or
-JSON that is not the shape this module expects (missing version, missing
+with a note on stderr -- for a missing file, an empty file, invalid JSON,
+JSON nested deeper than any snapshot this module writes (see MAX_JSON_DEPTH),
+or JSON that is not the shape this module expects (missing version, missing
 workspace/model/mode). It never raises. This project has already been bitten
 once by a state file that took the whole process down with it; this module
 is built specifically not to repeat that.
@@ -133,6 +134,15 @@ RECENT_EVENTS_LIMIT = 400
 # arguments, and for write_file that is a whole file body, so a count alone
 # does not bound the file. Measured as the json.dumps length of each event.
 RECENT_EVENTS_BYTES = 2 * 1024 * 1024
+
+# How deeply nested a loaded file may be. Nothing snapshot() writes comes
+# close (an engine message's tool arguments are a handful of levels down), and
+# json.loads on something like "[" * 100000 does not fail with a ValueError at
+# all: it raises RecursionError, which used to escape load() and take every
+# caller with it. A file nested just under the parser's own limit would parse
+# and then raise the same error later, when it is written back out or sent
+# down an event stream, so load() refuses both at the door.
+MAX_JSON_DEPTH = 64
 
 # Never allowed to appear as a top-level key in a persisted snapshot. Defence
 # in depth for the "do not leak the token" requirement -- see the module
@@ -422,8 +432,12 @@ def load(path=None):
         return None  # nothing persisted yet (or not text at all) -- not a crash
     try:
         data = json.loads(raw)
-    except ValueError:
-        print("[hearth-session-state] {} is not valid JSON (truncated or corrupt); "
+    except (ValueError, RecursionError):
+        print("[hearth-session-state] {} is not valid JSON (truncated, corrupt, or nested "
+              "too deeply to parse); starting a fresh session".format(path), file=sys.stderr)
+        return None
+    if _too_deep(data):
+        print("[hearth-session-state] {} is nested more deeply than any saved session; "
               "starting a fresh session".format(path), file=sys.stderr)
         return None
     if not isinstance(data, dict) or data.get("version") != STATE_VERSION:
@@ -436,6 +450,26 @@ def load(path=None):
                   "starting a fresh session".format(path, key), file=sys.stderr)
             return None
     return data
+
+
+def _too_deep(value, limit=MAX_JSON_DEPTH):
+    """True if `value` (parsed JSON) nests lists and dicts more than `limit`
+    levels deep. Iterative on purpose: the point is to measure something a
+    recursive walk could not survive."""
+    stack = [(value, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if isinstance(node, dict):
+            children = node.values()
+        elif isinstance(node, list):
+            children = node
+        else:
+            continue
+        if depth > limit:
+            return True
+        stack.extend((child, depth + 1) for child in children
+                     if isinstance(child, (dict, list)))
+    return False
 
 
 def _engine_state_is_trustworthy(engine_state, mode, engine):
@@ -1097,6 +1131,19 @@ def _self_test():
         cut_restored = restore_session(cut_persisted, restore_engine_factory)
         cut_kinds = [e["kind"] for e in cut_restored.events_after(0, timeout=1)]
         assert cut_kinds[0] == "events_dropped", cut_kinds
+
+        # === a file nested past the parser's limit is corrupt, not a crash =
+        nested = os.path.join(scratch, "nested.json")
+        with open(nested, "w", encoding="utf-8") as fh:
+            fh.write("[" * 100000)
+        assert load(nested) is None, "RecursionError must degrade to None like any corruption"
+        deep_value = {"x": 1}
+        for _ in range(MAX_JSON_DEPTH + 5):
+            deep_value = [deep_value]
+        with open(nested, "w", encoding="utf-8") as fh:
+            json.dump(dict(genuine_persisted, version=STATE_VERSION, engine_state=deep_value), fh)
+        assert load(nested) is None, "parseable but deeper than any snapshot: refused too"
+        assert not _too_deep(genuine_persisted)
 
         # load()/save() take an explicit path for a per-conversation file.
         other = os.path.join(scratch, "elsewhere", "c.json")

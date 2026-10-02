@@ -290,7 +290,9 @@ class ConversationStore:
         try:
             with open(self.index_path(), "r", encoding="utf-8") as fh:
                 raw = json.load(fh)
-        except (OSError, ValueError, UnicodeDecodeError):
+        except (OSError, ValueError, UnicodeDecodeError, RecursionError):
+            # RecursionError is what json raises for "[[[[..." nested past
+            # its limit -- not a ValueError, and just as much corruption.
             raw = None
         if not (isinstance(raw, dict) and raw.get("version") == INDEX_VERSION
                 and isinstance(raw.get("items"), list)):
@@ -722,6 +724,28 @@ def _self_test_body(scratch):
     assert store.prune_if_empty(c) is False, "unreadable is not the same as empty"
     os.remove(os.path.join(root, c + ".json"))
     os.remove(os.path.join(root, d + ".json"))
+
+    # === nesting past the JSON parser's limit is corruption too ==========
+    # json raises RecursionError, not ValueError, for this. Uncaught, it
+    # broke the listing and made every save raise, which the persist hook
+    # swallows -- so nothing was saved any more, silently.
+    deep = new_id()
+    with open(os.path.join(root, deep + ".json"), "w", encoding="utf-8") as fh:
+        fh.write("[" * 100000)
+    with open(store.index_path(), "w", encoding="utf-8") as fh:
+        fh.write("[" * 100000)
+    ids = {i["id"] for i in store.list()["items"]}
+    assert ids == {a, b}, ids
+    assert store.load(deep) is None and store.get(deep) is None
+    before = os.stat(os.path.join(root, a + ".json")).st_mtime_ns
+    time.sleep(0.02)
+    assert store.save(a, _snap("/tmp/ws-a", prompt="still saving")) is True
+    assert os.stat(os.path.join(root, a + ".json")).st_mtime_ns != before, \
+        "a save must still reach the file with a hostile index and neighbour"
+    assert store.get(a)["title"] == "My chat about auth"
+    with open(store.index_path(), encoding="utf-8") as fh:
+        assert json.load(fh)["version"] == INDEX_VERSION, "the index was rebuilt, not left broken"
+    os.remove(os.path.join(root, deep + ".json"))
 
     # === delete, and a late persist cannot bring it back =================
     store.set_active(b)
