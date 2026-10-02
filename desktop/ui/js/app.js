@@ -15,6 +15,7 @@ import { ShopView } from "./shop.js";
 import { LoopConfigPanel, LoopRunBar, account as loopAccount } from "./loop.js";
 import { SwarmConfigPanel, SwarmRunBar, account as swarmAccount } from "./swarm.js";
 import { renderUpdate } from "./update.js";
+import { McpPanel } from "./mcp.js";
 
 const RECENTS_KEY = "hearth.recentWorkspaces"; // workspace paths only; the bearer token is never stored
 const MAX_RECENTS = 8;
@@ -110,21 +111,30 @@ const swarmRunBar = new SwarmRunBar(ui.swarmRunBar);
 
 // ---------------------------------------------------------------------- views
 
-/** Chat and the shop are two panes over one sidebar, not two pages: the
- *  download stream, the session and the event stream all belong to the page,
- *  so switching views must never tear any of them down. That is also what
- *  makes "downloads survive navigating between chat and shop" true by
- *  construction rather than by bookkeeping. */
+/** Chat, the shop and the Tools screen are panes over one sidebar, not
+ *  separate pages: the download stream, the session and the event stream all
+ *  belong to the page, so switching views must never tear any of them down.
+ *  That is also what makes "downloads survive navigating between chat and
+ *  shop" true by construction rather than by bookkeeping. The Tools screen
+ *  holds no stream at all; it polls only while it is the one showing. */
+let mcpPanel = null;
+
 function setView(name) {
+  const views = {
+    chat: [ui.chatView, ui.tabChat],
+    shop: [ui.shopView, ui.tabShop],
+    tools: [$("#tools"), $("#tab-tools")],
+  };
+  if (!views[name]) name = "chat";
   state.view = name;
-  const shop = name === "shop";
-  ui.chatView.hidden = shop;
-  ui.shopView.hidden = !shop;
-  ui.tabChat.classList.toggle("is-active", !shop);
-  ui.tabShop.classList.toggle("is-active", shop);
-  ui.tabChat.setAttribute("aria-pressed", String(!shop));
-  ui.tabShop.setAttribute("aria-pressed", String(shop));
-  if (shop) shopView?.focus();
+  for (const [key, [pane, tab]] of Object.entries(views)) {
+    const on = key === name;
+    pane.hidden = !on;
+    tab.classList.toggle("is-active", on);
+    tab.setAttribute("aria-pressed", String(on));
+  }
+  if (name === "shop") shopView?.focus();
+  if (name === "tools") mcpPanel?.show();
 }
 
 // ---------------------------------------------------------------- connection
@@ -1626,6 +1636,7 @@ async function browseForFolder() {
 
 ui.tabChat.addEventListener("click", () => setView("chat"));
 ui.tabShop.addEventListener("click", () => setView("shop"));
+$("#tab-tools").addEventListener("click", () => setView("tools"));
 ui.connect.addEventListener("click", startSession);
 ui.browse.addEventListener("click", browseForFolder);
 ui.reloadModels.addEventListener("click", refreshModels);
@@ -1730,6 +1741,12 @@ async function boot() {
     onDownloadsChanged: paintDownloadBadge,
   });
   shopView.startDownloadStream();
+
+  // The Tools screen (MCP servers). Built now so its tab works from the first
+  // click; it reads nothing until it is shown, and never starts a server.
+  mcpPanel = new McpPanel($("#tools"), {
+    sidecar, openModal, closeModal, isRunning: () => state.running,
+  });
 
   // Not awaited: the GPU engine fetch runs for as long as it runs, and the
   // whole point is that nothing waits for it. watchEngine paints the panel

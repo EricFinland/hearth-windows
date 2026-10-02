@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="./mcp.css" />
 <meta name="referrer" content="no-referrer" />
 <title>hearth</title>
 <link rel="stylesheet" href="./diff.css" />
@@ -35,6 +36,7 @@
     <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="12" r="3.5"/><path d="M11.5 12H21M18 12v3M15 12v2.2"/></symbol>
     <symbol id="i-chat" viewBox="0 0 24 24"><path d="M20.5 12.5c0 3.9-3.8 7-8.5 7-1 0-2-.15-2.9-.42L4 20.5l1.5-3.6C4.2 15.7 3.5 14.2 3.5 12.5c0-3.9 3.8-7 8.5-7s8.5 3.1 8.5 7z"/></symbol>
     <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v10.5M7.5 10.5L12 15l4.5-4.5"/><path d="M4.5 17.5v2h15v-2"/></symbol>
+    <symbol id="i-plug" viewBox="0 0 24 24"><path d="M9 3.5V8M15 3.5V8"/><path d="M6.5 8h11v2.5a5.5 5.5 0 0 1-11 0z"/><path d="M12 16v4.5"/></symbol>
   </defs>
 </svg>
 
@@ -53,6 +55,9 @@
       <button class="view-tab" id="tab-shop" type="button" aria-pressed="false">
         <svg class="i"><use href="#i-download"/></svg><span>Model shop</span>
         <span class="tab-badge" id="tab-shop-badge" hidden></span>
+      </button>
+      <button class="view-tab" id="tab-tools" type="button" aria-pressed="false" title="MCP servers: programs that give the model extra tools">
+        <svg class="i"><use href="#i-plug"/></svg><span>Tools</span>
       </button>
     </nav>
 
@@ -187,6 +192,7 @@
     </main>
 
     <main class="shop" id="shop" hidden></main>
+    <main class="tools" id="tools" hidden></main>
 
   </div>
 </div>

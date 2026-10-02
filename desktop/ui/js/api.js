@@ -37,6 +37,7 @@ const SIDECAR_ROUTES = new Set([
   "/loop", "/loop/events",
   "/swarm", "/swarm/events",
   "/update", "/update/events",
+  "/mcp", "/mcp/save", "/mcp/toggle", "/mcp/remove", "/mcp/test",
 ]);
 
 export class HttpError extends Error {

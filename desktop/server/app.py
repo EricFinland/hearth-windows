@@ -258,6 +258,51 @@ Endpoints:
                   restore that only checked `status` could run `git
                   read-tree -u --reset` while that worker was still mutating
                   the same files underneath it.
+  GET  /mcp       the MCP servers in mcp.json (see agent/hearth_mcp.py and
+                  mcp_admin.py), each with its live status (running, error,
+                  exited, starting, idle, disabled, or invalid with the reason
+                  the loader ignores it), its tools and their risk classes
+                  once a turn has started it, and its last Test result.
+                  Never starts a server. Environment values and arguments
+                  that look like credentials are masked: at most two leading
+                  characters and a length ever leave the sidecar.
+  POST /mcp/save  add ({"create": true}) or edit a server: {"key",
+                  "command", "args", "env", "enabled"?}. The command is one
+                  program, never a command line; mcp_admin.validate_command
+                  says exactly what is refused. A masked value is kept with a
+                  sentinel instead of being sent back.
+
+                  SECURITY: this route chooses an executable Hearth will
+                  launch as the user. It turns a bearer token into "pick
+                  what Hearth runs", the same class of exposure the bypass
+                  refusal above exists for. Two mitigations, both here and
+                  not only in the page: a save that adds a server or
+                  changes what would run (command, args, env, cwd) is 400
+                  with `needs_acknowledge` unless the body carries
+                  "acknowledge": "runs-program", which the UI sends only
+                  from a dialog that says in plain words the program will
+                  run on this computer; and a new server is disabled unless
+                  that same dialog enabled it. It does not make the token
+                  less powerful, it makes using it this way deliberate and
+                  visible. Not a new capability either: a session in auto
+                  mode with run_command can already write mcp.json.
+  POST /mcp/toggle  {"key", "enabled"}. Enabling does not start anything;
+                  the server starts with the next turn that needs tools.
+  POST /mcp/remove  {"key"}.
+
+                  Every change that touches an enabled server stops the
+                  running MCP servers (hearth_mcp.invalidate) so the next
+                  turn sees the file as it now stands -- otherwise a server
+                  disabled here would keep running and its tools would stay
+                  callable. That would kill a tool call in flight, so such a
+                  change is refused with 409 while Session.is_workspace_busy()
+                  is true. A change to a server disabled before and after
+                  touches nothing live and is always accepted.
+  POST /mcp/test  {"key"}: start a private handshake and tools/list against
+                  that server (hearth_mcp.probe_server, 15s bounds) and
+                  return at once; the result appears on GET /mcp. Never the
+                  live registry, and refused with 409 for a disabled server,
+                  because testing launches it.
 
 Every route except GET /healthz requires, in this order: a valid Host header
 (the DNS-rebinding defence), a valid Origin header when one is present, and a
@@ -1245,6 +1290,8 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._send_json(200, self.state.get_updater().snapshot())
         elif path == "/update/events":
             self._get_update_events()
+        elif path == "/mcp":
+            self._get_mcp()
         else:
             self._send_json(404, {"error": "not_found"})
 
@@ -1278,6 +1325,8 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._post_engine()
         elif path == "/update":
             self._post_update()
+        elif path in ("/mcp/save", "/mcp/toggle", "/mcp/remove", "/mcp/test"):
+            self._post_mcp(path.rsplit("/", 1)[1])
         else:
             self._send_json(404, {"error": "not_found"})
 
@@ -2082,6 +2131,46 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": "idle_probe_failed: {}".format(exc)})
             return
         self._send_json(200, status)
+
+    def _get_mcp(self):
+        """GET /mcp. mcp_admin is imported here rather than at the top for the
+        reason hearth_tools imports hearth_mcp lazily: MCP is optional, and a
+        sidecar that never opens the panel never loads it."""
+        import mcp_admin  # noqa: PLC0415
+        self._send_json(200, mcp_admin.list_servers())
+
+    def _post_mcp(self, action):
+        """POST /mcp/save, /mcp/toggle, /mcp/remove, /mcp/test. The rules all
+        live in mcp_admin; this only maps its refusals onto status codes and
+        tells it how to ask whether a turn is busy."""
+        import mcp_admin  # noqa: PLC0415
+        body = self._read_json()
+        if body is None:
+            self._send_json(400, {"error": "invalid_json"})
+            return
+        try:
+            if action == "save":
+                out = mcp_admin.save(body, busy=self._mcp_busy)
+            elif action == "toggle":
+                out = mcp_admin.toggle(body, busy=self._mcp_busy)
+            elif action == "remove":
+                out = mcp_admin.remove(body, busy=self._mcp_busy)
+            else:
+                out = mcp_admin.start_test(body)
+        except mcp_admin.AdminError as exc:
+            self._send_json(exc.status, exc.body())
+            return
+        except OSError as exc:
+            self._send_json(500, {"error": "mcp_config_write_failed: {}".format(exc)})
+            return
+        self._send_json(200, out)
+
+    def _mcp_busy(self):
+        """Busy in the sense POST /restore uses: a turn running, or a
+        cancelled turn's abandoned worker still executing, either of which
+        may be partway through an MCP tool call."""
+        s = self.state.get_session()
+        return s is not None and s.is_workspace_busy()
 
     def _write_sse(self, ev):
         payload = json.dumps({"turn_id": ev["turn_id"], "kind": ev["kind"],
@@ -4450,6 +4539,115 @@ def _self_test():
             else:
                 os.environ["HEARTH_DATA_DIR"] = prev_data_dir
             shutil.rmtree(loop_tmp, ignore_errors=True)
+
+        # === the MCP panel's routes: GET /mcp and POST /mcp/* ==========
+        # mcp_admin's own self-test covers the rules exhaustively; this proves
+        # the wiring: auth, the acknowledgement surviving the transport, the
+        # 409 while a turn runs, and that a refusal is a status code rather
+        # than a 500. No MCP server is launched: the one enabled entry names
+        # a program that does not exist, and nothing here starts a turn that
+        # asks for tools.
+        mcp_tmp = tempfile.mkdtemp(prefix="hearth-app-mcp-")
+        prev_mcp_env = {k: os.environ.get(k) for k in ("HEARTH_MCP_CONFIG", "HEARTH_DATA_DIR")}
+        os.environ["HEARTH_MCP_CONFIG"] = os.path.join(mcp_tmp, "mcp.json")
+        os.environ["HEARTH_DATA_DIR"] = os.path.join(mcp_tmp, "data")
+        server_m, state_m = _start(engine_factory=lambda: _StubbornEngine())
+        try:
+            port_m = state_m.port
+            headers_m = {"Host": "127.0.0.1:{}".format(port_m),
+                         "Authorization": "Bearer " + state_m.token,
+                         "Content-Type": "application/json"}
+
+            def _mcp(method, path, body=None):
+                st, raw = _raw_request(port_m, method, path, headers=headers_m,
+                                       body=None if body is None else json.dumps(body))
+                return st, json.loads(raw or b"{}")
+
+            # auth applies, exactly as for every other route
+            st, _ = _raw_request(port_m, "GET", "/mcp",
+                                 headers={"Host": "127.0.0.1:{}".format(port_m)})
+            assert st == 401, st
+            st, _ = _raw_request(port_m, "POST", "/mcp/save", headers={
+                "Host": "127.0.0.1:{}".format(port_m), "Content-Type": "application/json"},
+                body=json.dumps({"create": True, "key": "x", "command": "npx",
+                                 "acknowledge": "runs-program"}))
+            assert st == 401, st
+            assert not os.path.exists(os.environ["HEARTH_MCP_CONFIG"])
+
+            st, body = _mcp("GET", "/mcp")
+            assert st == 200 and body["servers"] == [] and body["exists"] is False, body
+            assert body["acknowledge"] == "runs-program", body
+
+            ghost = os.path.join(mcp_tmp, "no-such-server.exe")
+            new = {"create": True, "key": "ghost", "command": ghost, "args": ["--stdio"],
+                   "env": {"API_TOKEN": "tok-" + "x9" * 12}, "enabled": True}
+            st, body = _mcp("POST", "/mcp/save", new)
+            assert st == 400 and body["needs_acknowledge"] is True, (st, body)
+            assert "x9x9" not in json.dumps(body), "a refusal must not echo a secret"
+            assert not os.path.exists(os.environ["HEARTH_MCP_CONFIG"]), \
+                "an unacknowledged save must write nothing"
+            st, body = _mcp("POST", "/mcp/save", dict(new, command="npx -y server",
+                                                      acknowledge="runs-program"))
+            assert st == 400 and body["field"] == "command", (st, body)
+            st, body = _mcp("POST", "/mcp/save", dict(new, acknowledge="runs-program"))
+            assert st == 200 and body["changed"] is True, (st, body)
+
+            st, body = _mcp("GET", "/mcp")
+            assert st == 200 and len(body["servers"]) == 1, body
+            srv = body["servers"][0]
+            assert srv["key"] == "ghost" and srv["enabled"] is True, srv
+            assert srv["status"] == "idle", "listing must never start a server"
+            assert srv["env"][0]["masked"] is True and "x9x9" not in json.dumps(body), srv
+
+            # a turn running makes a change to an enabled server a 409 ...
+            st, _ = _raw_request(port_m, "POST", "/session", headers=headers_m,
+                                 body=json.dumps({"workspace": mcp_tmp, "model": "m"}))
+            assert st == 200
+            st, _ = _raw_request(port_m, "POST", "/prompt", headers=headers_m,
+                                 body=json.dumps({"message": "hold"}))
+            assert st == 200
+            time.sleep(0.1)
+            st, body = _mcp("POST", "/mcp/toggle", {"key": "ghost", "enabled": False})
+            assert st == 409 and "turn is running" in body["error"], (st, body)
+            st, body = _mcp("POST", "/mcp/remove", {"key": "ghost"})
+            assert st == 409, (st, body)
+            # ... but adding a disabled one touches nothing live
+            st, body = _mcp("POST", "/mcp/save", {
+                "create": True, "key": "spare", "command": ghost,
+                "acknowledge": "runs-program"})
+            assert st == 200, (st, body)
+            st, _ = _raw_request(port_m, "POST", "/cancel", headers=headers_m)
+            assert st == 200
+            deadline_m = time.monotonic() + 5
+            while state_m.get_session().is_workspace_busy() and time.monotonic() < deadline_m:
+                time.sleep(0.02)
+
+            st, body = _mcp("POST", "/mcp/test", {"key": "spare"})
+            assert st == 409 and "disabled" in body["error"], (st, body)
+            st, body = _mcp("POST", "/mcp/toggle", {"key": "ghost", "enabled": "no"})
+            assert st == 400, (st, body)
+            st, body = _mcp("POST", "/mcp/toggle", {"key": "ghost", "enabled": False})
+            assert st == 200 and body["changed"] is True, (st, body)
+            st, body = _mcp("POST", "/mcp/remove", {"key": "nope"})
+            assert st == 404, (st, body)
+            st, body = _mcp("POST", "/mcp/remove", {"key": "ghost"})
+            assert st == 200 and body["removed"] is True, (st, body)
+            st, body = _mcp("GET", "/mcp")
+            assert [s["key"] for s in body["servers"]] == ["spare"], body
+            st, raw = _raw_request(port_m, "POST", "/mcp/save", headers=headers_m,
+                                   body="{not json")
+            assert st == 400, (st, raw)
+        finally:
+            server_m.shutdown()
+            server_m.server_close()
+            import hearth_mcp as _hearth_mcp  # noqa: PLC0415
+            _hearth_mcp.invalidate()
+            for k, v in prev_mcp_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            shutil.rmtree(mcp_tmp, ignore_errors=True)
 
         # === the four route allowlists agree ==========================
         # This router's table is duplicated, by necessity, in three other
