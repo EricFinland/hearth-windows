@@ -53,15 +53,23 @@ event log, and into session state. So:
     hunks actually shown are therefore scanned again on their own, which
     covers a secret sitting in the unscanned middle of a big file as long as
     it lies within one hunk.
+  - A finding too long for hearth_secrets to redact (MAX_REDACT_SPAN) hides
+    the whole file rather than being shown; see _redact_keep_lines.
 
 SIZE. The approval event is persisted (session_state keeps a tail of recent
 events) and replayed over SSE on every reconnect, so it must stay small no
 matter how large the write is. A preview is capped at MAX_DIFF_LINES emitted
-lines and MAX_DIFF_BYTES of serialised text in total, a single line at
-MAX_LINE_CHARS, and an input file at MAX_INPUT_CHARS / MAX_INPUT_LINES (past
-which SequenceMatcher's worst case stops being cheap). Every cap that bites
-is reported -- `truncated`, `cut` on a line, `hidden_reason` on a file --
-never applied silently.
+lines and MAX_DIFF_BYTES serialised in total (paths, notes and hunk headers
+included, not only line text), a single line at MAX_LINE_CHARS, and an input
+file at MAX_INPUT_CHARS / MAX_INPUT_LINES. Every cap that bites is reported
+-- `truncated`, `cut` on a line, `hidden_reason` on a file, `files_omitted`
+-- never applied silently.
+
+TIME. The preview is worked out at the approval gate, before the card is
+raised, so it must stay quick whatever the file looks like. Comparing is
+bounded in work and in wall-clock time, not only in input size; see the
+comment above _unique_anchors. Past the bound a stretch is shown as whole
+blocks out and in rather than compared line by line, and the file says so.
 
 SHAPE. Structured lines, not a unified-diff string, so the page never parses
 anything:
@@ -88,11 +96,13 @@ tool as it then is; the card says what was true when it was drawn.
 Standard library only. No network. Reads files; never writes any.
 """
 
+import bisect
 import difflib
 import fnmatch
 import json
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hearth_checkpoint  # noqa: E402
@@ -113,6 +123,10 @@ MAX_FILES = 20             # files given a full diff in one preview
 MAX_LISTED_FILES = 500     # files named at all; beyond this only a count
 MAX_INPUT_CHARS = 2_000_000  # the same 2 MB replace_in_files itself skips past
 MAX_INPUT_LINES = 50_000
+LISTING_RESERVE = 16 * 1024  # of MAX_DIFF_BYTES, kept back from line text for file names
+MATCH_CALL_CELLS = 1_000_000   # one SequenceMatcher call: old lines * new lines it compares
+MATCH_TOTAL_CELLS = 8_000_000  # every such call in one preview, all files together
+PREVIEW_SECONDS = 2.0          # wall-clock belt over the comparing for one preview
 
 HIDDEN_SECRET_FILE = ("this looks like a secrets file (.env, a key, credentials), "
                       "so its content is not shown")
@@ -132,26 +146,71 @@ NOTE_TO_CRLF = "line endings change from LF to CRLF on every line"
 NOTE_TO_LF = "line endings change from CRLF to LF on every line"
 NOTE_ADDS_FINAL_NEWLINE = "adds a newline at the end of the file"
 NOTE_DROPS_FINAL_NEWLINE = "removes the newline at the end of the file"
+NOTE_COARSE = ("part of this change was too large to compare line by line, so it is "
+               "shown as whole blocks removed and added, and the counts may be high")
 
 
 class _Budget:
-    """The shared line and byte allowance for one whole preview. Charged per
-    emitted line at its JSON-encoded size, which is what it actually costs in
-    the persisted event (a non-ASCII character serialises as \\uXXXX)."""
+    """The shared allowances for one whole preview: lines, bytes and compute.
 
-    def __init__(self, max_lines=MAX_DIFF_LINES, max_bytes=MAX_DIFF_BYTES):
+    Bytes are charged at JSON-encoded size, which is what the preview
+    actually costs in the persisted event (a non-ASCII character serialises
+    as \\uXXXX). Line text and hunk headers may use the byte allowance less
+    LISTING_RESERVE; file entries, with their paths, reasons and notes, are
+    charged against the whole of it. The reserve is what lets a
+    preview whose diffs filled their share still name the files it did not
+    diff, and charging the names at all is what makes MAX_DIFF_BYTES a bound
+    on the whole preview rather than on its line text alone.
+
+    Compute is counted in "cells": a SequenceMatcher call over n old lines
+    and m new lines is charged n * m, roughly its worst case. The deadline is
+    a wall-clock belt over all of it; see _matching_blocks."""
+
+    def __init__(self, max_lines=MAX_DIFF_LINES, max_bytes=MAX_DIFF_BYTES,
+                 max_cells=MATCH_TOTAL_CELLS, seconds=None):
         self.lines_left = max_lines
         self.bytes_left = max_bytes
+        self.line_bytes_left = max(0, max_bytes - LISTING_RESERVE)
+        self.cells_left = max_cells
+        # Read at call time, not bound as a default, so the module-wide
+        # belt can be tuned (the self-test sets it to nothing).
+        self.deadline = time.monotonic() + (PREVIEW_SECONDS if seconds is None else seconds)
         self.exhausted = False
 
-    def take(self, text):
-        cost = len(json.dumps(text)) + 8
-        if self.lines_left <= 0 or cost > self.bytes_left:
+    def take(self, line):
+        """Charge one emitted [tag, text] or [tag, text, cut] line."""
+        cost = len(json.dumps(line)) + 2  # and the ", " that separates it from the next
+        if self.lines_left <= 0 or cost > self.line_bytes_left or cost > self.bytes_left:
             self.exhausted = True
             return False
         self.lines_left -= 1
+        self.line_bytes_left -= cost
         self.bytes_left -= cost
         return True
+
+    def charge(self, obj, diff_share=False):
+        """Charge the serialised size of `obj` (an entry or hunk with its
+        lines left out) against the whole byte allowance, or with
+        `diff_share` (a hunk header, part of the diff itself) against the
+        line text's share as well. False, and nothing charged, when it does
+        not fit."""
+        cost = len(json.dumps(obj)) + 2
+        if cost > self.bytes_left or (diff_share and cost > self.line_bytes_left):
+            self.exhausted = True
+            return False
+        self.bytes_left -= cost
+        if diff_share:
+            self.line_bytes_left -= cost
+        return True
+
+    def spend_cells(self, cells):
+        if cells > self.cells_left or self.out_of_time():
+            return False
+        self.cells_left -= cells
+        return True
+
+    def out_of_time(self):
+        return time.monotonic() > self.deadline
 
 
 def is_secret_path(path):
@@ -190,19 +249,33 @@ def _redact_keep_lines(norm, findings, line_count):
     lines exactly as long as the unredacted one. A finding spanning several
     lines (a PEM body) keeps its line breaks after the marker, so nothing
     below it moves. Returns (lines, set of line indexes touched), or
-    (None, None) if the line count could not be kept, which the caller treats
-    as "do not show this text" rather than risk misaligned lines."""
+    (None, None) when the text cannot be shown safely: the line count could
+    not be kept, or a finding is longer than hearth_secrets.MAX_REDACT_SPAN.
+
+    The second is a deliberate break from hearth_secrets.redact(), which
+    leaves an oversized span in place rather than blank an unbounded run of
+    content being written. Here the run may be a context line from a file on
+    disk that nobody asked to see, which is exactly what this module exists
+    to keep off the screen, so the caller hides the whole file (or blanks the
+    whole hunk) instead of showing the span or guessing at a partial cut."""
     spans = sorted(
         (f["start"], f["end"], f["kind"]) for f in findings
         if 0 <= f["start"] < f["end"] <= len(norm))
+    # Overlapping findings merge into one span reaching the furthest end, so
+    # a second finding that starts inside the first and runs past it is not
+    # left half shown.
+    merged = []
+    for start, end, kind in spans:
+        if end - start > hearth_secrets.MAX_REDACT_SPAN:
+            return None, None
+        if merged and start < merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+            continue
+        merged.append([start, end, kind])
     out = []
     touched = set()
     cursor = 0
-    for start, end, kind in spans:
-        if start < cursor:
-            continue  # overlapping finding; the earlier span already covers it
-        if end - start > hearth_secrets.MAX_REDACT_SPAN:
-            continue  # same rule as hearth_secrets.redact: never hide an unbounded run
+    for start, end, kind in merged:
         out.append(norm[cursor:start])
         first_line = norm.count("\n", 0, start)
         breaks = norm.count("\n", start, end)
@@ -277,14 +350,170 @@ def _status(old, new):
     return "modified" if old != new else "unchanged"
 
 
-def _counts(a, b):
-    added = removed = 0
-    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b).get_opcodes():
-        if tag in ("replace", "delete"):
-            removed += i2 - i1
-        if tag in ("replace", "insert"):
-            added += j2 - j1
-    return added, removed
+# ---------------------------------------------------------------------------
+# Comparing. difflib.SequenceMatcher alone is roughly quadratic in the lines
+# it is given when the matches are many and small (a file where every other
+# line changed): measured at about 4 s for 8,000 lines and 20 s for 16,000,
+# and this runs at the approval gate, before the card is raised, where Cancel
+# cannot reach it. So it is only ever given a bounded stretch:
+#
+#   1. The common prefix and suffix are matched by a linear walk first. Most
+#      edits touch a small part of a file, and this alone shrinks them to it.
+#   2. A stretch small enough (MATCH_CALL_CELLS, against a per-preview total
+#      of MATCH_TOTAL_CELLS) goes to SequenceMatcher as it is.
+#   3. A larger one is split on lines that occur exactly once on each side,
+#      kept in order by a longest-increasing-subsequence pass (the "patience"
+#      idea): linear to find, n log n to order. Source files are mostly
+#      unique lines, so this splits a big file into many small stretches,
+#      each of which goes back through 1-3.
+#   4. A stretch that is still too large, has no such lines, or is reached
+#      after the wall-clock belt has run out is not compared further: it is
+#      shown as its old lines removed and its new lines added. That is still
+#      a correct diff, only not the smallest one, and the file says so
+#      (NOTE_COARSE).
+# ---------------------------------------------------------------------------
+
+
+def _unique_anchors(a, alo, ahi, b, blo, bhi):
+    """Pairs (i, j), increasing in both, of lines that occur exactly once in
+    a[alo:ahi] and exactly once in b[blo:bhi] and agree in order."""
+    in_a = {}
+    for i in range(alo, ahi):
+        line = a[i]
+        in_a[line] = -1 if line in in_a else i
+    in_b = {}
+    for j in range(blo, bhi):
+        line = b[j]
+        if in_a.get(line, -1) >= 0:
+            in_b[line] = -1 if line in in_b else j
+    pairs = sorted((in_a[line], j) for line, j in in_b.items() if j >= 0)
+    # Longest run increasing in j among pairs already sorted by i (patience
+    # sorting): tails[k] is the pair ending the best run of length k + 1.
+    tails, tail_js, back = [], [], [None] * len(pairs)
+    for index, (_i, j) in enumerate(pairs):
+        k = bisect.bisect_left(tail_js, j)
+        back[index] = tails[k - 1] if k else None
+        if k == len(tails):
+            tails.append(index)
+            tail_js.append(j)
+        else:
+            tails[k] = index
+            tail_js[k] = j
+    out = []
+    index = tails[-1] if tails else None
+    while index is not None:
+        out.append(pairs[index])
+        index = back[index]
+    out.reverse()
+    return out
+
+
+def _matching_blocks(a, b, budget):
+    """(blocks, coarse): sorted (i, j, size) runs of equal lines, and whether
+    any stretch was left uncompared. See the comment block above."""
+    blocks = []
+    coarse = False
+    stack = [(0, len(a), 0, len(b))]
+    while stack:
+        alo, ahi, blo, bhi = stack.pop()
+        k = 0
+        while alo + k < ahi and blo + k < bhi and a[alo + k] == b[blo + k]:
+            k += 1
+        if k:
+            blocks.append((alo, blo, k))
+            alo += k
+            blo += k
+        k = 0
+        while ahi - k > alo and bhi - k > blo and a[ahi - k - 1] == b[bhi - k - 1]:
+            k += 1
+        if k:
+            blocks.append((ahi - k, bhi - k, k))
+            ahi -= k
+            bhi -= k
+        if alo == ahi or blo == bhi:
+            continue
+        if ahi - alo == 1 or bhi - blo == 1:
+            # One line against many: the first equal line is the whole
+            # answer, and a SequenceMatcher per such stretch would be most of
+            # the cost of a file where every other line changed.
+            if ahi - alo == 1:
+                try:
+                    blocks.append((alo, b.index(a[alo], blo, bhi), 1))
+                except ValueError:
+                    pass
+            else:
+                try:
+                    blocks.append((a.index(b[blo], alo, ahi), blo, 1))
+                except ValueError:
+                    pass
+            continue
+        cells = (ahi - alo) * (bhi - blo)
+        if cells <= MATCH_CALL_CELLS and budget.spend_cells(cells):
+            matcher = difflib.SequenceMatcher(None, a[alo:ahi], b[blo:bhi])
+            blocks.extend((alo + i, blo + j, n) for i, j, n in matcher.get_matching_blocks() if n)
+            continue
+        anchors = [] if budget.out_of_time() else _unique_anchors(a, alo, ahi, b, blo, bhi)
+        if not anchors:
+            coarse = True
+            continue
+        prev_i, prev_j = alo, blo
+        for i, j in anchors:
+            stack.append((prev_i, i, prev_j, j))
+            blocks.append((i, j, 1))
+            prev_i, prev_j = i + 1, j + 1
+        stack.append((prev_i, ahi, prev_j, bhi))
+    blocks.sort()
+    merged = []
+    for i, j, n in blocks:
+        if merged and merged[-1][0] + merged[-1][2] == i and merged[-1][1] + merged[-1][2] == j:
+            merged[-1][2] += n
+        else:
+            merged.append([i, j, n])
+    return merged, coarse
+
+
+def _opcodes(a, b, budget):
+    """(opcodes, coarse), opcodes in SequenceMatcher.get_opcodes()'s format."""
+    blocks, coarse = _matching_blocks(a, b, budget)
+    codes = []
+    i = j = 0
+    for ai, bj, size in blocks + [[len(a), len(b), 0]]:
+        if i < ai and j < bj:
+            codes.append(("replace", i, ai, j, bj))
+        elif i < ai:
+            codes.append(("delete", i, ai, j, bj))
+        elif j < bj:
+            codes.append(("insert", i, ai, j, bj))
+        i, j = ai + size, bj + size
+        if size:
+            codes.append(("equal", ai, i, bj, j))
+    return codes, coarse
+
+
+def _grouped(codes, n):
+    """Hunks from opcodes, `n` lines of context either side: the same
+    grouping SequenceMatcher.get_grouped_opcodes() does, over opcodes this
+    module computed itself."""
+    if not codes:
+        return []
+    codes = list(codes)
+    if codes[0][0] == "equal":
+        tag, i1, i2, j1, j2 = codes[0]
+        codes[0] = tag, max(i1, i2 - n), i2, max(j1, j2 - n), j2
+    if codes[-1][0] == "equal":
+        tag, i1, i2, j1, j2 = codes[-1]
+        codes[-1] = tag, i1, min(i2, i1 + n), j1, min(j2, j1 + n)
+    groups, group = [], []
+    for tag, i1, i2, j1, j2 in codes:
+        if tag == "equal" and i2 - i1 > 2 * n:
+            group.append((tag, i1, min(i2, i1 + n), j1, min(j2, j1 + n)))
+            groups.append(group)
+            group = []
+            i1, j1 = max(i1, i2 - n), max(j1, j2 - n)
+        group.append((tag, i1, i2, j1, j2))
+    if group and not (len(group) == 1 and group[0][0] == "equal"):
+        groups.append(group)
+    return [g for g in groups if any(op[0] != "equal" for op in g)]
 
 
 def file_diff(path, old, new, budget=None, context=CONTEXT_LINES, hidden_reason=None):
@@ -295,7 +524,10 @@ def file_diff(path, old, new, budget=None, context=CONTEXT_LINES, hidden_reason=
     `path` is display text the caller has already made workspace-relative;
     nothing here touches the filesystem. A caller that passes a reason has
     usually not loaded the content either (a binary or ignored file), so no
-    line counts are claimed for it."""
+    line counts are claimed for it.
+
+    Line text and hunk headers are charged to `budget` here; the entry's own
+    fields are charged by build_preview once the entry is complete."""
     budget = budget if budget is not None else _Budget()
     entry = {"path": path, "status": _status(old, new), "added": None, "removed": None,
              "hunks": [], "truncated": False}
@@ -313,10 +545,21 @@ def file_diff(path, old, new, budget=None, context=CONTEXT_LINES, hidden_reason=
 
     old_norm, a, old_final = _split(old_text)
     new_norm, b, new_final = _split(new_text)
-    entry["added"], entry["removed"] = _counts(a, b)
+    # One comparison per file: the counts and the hunks come from the same
+    # opcodes.
+    codes, coarse = _opcodes(a, b, budget)
+    added = removed = 0
+    for tag, i1, i2, j1, j2 in codes:
+        if tag in ("replace", "delete"):
+            removed += i2 - i1
+        if tag in ("replace", "insert"):
+            added += j2 - j1
+    entry["added"], entry["removed"] = added, removed
     notes = _eol_notes(old, new, old_final, new_final)
     if entry["status"] == "unchanged":
         notes.append(NOTE_IDENTICAL)
+    if coarse:
+        notes.append(NOTE_COARSE)
     if notes:
         entry["notes"] = notes
 
@@ -339,25 +582,31 @@ def file_diff(path, old, new, budget=None, context=CONTEXT_LINES, hidden_reason=
     b_shown = b_shown if b_shown is not None else b
 
     redacted = 0
-    matcher = difflib.SequenceMatcher(None, a, b)
-    for group in matcher.get_grouped_opcodes(context):
+    for group in _grouped(codes, context):
         first, last = group[0], group[-1]
         hunk = {"old_start": first[1] + 1, "old_count": last[2] - first[1],
                 "new_start": first[3] + 1, "new_count": last[4] - first[3], "lines": []}
+        if not budget.charge(hunk, diff_share=True):
+            entry["truncated"] = True
+            break
         # Text comes from the redacted copies at the same indexes; see the
         # module docstring for why the opcodes themselves come from the raw
-        # lines.
+        # lines. Never more than the budget could still take, so a coarse
+        # whole-file block is not built out in full only to be cut.
+        room = max(budget.lines_left, 0)
         raw = []
         for tag, i1, i2, j1, j2 in group:
+            if len(raw) > room:
+                break
             if tag == "equal":
-                raw.extend([" ", a_shown[i], i in a_touched] for i in range(i1, i2))
+                raw.extend([" ", a_shown[i], i in a_touched] for i in range(i1, min(i2, i1 + room + 1)))
                 continue
             if tag in ("replace", "delete"):
-                raw.extend(["-", a_shown[i], i in a_touched] for i in range(i1, i2))
+                raw.extend(["-", a_shown[i], i in a_touched] for i in range(i1, min(i2, i1 + room + 1)))
             if tag in ("replace", "insert"):
-                raw.extend(["+", b_shown[j], j in b_touched] for j in range(j1, j2))
-        if len(raw) > budget.lines_left:
-            raw = raw[:max(budget.lines_left, 0)]
+                raw.extend(["+", b_shown[j], j in b_touched] for j in range(j1, min(j2, j1 + room + 1)))
+        if len(raw) > room:
+            raw = raw[:room]
             entry["truncated"] = True
         lines = [[tag, text] for tag, text, _hit in raw]
         redacted += sum(1 for _tag, _text, hit in raw if hit)
@@ -367,7 +616,7 @@ def file_diff(path, old, new, budget=None, context=CONTEXT_LINES, hidden_reason=
             if len(text) > MAX_LINE_CHARS:
                 line[1] = text[:MAX_LINE_CHARS]
                 line.append(len(text) - MAX_LINE_CHARS)
-            if not budget.take(line[1]):
+            if not budget.take(line):
                 entry["truncated"] = True
                 break
             hunk["lines"].append(line)
@@ -388,8 +637,10 @@ def build_preview(entries, max_files=MAX_FILES, budget=None):
     files past `max_files`, which the caller should not even load).
 
     The first `max_files` entries get a diff; the rest, up to
-    MAX_LISTED_FILES, are named with their status; anything beyond that is
-    only counted."""
+    MAX_LISTED_FILES and for as long as the byte budget lasts, are named with
+    their status; anything beyond that is only counted (`files_omitted`).
+    Every entry is charged to the same budget as the line text, so
+    MAX_DIFF_BYTES bounds the whole preview, names included."""
     budget = budget if budget is not None else _Budget()
     files = []
     total_added = total_removed = 0
@@ -397,25 +648,32 @@ def build_preview(entries, max_files=MAX_FILES, budget=None):
     for index, item in enumerate(entries[:MAX_LISTED_FILES]):
         if item.get("skip_content") or index >= max_files:
             status = item.get("status") or _status(item.get("old"), item.get("new"))
-            files.append({"path": item["path"], "status": status, "added": None,
-                          "removed": None, "hunks": [], "truncated": True,
-                          "hidden_reason": item.get("hidden_reason") or HIDDEN_NOT_PREVIEWED})
+            entry = {"path": item["path"], "status": status, "added": None,
+                     "removed": None, "hunks": [], "truncated": True,
+                     "hidden_reason": item.get("hidden_reason") or HIDDEN_NOT_PREVIEWED}
+        else:
+            entry = file_diff(item["path"], item.get("old"), item.get("new"), budget,
+                              hidden_reason=item.get("hidden_reason"))
+            if item.get("status"):
+                entry["status"] = item["status"]
+            if item.get("note"):
+                # The caller's note explains the outcome itself ("the find
+                # text is missing"), so a generic "identical" beside it is
+                # noise.
+                entry["notes"] = [item["note"]] + [
+                    n for n in entry.get("notes", []) if n != NOTE_IDENTICAL]
+        # Charged once complete, lines left out (they were charged as they
+        # were emitted). Line text never reaches into LISTING_RESERVE, so a
+        # diffed file's own entry fits; the name that does not fit is where
+        # the listing stops, and everything from it on is only counted.
+        if not budget.charge(dict(entry, hunks=[])):
             truncated = True
-            continue
-        entry = file_diff(item["path"], item.get("old"), item.get("new"), budget,
-                          hidden_reason=item.get("hidden_reason"))
-        if item.get("status"):
-            entry["status"] = item["status"]
-        if item.get("note"):
-            # The caller's note explains the outcome itself ("the find text
-            # is missing"), so a generic "identical" beside it is noise.
-            entry["notes"] = [item["note"]] + [
-                n for n in entry.get("notes", []) if n != NOTE_IDENTICAL]
+            break
         total_added += entry["added"] or 0
         total_removed += entry["removed"] or 0
         truncated = truncated or entry["truncated"]
         files.append(entry)
-    omitted = max(0, len(entries) - MAX_LISTED_FILES)
+    omitted = len(entries) - len(files)
     return {"files": files, "added": total_added, "removed": total_removed,
             "truncated": truncated or omitted > 0, "files_total": len(entries),
             "files_omitted": omitted}
@@ -526,10 +784,17 @@ def _preview_replace_in_files(args, workspace):
         return None
     root = os.path.realpath(workspace)
     spec = hearth_contain.load_ignore(root)
+    budget = _Budget()
     entries = []
     for dirpath, dirs, files in os.walk(base):
         hearth_contain.prune(dirpath, dirs, hearth_tools._TREE_SKIP, root=root, ignore_spec=spec)
         for fn in sorted(files):
+            if budget.out_of_time():
+                # The walk shares the preview's wall-clock belt. A tree too
+                # big to search in that time gets no preview (the card shows
+                # the raw arguments, as before this module existed) rather
+                # than a count of matching files that is quietly short.
+                return None
             if pattern and not hearth_tools._glob_match(fn, pattern):
                 continue
             fp = os.path.join(dirpath, fn)
@@ -561,7 +826,7 @@ def _preview_replace_in_files(args, workspace):
                                 "skip_content": True})
     if not entries:
         return None
-    return build_preview(entries)
+    return build_preview(entries, budget=budget)
 
 
 _PREVIEWERS = {
@@ -702,7 +967,8 @@ def _self_test():
         shown = sum(len(h["lines"]) for h in bf["hunks"])
         assert bf["truncated"] and big["truncated"], bf["truncated"]
         assert 0 < shown <= MAX_DIFF_LINES, shown
-        assert len(json.dumps(big)) < MAX_DIFF_BYTES + 4096, len(json.dumps(big))
+        # Slack is the top-level keys only; everything inside is charged.
+        assert len(json.dumps(big)) <= MAX_DIFF_BYTES + 256, len(json.dumps(big))
         assert bf["added"] == 5000, bf["added"]
         long_line = preview_tool_call("write_file", {"path": "long.txt",
                                                      "content": "q" * 5000 + "\n"}, ws)
@@ -710,6 +976,66 @@ def _self_test():
         assert len(ll[1]) == MAX_LINE_CHARS and ll[2] == 5000 - MAX_LINE_CHARS, ll[2:]
         too_big = file_diff("x.txt", None, "a\n" * (MAX_INPUT_LINES + 5))
         assert too_big["hidden_reason"] == HIDDEN_TOO_LARGE and too_big["added"] is None, too_big
+
+        # -- the byte cap covers names too: hundreds of long paths, a few of
+        #    them diffed in full, still serialise within MAX_DIFF_BYTES, and
+        #    the names that did not fit are counted, not dropped silently. --
+        long_dir = "deep/" + "d" * 180 + "/"
+        named = [{"path": long_dir + "f{:03d}.txt".format(i),
+                  "old": huge if i < 3 else None, "new": huge.replace("z", "y") if i < 3 else None,
+                  "status": "modified", "skip_content": i >= 3} for i in range(MAX_LISTED_FILES)]
+        listed = build_preview(named)
+        assert len(json.dumps(listed)) <= MAX_DIFF_BYTES + 256, len(json.dumps(listed))
+        assert listed["files_omitted"] > 0 and listed["truncated"], listed["files_omitted"]
+        assert len(listed["files"]) + listed["files_omitted"] == MAX_LISTED_FILES, listed["files_omitted"]
+        # ... and the reserve kept back from line text means files past the
+        # diffed ones are still named, not crowded out by the diffs.
+        assert len(listed["files"]) > 3 + LISTING_RESERVE // 512, len(listed["files"])
+
+        # -- time: the comparison is bounded in work, not just input size.
+        #    Every other line changed is SequenceMatcher's slow case (it took
+        #    minutes at this size before the work was bounded); it must now
+        #    finish quickly and still give exact counts. -------------------
+        n = MAX_INPUT_LINES - 10
+        plain = "".join("line {}\n".format(i) for i in range(n))
+        every_other = "".join(("line {}\n" if i % 2 else "changed {}\n").format(i) for i in range(n))
+        write("interleaved.txt", plain)
+        started = time.monotonic()
+        inter = preview_tool_call("write_file", {"path": "interleaved.txt",
+                                                 "content": every_other}, ws)
+        took = time.monotonic() - started
+        assert took < 5.0, "an interleaved change took {:.1f}s to preview".format(took)
+        itf = inter["files"][0]
+        assert (itf["added"], itf["removed"]) == (n // 2, n // 2), itf
+        assert NOTE_COARSE not in itf.get("notes", []), itf
+        assert len(json.dumps(inter)) <= MAX_DIFF_BYTES + 256, len(json.dumps(inter))
+        # A stretch with no line unique to it (a repetitive file) is shown
+        # as whole blocks, quickly, and says so; the blocks still rebuild
+        # the new file exactly.
+        rep_a = ["}" if i % 2 else "x" for i in range(20000)]
+        rep_b = ["}" if i % 3 else "y" for i in range(20000)]
+        started = time.monotonic()
+        codes, coarse = _opcodes(rep_a, rep_b, _Budget())
+        assert time.monotonic() - started < 5.0 and coarse, coarse
+        rebuilt = []
+        for tag, i1, i2, j1, j2 in codes:
+            if tag == "equal":
+                assert rep_a[i1:i2] == rep_b[j1:j2], (i1, j1)
+            rebuilt.extend(rep_b[j1:j2])
+        assert rebuilt == rep_b
+        rep = file_diff("rep.txt", "\n".join(rep_a), "\n".join(rep_b))
+        assert NOTE_COARSE in rep["notes"], rep.get("notes")
+        # Out of time: nothing more is compared, the result is still correct.
+        late = _Budget(seconds=-1)
+        codes, coarse = _opcodes(["a", "b", "c", "d"], ["a", "x", "y", "d"], late)
+        assert coarse and codes[0][0] == "equal" and codes[-1][0] == "equal", codes
+        # And small inputs give the same counts difflib itself would.
+        for old_l, new_l in ((list("abcabba"), list("cbabac")), (list("xaybzc"), list("abc")),
+                             ([], list("ab")), (list("ab"), [])):
+            mine = _opcodes(old_l, new_l, _Budget())[0]
+            ref = difflib.SequenceMatcher(None, old_l, new_l).get_opcodes()
+            changed = lambda cs: sum(i2 - i1 + j2 - j1 for t, i1, i2, j1, j2 in cs if t != "equal")
+            assert changed(mine) <= changed(ref), (old_l, new_l, mine, ref)
 
         # -- secrets. Built at runtime like hearth_secrets' own fixtures, so
         #    this file never holds the matching string as a literal. --------
@@ -768,6 +1094,25 @@ def _self_test():
         mid = preview_tool_call("edit_file", {"path": "huge.py", "find": "keep = 1",
                                               "replace": "keep = 2"}, ws)
         assert key not in json.dumps(mid), "the hunk re-scan missed a mid-file secret"
+        # (7) a finding too long for hearth_secrets to redact, sitting in an
+        #     existing file's unchanged lines: the whole file is hidden, not
+        #     shown because redact() would have left it in place.
+        over = "\n".join(hearth_secrets._rand_alnum(64)
+                         for _ in range(hearth_secrets.MAX_REDACT_SPAN // 64 + 40))
+        write("big_key.txt", "top\n-----BEGIN PRIVATE KEY-----\n" + over
+              + "\n-----END PRIVATE KEY-----\nbottom\n")
+        ov = preview_tool_call("edit_file", {"path": "big_key.txt", "find": "bottom",
+                                             "replace": "BOTTOM"}, ws)
+        of = ov["files"][0]
+        assert of["hidden_reason"] == HIDDEN_UNSAFE and of["hunks"] == [], of
+        assert over.split("\n")[0] not in json.dumps(ov), "an oversized key body was shown"
+        assert (of["added"], of["removed"]) == (1, 1), of
+        # (8) overlapping findings: the second one's tail past the first is
+        #     covered too, not left showing.
+        merged_lines, merged_touched = _redact_keep_lines(
+            "0123456789\nabc\n", [{"start": 2, "end": 6, "kind": "a"},
+                                  {"start": 4, "end": 9, "kind": "b"}], 2)
+        assert merged_lines == ["01[REDACTED:a]9", "abc"] and merged_touched == {0}, merged_lines
 
         # -- .hearthignore and containment: the tool would refuse, so there
         #    is no preview at all. ------------------------------------------
@@ -795,6 +1140,15 @@ def _self_test():
         allws = preview_tool_call("replace_in_files", {"find": "beta", "replace": "B"}, ws)
         assert "private/beta.txt" not in [f["path"] for f in allws["files"]], allws
         assert preview_tool_call("replace_in_files", {"find": "zzz-not-here"}, ws) is None
+        # A tree that cannot be searched within the time belt gets no
+        # preview at all (raw arguments), never a quietly short file count.
+        global PREVIEW_SECONDS
+        saved_seconds, PREVIEW_SECONDS = PREVIEW_SECONDS, -1.0
+        try:
+            assert preview_tool_call("replace_in_files", {"path": "r", "find": "beta",
+                                                          "replace": "B"}, ws) is None
+        finally:
+            PREVIEW_SECONDS = saved_seconds
         for i in range(MAX_FILES + 3):
             write("many/f{:02d}.txt".format(i), "needle\n")
         many = preview_tool_call("replace_in_files", {"path": "many", "find": "needle",
