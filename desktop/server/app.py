@@ -180,10 +180,12 @@ Endpoints:
                   400 for a malformed id (checked before git is run), 404
                   with no session, 409 for an id the store does not know,
                   503 while another checkpoint or restore holds the store.
-                  Not refused while a turn runs: it writes nothing to the
-                  workspace, and a preview that is a moment stale is still
-                  the best answer available.
-  GET  /setup    hearth_setup.diagnose(): can this machine even run a local
+                  409 with "workspace_busy": true while work is live in the
+                  workspace, the same check POST /restore makes: the
+                  preview stages the whole workspace under the store lock,
+                  which would hold up that turn's own checkpoint, and a
+                  restore it previews would be refused anyway.
+  GET  /setup     hearth_setup.diagnose(): can this machine even run a local
                   model right now, and if not, the one concrete next step.
                   Never requires a session to exist -- a UI needs this
                   before it can show a chat box at all. Runs the full
@@ -1573,6 +1575,15 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 and all(c in "0123456789abcdefABCDEF" for c in checkpoint_id)):
             self._send_json(400, {"error": "id must be a checkpoint id: 7 to 64 hex characters"})
             return
+        if s.is_workspace_busy():
+            # See the module docstring: refused for the same reason and on
+            # the same check as POST /restore, flagged so the page can say
+            # "wait for the turn" rather than "this checkpoint is unknown".
+            self._send_json(409, {
+                "error": "cannot preview a restore while the workspace has running or "
+                         "abandoned work in progress; wait for it to finish and try again",
+                "workspace_busy": True})
+            return
         try:
             result = engine_mod.hearth_checkpoint.preview_restore(s.workspace, checkpoint_id)
         except Exception as exc:  # noqa: BLE001 - a preview bug must not break the route
@@ -2441,6 +2452,18 @@ def _self_test():
             status, _ = _raw_request(port, "GET", "/checkpoints/diff?id=" + "d" * 40,
                                      headers=no_auth)
             assert status == 401, status
+            # Live work in the workspace: refused like POST /restore, and
+            # flagged so the page can tell this apart from an unknown id.
+            busy_sess = state.get_session()
+            with busy_sess._lock:
+                busy_sess._live_workers += 1
+            try:
+                status, data = _raw_request(port, "GET", "/checkpoints/diff?id=" + "d" * 40,
+                                            headers=auth_headers)
+            finally:
+                with busy_sess._lock:
+                    busy_sess._live_workers -= 1
+            assert status == 409 and json.loads(data).get("workspace_busy") is True, (status, data)
 
             if engine_mod.hearth_checkpoint.is_git_available():
                 note = os.path.join(diff_ws, "note.txt")

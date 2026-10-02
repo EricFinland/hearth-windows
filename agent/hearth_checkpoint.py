@@ -1104,6 +1104,15 @@ def preview_restore(workspace, checkpoint_id, max_files=PREVIEW_MAX_FILES,
     PREVIEW_LOCK_TIMEOUT_S, a few seconds rather than a minute) comes back
     with "busy": True as well, so a caller can say "try again" rather than
     "something is broken".
+
+    Like restore(), this holds the store lock for the whole of the staging
+    step, a full `git add -A` of the workspace, which on a large tree is the
+    slow part. A checkpoint() or restore() wanting the store waits for it,
+    and git reads every file while the agent may be replacing some of them.
+    So a caller should not run it while work is live in the workspace: the
+    sidecar's GET /checkpoints/diff refuses then, exactly as POST /restore
+    does. The diffing itself (hearth_diff.build_preview) happens after the
+    lock is released.
     """
     import hearth_diff  # local: hearth_diff imports this module for its secret patterns
 

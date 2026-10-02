@@ -742,14 +742,16 @@ async function refreshCheckpoints() {
  * GET /checkpoints/diff, which runs the same comparison restore makes and
  * stops before writing anything. The diff is drawn in restore's direction:
  * "-" lines are what is on disk now and will go, "+" lines are what the
- * checkpoint puts back. It also names any excluded secrets files (.env and similar) that
- * changed since the checkpoint, the one gap restore documents: they were
- * never captured, so they cannot be put back.
+ * checkpoint puts back. It also names any excluded secrets files (.env and
+ * similar) that changed since the checkpoint, the one gap restore documents:
+ * they were never captured, so they cannot be put back.
  *
  * The preview is fetched after the dialog opens and never gates it. Restore
  * stays clickable while it loads and when it fails, because the preview is an
  * aid to the decision, and the restore response still reports exactly what
- * changed in the transcript afterwards.
+ * changed in the transcript afterwards. While a turn is live in the workspace
+ * the sidecar refuses the preview, as it refuses the restore itself, and the
+ * dialog says to wait rather than calling it a failure.
  */
 function confirmRestore(cp, index) {
   const when = formatTime(cp.timestamp ?? cp.commit_time);
@@ -787,7 +789,9 @@ async function loadRestorePreview(cp, holder) {
       class: "panel-note is-error",
       text: err instanceof HttpError && err.status === 503
         ? "A checkpoint is being written right now, so the preview is not available. Reopen this in a moment to see it; Restore itself still works."
-        : "Could not preview this restore (" + errorText(err) + "). Restore itself still works, and its result lists every file it changed.",
+        : err instanceof HttpError && err.body?.workspace_busy
+          ? "A turn is still working in this workspace, so there is nothing settled to preview yet. Restore waits for it too; reopen this once the turn has finished."
+          : "Could not preview this restore (" + errorText(err) + "). Restore itself still works, and its result lists every file it changed.",
     }));
     return;
   }
