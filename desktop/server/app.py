@@ -1041,7 +1041,11 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "attachments can only be sent in a chat session"})
             return None
         try:
-            return attachments_mod.compose(message, paths, s.workspace, s.model)
+            # The budget leaves room for the conversation already in the
+            # engine's history, so a long chat shrinks it rather than
+            # overflowing the model's context.
+            return attachments_mod.compose(message, paths, s.workspace, s.model,
+                                           used_chars=attachments_mod.engine_history_chars(s.engine))
         except attachments_mod.AttachError as exc:
             self._send_json(exc.status, exc.payload())
             return None
@@ -1069,7 +1073,9 @@ class SidecarHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "attachments can only be sent in a chat session"})
                 return
             else:
-                out = attachments_mod.handle(path, body, s.workspace, s.model)
+                out = attachments_mod.handle(
+                    path, body, s.workspace, s.model,
+                    used_chars=attachments_mod.engine_history_chars(s.engine))
         except attachments_mod.AttachError as exc:
             self._send_json(exc.status, exc.payload())
             return
@@ -3765,6 +3771,7 @@ def _self_test():
             status, rec = _att("/attach/finish", {"id": upload_id})
             assert status == 200 and rec["path"] == "imports/_CON.txt", (status, rec)
             assert rec["readable"] and rec["budget_chars"] == attachments_mod.budget_chars(4096), rec
+            assert rec["overhead_chars"] > 0, rec
             with open(os.path.join(att_ws, "imports", "_CON.txt"), "rb") as fh:
                 assert fh.read() == content
             # Over the per-file cap, and garbage bodies.

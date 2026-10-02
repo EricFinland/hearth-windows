@@ -1245,10 +1245,20 @@ class RealEngine:
         # words; this is the one place they are joined to what the model
         # sees. Their injection scan is surfaced exactly as a suspicious tool
         # result's is: kept as self._last_scan, so the next gated approval
-        # carries the finding (module docstring, point 3).
+        # carries the finding (module docstring, point 3). Only the newest
+        # message's files stay inline: their budget assumed earlier ones were
+        # collapsed to a one-line summary (attachments.collapse_history),
+        # which is done here, or every attached message would stack up in
+        # the history until the context window overflowed.
         content = str(ctx.message)
         extra = getattr(ctx.message, "attachment_text", None)
         if extra:
+            collapse = getattr(ctx.message, "collapse_history", None)
+            if callable(collapse):
+                for earlier in self._messages:
+                    if (isinstance(earlier, dict) and earlier.get("role") == "user"
+                            and isinstance(earlier.get("content"), str)):
+                        earlier["content"] = collapse(earlier["content"])
             content += "\n\n" + extra
         attached_scan = getattr(ctx.message, "attachment_scan", None)
         if attached_scan is not None and hearth_injection.meets_threshold(
@@ -3280,6 +3290,45 @@ def _self_test():
     _wait_idle(sessS2)
     assert [m for m in seenS[0] if m["role"] == "user"][-1]["content"] == "just words"
     assert engineS2._last_scan is None, "no attachment, no scan"
+
+    # Three back-to-back messages, each attaching a 100 KB log, at the
+    # 4096-token fallback context: the history sent must stay inside the
+    # window every time. Only the newest message keeps its file inline; the
+    # earlier ones are collapsed to their one-line summary, and each budget
+    # allows for the conversation already there.
+    import shutil as _shutilS
+    import tempfile as _tempfileS
+    wsS3 = _tempfileS.mkdtemp(prefix="hearth-engine-attach-")
+    try:
+        os.makedirs(os.path.join(wsS3, "imports"))
+        with open(os.path.join(wsS3, "imports", "big.log"), "w", encoding="utf-8") as fh:
+            fh.write("".join("{:06d} service started, all checks passed\n".format(i)
+                             for i in range(2300)))
+        seenS.clear()
+        engineS3 = RealEngine(chat_fn=_recording_chat([
+            ({"role": "assistant", "content": "read it", "tool_calls": []}, 1, 1)] * 3),
+            execute_tool_fn=fake_execute_tool, checkpoint_fn=fake_checkpoint)
+        sessS3 = session_mod.Session(wsS3, "fake-model", "edit", engine=engineS3)
+        window = 4096 * attachments_mod.CHARS_PER_TOKEN
+        for n in range(3):
+            used = attachments_mod.engine_history_chars(engineS3)
+            promptS3 = attachments_mod.compose("look at the log, round {}".format(n), ["imports/big.log"],
+                                               wsS3, ctx_fn=lambda m: 4096, used_chars=used)
+            sessS3.submit_prompt(promptS3)
+            deadlineS3 = time.monotonic() + 5
+            while len(seenS) < n + 1 and time.monotonic() < deadlineS3:
+                time.sleep(0.01)
+            _wait_idle(sessS3)
+            sent = sum(len(m.get("content") or "") for m in seenS[n])
+            assert sent <= window * attachments_mod.HISTORY_CEILING + 200, (n, sent, window)
+            users = [m["content"] for m in seenS[n] if m["role"] == "user"]
+            assert len(users) == n + 1, users
+            assert users[-1].count("<<<BEGIN ATTACHMENT ") == 1, "the newest keeps its file inline"
+            for older in users[:-1]:
+                assert "BEGIN ATTACHMENT" not in older and '"imports/big.log"' in older, older
+        assert len(seenS) == 3, len(seenS)
+    finally:
+        _shutilS.rmtree(wsS3, ignore_errors=True)
 
     print("hearth-desktop-engine self-test OK")
     return 0

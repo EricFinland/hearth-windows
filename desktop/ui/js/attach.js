@@ -35,10 +35,14 @@ export const LIMITS = Object.freeze({
 });
 
 const CHUNK_BYTES = 1024 * 1024;
-// attachments.py's BLOCK_OVERHEAD_CHARS and MIN_EXCERPT_CHARS: the chip's
-// "full text" or "excerpt" is the same arithmetic the sidecar will do at send
-// time, so the label does not promise something the prompt will not do.
-const BLOCK_OVERHEAD_CHARS = 420;
+// attachments.py's _SET_OVERHEAD_CHARS, BLOCK_OVERHEAD_CHARS and
+// MIN_EXCERPT_CHARS: the chip's "full text" or "excerpt" is the same
+// arithmetic the sidecar will do at send time, so the label does not promise
+// something the prompt will not do. Each finish record carries its own
+// overhead_chars (the fence grows with the file's name); the constant is only
+// the fallback for a record without one.
+const SET_OVERHEAD_CHARS = 400;
+const BLOCK_OVERHEAD_CHARS = 520;
 const MIN_EXCERPT_CHARS = 200;
 const NOTICE_MS = 5000;
 
@@ -61,7 +65,9 @@ export function planInline(records) {
   const list = Array.isArray(records) ? records : [];
   if (!list.length) return [];
   const budgets = list.map((r) => Number(r && r.budget_chars) || 0);
-  let remaining = Math.max(0, Math.min(...budgets) - BLOCK_OVERHEAD_CHARS * list.length);
+  const overhead = list.reduce(
+    (sum, r) => sum + (Number(r && r.overhead_chars) || BLOCK_OVERHEAD_CHARS), SET_OVERHEAD_CHARS);
+  let remaining = Math.max(0, Math.min(...budgets) - overhead);
   const plan = list.map(() => "none");
   const readable = list
     .map((r, i) => ({ i, len: r && r.readable ? Number(r.text_chars) || 0 : -1 }))
