@@ -11,6 +11,7 @@ import { el, icon, appendAll, clear, setText, neutralize, $ } from "./dom.js";
 import { blob } from "./safe-text.js";
 import { ShopView } from "./shop.js";
 import { LoopConfigPanel, LoopRunBar, account as loopAccount } from "./loop.js";
+import { initAttachments, takeAttachments, returnAttachments } from "./attach.js";
 import { SwarmConfigPanel, SwarmRunBar, account as swarmAccount } from "./swarm.js";
 import { renderUpdate } from "./update.js";
 
@@ -1115,16 +1116,19 @@ function autosize() {
 async function send() {
   const message = ui.composer.value.trim();
   if (!message || !state.session || state.running) return;
+  const attached = takeAttachments();
   ui.composer.value = "";
   autosize();
   transcript.addUser(message);
   state.running = true;
   updateTurnUi();
+  if (attached.length) transcript.addUserAttachments(attached);
   try {
-    await sidecar.prompt(message);
+    await sidecar.prompt(message, attached.map((a) => a.path));
   } catch (err) {
     state.running = false;
     updateTurnUi();
+    returnAttachments(attached);
     transcript.addNotice("error", "Could not submit that prompt.", errorText(err));
   }
 }
@@ -1480,6 +1484,7 @@ ui.reloadSetup.addEventListener("click", refreshSetup);
 ui.reloadCheckpoints.addEventListener("click", refreshCheckpoints);
 ui.send.addEventListener("click", send);
 ui.stop.addEventListener("click", cancel);
+initAttachments({ sidecar, getSession: () => state.session, isRunning: () => state.running });
 
 // The bounds form appears the moment "work loop" is chosen, not after a
 // session exists: a person deciding whether to run one unattended needs to

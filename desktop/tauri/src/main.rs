@@ -554,6 +554,7 @@ fn create_window(app: &tauri::AppHandle, origin: &str) -> Result<(), String> {
         .min_inner_size(900.0, 600.0)
         .background_color(tauri::webview::Color(0x14, 0x10, 0x0d, 0xff))
         .initialization_script(BRIDGE)
+        .disable_drag_drop_handler() // else WebView2 swallows HTML5 file drops (js/attach.js)
         .on_navigation(move |url| {
             let text = url.as_str();
             if text == allowed || text.starts_with(&format!("{}/", allowed)) {
