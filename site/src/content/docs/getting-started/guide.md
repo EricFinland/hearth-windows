@@ -66,10 +66,13 @@ everything else on this page.
   including a real tool call, the permission gate firing, an approval
   resolved over HTTP, a byte-exact workspace change, an automatic pre-turn
   checkpoint, and a byte-exact restore.
-- Session persistence (`desktop/server/session_state.py`): the conversation,
-  workspace, model, and mode survive a sidecar restart. A turn or an
-  approval that was in flight when the process stopped is never silently
-  resumed; see "What survives a restart" below.
+- Session persistence and saved chats (`desktop/server/session_state.py`,
+  `desktop/server/conversations.py`): every session is a conversation,
+  kept in its own file, and the Chats sidebar on the Chat tab lists them
+  so you can start a new one, go back to an old one, rename, or delete.
+  The conversation, workspace, model, and mode survive a sidecar restart.
+  A turn or an approval that was in flight when the process stopped is
+  never silently resumed; see "What survives a restart" below.
 - Model downloads with honest progress (`agent/hearth_pull.py`): drives
   Ollama's own pull stream and turns it into a progress bar and byte count
   that never move backwards, with cancellation, a disk-space check up
@@ -550,6 +553,42 @@ losing the conversation, the workspace/model/mode in use, and the record
 of what was approved. `desktop/server/session_state.py` persists the
 conversation, the workspace, model, and mode, and a bounded tail of recent
 events, so a restart is a resumption rather than a reset.
+
+Every session is also one saved conversation among many. Starting a
+session, pressing New chat (or Ctrl+N), or restarting a session from the
+sidebar form starts a new conversation and leaves the previous one under
+Chats, on the left of the Chat tab, grouped by Today, Previous 7 days and
+Older. Click one to reopen it; its history replays into the transcript and
+the model picks up the same context it had. Rename a chat inline (the
+pencil, or F2) and delete it with the bin (or Del), which asks first.
+After a restart, whichever chat was open last is the one that reopens.
+Switching chats, starting a new one, and deleting the open one are refused
+while a turn is still running, because the turn and any tool call it
+started would otherwise carry on behind a session nothing can reach: stop
+it first (Esc). Deleting the open chat ends its session; deleting any chat
+never touches the files in its workspace or its checkpoints.
+
+Where it lives: one file per conversation in
+`%LOCALAPPDATA%\Hearth\desktop\conversations\`, plus an `index.json` that
+is only a cache. If the index is lost or damaged it is rebuilt from the
+conversation files, and a conversation file that cannot be read is skipped
+(and left where it is) rather than hiding the others. An older Hearth's
+single `session_state.json` is copied in on first start and the original is
+renamed to `session_state.json.migrated`, never deleted. A chat is titled
+from its first prompt, with control characters and text-direction overrides
+removed, and that title is still treated as untrusted text by the UI.
+
+How much of a chat replays: the model's own context is saved whole, but
+the on-screen history is a bounded tail, roughly the last 400 entries and
+at most 2 MB, with each streamed reply stored as one entry. A long chat
+reopened from disk therefore starts with a note saying earlier messages
+are not shown, rather than looking like it began part way through.
+
+These files sit in a folder the agent's own `run_command` could write to,
+so reopening a chat is treated exactly like a restart: a saved session in
+`bypass` mode is refused, a saved conversation whose system prompt Hearth
+did not write is dropped, and a saved work loop or swarm has its bounds
+re-checked rather than believed.
 
 What is deliberately not persisted matters as much as what is. A pending
 approval is never resurrected: an approval is a live question with a
