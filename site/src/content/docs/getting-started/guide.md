@@ -339,9 +339,42 @@ It annotates one the permission mode had already decided to ask for:
   that scored `high` is dropped from view entirely if the very next tool
   call is one the mode allows without asking.
 
-There is also no UI reading any of this yet (see "Where this actually
-stands today"): today these are fields on events the sidecar emits, not
-something on a screen.
+The approval card shows each finding in its own block under the call it
+belongs to; nothing else in the window reacts to them.
+
+**What a file write would actually change.** An approval for `write_file`,
+`edit_file` or `replace_in_files` shows a diff rather than the raw file
+body: a `+N -M` summary, each file's path and whether it is new or
+modified, removed and added lines with old and new line numbers, and three
+unchanged lines either side of each change (more are a click away). The
+exact arguments are still on the card, folded underneath, because the diff
+is the readable answer and the arguments are what will literally be
+written. The sidecar works the diff out, not the window, because only the
+sidecar can read the file on disk:
+
+- It resolves the path exactly the way the tool will (workspace
+  containment, then `.hearthignore`) and shows nothing for a write the tool
+  is going to refuse anyway; the tool's own error says why.
+- `write_file` over an existing file is compared against what is there now.
+  A CRLF file stays CRLF (the tool converts for you), so it does not show
+  every line changed; a genuine line-ending change is stated as a note
+  instead. `edit_file` whose `find` text is not in the file says so rather
+  than showing a diff of nothing.
+- Unchanged context lines come from the file already on disk, and that file
+  can hold a credential the write never mentions. Both sides are run
+  through the secret scanner above and every finding is replaced with
+  `[REDACTED:kind]` before a line is shown, and a file matching the secret
+  patterns undo excludes (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `*.pfx`,
+  `credentials*`) is named with its line counts but never shown. The
+  redaction applies to the preview only: approving still writes the real
+  text.
+- A preview is capped (2,000 lines and 64 KB per approval, 20 files for
+  `replace_in_files`) because the approval is saved with the session and
+  replayed when the window reconnects. Whatever a cap cut off, the card
+  says so.
+
+The diff is computed when the card appears. If the file changes on disk
+before you click, the tool writes against the file as it is then.
 
 **The prompt-injection scanner** (`agent/hearth_injection.py`) looks at
 content the agent reads: repo files, web pages, dependency READMEs, tool
@@ -506,6 +539,19 @@ restore look complete when it wasn't. A checkpoint taken before this
 existed has no baseline to compare against; restore says so explicitly
 (`excluded_manifest_available: false`) rather than reporting a false "no
 changes."
+
+You can see what a restore would do before you do it. Clicking restore on a
+checkpoint opens a dialog that shows the actual per-file diff: the same
+comparison restore makes, run without the step that writes anything, drawn
+the same way an approval card draws a write. Lines marked `-` are on disk
+now and will go; lines marked `+` come back from the checkpoint. The dialog
+also lists any secret-pattern file that changed since the checkpoint (the
+gap described above), so you learn that before clicking rather than after.
+The same rules as the approval card apply: credentials are redacted, secret
+files and files your `.hearthignore` excludes are named without their
+content, and binary files are named only. If a checkpoint is being written
+at that moment the preview says to reopen it in a moment; the Restore
+button works either way.
 
 ## Staying out of your way
 
