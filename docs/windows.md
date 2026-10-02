@@ -365,10 +365,17 @@ sidecar can read the file on disk:
   `credentials*`) is named with its line counts but never shown. The
   redaction applies to the preview only: approving still writes the real
   text.
-- A preview is capped (2,000 lines and 64 KB per approval, 20 files for
-  `replace_in_files`) because the approval is saved with the session and
-  replayed when the window reconnects. Whatever a cap cut off, the card
-  says so.
+- A preview is capped (2,000 lines and 64 KB per approval, file names
+  included, 20 files diffed for `replace_in_files`) because the approval is
+  saved with the session and replayed when the window reconnects. Whatever a
+  cap cut off, the card says so.
+- Working the diff out is bounded in time as well as size, because the card
+  waits for it. Most of a large file is matched quickly on the lines it
+  shares with the new version; a stretch that is still too big to compare
+  line by line within that bound (a long, highly repetitive file, say) is
+  shown as whole blocks removed and added, with a note saying so, rather
+  than holding the card back. A secret too long for the scanner to redact
+  cleanly hides that file's content entirely.
 
 The diff is computed when the card appears. If the file changes on disk
 before you click, the tool writes against the file as it is then.
@@ -548,7 +555,10 @@ The same rules as the approval card apply: credentials are redacted, secret
 files and files your `.hearthignore` excludes are named without their
 content, and binary files are named only. If a checkpoint is being written
 at that moment the preview says to reopen it in a moment; the Restore
-button works either way.
+button works either way. While a turn is still working in the workspace
+there is no preview, for the same reason restore itself waits: the preview
+has to take stock of the whole workspace, which would hold up that turn's
+own checkpoint.
 
 ## Staying out of your way
 
