@@ -478,11 +478,15 @@ def _gpu_vram_bytes(hw):
     Callers that show this figure to a user should be clear it is a ceiling,
     not a live free-memory reading.
 
-    approximate is True when that reading came from hearth_hw's WMI/CIM or
-    wmic fallback path rather than nvidia-smi (see hearth_hw's module
-    docstring: Win32_VideoController.AdapterRAM is a signed 32-bit field
-    that misreports anything above ~4GB, in either direction - it can read
-    low, high, or even negative-clamped-to-zero). Every caller that turns
+    approximate is True when that reading came from hearth_hw's last-resort
+    path: neither nvidia-smi nor the display driver's own 64-bit figure in
+    the registry could be read, so all that was left was
+    Win32_VideoController.AdapterRAM, a 32-bit field that misreports
+    anything above ~4GB, in either direction - it can read low, high, or
+    even negative-clamped-to-zero (see hearth_hw's module docstring). AMD
+    and Intel cards are exact readings too wherever the registry answers;
+    this flag is about how the number was read, not who made the card.
+    Every caller that turns
     vram_bytes into a verdict or a message MUST also look at approximate;
     a confident "great" or "wont_fit" built on a guessed number is not
     honest.
@@ -551,9 +555,10 @@ def _ram_budget_bytes(hw):
 # against is a known-unreliable reading (see _gpu_vram_bytes), so no caller
 # can display a verdict without also surfacing the uncertainty behind it.
 _VRAM_APPROX_NOTE = (
-    " This machine's VRAM size could not be read precisely (no nvidia-smi "
-    "available), so the figure behind this verdict is an approximate "
-    "reading and could be significantly off, in either direction."
+    " This machine's VRAM size could not be read precisely (neither "
+    "nvidia-smi nor the display driver reported an exact figure), so the "
+    "figure behind this verdict is an approximate reading and could be "
+    "significantly off, in either direction."
 )
 
 # Appended to a verdict's message whenever the GPU behind it is Intel or
@@ -585,8 +590,8 @@ def _reading_notes(vram_approximate, shared_memory_likely, integrated):
     """Every caveat a verdict's message carries about the figure behind it.
 
     A confirmed integrated GPU gets ONE note, not two. The approximate note
-    explains the number as a VRAM reading that might be wrong because there
-    was no nvidia-smi to ask; the integrated note explains the same number
+    explains the number as a VRAM reading that might be wrong because no
+    exact source could be asked; the integrated note explains the same number
     as the small slice of system RAM a driver reserved. The second account
     is both more specific and more useful, and printing them together puts
     two different explanations of one figure in front of a user and invites
@@ -640,7 +645,8 @@ def verdict_for(model, hw, context_tokens=None):
       vram_bytes            - VRAM this verdict was judged against (the
                               largest single GPU; see _gpu_vram_bytes).
       vram_approximate      - True when vram_bytes came from a known-unreliable
-                              fallback reading rather than nvidia-smi (see
+                              fallback reading rather than nvidia-smi or the
+                              display driver's registry figure (see
                               _gpu_vram_bytes and hearth_hw's module
                               docstring). A caller MUST check this before
                               presenting the verdict with any confidence; a
@@ -2692,6 +2698,20 @@ def _self_test():
         "dedicated video memory", v_igpu,
     )
     assert "integrated GPU" in v_igpu["message"], v_igpu
+    # hearth_hw now reads that 512MB exactly from the driver's registry
+    # figure, so the same iGPU arrives with approximate=False. Exact is not
+    # the same as dedicated: the carve-out must be graded exactly as
+    # cautiously, and the message must still explain it as integrated
+    # memory, without an "approximate" hedge that is no longer true.
+    hw_amd_igpu_exact = _hw(512 * 1024 ** 2, 32 * 1024 ** 3, approximate=False,
+                            vendor=hearth_hw.VENDOR_AMD, integrated=True,
+                            platform="Windows", name="AMD Radeon(TM) 880M Graphics")
+    v_igpu_exact = verdict_for(syn_7b_q4, hw_amd_igpu_exact, context_tokens=8192)
+    assert v_igpu_exact["vram_approximate"] is False, v_igpu_exact
+    assert v_igpu_exact["shared_memory_likely"] is True, v_igpu_exact
+    assert v_igpu_exact["verdict"] == VERDICT_CPU_SPILLOVER, v_igpu_exact
+    assert v_igpu_exact["message"].count(_INTEGRATED_MEMORY_NOTE.strip()) == 1, v_igpu_exact
+    assert _VRAM_APPROX_NOTE.strip() not in v_igpu_exact["message"], v_igpu_exact
     # And the same-sized reading on a GPU hearth_hw cleared as discrete is
     # still trusted: the flag has to work in both directions or it is just
     # a blanket downgrade.

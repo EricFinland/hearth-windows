@@ -5,8 +5,10 @@ description: What the boundaries are on Windows, what they are not, and which on
 
 This document covers Hearth for Windows: the Tauri desktop shell plus the Python
 sidecar, packaged and run as a normal application on someone's own machine.
-Nothing about this build is published yet, so this is written to shape the
-design, not to explain a decision already made or respond to an incident.
+Installers are published on the GitHub releases page (unsigned; see 3.4), so
+this describes code people are running. It records what each boundary is as
+built today, what it was meant to be where those differ, and what is still
+open.
 
 Read `SECURITY.md` first for the summary; this is the analysis behind it.
 
@@ -27,9 +29,13 @@ What an attacker who reaches Hearth actually wants:
 - **The agent's ability to execute code.** Hearth Code exists to let a model
   write files and run commands on the user's behalf. That capability is the
   prize; everything else follows from it.
-- **Cloud API keys the user adds later.** M1 talks to a local Ollama only, but
-  the product roadmap includes wiring in hosted model providers. A key typed
-  into Hearth is as valuable as a key typed into any other tool.
+- **The sidecar's bearer token.** Whoever holds it can do anything the
+  interface can, including answering the approval card. Section 4 traces
+  every place it travels.
+- **Cloud API keys the user adds later.** Hearth runs local models only today
+  (its bundled `llama-server`, or an Ollama the user already runs), but the
+  product roadmap includes wiring in hosted model providers. A key typed into
+  Hearth is as valuable as a key typed into any other tool.
 - **The audit database.** It is a record of every run: prompts, tool calls,
   cost, latency, errors. Useful to an attacker for reconnaissance (what
   repos exist, what the user works on, what credentials past runs touched)
@@ -44,12 +50,31 @@ What an attacker who reaches Hearth actually wants:
 Be precise about where the boundaries actually are, because on Windows most
 of the ones that felt free on NixOS are gone.
 
-- **Process boundary (Rust shell vs. Python sidecar vs. Ollama).** This is a
-  real boundary: three separate processes, communicating over HTTP on
-  loopback. It stops one crashing the others and lets the shell restart the
-  sidecar. It is not a security boundary against a malicious sidecar or a
-  malicious model, because the shell trusts what the sidecar tells it and the
-  sidecar trusts what Ollama streams back.
+- **Process boundary (Rust shell vs. Python sidecar vs. inference engine).**
+  This is a real boundary between separate processes, but not a security
+  boundary in the direction that matters most. The shell (`Hearth.exe`,
+  `desktop/tauri/`) hosts the WebView2 renderer and a small loopback HTTP
+  server of its own (`origin.rs`, below). It starts the sidecar with the
+  bundled CPython and holds it in a kill-on-close Job object
+  (`desktop/tauri/src/sidecar.rs`). The sidecar in turn starts the bundled
+  `llama-server`, in a Job object of its own (`agent/hearth_llama.py`), or
+  talks to an Ollama daemon the user already runs, which is optional. All of
+  them run as the same user with the same privileges, so the split stops one
+  crashing the others and guarantees nothing is orphaned holding gigabytes
+  of VRAM; it does not stop a compromised sidecar from doing anything the
+  user could. The sidecar trusts what the engine streams back as text and
+  nothing more: a tool call the model emits still goes through the
+  permission and containment checks below. The shell does not trust the
+  sidecar where it acts on its answer: before running an update it
+  re-derives the staging directory, re-hashes the installer and re-checks
+  the version itself (`desktop/tauri/src/update.rs`).
+- **`llama-server`'s own HTTP API has no authentication.** It binds
+  `127.0.0.1` explicitly (so a stray `LLAMA_ARG_HOST` cannot widen it) on an
+  ephemeral port, with its web UI turned off, but Hearth passes no API key.
+  Any process running as the user, or a page that finds the port, can send
+  it requests for as long as it runs. It has no route to files or tools,
+  which all live in the sidecar, so what it exposes is the loaded model and
+  the machine's compute rather than the agent.
 - **The workspace boundary.** `agent/hearth_contain.py`'s `safe_join` is the
   boundary between "files the agent may touch" and "everything else on disk."
   This is a real, enforced boundary for every file tool that goes through it,
@@ -82,7 +107,9 @@ of the ones that felt free on NixOS are gone.
   Design and review decisions should still treat the HTTP surface as
   internet-facing rather than assuming the loopback bind is doing any work
   on its own; the token and header checks are the control, not the bind
-  address.
+  address. The same goes for the shell's own origin server, the second
+  loopback listener in the chain: it is reachable by every local process
+  too, which is why it holds no credential of its own (section 4).
 - **The permission mode boundary.** `agent/permissions.py` draws a line
   between what the model can do unattended and what needs a human to click
   approve. This is a real boundary for tool *dispatch*, but it is enforced by
@@ -134,17 +161,25 @@ other classes below.
 
 ### 3.2 A malicious or typosquatted model
 
-M1 assumes the user already has Ollama installed and a model already pulled;
-Hearth does not fetch or manage models yet. M2 plans a model manager
-("one-button download"). Whenever that ships, model acquisition becomes part
-of Hearth's own attack surface: models are large, opaque binary blobs pulled
-over the network, and a typosquatted or trojaned entry in a model listing is
-a realistic way to get a user to run something they did not intend to trust.
-Weights themselves are not generally a code-execution vector the way a
-binary is, but the surrounding template, tool-call format, and any bundled
-code in a model's ecosystem can be. This section is forward-looking:
-today the risk is bounded by the user's own choice of Ollama model, made
-outside Hearth.
+Hearth fetches models itself now. The model shop searches Hugging Face and
+downloads GGUF files from it (`agent/hearth_hf.py`,
+`desktop/server/downloads.py`), so model acquisition is part of Hearth's own
+attack surface: models are large, opaque binary blobs pulled over the
+network, and a typosquatted or trojaned repository in a search result is a
+realistic way to get a user to run something they did not intend to trust.
+Weights are not a code-execution vector the way a binary is, but two things
+around them are. A GGUF is parsed by `llama-server`, which is native code
+reading an untrusted file format with the user's full privileges, and
+llama.cpp's GGUF loader has had memory-safety bugs reported upstream before.
+And the chat template inside the file decides how the conversation, tool
+results included, is laid out for the model, which is a lever for the kind
+of injection in 3.1.
+
+The engine itself is fetched too: on first run Hearth can download a GPU
+build of `llama-server` (Vulkan, or another pinned build named in
+`HEARTH_GPU_ENGINE`) from llama.cpp's GitHub releases
+(`agent/hearth_engine.py`, `scripts/vendor_llama.py`). That is a binary, and
+it is executed.
 
 ### 3.3 Another local process, or a website the user has open
 
@@ -156,16 +191,25 @@ the wrong token, or a spoofed `Host` is refused before it reaches a route
 handler. What those checks do not do is limit what a *correct* token can
 reach - a process on the machine that does obtain the token (by reading it
 out of another compromised process, for instance) can still drive the agent
-by proxy, exactly as if it were the legitimate UI.
+by proxy, exactly as if it were the legitimate UI. That includes a command
+the agent itself ran: at the default `limits` sandbox level a child process
+can still read other processes' memory (see the probe table in section 4),
+and the token lives in the sidecar's and the page's memory.
 
 ### 3.4 Supply-chain compromise of the installer or update channel
 
-If the Hearth installer, or whatever update mechanism ships later, is
-compromised, an attacker gets to run arbitrary code on every machine that
-updates. This is a real and serious risk for any downloaded desktop app, but
-it is generic to the category rather than specific to what Hearth does, and
-it is ranked below the three above because it requires compromising Hearth's
-own distribution rather than exploiting how the product is used.
+If the Hearth installer or its update channel is compromised, an attacker
+gets to run arbitrary code on every machine that installs or updates. This
+is a real and serious risk for any downloaded desktop app, but it is generic
+to the category rather than specific to what Hearth does, and it is ranked
+below the three above because it requires compromising Hearth's own
+distribution rather than exploiting how the product is used. The installer
+is built by GitHub Actions from this repository (`.github/workflows/build.yml`)
+and is not Authenticode-signed. An updater exists in the code
+(`agent/hearth_update.py` and `desktop/tauri/src/update.rs`) but its feed
+in `release/trust.json` points at `releases.hearth.invalid`, a reserved name
+that cannot resolve, so no shipped build fetches an update from anywhere
+yet.
 
 ### 3.5 Conventional malware (lowest, but not absent)
 
@@ -179,8 +223,10 @@ because Hearth is a distinguishing target.
 ## 4. Per-threat mitigations
 
 Stated honestly. "Designed" means the mechanism exists and is intended to
-hold. "Planned" means it is specified but not yet built. "Not mitigated"
-means exactly that, and is listed so nobody assumes otherwise later.
+hold. "Planned" means it is specified but not yet built. "Changed from the
+original design" means something was built differently from what an earlier
+version of this document promised, and says why. "Not mitigated" means
+exactly that, and is listed so nobody assumes otherwise later.
 
 ### Prompt injection (3.1)
 
@@ -200,24 +246,33 @@ means exactly that, and is listed so nobody assumes otherwise later.
 
 | Status | Mitigation |
 |---|---|
-| Not yet applicable | M1 does not fetch models; the user's own Ollama installation is the trust decision for now. |
-| Planned | A future model manager should verify what it downloads (checksums against a known-good listing at minimum) and should not silently run installer code with elevated trust just because it came from "the shop." No specific mechanism is committed yet; this is a requirement to carry into M2 design, not a built control. |
+| Designed | Every GGUF the shop downloads is hashed against the sha256 the Hub publishes for it (the tree API's `lfs.oid`) before it is renamed out of its `.part` file, so a CDN or redirect target cannot substitute content. What to download is decided by the sidecar, which re-fetches the file list, sizes and hashes from the Hub itself: `POST /downloads` takes a repository and a quantisation name, never a URL, a size or a hash, so a compromised page cannot point it anywhere else. A file the Hub publishes no sha256 for is reported as `verification: "size_only"` rather than as verified. |
+| Designed | A GPU engine build is fetched only from `github.com/ggml-org/llama.cpp/releases`, checked against the sha256 pinned in `vendor/llama_manifest.json` (committed to this repository) before the archive is opened, and run (`--version`, `--list-devices`) before it is made active. A build that fails any step is deleted and the bundled CPU engine stays in use. |
+| Not mitigated | Hash checks prove the bytes are the ones the Hub published, not that the publisher is who the user thinks. A typosquatted or trojaned repository is downloaded and verified exactly as faithfully as the real one. The shop shows the repository name, downloads and likes; choosing whom to trust is still the user's call. |
+| Not mitigated | `llama-server` parses the GGUF with the user's full privileges and no sandbox. A file crafted to exploit a parser bug runs as the user. |
 | Designed (partial) | Because the model is treated as unreliable rather than trusted (see `hearth_router` and tool-call handling generally), a malformed or adversarial tool call from a bad model still has to pass through the same permission and containment checks as a call from a good one. The model has no special path to bypass either. |
 
 ### Another local process or a website (3.3)
 
 | Status | Mitigation |
 |---|---|
-| Designed | A bearer token is required on every sidecar route except `GET /healthz`, checked with `hmac.compare_digest` rather than `==` so a wrong guess cannot be narrowed byte-by-byte through timing. `Host` and `Origin` are validated against `127.0.0.1:<port>`/`localhost:<port>` before the token is even checked, and the server binds `127.0.0.1` on an ephemeral (not fixed) port. The token and port are never hardcoded: `main.py` generates the token with `secrets.token_urlsafe(32)` and prints it, with the ephemeral port and the process id, as one line of JSON on stdout for a caller (the eventual Rust shell, or today's test harness) to read at startup, and never again after that (`desktop/server/auth.py`, `desktop/server/app.py`, `desktop/server/main.py`). `GET /healthz` itself returns nothing beyond `{"ok": true}` - no token, no workspace path, no other state. |
+| Designed | A bearer token is required on every sidecar route except `GET /healthz`, checked with `hmac.compare_digest` rather than `==` so a wrong guess cannot be narrowed byte-by-byte through timing. `Host` and `Origin` are validated against `127.0.0.1:<port>`/`localhost:<port>` before the token is even checked, and the server binds `127.0.0.1` on an ephemeral (not fixed) port. The token and port are never hardcoded: `main.py` generates the token with `secrets.token_urlsafe(32)` and prints it, with the ephemeral port and the process id, as one line of JSON on stdout, once, at startup (`desktop/server/auth.py`, `desktop/server/app.py`, `desktop/server/main.py`). The shell reads that line off the pipe (`desktop/tauri/src/sidecar.rs`) and consumes it there: the handshake line is never forwarded to the log sink, and the token is never written to a file, put on a command line, or placed in the sidecar's environment. `GET /healthz` itself returns nothing beyond `{"ok": true}` - no token, no workspace path, no other state. |
+| Designed | The shell's origin server (`desktop/tauri/src/origin.rs`) is the only path from the page to the sidecar, and it adds no authority. It serves the interface from bytes compiled into the executable, so there is no directory on disk to swap or traverse. It forwards only the paths in its `SIDECAR_ROUTES` allowlist, so it cannot be used as an open proxy. It refuses any request whose `Origin` is not its own exact origin (403), and any request to a route other than `/healthz` that carries no `Authorization` header (401), before the sidecar is contacted. It forwards the page's `Authorization` header unchanged, mints and injects nothing, rewrites `Host` to the sidecar's literal loopback address, drops `Origin` and `Referer`, and sends one request per connection (`Connection: close`) so a rejected request cannot smuggle a second one. |
+| Designed | The page is served with `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; ...; frame-ancestors 'none'` (`CSP` in `origin.rs`): no inline script or style, no `eval`, no frames, no connections except to its own origin and Tauri's IPC. Every string from the model, a file, a tool result or Hugging Face is rendered as text through `desktop/ui/js/dom.js` and `safe-text.js`, never as HTML, and `desktop/ui/xss-check.html` exercises that against hostile fixtures. |
+| Designed | The page reaches the shell through exactly three Tauri commands (`handshake`, `pick_folder`, `install_update`; `desktop/tauri/capabilities/main.json`). `withGlobalTauri` is off and no plugin permission is granted, and each command first checks that the calling webview is on the shell's own origin. The shell clears the `WEBVIEW2_*` environment variables at startup, before any webview exists, so a poisoned environment cannot open a remote-debugging port on the page or load the browser from another folder. |
 | Designed | `POST /session` rejects `mode: "bypass"` over this transport with 400. `permissions.decide` still implements `bypass` for the Linux CLI, but the sidecar's HTTP surface cannot be asked for it, so one leaked or guessed token cannot turn into unattended arbitrary command execution over the network. |
 | Designed | DNS rebinding is handled by checking the literal `Host` header text against the loopback allowlist, not by resolving a hostname and comparing addresses - a rebound name that resolves to `127.0.0.1` on the wire still fails the check because its `Host` header does not read `127.0.0.1:<port>` or `localhost:<port>`. |
-| Designed (intent, not yet built) | The token is meant to never reach the WebView. The Rust shell would hold it and proxy sidecar calls, specifically so that an XSS bug in the UI layer cannot read the token and use it to talk to the sidecar directly. There is still no Rust shell, so this remains a design intention rather than something built and tested. |
+| Changed from the original design | The plan was that the token would never reach the WebView: the shell would hold it and inject it while proxying. As built, the shell hands the token to the page over the `handshake` IPC command, and the page keeps it in a module-private variable in memory only (`desktop/ui/js/api.js`): never in `localStorage` or `sessionStorage`, never in a URL or query string, only ever in an `Authorization` header. The reason is the origin server's design, above: one that injected the token would grant authority to any local process that can reach its port, which is every process on the machine. The cost is that the CSP and the text-only rendering rules are what keep script out of the page. |
+| Not mitigated | Script running in the page holds the token, and the token can do everything the interface can, including approving a pending tool call. A cross-site scripting bug in the interface is therefore equivalent to a stolen token. `desktop/ui/dev-host.mjs`, the browser dev host, also serves the token over HTTP to any local process by design; `build.rs` and `scripts/build_windows.py` exclude it from every build, and it must never be run on a machine with anything to lose. |
 
 ### Supply-chain compromise of installer or updates (3.4)
 
 | Status | Mitigation |
 |---|---|
-| Not addressed in this document | Code signing, update integrity, and release pipeline hardening are a separate concern from the runtime threat model and are not covered here. Flagging it as real and out of the scope of what this document tracks, so it does not get silently forgotten. |
+| Designed | Updates are trusted by signature, not by host. A release manifest is accepted only with a valid Ed25519 signature from a key listed in `release/trust.json`, which ships inside the install; TLS is used and is not the check. The manifest's signature is checked before any installer byte is requested, the installer's size and SHA-256 are checked against the signed manifest, and a manifest whose version is not newer than the installed one, is below the persisted version floor, or is past its expiry is refused, which covers downgrade and freeze attacks (`agent/hearth_update.py`). The sidecar never executes what it downloads. |
+| Designed | The one place a downloaded file is executed is the shell (`desktop/tauri/src/update.rs`), and it does not take the sidecar's word for anything: it derives the staging directory itself and refuses a path outside it, recomputes the size and SHA-256 from the file on disk immediately before the spawn, requires the version to be strictly greater than the one compiled into the running executable, and shows the user what will run before a yes proceeds. |
+| Designed | The installer is built only by GitHub Actions from this repository, and the build attests its provenance (`actions/attest-build-provenance`), so anyone can check with `gh attestation verify` that a given `.exe` came out of this repository's workflow at a given commit. The pinned llama.cpp and CPython it bundles are fetched by hash from the pins committed in `vendor/`. |
+| Not mitigated | The installer is not Authenticode-signed, so Windows shows a SmartScreen warning and a user has no publisher identity to check; see `docs/code-signing-policy.md`. The update feed is not switched on (above), so today an update means downloading the next installer by hand, with the same exposure as the first one. The release key in `release/trust.json` was generated on a development machine and is due to be replaced before the feed goes live, as that file says. A compromise of the GitHub account or the Actions pipeline would produce an attested, working installer. |
 
 ### Conventional malware already on the machine (3.5)
 
@@ -321,11 +376,14 @@ something was built.
 - **The environment is reduced, which helps with one specific thing.**
   `agent/hearth_proc.py`'s `child_env` builds the child's environment from an
   allow list rather than inheriting the sidecar's environment wholesale.
-  `HEARTH_DB`, `HEARTH_REPO`, `HEARTH_DAILY_TOKEN_CAP`, and (later) the
-  sidecar's bearer token are deliberately excluded, so a shell command the
-  agent issues cannot read the audit database's path or steal the token out
-  of its own environment. This narrows one specific leak. It does not
-  contain the command in any other way.
+  `HEARTH_DB`, `HEARTH_REPO`, `HEARTH_DAILY_TOKEN_CAP` and every other
+  `HEARTH_*` variable are deliberately excluded, so a shell command the
+  agent issues cannot read the audit database's path out of its own
+  environment. The sidecar's bearer token is never in any environment to
+  begin with: `main.py` holds it in memory and prints it once to the shell.
+  This narrows one specific leak. It does not contain the command in any
+  other way, and a command that can read process memory or the user's files
+  is a separate question (see the probe table above).
 
 ## 5. Explicitly out of scope
 
@@ -346,10 +404,12 @@ something was built.
   runs it with every guard disabled, Hearth is not going to save them from
   their own configuration choice. The permission engine documents this
   ("everything runs, no prompts") rather than hiding it.
-- **Vulnerabilities in Ollama, Windows itself, or the browser rendering
-  fetched web content.** Hearth depends on all three and inherits whatever
-  they get wrong. Tracking their individual CVEs is not the job of this
-  document.
+- **Vulnerabilities in llama.cpp's `llama-server`, Ollama, WebView2,
+  Windows itself, or the browser rendering fetched web content.** Hearth
+  depends on all of them and inherits whatever they get wrong. Tracking
+  their individual CVEs is not the job of this document; keeping the pinned
+  llama.cpp and CPython current is (`vendor/llama_manifest.json`,
+  `vendor/python_manifest.json`).
 - **Detecting or removing malware already resident on the machine.** Hearth
   is not an antivirus product and does not attempt to be one; see section
   4's note on conventional malware.

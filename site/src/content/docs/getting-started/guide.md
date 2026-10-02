@@ -121,8 +121,7 @@ only an API.
 **Still not done.** The installer is **not code signed**, so Windows shows a
 full-screen SmartScreen warning on first run;
 [docs/code-signing-policy.md](/hearth-windows/reference/code-signing/) covers what signing
-would and would not prove. There is no cloud API key support. AMD and Intel
-GPU detection is incomplete: NVIDIA is detected, others fall back to CPU.
+would and would not prove. There is no cloud API key support.
 
 **Downloading it.** Installers are published on the
 [GitHub releases page](https://github.com/EricFinland/hearth-windows/releases/latest),
@@ -193,14 +192,26 @@ difference the KV-cache math makes over just picking "the biggest number
 that sounds safe."
 
 One honesty note that matters: on Windows, VRAM is read through
-`nvidia-smi` when it's available, which is precise. When it isn't,
-detection falls back to PowerShell or `wmic`, both of which read
-`Win32_VideoController.AdapterRAM`, a signed 32-bit field. That field wraps
-above roughly 4GB, so a 24GB card can report a small or even negative
-number through that path. Every reading from the fallback path is marked
-approximate, and the shop's verdicts are deliberately softened when they're
-built on an approximate reading rather than a precise one - a confident
-"this runs great" is never shown on a guessed number.
+`nvidia-smi` when it's available, which is precise. When it isn't (every
+AMD and Intel machine, and NVIDIA ones without the tool), Hearth lists the
+adapters through PowerShell or `wmic` and then reads each one's memory size
+from its display driver's own registry entry
+(`HardwareInformation.qwMemorySize`), the same 64-bit figure Task Manager
+shows. That is exact too, for every vendor. Only when the driver has not
+written that value does Hearth fall back to
+`Win32_VideoController.AdapterRAM`, a 32-bit field that tops out just under
+4GB (a 16GB card reads as 4GB) and can wrap to a small or even negative
+number. A reading from that last path is marked approximate, and the
+shop's verdicts are deliberately softened when they're built on one - a
+confident "this runs great" is never shown on a guessed number.
+
+An integrated GPU's figure is exact and still small: a Radeon 880M reports
+the 512MB slice of system RAM its driver reserves. Hearth knows that slice
+is not dedicated VRAM and grades it as shared memory, whichever way it was
+read.
+
+The hardware reading is taken once and reused for ten minutes, so browsing
+the shop does not launch PowerShell on every search.
 
 ## Getting a model onto your machine
 

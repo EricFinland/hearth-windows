@@ -690,10 +690,11 @@ async function refreshCheckpoints() {
     setText(ui.cpNote, "No session yet.");
     return;
   }
-  // GET /checkpoints runs `git log` against the workspace's shadow store, and
-  // this is refreshed the moment a `checkpoint` event arrives, which is exactly
-  // when that store is being written. Losing that race is a transient 500, not
-  // a broken history, so retry once before reporting anything.
+  // GET /checkpoints reads the workspace's shadow store under the same lock a
+  // checkpoint or restore holds, so it never sees a half-written store. If one
+  // holds it for longer than the sidecar will wait, the answer is a 503
+  // checkpoint_store_busy: ask once more after a moment. Any other failure is
+  // real and is reported straight away rather than retried into hiding.
   let list;
   for (let attempt = 0; ; attempt++) {
     try {
@@ -701,7 +702,7 @@ async function refreshCheckpoints() {
       list = Array.isArray(body.checkpoints) ? body.checkpoints : [];
       break;
     } catch (err) {
-      if (attempt === 0) { await sleep(700); continue; }
+      if (attempt === 0 && err?.status === 503) { await sleep(700); continue; }
       clear(ui.cpList);
       ui.cpNote.className = "panel-note is-error";
       setText(ui.cpNote, "Could not read checkpoint history: " + errorText(err));
