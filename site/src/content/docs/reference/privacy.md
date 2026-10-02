@@ -40,7 +40,10 @@ All of it, unless a section further down says otherwise.
 - **Downloaded models.** Stored locally and reused.
 - **Files you attach to a message.** Copied into an `imports` folder inside
   your workspace and read on your machine; nothing about them is uploaded.
-  Like any other workspace file they are captured by checkpoints.
+  Like any other workspace file they are captured by checkpoints. The part
+  of a file's text that is placed in your message also becomes part of the
+  saved conversation in Hearth's data folder (`desktop\session_state.json`),
+  like any tool output, including anything the credential scan warned about.
 
 ## What leaves your machine, and only when it has to
 

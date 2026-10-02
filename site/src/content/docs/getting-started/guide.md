@@ -481,8 +481,9 @@ top of the session's workspace (`<workspace>\imports\`), created when
 first needed. Names are cleaned up for Windows on the way in: folder parts,
 control and invisible characters, `:` (alternate data streams), trailing
 dots and spaces, and reserved device names such as `CON` or `NUL.txt` are
-removed or prefixed with `_`, and very long names are shortened to 120
-characters. A name that is already taken gets ` (2)`, ` (3)` and so on;
+removed or prefixed with `_`, square brackets become parentheses (the model's
+prompt uses brackets for its own notes), and very long names are shortened
+to 120 characters. A name that is already taken gets ` (2)`, ` (3)` and so on;
 nothing already in `imports` is ever overwritten. While a file uploads its
 bytes are staged in Hearth's own data folder, not the workspace, so the
 agent never sees a half-written file. This copy is your action, so it does
@@ -494,13 +495,22 @@ junction, attaching is refused rather than written through.
 
 **What the model is shown.** Text is read out of each file and placed
 after your message, fenced with markers that say it is the content of a
-file you attached and is untrusted data, not instructions. All the files on
-one message share a budget of about 40% of the model's context window, so
-there is room left for the conversation and the reply. A file that fits is
+file you attached and is untrusted data, not instructions. File names are
+shown to the model in quotes, as data, never as part of the prompt's own
+wording. All the files on one message share a budget of about 40% of the
+model's context window, less if the conversation so far already fills much
+of it, so there is room left for the conversation and the reply. With the
+model set to `auto` the router can pick a different model for each step, so
+the budget assumes the smallest context any of them runs with (4096
+tokens). A file that fits is
 included whole; one that does not is included as an excerpt from its start,
 with a note telling the agent the full file is at `imports\<name>` so it
 can read the rest with its own tools. The chip says which you will get
-(`full text` or `excerpt`) before you send. Your message itself stays
+(`full text` or `excerpt`) before you send. Only your newest message keeps
+its files in the conversation: when you send another message with files,
+the earlier files' text is replaced by a one-line note naming them and
+where they are in `imports`, so the agent can read them again with its own
+tools if it needs to. Your message itself stays
 exactly what you typed: the transcript shows your words with the attached
 files as chips underneath.
 
@@ -518,10 +528,12 @@ the model is told where they are, but their contents are not shown: there
 is no vision support yet.
 
 **Warnings before you send.** Attached text is treated like any other
-content the agent reads from outside: it is scanned for prompt injection,
-and if it scores high the chip warns you, and the finding is shown again on
-the next approval card the turn raises, the same way a suspicious tool
-result is. It is also scanned for credentials (API keys, private keys,
+content the agent reads from outside: its text and its name are scanned
+for prompt injection, and if they score high the chip warns you. The
+finding is also carried into the turn the same way a suspicious tool
+result's is, so the approval card shows it if the agent's first gated
+action comes before it reads anything else; once another tool result
+arrives, the card shows that result's scan instead. It is also scanned for credentials (API keys, private keys,
 passwords in connection strings), and the chip warns you if it finds one,
 showing a masked preview, never the value. Neither scan removes or blocks
 anything; they tell you, and you decide whether to remove the file.
