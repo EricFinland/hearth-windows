@@ -3056,7 +3056,13 @@ def _self_test():
             def residency_snapshot(self, probe=True):
                 return dict(self.state)
 
-            def unload_all(self, only_if_idle=True):
+            def unload_all(self, only_if_idle=True, backends=None):
+                # The sidecar always names its target (the chip's backend,
+                # or only the bundled engine for the timer); never all.
+                assert backends is not None, "unload_all must name its backends"
+                if self.state["backend"] not in backends:
+                    return {"unloaded": False, "busy": False,
+                            "reason": "nothing is loaded"}
                 if self.state["inflight_total"] or self.state["loading"]:
                     return {"unloaded": False, "busy": True,
                             "reason": "the model is answering a request"}

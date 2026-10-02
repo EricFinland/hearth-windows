@@ -26,6 +26,14 @@ hearth_backend.LlamaBackend.unload and residency_snapshot):
     not Hearth's call to make on a timer. The manual button still works
     for Ollama, because a click is the user's call.
 
+WHICH BACKEND IS ACTED ON. hearth_backend keeps one instance per backend
+for the life of the process, so a session that used both the bundled engine
+and Ollama has both built. Every unload here names its target: the timer
+names the bundled engine only, and the button names the backend the chip
+is showing. Neither ever walks every instance, because that would also tell
+Ollama to drop the model Hearth last used there, which is neither shown on
+the chip nor (for the timer) Hearth's decision to make.
+
 The next prompt after an unload reloads the model through the backend's
 ordinary load path. Nothing here starts a model.
 
@@ -63,6 +71,10 @@ PREFS_SCHEMA = 1
 #: The idle delays a person can choose, in minutes. None means never.
 AUTO_UNLOAD_OPTIONS = (5, 15, 30, 60, None)
 DEFAULT_AUTO_UNLOAD_MINUTES = 15
+
+#: The only backend the idle timer ever unloads: the bundled engine, whose
+#: memory Hearth owns. Ollama runs its own keep-alive schedule.
+TIMER_BACKENDS = (hearth_backend.BACKEND_LLAMA,)
 
 #: How often the watcher looks. The shortest delay is five minutes, so a
 #: twenty-second granularity is invisible and costs nothing.
@@ -102,7 +114,7 @@ class ResidencyManager:
 
     Everything is injectable so the self-tests never need a real engine:
     `backend` is anything with residency_snapshot(probe) and
-    unload_all(only_if_idle) (the hearth_backend module by default),
+    unload_all(only_if_idle, backends) (the hearth_backend module by default),
     `state_busy_fn` returns a reason string or None, `now_fn` is the wall
     clock the idle timer reads (the backend stamps last_used_at with
     time.time()), and `poll_seconds` of None or 0 means no watcher thread,
@@ -285,18 +297,27 @@ class ResidencyManager:
         409 {"error": reason} while busy (checked here first, then again by
         the backend under its own lock, which is the check that actually
         closes the race). 200 with the fresh snapshot otherwise, carrying
-        unloaded true or false and why. 502 when Ollama would not answer."""
+        unloaded true or false and why. 502 when Ollama would not answer.
+
+        Only the backend the chip is showing is unloaded (see WHICH BACKEND
+        IS ACTED ON in the module docstring). Whatever freed memory is a
+        200, even when something else also refused: a 409 after the model
+        was in fact stopped would tell the person the opposite of what
+        happened."""
         snap = self.snapshot(probe=False)
         if snap["busy"]:
             return 409, {"error": snap["busy_reason"]}
+        target = snap.get("backend")
         try:
-            result = self.backend.unload_all(only_if_idle=True)
+            result = self.backend.unload_all(
+                only_if_idle=True, backends=(target,) if target else ())
         except Exception as exc:  # noqa: BLE001 - surfaced, not raised
             return 502, {"error": "unload failed: {}: {}".format(type(exc).__name__, exc)}
-        if result.get("busy"):
-            return 409, {"error": result.get("reason") or "the model is in use"}
-        if result.get("error") and not result.get("unloaded"):
-            return 502, {"error": result.get("reason") or "unload failed"}
+        if not result.get("unloaded"):
+            if result.get("busy"):
+                return 409, {"error": result.get("reason") or "the model is in use"}
+            if result.get("error"):
+                return 502, {"error": result.get("reason") or "unload failed"}
         body = self.snapshot(probe=True)
         body["unloaded"] = bool(result.get("unloaded"))
         body["reason"] = None if body["unloaded"] else result.get("reason")
@@ -329,7 +350,7 @@ class ResidencyManager:
         since = self._idle_since(snap)
         if since is None or now - since < minutes * 60:
             return "waiting"
-        result = self.backend.unload_all(only_if_idle=True)
+        result = self.backend.unload_all(only_if_idle=True, backends=TIMER_BACKENDS)
         if result.get("unloaded"):
             with self._lock:
                 self._last_auto_unload_at = now
@@ -384,11 +405,15 @@ class _FakeBackend:
                                  "approximate": True},
                       "note": None}
         self.unloads = 0
+        self.targets = []
 
     def residency_snapshot(self, probe=True):
         return dict(self.state)
 
-    def unload_all(self, only_if_idle=True):
+    def unload_all(self, only_if_idle=True, backends=None):
+        self.targets.append(None if backends is None else tuple(backends))
+        if backends is not None and self.state["backend"] not in backends:
+            return {"unloaded": False, "busy": False, "reason": "nothing is loaded"}
         if self.state["inflight_total"] or self.state["loading"]:
             return {"unloaded": False, "busy": True, "reason": "the model is busy"}
         if not self.state["loaded"]:
@@ -396,6 +421,89 @@ class _FakeBackend:
         self.unloads += 1
         self.state["loaded"] = False
         return {"unloaded": True, "busy": False, "reason": None}
+
+
+def _real_test_both_backends():
+    """The timer and the button against the real hearth_backend with a
+    LlamaBackend and an OllamaBackend both built. Ollama's HTTP is faked and
+    every /api/generate is recorded: the timer must send none, and the
+    button must send one only when the chip is showing Ollama."""
+    hb = hearth_backend
+
+    class _Proc:
+        def __init__(self, pid):
+            self.pid = pid
+            self.stopped = False
+
+        def poll(self):
+            return 0 if self.stopped else None
+
+    class _Server:
+        def __init__(self, pid):
+            self.proc = _Proc(pid)
+
+        def stop(self):
+            self.proc.stopped = True
+
+    posted = []
+
+    def _fake_http(url, timeout, body=None):
+        if url.endswith("/api/ps"):
+            return {"models": [{"name": "ours:7b", "model": "ours:7b",
+                                "size": 6 * 1024 ** 3, "size_vram": 5 * 1024 ** 3}]}
+        if url.endswith("/api/chat"):
+            return {"message": {"role": "assistant", "content": "ok"},
+                    "prompt_eval_count": 1, "eval_count": 1}
+        if url.endswith("/api/generate"):
+            posted.append(body)
+            return {"done": True, "done_reason": "unload"}
+        raise AssertionError("unexpected Ollama call " + url)
+
+    saved_instances = dict(hb._INSTANCES)
+    saved_active = hb._ACTIVE
+    real_http = hb._http_json
+    hb._http_json = _fake_http
+    try:
+        llama = hb.LlamaBackend()
+        llama._server = _Server(4242)
+        llama._ref = hb.ModelRef.gguf(os.path.join("models", "m.gguf"))
+        llama.last_used_at = 0.0  # idle since the epoch: long past any delay
+        ollama = hb.OllamaBackend("http://ollama.invalid")
+        ollama.chat("ours:7b", [{"role": "user", "content": "x"}])
+        with hb._ACTIVE_LOCK:
+            hb._INSTANCES.clear()
+            hb._INSTANCES.update({hb.BACKEND_LLAMA: llama, hb.BACKEND_OLLAMA: ollama})
+            hb._ACTIVE = ollama
+        clock = {"now": 10.0 ** 9}
+        mgr = ResidencyManager(backend=hb, now_fn=lambda: clock["now"], poll_seconds=None,
+                               prefs_path=os.path.join(hearth_paths.data_dir(), "both.json"))
+        mgr.set_minutes(5)
+        assert mgr.tick() == "unloaded", "the idle bundled engine must be freed"
+        assert llama.server is None
+        assert posted == [], ("the timer told Ollama to unload", posted)
+        # Ollama on display now, model resident, idle for an hour: still
+        # the timer's business never.
+        ollama.last_used_at = clock["now"] - 3600
+        assert mgr.snapshot(probe=False)["managed_by"] == "ollama"
+        assert mgr.tick() == "idle" and posted == [], posted
+        # The button with Ollama on display frees Ollama's model, and only it.
+        code, body = mgr.unload()
+        assert code == 200 and body["unloaded"] is True, (code, body)
+        assert posted == [{"model": "ours:7b", "keep_alive": 0, "stream": False}], posted
+        # The button with the bundled engine on display leaves Ollama alone.
+        posted.clear()
+        llama._server = _Server(4243)
+        llama._ref = hb.ModelRef.gguf(os.path.join("models", "m.gguf"))
+        assert mgr.snapshot(probe=False)["backend"] == hb.BACKEND_LLAMA
+        code, body = mgr.unload()
+        assert code == 200 and body["unloaded"] is True and llama.server is None, (code, body)
+        assert posted == [], ("the button unloaded a backend it was not showing", posted)
+    finally:
+        hb._http_json = real_http
+        with hb._ACTIVE_LOCK:
+            hb._INSTANCES.clear()
+            hb._INSTANCES.update(saved_instances)
+            hb._ACTIVE = saved_active
 
 
 def _self_test():
@@ -557,11 +665,39 @@ def _self_test():
             def residency_snapshot(self, probe=True):
                 raise RuntimeError("no")
 
-            def unload_all(self, only_if_idle=True):
+            def unload_all(self, only_if_idle=True, backends=None):
                 raise RuntimeError("no")
         snap = ResidencyManager(backend=_Raising(), poll_seconds=None).snapshot()
         assert snap["status"] == "unknown" and snap["busy"] is False, snap
         assert ResidencyManager(backend=_Raising(), poll_seconds=None).tick() == "idle"
+
+        # Every unload names its target: the timer only ever the bundled
+        # engine, the button the backend on display.
+        assert fake.targets and all(t is not None for t in fake.targets), fake.targets
+        fake.targets.clear()
+        fake.state.update(loaded=True, managed_by="hearth", backend="llama",
+                          last_used_at=0.0)
+        mgr.set_minutes(5)
+        assert mgr.tick() == "unloaded" and fake.targets == [TIMER_BACKENDS], fake.targets
+        fake.state.update(loaded=True, managed_by="ollama", backend="ollama")
+        fake.targets.clear()
+        code, body = mgr.unload()
+        assert code == 200 and fake.targets == [("ollama",)], (code, fake.targets)
+
+        # Freed memory is a 200 even if another backend refused at the same
+        # time: a 409 would say nothing was stopped when something was.
+        class _Mixed(_FakeBackend):
+            def unload_all(self, only_if_idle=True, backends=None):
+                return {"unloaded": True, "busy": True, "error": False,
+                        "reason": "the model is answering a request"}
+        code, body = ResidencyManager(backend=_Mixed(), poll_seconds=None).unload()
+        assert code == 200 and body["unloaded"] is True and body["reason"] is None, (code, body)
+
+        # -- with BOTH real backends built, the timer leaves Ollama alone ----
+        # The real hearth_backend, not a fake: a session that used the
+        # bundled engine and then an Ollama model has both instances, and
+        # the timer must free the engine without telling Ollama anything.
+        _real_test_both_backends()
 
         # -- the watcher thread runs, swallows failures, and stops ----------
         logged = []
@@ -573,7 +709,7 @@ def _self_test():
                 type(self).calls += 1
                 return super().residency_snapshot(probe)
 
-            def unload_all(self, only_if_idle=True):
+            def unload_all(self, only_if_idle=True, backends=None):
                 raise RuntimeError("engine went away")
 
         flaky = _Flaky()

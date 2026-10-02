@@ -186,6 +186,14 @@ OLLAMA_UNLOAD_TIMEOUT = 15
 #: How long a memory figure (nvidia-smi, /api/ps) is reused. The UI polls
 #: every few seconds and none of these numbers move meaningfully faster.
 MEMORY_CACHE_SECONDS = 5
+#: How long a VRAM figure from nvidia-smi is reused. Much longer than
+#: MEMORY_CACHE_SECONDS because nvidia-smi is not free: it is a subprocess,
+#: and on a hybrid-graphics laptop it wakes the discrete GPU, which costs
+#: battery even when the model is running on the integrated one. A loaded
+#: model's VRAM does not move between polls, so a minute-old figure is as
+#: good as a fresh one. See LlamaBackend.memory_estimate for when nvidia-smi
+#: is not asked at all.
+VRAM_CACHE_SECONDS = 60
 
 #: The prompt hearth_bench uses. Kept here so both backends measure the same
 #: work, and re-exported rather than duplicated in hearth_bench.
@@ -1025,6 +1033,7 @@ class LlamaBackend(Backend):
         self.last_used_at = None    # wall clock, when the last request ended
         self.unloaded_at = None     # wall clock, when unload() last freed it
         self._mem_cache = None      # (pid, monotonic at, memory dict)
+        self._vram_cache = None     # (pid, monotonic at, bytes or None, settled)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -1122,6 +1131,7 @@ class LlamaBackend(Backend):
             self._ref = None
             with self._status_lock:
                 self._mem_cache = None
+                self._vram_cache = None
                 if alive:
                     self.unloaded_at = time.time()
             if not alive:
@@ -1169,9 +1179,19 @@ class LlamaBackend(Backend):
     def memory_estimate(self, pid):
         """Approximate memory held by our llama-server: its VRAM from
         nvidia-smi's per-process query when that answers, and its resident
-        set from the OS, which nearly always can. Cached for
-        MEMORY_CACHE_SECONDS per PID, because nvidia-smi is a subprocess
-        and the UI polls.
+        set from the OS, which nearly always can.
+
+        The two halves are cached differently, because they cost
+        differently. The resident set is a cheap ctypes/procfs read, reused
+        for MEMORY_CACHE_SECONDS. nvidia-smi is a subprocess that wakes the
+        discrete GPU on a hybrid-graphics laptop, so its answer is reused
+        for VRAM_CACHE_SECONDS, and once it has answered WITHOUT our PID it
+        is not asked again for this server at all: a llama-server allocates
+        its VRAM while loading, so one that is absent from the compute list
+        after the load is running on the CPU or on a Vulkan device
+        nvidia-smi never lists, and will stay that way until the PID
+        changes. A failed query (no driver, a timeout) is retried, more
+        slowly.
 
         Approximate twice over, and labelled so: nvidia-smi rounds to MiB,
         and a memory-mapped model's resident set moves with what the OS has
@@ -1179,14 +1199,23 @@ class LlamaBackend(Backend):
         now = time.monotonic()
         with self._status_lock:
             cached = self._mem_cache
+            vram_cached = self._vram_cache
         if (cached is not None and cached[0] == pid
                 and now - cached[1] < MEMORY_CACHE_SECONDS):
             return dict(cached[2])
-        vram = None
-        apps = _compute_apps()
-        for app in apps or ():
-            if app["pid"] == pid:
-                vram = (vram or 0) + app["bytes"]
+        if (vram_cached is not None and vram_cached[0] == pid
+                and (vram_cached[3] or now - vram_cached[1] < VRAM_CACHE_SECONDS)):
+            vram = vram_cached[2]
+        else:
+            vram = None
+            apps = _compute_apps()
+            for app in apps or ():
+                if app["pid"] == pid:
+                    vram = (vram or 0) + app["bytes"]
+            # Settled: nvidia-smi answered and we are not on its list.
+            settled = apps is not None and vram is None
+            with self._status_lock:
+                self._vram_cache = (pid, time.monotonic(), vram, settled)
         result = {"vram_bytes": vram, "rss_bytes": _process_rss_bytes(pid),
                   "approximate": True}
         with self._status_lock:
@@ -1592,6 +1621,11 @@ class OllamaBackend(Backend):
         # What Hearth itself last asked this daemon for, so status() and
         # unload() are about OUR model and never about some other client's.
         self._status_lock = threading.Lock()
+        # Signalled when an unload finishes; chat() waits on it (bounded)
+        # so a turn never starts in the gap between unload()'s in-flight
+        # check and Ollama acting on keep_alive 0. Shares _status_lock.
+        self._status_cv = threading.Condition(self._status_lock)
+        self._unloading = False
         self._last_ref = None
         self._inflight = 0
         self.last_used_at = None
@@ -1622,7 +1656,12 @@ class OllamaBackend(Backend):
         arrived and "stopped": True.
         """
         ref = self.check_ref(ref)
-        with self._status_lock:
+        with self._status_cv:
+            # An unload under way finishes first. Bounded by the unload's
+            # own timeouts, and on expiry the turn simply goes ahead: the
+            # worst Ollama then does is load the model again for it.
+            self._status_cv.wait_for(lambda: not self._unloading,
+                                     timeout=OLLAMA_UNLOAD_TIMEOUT + PS_TIMEOUT + 1)
             self._last_ref = ref
             self._inflight += 1
         try:
@@ -1748,15 +1787,32 @@ class OllamaBackend(Backend):
         keep_alive 0. Only our own model is ever named, and only when /api/ps
         says it is actually resident, because the same request against a
         model that is not loaded would make Ollama load it first. Refuses
-        while one of our requests is in flight, like LlamaBackend.unload.
+        while one of our requests is in flight, like LlamaBackend.unload,
+        and a chat() that starts while the request is out waits for it
+        rather than slipping in between the check and the eviction.
         Never raises: an unreachable daemon is {"error": True, ...}."""
         with self._status_lock:
             ref = self._last_ref
             if self._inflight > 0:
                 return {"unloaded": False, "busy": True,
                         "reason": "the model is answering a request"}
-        if ref is None:
-            return {"unloaded": False, "busy": False, "reason": "nothing is loaded"}
+            if self._unloading:
+                return {"unloaded": False, "busy": True,
+                        "reason": "the model is already being unloaded"}
+            if ref is None:
+                return {"unloaded": False, "busy": False, "reason": "nothing is loaded"}
+            # Claimed under the same hold as the in-flight check, so a chat
+            # arriving from here on waits in chat() instead of racing us.
+            self._unloading = True
+        try:
+            return self._unload_claimed(ref)
+        finally:
+            with self._status_cv:
+                self._unloading = False
+                self._status_cv.notify_all()
+
+    def _unload_claimed(self, ref):
+        """unload()'s body, run while self._unloading holds chats back."""
         models = self._ps(fresh=True)
         if models is None:
             return {"unloaded": False, "busy": False, "error": True,
@@ -2185,14 +2241,24 @@ def residency_snapshot(probe=True):
     return out
 
 
-def unload_all(only_if_idle=True):
-    """Unload every built backend's model. With only_if_idle (the default,
-    and the only mode the sidecar uses) each backend refuses on its own
-    while busy; without it, this is close(), the shutdown path, which stops
+def unload_all(only_if_idle=True, backends=None):
+    """Unload built backends' models. With only_if_idle (the default, and
+    the only mode the sidecar uses) each backend refuses on its own while
+    busy; without it, this is close(), the shutdown path, which stops
     regardless. Returns {"unloaded", "busy", "error", "reason", "results"}
     where reason is the first refusal's or failure's, else "nothing is
-    loaded" when nothing was."""
+    loaded" when nothing was.
+
+    `backends` is an iterable of backend names (BACKEND_LLAMA, ...) to act
+    on; None means every built one. The sidecar always names one: its idle
+    timer only ever frees the bundled engine, and its Unload button frees
+    the backend the chip is showing. Walking every instance would also tell
+    Ollama to drop the model Hearth last used there, which neither of them
+    shows or intends, and which defeats a person's own OLLAMA_KEEP_ALIVE."""
     instances, _active = _instances()
+    if backends is not None:
+        wanted = set(backends)
+        instances = [inst for inst in instances if inst.name in wanted]
     results = {}
     for inst in instances:
         if not only_if_idle:
@@ -3482,8 +3548,48 @@ def _self_test_unload(_FakeProc):
         assert mem["vram_bytes"] == 3 * 1024 ** 3 and mem["approximate"] is True, mem
         lb6.memory_estimate(903)
         assert len(calls) == 1, "nvidia-smi must be cached between polls"
+
+        def _age(cache, seconds):
+            pid, at = getattr(lb6, cache)[:2]
+            setattr(lb6, cache, (pid, at - seconds) + getattr(lb6, cache)[2:])
+        # The RSS half refreshes on its own short clock; nvidia-smi is not
+        # asked again until VRAM_CACHE_SECONDS, because on a hybrid-graphics
+        # laptop every call wakes the discrete GPU.
+        _age("_mem_cache", MEMORY_CACHE_SECONDS + 1)
+        _age("_vram_cache", MEMORY_CACHE_SECONDS + 1)
+        assert lb6.memory_estimate(903)["vram_bytes"] == 3 * 1024 ** 3
+        assert len(calls) == 1, "nvidia-smi re-run inside VRAM_CACHE_SECONDS"
+        assert VRAM_CACHE_SECONDS >= 30, VRAM_CACHE_SECONDS
+        _age("_mem_cache", MEMORY_CACHE_SECONDS + 1)
+        _age("_vram_cache", VRAM_CACHE_SECONDS + 1)
+        lb6.memory_estimate(903)
+        assert len(calls) == 2, "a stale VRAM figure must be refreshed"
+        # nvidia-smi answers but our PID is not on its list (CPU or Vulkan):
+        # settled for this PID, never asked again however long it runs.
+        globals()["_compute_apps"] = lambda: (calls.append(1) or [
+            {"pid": 5, "name": "y", "bytes": 1}])
+        lb6._mem_cache = lb6._vram_cache = None
+        assert lb6.memory_estimate(903)["vram_bytes"] is None
+        assert len(calls) == 3
+        for _ in range(3):
+            _age("_mem_cache", MEMORY_CACHE_SECONDS + 1)
+            _age("_vram_cache", 10 * VRAM_CACHE_SECONDS)
+            assert lb6.memory_estimate(903)["vram_bytes"] is None
+        assert len(calls) == 3, "nvidia-smi re-run for a server it never lists"
+        # ...but a new server (a new PID) is asked about afresh.
+        lb6.memory_estimate(904)
+        assert len(calls) == 4
+        # A FAILED query is not settled: retried once the cache ages out.
+        fails = []
+        globals()["_compute_apps"] = lambda: (fails.append(1) and None)
+        lb6._mem_cache = lb6._vram_cache = None
+        assert lb6.memory_estimate(903)["vram_bytes"] is None and len(fails) == 1
+        _age("_mem_cache", MEMORY_CACHE_SECONDS + 1)
+        _age("_vram_cache", VRAM_CACHE_SECONDS + 1)
+        lb6.memory_estimate(903)
+        assert len(fails) == 2, "a failed nvidia-smi query must be retried"
         globals()["_compute_apps"] = lambda: None
-        lb6._mem_cache = None
+        lb6._mem_cache = lb6._vram_cache = None
         assert lb6.memory_estimate(903)["vram_bytes"] is None
         st = lb6.status(probe=True)
         assert st["memory"]["vram_bytes"] is None and st["pid"] == 903, st
@@ -3546,6 +3652,44 @@ def _self_test_unload(_FakeProc):
         got = ob.unload()
         assert got["unloaded"] is False and got.get("error") is True, got
         assert ob.status(probe=True)["loaded"] is None
+
+        # A chat that starts while the keep_alive 0 request is out waits for
+        # it instead of slipping in between the in-flight check and the
+        # eviction; a second unload meanwhile is refused as busy.
+        ps_models["value"] = [{"name": "ours:7b", "model": "ours:7b",
+                               "size": 1, "size_vram": 1}]
+        ob._ps_cache = None
+        in_generate, release_generate = threading.Event(), threading.Event()
+        order = []
+
+        def _gated_http(url, timeout, body=None):
+            if url.endswith("/api/generate"):
+                in_generate.set()
+                assert release_generate.wait(5)
+                order.append("generate")
+            elif url.endswith("/api/chat"):
+                order.append("chat")
+            return _fake_http(url, timeout, body)
+        globals()["_http_json"] = _gated_http
+        outcome = {}
+        unloader = threading.Thread(
+            target=lambda: outcome.setdefault("unload", ob.unload()), daemon=True)
+        unloader.start()
+        assert in_generate.wait(5)
+        again = ob.unload()
+        assert again["busy"] is True and "already" in again["reason"], again
+        chatter = threading.Thread(
+            target=lambda: outcome.setdefault("chat", ob.chat("ours:7b", [])), daemon=True)
+        chatter.start()
+        time.sleep(0.1)
+        assert order == [] and ob.status()["inflight"] == 0,             ("a chat started under an unload", order)
+        release_generate.set()
+        unloader.join(5)
+        chatter.join(5)
+        assert outcome["unload"]["unloaded"] is True, outcome
+        assert outcome["chat"]["message"]["content"] == "ok", outcome
+        assert order == ["generate", "chat"], order
+        assert ob._unloading is False and ob.status()["inflight"] == 0
     finally:
         globals()["_http_json"] = _real_http
 
@@ -3569,9 +3713,13 @@ def _self_test_unload(_FakeProc):
         snap = residency_snapshot(probe=False)
         assert snap["backend"] == BACKEND_LLAMA and snap["loaded"] is True, snap
         assert snap["inflight_total"] == 0, snap
-        out = unload_all()
+        # A named target leaves every other backend untouched: Ollama is
+        # not even asked (its URL is unresolvable, so asking would error).
+        out = unload_all(backends=(BACKEND_LLAMA,))
         assert out["unloaded"] is True and out["busy"] is False, out
+        assert list(out["results"]) == [BACKEND_LLAMA], out
         assert lbx.server is None
+        assert unload_all(backends=())["reason"] == "nothing is loaded"
         # With llama idle and empty, the active backend is what is shown.
         assert residency_snapshot(probe=False)["backend"] == BACKEND_OLLAMA
     finally:

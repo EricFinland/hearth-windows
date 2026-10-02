@@ -281,13 +281,19 @@ card where `nvidia-smi` can see the engine it is graphics memory.
 Otherwise it is the RAM the engine process holds, which for a
 memory-mapped model moves with what Windows has paged in. The Vulkan build
 is often in this second group, because `nvidia-smi` does not always
-attribute its graphics memory to the process.
+attribute its graphics memory to the process. Hearth asks `nvidia-smi` at
+most about once a minute, and stops asking for an engine it has already
+seen running without graphics memory, because on a laptop with two GPUs
+each query can wake the discrete one and cost battery.
 
 If you run models through Ollama instead of Hearth's own engine, the chip
 shows the Ollama model Hearth last used, and Unload asks Ollama to drop
 that one model (never any other model Ollama is holding). The idle timer
 does not apply there: Ollama unloads models on its own keep-alive schedule
-(five minutes by default), and the chip says so.
+(five minutes by default), and the chip says so. If you have used both
+in one session, Unload frees only the one the chip is showing, and the
+idle timer only ever frees Hearth's own engine, so a long
+`OLLAMA_KEEP_ALIVE` you set yourself is left alone.
 
 ## What the permission modes mean
 
