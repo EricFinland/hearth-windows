@@ -69,6 +69,7 @@ const SIDECAR_ROUTES = new Set([
   "/engine", "/engine/events",
   "/loop", "/loop/events",
   "/swarm", "/swarm/events",
+  "/attach", "/attach/chunk", "/attach/finish", "/attach/cancel",
   "/update", "/update/events",
 ]);
 

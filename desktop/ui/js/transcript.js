@@ -320,6 +320,35 @@ export class Transcript {
     ]));
   }
 
+  /** Chips under the most recent user message naming the files sent with
+   *  it (js/attach.js). A filename came off somebody's disk and is untrusted
+   *  text, so each one goes in through el({text}), never as markup, and a
+   *  bidi override in it shows as a visible marker rather than reversing the
+   *  extension. `files` are {name, path, plan}; plan is "full", "excerpt" or
+   *  anything else for a file the model is pointed at but not shown. */
+  addUserAttachments(files) {
+    const list = Array.isArray(files) ? files.filter(Boolean) : [];
+    const users = this.root.querySelectorAll(".msg-user");
+    const msg = users[users.length - 1];
+    if (!list.length || !msg) return null;
+    const row = el("div", { class: "att-sent", role: "list", "aria-label": "attached files" });
+    for (const file of list) {
+      const name = String(file.name ?? "attachment");
+      const how = file.plan === "full" ? "full text" : file.plan === "excerpt" ? "excerpt" : "stored";
+      row.appendChild(el("span", {
+        class: "att-sent-chip", role: "listitem",
+        title: file.path ? `${name}\n${String(file.path)}` : name,
+      }, [
+        icon("i-clip"),
+        el("span", { class: "att-sent-name", text: name }),
+        el("span", { class: "att-sent-meta", text: how }),
+      ]));
+    }
+    msg.appendChild(row);
+    this._autoscroll();
+    return row;
+  }
+
   /** Render one delta into the active agent bubble, opening one if needed.
    *
    *  `meta` is the delta event's own `stream_id` and `index`. Both are

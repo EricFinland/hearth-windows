@@ -34,6 +34,7 @@ const SIDECAR_ROUTES = new Set([
   "/engine", "/engine/events",
   "/loop", "/loop/events",
   "/swarm", "/swarm/events",
+  "/attach", "/attach/chunk", "/attach/finish", "/attach/cancel",
   "/update", "/update/events",
 ]);
 
@@ -111,11 +112,18 @@ export class Sidecar {
   models()                 { return this.request("GET", "/models"); }
   getSession()             { return this.request("GET", "/session"); }
   createSession(body)      { return this.request("POST", "/session", body); }
-  prompt(message)          { return this.request("POST", "/prompt", { message }); }
+  prompt(message, attachments) { return this.request("POST", "/prompt", attachments && attachments.length ? { message, attachments } : { message }); }
   approve(id, decision)    { return this.request("POST", "/approve", { id, decision }); }
   cancel()                 { return this.request("POST", "/cancel"); }
   checkpoints()            { return this.request("GET", "/checkpoints"); }
   restore(checkpointId)    { return this.request("POST", "/restore", { checkpoint_id: checkpointId }); }
+  /** Attaching a file (desktop/server/attachments.py): begin, then base64
+   *  chunks of at most `chunk_bytes` each, then finish. Chunked because the
+   *  packaged shell's proxy refuses any request body over 4 MiB. */
+  beginAttach(name, size)        { return this.request("POST", "/attach", { name, size }); }
+  attachChunk(id, offset, data)  { return this.request("POST", "/attach/chunk", { id, offset, data }); }
+  finishAttach(id)               { return this.request("POST", "/attach/finish", { id }); }
+  cancelAttach(id)               { return this.request("POST", "/attach/cancel", { id }); }
 
   /** Search the shop. The query is a user-typed string and goes in the query
    *  string, which is fine: it is not a secret. The bearer token never does --
