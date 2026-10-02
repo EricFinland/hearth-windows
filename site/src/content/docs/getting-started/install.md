@@ -29,8 +29,9 @@ your hardware and tells you which models actually fit rather than letting you
 pick one that will swap to disk. See
 [docs/model-shop.md](/hearth-windows/concepts/model-shop/) for how that arithmetic works.
 
-**A GPU helps and is not required.** Hearth detects NVIDIA VRAM and uses it if
-present. Without one, models run on the CPU, slower.
+**A GPU helps and is not required.** Hearth detects NVIDIA, AMD and Intel GPUs
+and their memory, and uses them if present. Without one, models run on the
+CPU, slower.
 
 You do **not** need Ollama. Earlier versions required it. Hearth now bundles
 llama.cpp's `llama-server` and drives it itself, so a fresh install has an

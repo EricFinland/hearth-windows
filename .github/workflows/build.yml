@@ -133,6 +133,63 @@ jobs:
           done
           test "$failed" -eq 0
 
+  # The Rust shell's own #[test]s: the origin server's route list and request
+  # parser, the sidecar handshake parser, and the updater's version ordering
+  # and path containment. Every one of those is a security boundary, and
+  # until this job existed none of them ran anywhere but a maintainer's
+  # machine, because `cargo tauri build` compiles the shell without testing
+  # it. Parallel to the self-tests rather than after them: it needs only
+  # Rust, and the installer should wait on both.
+  shell-tests:
+    name: shell tests (windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      # Kept where scripts/build_windows.py keeps it, under the ignored
+      # build/ directory, so desktop/tauri/ never grows a target/ of its own.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/build/cargo-target
+      # Incremental artifacts are useless on a fresh runner and only bloat
+      # the cached target directory.
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache the crate registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('desktop/tauri/Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
+
+      # Compiled dependencies are most of this job's time (Tauri and its
+      # WebView2 bindings). Keyed on the lockfile, so a dependency change
+      # starts clean and anything else reuses them; the shell's own crate is
+      # rebuilt every run regardless, which is the part under test.
+      - name: Cache compiled dependencies
+        uses: actions/cache@v4
+        with:
+          path: build/cargo-target
+          key: cargo-test-target-${{ runner.os }}-${{ hashFiles('desktop/tauri/Cargo.lock') }}
+
+      # tauri-build checks that every bundle resource in tauri.conf.json
+      # exists, even for a test build that bundles nothing, and two of them
+      # are the payload scripts/build_windows.py stages. Empty directories
+      # satisfy the check; nothing here reads them.
+      - name: Stand in for the staged payload
+        shell: bash
+        run: mkdir -p build/stage/python build/stage/hearth
+
+      - name: cargo test
+        shell: bash
+        working-directory: desktop/tauri
+        run: |
+          rustc --version
+          cargo test --locked
+
   # The real build. Fetches and checksums the pinned llama.cpp and CPython,
   # stages the payload, proves the staged payload runs under the staged
   # interpreter, compiles the Tauri shell, and produces the NSIS installer.
@@ -140,7 +197,7 @@ jobs:
   # exe rather than trusting that the build asked for it.
   installer:
     name: windows installer
-    needs: self-test
+    needs: [self-test, shell-tests]
     runs-on: windows-latest
     timeout-minutes: 60
     # Only what attestation needs, and nothing wider. id-token signs the

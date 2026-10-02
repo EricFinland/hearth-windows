@@ -358,6 +358,43 @@ select.input option { background: var(--panel-2); color: var(--fg); }
   margin-top: 10px; font-size: 11px; color: var(--fg-dim); cursor: pointer;
 }
 .update-auto { margin-top: 2px; flex: none; }
+/* A failure that is not anybody's fault (offline at launch, an overdue
+   release) keeps the grey edge: it is still not "up to date", but it is not
+   a warning either. */
+.update-body.is-failed.is-calm { border-left-color: var(--line); }
+
+/* The banner (js/update-banner.js). Fixed just under the 46px titlebar, at
+   body level outside .app so it takes no grid cell, and below the modal
+   scrim (z-index 50) so a dialog always covers it. Shown only for an update
+   that can actually be installed; it never carries a failure. */
+.update-banner {
+  position: fixed;
+  top: 54px; right: 16px;
+  width: min(380px, calc(100vw - 32px));
+  z-index: 40;
+  padding: 11px 13px 12px;
+  background: var(--bg-raise);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--accent);
+  border-radius: var(--radius);
+  box-shadow: 0 10px 28px -10px var(--bg);
+  font-family: var(--font-ui);
+}
+.update-banner[hidden] { display: none; }
+.update-banner-title {
+  margin: 0; font-size: 13px; font-weight: 620; color: var(--fg);
+  overflow-wrap: anywhere;
+}
+.update-banner-notes {
+  margin: 5px 0 0; font-size: 11.5px; line-height: 1.45; color: var(--fg-dim);
+  overflow-wrap: anywhere;
+}
+.update-banner-bar { margin-top: 9px; }
+.update-banner-pct {
+  margin: 5px 0 0; font-size: 11px; color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+}
+.update-banner-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 
 /* ---------- checkpoints ---------- */
 

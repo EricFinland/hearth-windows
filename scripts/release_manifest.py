@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 r"""Make, sign and check a Hearth release feed. The operator's half of the updater.
 
-    python scripts/release_manifest.py keygen --key-id hearth-release-2026
-    python scripts/release_manifest.py sign  --installer build/dist/Hearth-Setup-0.1.1.exe \
-                                             --version 0.1.1 --key release/keys/<id>.key \
-                                             --out build/feed
+    python scripts/release_manifest.py keygen --key-id hearth-release-2026-10 \
+                                             --out <a folder outside every checkout>/<id>.key
+    python scripts/release_manifest.py sign  --installer build/dist/Hearth-Setup-0.2.0.exe \
+                                             --version 0.2.0 --key <id>.key --out build/feed
+    python scripts/release_manifest.py sign  ... --seed-file <file holding only the hex seed>
     python scripts/release_manifest.py verify --feed build/feed --installed 0.1.0
     python scripts/release_manifest.py serve  --feed build/feed --port 8799
 
@@ -13,6 +14,24 @@ producer, and it deliberately does not ship: it is not staged into the
 installer, so a compromised Hearth install contains no signing code and no
 path to a key. See build_windows.py's stage(), which copies exactly one
 script.
+
+THE LAYOUT
+----------
+The layout follows release/trust.json. With "layout": "github-releases" (the
+shipped one), `sign` writes manifest-<channel>.json beside the installer, which
+are exactly the files to attach to a GitHub release, and the signed artifact
+path is download/v<version>/<installer>. `serve` then answers the way GitHub
+does, redirects included, so the shipped client can be pointed at it with
+HEARTH_UPDATE_FEED and driven end to end before anything is public. Without a
+layout, the older directory layout (<channel>/manifest.json and
+<channel>/<version>/<installer>, plus a plain index.html) is written and served
+as plain files.
+
+In CI, .github/workflows/release.yml runs `sign --seed-file` with the seed from
+the HEARTH_UPDATE_SIGNING_KEY secret written to a private temporary file. The
+seed is read from a file, never from an argument or this process's
+environment: arguments are visible to every process on the machine, and both
+end up in logs.
 
 WHAT IS SIGNED, AND WHAT IS NOT
 -------------------------------
@@ -28,10 +47,10 @@ makes this work on an unsigned build with no certificate.
 THE KEY
 -------
 Ed25519, 32 bytes of seed, written to a file this tool creates with 0600 where
-the platform honours it. `*.key` is in .gitignore, so a key file cannot be
-committed by accident, but that is a safety net rather than a policy: the
-private key belongs on removable media or in a password manager, on a machine
-that is not the release host and ideally not the build machine either. The
+the platform honours it (Windows does not: there the file inherits its
+folder's permissions, which is one more reason the folder must be private and
+must not be synced anywhere). `*.key` is in .gitignore, so a key file cannot be
+committed by accident, but that is a safety net rather than a policy. The
 public half goes in release/trust.json, is committed, and ships inside the
 application. Rotating a key means adding the new one to trust.json as `active`,
 shipping a build that carries it, and only then signing with it; the old key
@@ -43,8 +62,8 @@ WHAT THIS TOOL DOES NOT DO
 --------------------------
 It does not upload anything, does not talk to any remote host, and has no
 credentials for one. `serve` binds 127.0.0.1 and exists so the whole chain can
-be exercised end to end on one machine. Publishing is a deliberate, separate,
-human act; docs/updates.md describes it.
+be exercised end to end on one machine. Publishing is the release workflow's
+job, started by pushing a tag; docs/updates.md describes it.
 
 Python standard library only.
 """
@@ -59,6 +78,8 @@ import json
 import os
 import re
 import sys
+import urllib.parse
+import urllib.request
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "agent"))
@@ -72,8 +93,12 @@ KEYS_DIR = os.path.join(REPO_ROOT, "release", "keys")
 #: How long a manifest is valid for. Short enough that a feed nobody is
 #: maintaining stops being trusted, long enough that a release cadence of a
 #: few months does not strand anybody. hearth_update refuses anything above
-#: MAX_VALIDITY_DAYS whatever is passed here.
+#: MAX_VALIDITY_DAYS whatever is passed here. Once the newest manifest
+#: expires, every install's check fails (calmly) until a release or a
+#: re-signed manifest replaces it; docs/updates.md says how.
 DEFAULT_VALID_DAYS = 120
+
+_SEED_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 def _now():
@@ -82,6 +107,12 @@ def _now():
 
 def _stamp(when):
     return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def trust_layout(trust_path=TRUST_PATH):
+    """The feed layout the given trust file declares."""
+    data = _read_json(trust_path) or {}
+    return hu.layout_for(data)
 
 
 # --------------------------------------------------------------------------
@@ -146,13 +177,56 @@ def load_key(path):
     return key_id, seed
 
 
+def load_seed_file(path, trust_path=TRUST_PATH, key_id=None):
+    """A bare hex seed from a file, matched to a key in the trust file.
+
+    This is the CI path: the HEARTH_UPDATE_SIGNING_KEY secret holds only the
+    64 hex characters of `private_seed`, which is the smallest thing that can
+    be pasted into a secret without also pasting a format. The key id is not
+    taken on trust from anywhere: the public key is derived from the seed and
+    looked up in release/trust.json, so a secret that does not belong to an
+    ACTIVE key the shipped builds trust fails here, before anything is
+    signed, rather than producing a manifest every client refuses.
+
+    No message from this function ever includes what the file contains.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read(4096).strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise SystemExit("cannot read the seed file: {}".format(
+            exc.__class__.__name__)) from None
+    if not _SEED_RE.match(text):
+        raise SystemExit(
+            "the seed file does not hold exactly 64 hex characters (the "
+            "private_seed value from a key file made by keygen); refusing it")
+    seed = bytes.fromhex(text)
+    public = ed.to_hex(ed.public_key(seed))
+    trust = hu.load_trust(trust_path)
+    match = [k for k in trust["keys"] if k.get("public_key") == public]
+    if not match:
+        raise SystemExit(
+            "this seed's public key ({}) is not in {}. Sign with a key the "
+            "shipped builds trust, or add its public key there first.".format(
+                public, trust_path))
+    entry = match[0]
+    if entry.get("status") != "active":
+        raise SystemExit("this seed belongs to key {}, which is {} in {}; refusing "
+                         "to sign with it".format(entry["key_id"], entry.get("status"),
+                                                  trust_path))
+    if key_id and key_id != entry["key_id"]:
+        raise SystemExit("this seed belongs to key {}, not {}".format(
+            entry["key_id"], key_id))
+    return entry["key_id"], seed
+
+
 # --------------------------------------------------------------------------
 # sign
 # --------------------------------------------------------------------------
 
 def build_signed(version, channel, artifact_path, notes="", released_at=None,
                  valid_days=DEFAULT_VALID_DAYS, minimum_version="0.0.0",
-                 app_id="com.hearthlocal.hearth"):
+                 app_id="com.hearthlocal.hearth", layout=hu.LAYOUT_DIRECTORY):
     """The block that gets signed, built from the installer on disk.
 
     The size and hash are read off the FILE, never taken from an argument.
@@ -162,12 +236,18 @@ def build_signed(version, channel, artifact_path, notes="", released_at=None,
     """
     if hu.parse_version(version) is None:
         raise SystemExit("--version must be MAJOR.MINOR.PATCH, got {!r}".format(version))
+    if layout not in hu.LAYOUTS:
+        raise SystemExit("unknown layout {!r}".format(layout))
     if not os.path.isfile(artifact_path):
         raise SystemExit("no installer at {}".format(artifact_path))
     name = os.path.basename(artifact_path)
     size = os.path.getsize(artifact_path)
     digest = hu.sha256_file(artifact_path)
     released = released_at or _now()
+    if layout == hu.LAYOUT_GITHUB:
+        path = hu.github_artifact_path(version, name)
+    else:
+        path = "{}/{}/{}".format(channel, version, name)
     signed = {
         "schema": 1,
         "app_id": app_id,
@@ -179,7 +259,7 @@ def build_signed(version, channel, artifact_path, notes="", released_at=None,
         "notes": notes or "",
         "artifact": {
             "name": name,
-            "path": "{}/{}/{}".format(channel, version, name),
+            "path": path,
             "size_bytes": size,
             "sha256": digest,
         },
@@ -199,28 +279,44 @@ def sign_document(signed, key_id, seed):
     }
 
 
-def stage_feed(document, artifact_path, out_dir):
-    """Lay out a feed directory an operator can upload verbatim.
+def stage_feed(document, artifact_path, out_dir, layout=hu.LAYOUT_DIRECTORY):
+    """Lay out a feed an operator can publish verbatim. Returns the manifest path.
+
+    Directory layout, for a static host:
 
         <out>/<channel>/manifest.json
         <out>/<channel>/<version>/<installer>
         <out>/index.html          a plain download page, local artifact only
 
-    Returns the manifest path.
+    GitHub Releases layout, the release assets themselves (one flat folder):
+
+        <out>/manifest-<channel>.json
+        <out>/<installer>         copied only when it is not already there
     """
     signed = document["signed"]
     channel = signed["channel"]
     rel = signed["artifact"]["path"]
     hu._check_relative_path(rel)
-    target = os.path.join(out_dir, *rel.split("/"))
-    os.makedirs(os.path.dirname(target), exist_ok=True)
+    if layout == hu.LAYOUT_GITHUB:
+        expected = hu.github_artifact_path(signed["version"], signed["artifact"]["name"])
+        if rel != expected:
+            raise SystemExit("a GitHub release serves its installer at {}, but this "
+                             "manifest names {}".format(expected, rel))
+        target = os.path.join(out_dir, signed["artifact"]["name"])
+        manifest_path = os.path.join(out_dir, hu.flat_manifest_name(channel))
+    else:
+        target = os.path.join(out_dir, *rel.split("/"))
+        manifest_path = os.path.join(out_dir, channel, hu.MANIFEST_NAME)
+    os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
     if os.path.abspath(target) != os.path.abspath(artifact_path):
         with open(artifact_path, "rb") as src, open(target, "wb") as dst:
             for chunk in iter(functools.partial(src.read, 1024 * 1024), b""):
                 dst.write(chunk)
-    manifest_path = os.path.join(out_dir, channel, hu.MANIFEST_NAME)
     _write_json(manifest_path, document)
-    _write_download_page(out_dir, document)
+    if layout != hu.LAYOUT_GITHUB:
+        # A GitHub release page already is the download page, with the hash
+        # in its notes; a second one beside it would only disagree with it.
+        _write_download_page(out_dir, document)
     return manifest_path
 
 
@@ -282,7 +378,8 @@ is making.</p>
 # verify
 # --------------------------------------------------------------------------
 
-def verify_feed(feed_dir, trust_path=TRUST_PATH, installed=None, channel=None):
+def verify_feed(feed_dir, trust_path=TRUST_PATH, installed=None, channel=None,
+                layout=None):
     """Check a staged feed the way a client would. Returns a report dict.
 
     Reads the manifest and the artifact off disk and runs them through the
@@ -292,17 +389,31 @@ def verify_feed(feed_dir, trust_path=TRUST_PATH, installed=None, channel=None):
     """
     trust = hu.load_trust(trust_path)
     channel = channel or trust["default_channel"]
-    manifest_path = os.path.join(feed_dir, channel, hu.MANIFEST_NAME)
+    layout = layout or hu.layout_for(trust)
+    if layout == hu.LAYOUT_GITHUB:
+        manifest_path = os.path.join(feed_dir, hu.flat_manifest_name(channel))
+    else:
+        manifest_path = os.path.join(feed_dir, channel, hu.MANIFEST_NAME)
     document = _read_json(manifest_path)
     if document is None:
         raise SystemExit("no manifest at {}".format(manifest_path))
     signed, key_id = hu.verify_document(document, trust)
     hu.validate_signed(signed, trust, channel)
-    artifact = os.path.join(feed_dir, *signed["artifact"]["path"].split("/"))
+    if layout == hu.LAYOUT_GITHUB:
+        expected = hu.github_artifact_path(signed["version"], signed["artifact"]["name"])
+        if signed["artifact"]["path"] != expected:
+            # GitHub serves an asset only under its own release's tag. A path
+            # naming any other tag is a manifest whose installer 404s.
+            raise hu.UpdateError("the signed artifact path is {} but a GitHub release "
+                                 "serves it at {}".format(signed["artifact"]["path"],
+                                                          expected))
+        artifact = os.path.join(feed_dir, signed["artifact"]["name"])
+    else:
+        artifact = os.path.join(feed_dir, *signed["artifact"]["path"].split("/"))
     hu.verify_file(artifact, signed["artifact"]["sha256"],
                    signed["artifact"]["size_bytes"])
     report = {"manifest": manifest_path, "signed_by": key_id,
-              "version": signed["version"], "channel": channel,
+              "version": signed["version"], "channel": channel, "layout": layout,
               "artifact": artifact, "sha256": signed["artifact"]["sha256"],
               "size_bytes": signed["artifact"]["size_bytes"],
               "expires_at": signed["expires_at"]}
@@ -327,14 +438,87 @@ class _FeedHandler(http.server.SimpleHTTPRequestHandler):
         return None
 
 
-def serve(feed_dir, port=0, host="127.0.0.1"):
+class _GitHubFeedHandler(_FeedHandler):
+    """A flat release folder, answered the way GitHub answers release assets.
+
+        /latest/download/<name>      302 -> /download/v<newest>/<name>
+        /download/v<version>/<name>  302 -> /asset/<name>?token=...
+        /asset/<name>                the file
+
+    The second redirect stands in for GitHub's hop to its asset host, query
+    token and all, so the client's redirect handling and its habit of keeping
+    tokens out of messages are exercised rather than assumed. Anything else is
+    a 404, like a release asset that does not exist.
+    """
+
+    def _versions(self):
+        found = set()
+        for name in os.listdir(self.directory):
+            if name.startswith("manifest-") and name.endswith(".json"):
+                doc = _read_json(os.path.join(self.directory, name)) or {}
+                version = ((doc.get("signed") or {}).get("version"))
+                if hu.parse_version(version or ""):
+                    found.add(version)
+        return found
+
+    def _route(self):
+        path = urllib.parse.urlsplit(self.path).path
+        parts = [p for p in path.split("/") if p]
+        if len(parts) == 3 and parts[:2] == ["latest", "download"]:
+            versions = self._versions()
+            if not versions:
+                return ("missing", None)
+            newest = max(versions, key=hu.parse_version)
+            return ("redirect", "/download/v{}/{}".format(newest, parts[2]))
+        if len(parts) == 3 and parts[0] == "download" and parts[1].startswith("v"):
+            if parts[1][1:] in self._versions():
+                return ("redirect", "/asset/{}?token=local-test-token".format(parts[2]))
+            return ("missing", None)
+        if len(parts) == 2 and parts[0] == "asset" and "/" not in parts[1]:
+            if os.path.isfile(os.path.join(self.directory, parts[1])):
+                return ("file", "/" + parts[1])
+        return ("missing", None)
+
+    def _answer(self, head_only):
+        kind, where = self._route()
+        if kind == "redirect":
+            self.send_response(302)
+            self.send_header("Location", where)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if kind == "file":
+            self.path = where
+            return super().do_HEAD() if head_only else super().do_GET()
+        self.send_error(404, "not found")
+
+    def do_GET(self):  # noqa: N802 - the stdlib's name
+        self._answer(False)
+
+    def do_HEAD(self):  # noqa: N802
+        self._answer(True)
+
+
+def detect_layout(feed_dir):
+    """Which layout a staged folder is in, from what is in it."""
+    try:
+        names = os.listdir(feed_dir)
+    except OSError:
+        return hu.LAYOUT_DIRECTORY
+    if any(n.startswith("manifest-") and n.endswith(".json") for n in names):
+        return hu.LAYOUT_GITHUB
+    return hu.LAYOUT_DIRECTORY
+
+
+def serve(feed_dir, port=0, host="127.0.0.1", layout=None):
     """Serve a staged feed on loopback. Returns the running server.
 
     Loopback only, always. This is a test harness for the update path, not a
-    way to distribute anything: publishing means uploading the same directory
-    to a real host, deliberately, by hand.
+    way to distribute anything.
     """
-    handler = functools.partial(_FeedHandler, directory=os.path.abspath(feed_dir))
+    layout = layout or detect_layout(feed_dir)
+    cls = _GitHubFeedHandler if layout == hu.LAYOUT_GITHUB else _FeedHandler
+    handler = functools.partial(cls, directory=os.path.abspath(feed_dir))
     server = http.server.ThreadingHTTPServer((host, port), handler)
     return server
 
@@ -376,11 +560,20 @@ def _build_parser():
     kg.add_argument("--no-trust", action="store_true",
                     help="do not add the public key to release/trust.json")
 
-    sg = sub.add_parser("sign", help="sign an installer into a feed directory")
+    sg = sub.add_parser("sign", help="sign an installer into a feed")
     sg.add_argument("--installer", required=True)
     sg.add_argument("--version", required=True)
-    sg.add_argument("--key", required=True)
-    sg.add_argument("--out", required=True, help="the feed directory to write")
+    which = sg.add_mutually_exclusive_group(required=True)
+    which.add_argument("--key", help="a key file written by keygen")
+    which.add_argument("--seed-file",
+                       help="a file holding only the 64-hex-character private seed "
+                            "(how CI passes the HEARTH_UPDATE_SIGNING_KEY secret)")
+    sg.add_argument("--key-id", default=None,
+                    help="with --seed-file: refuse unless the seed is this key")
+    sg.add_argument("--out", required=True, help="the feed folder to write")
+    sg.add_argument("--trust", default=TRUST_PATH)
+    sg.add_argument("--layout", choices=hu.LAYOUTS, default=None,
+                    help="default: the layout release/trust.json declares")
     sg.add_argument("--channel", default="stable")
     sg.add_argument("--notes", default="")
     sg.add_argument("--notes-file", default=None)
@@ -394,10 +587,12 @@ def _build_parser():
     vf.add_argument("--trust", default=TRUST_PATH)
     vf.add_argument("--channel", default=None)
     vf.add_argument("--installed", default=None)
+    vf.add_argument("--layout", choices=hu.LAYOUTS, default=None)
 
     sv = sub.add_parser("serve", help="serve a feed on loopback, for testing")
     sv.add_argument("--feed", required=True)
     sv.add_argument("--port", type=int, default=0)
+    sv.add_argument("--layout", choices=hu.LAYOUTS, default=None)
     return p
 
 
@@ -415,8 +610,9 @@ def main(argv=None):
         print("public key  {}".format(result["public_key"]))
         if not args.no_trust:
             print("added to    {}".format(TRUST_PATH))
-        print("\nThe private seed is in that file and nowhere else. Move it off "
-              "this machine.\nIt is not printed here on purpose.")
+        print("\nThe private seed is in that file and nowhere else. Keep that "
+              "folder private and\nout of anything that syncs. It is not printed "
+              "here on purpose.")
         return 0
 
     if args.command == "sign":
@@ -427,19 +623,28 @@ def main(argv=None):
         released = None
         if args.released_at:
             released = hu._parse_time(args.released_at, "--released-at")
-        key_id, seed = load_key(args.key)
+        if args.seed_file:
+            key_id, seed = load_seed_file(args.seed_file, trust_path=args.trust,
+                                          key_id=args.key_id)
+        else:
+            key_id, seed = load_key(args.key)
+        layout = args.layout or trust_layout(args.trust)
         signed = build_signed(args.version, args.channel, args.installer,
                               notes=notes, released_at=released,
                               valid_days=args.valid_days,
-                              minimum_version=args.minimum_version)
+                              minimum_version=args.minimum_version,
+                              layout=layout)
         document = sign_document(signed, key_id, seed)
-        manifest = stage_feed(document, args.installer, args.out)
+        manifest = stage_feed(document, args.installer, args.out, layout=layout)
         print("signed {} {} with {}".format(args.channel, args.version, key_id))
+        print("  layout   {}".format(layout))
         print("  sha256   {}".format(signed["artifact"]["sha256"]))
         print("  size     {:,} bytes".format(signed["artifact"]["size_bytes"]))
+        print("  path     {}".format(signed["artifact"]["path"]))
         print("  expires  {}".format(signed["expires_at"]))
         print("  manifest {}".format(manifest))
-        report = verify_feed(args.out, channel=args.channel)
+        report = verify_feed(args.out, trust_path=args.trust, channel=args.channel,
+                             layout=layout)
         print("\nre-checked with the client's own verifier: signed by {}, "
               "artifact hash matches".format(report["signed_by"]))
         return 0
@@ -447,7 +652,8 @@ def main(argv=None):
     if args.command == "verify":
         try:
             report = verify_feed(args.feed, trust_path=args.trust,
-                                 installed=args.installed, channel=args.channel)
+                                 installed=args.installed, channel=args.channel,
+                                 layout=args.layout)
         except hu.UpdateError as exc:
             print("REFUSED: {}".format(exc), file=sys.stderr)
             return 2
@@ -455,7 +661,7 @@ def main(argv=None):
         return 0
 
     if args.command == "serve":
-        server = serve(args.feed, port=args.port)
+        server = serve(args.feed, port=args.port, layout=args.layout)
         host, port = server.server_address[:2]
         print("serving {} at http://{}:{}/".format(os.path.abspath(args.feed), host, port))
         print("point the app at it with HEARTH_UPDATE_FEED=http://{}:{}/".format(host, port))
@@ -478,18 +684,23 @@ def main(argv=None):
 def _self_test():
     import shutil
     import tempfile
+    import threading
+    import urllib.error
     import urllib.request
 
     tmp = tempfile.mkdtemp(prefix="hearth-release-test-")
+    saved_env = {k: os.environ.get(k) for k in ("HEARTH_DATA_DIR",)}
     try:
-        # -- the committed trust file is valid and has an active key --------
+        os.environ["HEARTH_DATA_DIR"] = os.path.join(tmp, "hearth-data")
+        # -- the committed trust file is valid and points at the real feed ---
         trust = hu.load_trust(TRUST_PATH)
         assert any(k["status"] == "active" for k in trust["keys"])
-        # ... and it must not point at a real host, because nothing has been
-        # published and a committed default that did would be a decision
-        # nobody made.
-        assert not hu.configured(trust, {}), (
-            "release/trust.json points at a real feed; nothing has been published")
+        assert hu.configured(trust, {}), "release/trust.json must name a real feed"
+        assert hu.layout_for(trust) == hu.LAYOUT_GITHUB, trust.get("layout")
+        assert trust_layout(TRUST_PATH) == hu.LAYOUT_GITHUB
+        # The 2026-08 seed sat in a cloud-synced folder; it must stay revoked.
+        assert {k["key_id"]: k["status"] for k in trust["keys"]}.get(
+            "hearth-release-2026-08") == "revoked"
 
         # -- keygen ---------------------------------------------------------
         trust_copy = os.path.join(tmp, "trust.json")
@@ -524,7 +735,7 @@ def _self_test():
         except SystemExit:
             pass
 
-        # -- sign, stage, verify --------------------------------------------
+        # -- sign, stage, verify (directory layout) --------------------------
         installer = os.path.join(tmp, "Hearth-Setup-0.2.0.exe")
         payload = b"MZ" + os.urandom(4096)
         with open(installer, "wb") as fh:
@@ -532,6 +743,7 @@ def _self_test():
         signed = build_signed("0.2.0", "stable", installer, notes="Test release.")
         assert signed["artifact"]["sha256"] == hashlib.sha256(payload).hexdigest()
         assert signed["artifact"]["size_bytes"] == len(payload)
+        assert signed["artifact"]["path"] == "stable/0.2.0/Hearth-Setup-0.2.0.exe"
         document = sign_document(signed, key_id, seed)
         feed_dir = os.path.join(tmp, "feed")
         manifest_path = stage_feed(document, installer, feed_dir)
@@ -539,6 +751,7 @@ def _self_test():
         assert os.path.isfile(os.path.join(feed_dir, "stable", "0.2.0",
                                            "Hearth-Setup-0.2.0.exe"))
         assert os.path.isfile(os.path.join(feed_dir, "index.html"))
+        assert detect_layout(feed_dir) == hu.LAYOUT_DIRECTORY
 
         report = verify_feed(feed_dir, trust_path=trust_copy, installed="0.1.0")
         assert report["signed_by"] == "test-key", report
@@ -596,9 +809,8 @@ def _self_test():
         assert "<img src=x" not in text, "the download page must escape release notes"
         assert "&lt;img src=x" in text, text[-600:]
 
-        # -- serve, and a real client fetch over loopback --------------------
+        # -- serve (directory layout), and a real client fetch over loopback --
         server = serve(feed_dir, port=0)
-        import threading
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
@@ -634,11 +846,168 @@ def _self_test():
         except SystemExit:
             pass
 
+        # -- the GitHub Releases layout --------------------------------------
+        gh_trust = os.path.join(tmp, "gh-trust.json")
+        gh_doc = dict(_read_json(trust_copy), layout=hu.LAYOUT_GITHUB,
+                      feed="https://github.com/o/r/releases/")
+        _write_json(gh_trust, gh_doc)
+        assert hu.validate_trust(gh_doc)
+        assert trust_layout(gh_trust) == hu.LAYOUT_GITHUB
+
+        # The CI path: the secret holds only the hex seed, and the key id is
+        # found by deriving the public key, never taken from the caller.
+        seed_file = os.path.join(tmp, "seed.txt")
+        with open(seed_file, "w", encoding="utf-8") as fh:
+            fh.write(ed.to_hex(seed) + "\n")
+        assert load_seed_file(seed_file, trust_path=gh_trust) == ("test-key", seed)
+        assert load_seed_file(seed_file, trust_path=gh_trust, key_id="test-key")[0] == "test-key"
+        for bad_trust_change, why in (
+                (lambda t: t.update(keys=[dict(t["keys"][0], status="revoked"),
+                                          {"key_id": "spare", "algorithm": "ed25519",
+                                           "public_key": other["public_key"],
+                                           "status": "active"}]), "revoked"),
+                (lambda t: t.update(keys=[{"key_id": "spare", "algorithm": "ed25519",
+                                           "public_key": other["public_key"],
+                                           "status": "active"}]), "not in")):
+            changed = json.loads(json.dumps(gh_doc))
+            bad_trust_change(changed)
+            bad_path = os.path.join(tmp, "bad-trust.json")
+            _write_json(bad_path, changed)
+            try:
+                load_seed_file(seed_file, trust_path=bad_path)
+                raise AssertionError("a seed whose key is {} must be refused".format(why))
+            except SystemExit as exc:
+                assert why in str(exc), str(exc)
+        try:
+            load_seed_file(seed_file, trust_path=gh_trust, key_id="someone-else")
+            raise AssertionError("a seed that is not the named key must be refused")
+        except SystemExit:
+            pass
+        # A malformed secret is refused, and the refusal never repeats it.
+        for junk in ("not hex at all", ed.to_hex(seed)[:-2], "0x" + ed.to_hex(seed),
+                     json.dumps({"private_seed": ed.to_hex(seed)})):
+            with open(seed_file, "w", encoding="utf-8") as fh:
+                fh.write(junk)
+            try:
+                load_seed_file(seed_file, trust_path=gh_trust)
+                raise AssertionError("must refuse seed file {!r}".format(junk[:8]))
+            except SystemExit as exc:
+                assert ed.to_hex(seed)[:16] not in str(exc), "a refusal printed the seed"
+        os.remove(seed_file)
+
+        gh_signed = build_signed("0.2.0", "stable", installer, notes="GitHub release.",
+                                 layout=hu.LAYOUT_GITHUB)
+        assert gh_signed["artifact"]["path"] == "download/v0.2.0/Hearth-Setup-0.2.0.exe", (
+            gh_signed["artifact"]["path"])
+        gh_document = sign_document(gh_signed, key_id, seed)
+        assets = os.path.join(tmp, "assets")
+        gh_manifest = stage_feed(gh_document, installer, assets, layout=hu.LAYOUT_GITHUB)
+        # Release assets are flat: exactly the manifest and the installer,
+        # no folders, no download page.
+        assert sorted(os.listdir(assets)) == ["Hearth-Setup-0.2.0.exe",
+                                              "manifest-stable.json"], os.listdir(assets)
+        assert gh_manifest == os.path.join(assets, "manifest-stable.json")
+        assert detect_layout(assets) == hu.LAYOUT_GITHUB
+        report = verify_feed(assets, trust_path=gh_trust, installed="0.1.0")
+        assert report["layout"] == hu.LAYOUT_GITHUB and report["action"] == "update", report
+        # Signing in place (the CI case: --out is the folder the installer is
+        # already in) does not copy the installer onto itself.
+        in_place = os.path.join(tmp, "in-place")
+        os.makedirs(in_place)
+        shutil.copy2(installer, in_place)
+        stage_feed(gh_document, os.path.join(in_place, "Hearth-Setup-0.2.0.exe"),
+                   in_place, layout=hu.LAYOUT_GITHUB)
+        assert verify_feed(in_place, trust_path=gh_trust)["version"] == "0.2.0"
+        # A GitHub manifest whose path names some other tag would 404; it is
+        # refused here rather than discovered by every client.
+        wrong = json.loads(json.dumps(gh_signed))
+        wrong["artifact"]["path"] = "download/v0.1.9/Hearth-Setup-0.2.0.exe"
+        _write_json(gh_manifest, sign_document(wrong, key_id, seed))
+        try:
+            verify_feed(assets, trust_path=gh_trust)
+            raise AssertionError("a GitHub manifest naming another tag must be refused")
+        except hu.UpdateError as exc:
+            assert "serves it at" in str(exc), str(exc)
+        try:
+            stage_feed(sign_document(wrong, key_id, seed), installer, assets,
+                       layout=hu.LAYOUT_GITHUB)
+            raise AssertionError("stage_feed must refuse a mismatched GitHub path")
+        except SystemExit:
+            pass
+        _write_json(gh_manifest, gh_document)
+
+        # -- end to end: the shipped client against a GitHub-shaped loopback --
+        # The real Updater, the real urllib opener and redirect handler, the
+        # feed reached through HEARTH_UPDATE_FEED exactly as an operator would
+        # test a release before publishing it. check -> download -> verify ->
+        # a staged receipt the shell would accept.
+        server = serve(assets, port=0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            base = "http://127.0.0.1:{}/".format(port)
+            # latest/ redirects to the versioned path, which redirects to the
+            # asset, the way GitHub does.
+            opener = urllib.request.build_opener(_NoRedirect())
+            try:
+                opener.open(base + "latest/download/manifest-stable.json", timeout=5)
+                raise AssertionError("latest/download must redirect")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 302, exc.code
+                assert exc.headers["Location"] == "/download/v0.2.0/manifest-stable.json"
+            try:
+                urllib.request.urlopen(base + "download/v0.1.0/manifest-stable.json",
+                                       timeout=5)
+                raise AssertionError("an unknown tag must 404")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 404, exc.code
+
+            data_dir = os.path.join(tmp, "client-data")
+            env = {"HEARTH_DATA_DIR": data_dir, hu.ENV_VERSION: "0.1.0",
+                   hu.ENV_FEED: base}
+            updater = hu.Updater(trust=_read_json(gh_trust), env=env,
+                                 disk_fn=lambda _p: 10 ** 12)
+            snap = updater.check_once(force=True)
+            assert snap["state"] == hu.STATE_AVAILABLE, snap
+            assert snap["available"]["version"] == "0.2.0", snap
+            snap = updater.download_once()
+            assert snap["state"] == hu.STATE_READY, snap
+            staged = snap["staged"]
+            # What desktop/tauri/src/update.rs verify() checks, in the same
+            # order: inside the staging root it derives itself, an .exe that
+            # exists, a version newer than the running one, and a size and
+            # SHA-256 recomputed from the file on disk.
+            root = os.path.realpath(os.path.join(data_dir, "update", "staged"))
+            real = os.path.realpath(staged["path"])
+            assert real.lower().startswith(root.lower() + os.sep), (real, root)
+            assert real.lower().endswith(".exe") and os.path.isfile(real)
+            assert hu.parse_version(staged["version"]) > hu.parse_version("0.1.0")
+            assert os.path.getsize(real) == staged["size_bytes"] == len(payload)
+            assert hu.sha256_file(real) == staged["sha256"] == hashlib.sha256(payload).hexdigest()
+            assert staged["signed_by"] == "test-key", staged
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
     finally:
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         shutil.rmtree(tmp, ignore_errors=True)
 
     print("release-manifest self-test OK")
     return 0
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """For the self-test: see a redirect instead of following it."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 if __name__ == "__main__":

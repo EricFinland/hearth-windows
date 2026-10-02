@@ -66,10 +66,13 @@ everything else on this page.
   including a real tool call, the permission gate firing, an approval
   resolved over HTTP, a byte-exact workspace change, an automatic pre-turn
   checkpoint, and a byte-exact restore.
-- Session persistence (`desktop/server/session_state.py`): the conversation,
-  workspace, model, and mode survive a sidecar restart. A turn or an
-  approval that was in flight when the process stopped is never silently
-  resumed; see "What survives a restart" below.
+- Session persistence and saved chats (`desktop/server/session_state.py`,
+  `desktop/server/conversations.py`): every session is a conversation,
+  kept in its own file, and the Chats sidebar on the Chat tab lists them
+  so you can start a new one, go back to an old one, rename, or delete.
+  The conversation, workspace, model, and mode survive a sidecar restart.
+  A turn or an approval that was in flight when the process stopped is
+  never silently resumed; see "What survives a restart" below.
 - Model downloads with honest progress (`agent/hearth_pull.py`): drives
   Ollama's own pull stream and turns it into a progress bar and byte count
   that never move backwards, with cancellation, a disk-space check up
@@ -114,15 +117,15 @@ Since that list was written, the parts it called missing were built: a Tauri
 shell in Rust (`desktop/tauri/`), the interface (`desktop/ui/`, plain HTML and
 ES modules, no framework and no build step), an installer that
 `scripts/build_windows.py` produces in one command, a bundled inference
-engine, an MCP client ([docs/mcp.md](/hearth-windows/concepts/mcp/)), and a signed updater
+engine, an MCP client with a Tools tab for adding and testing servers
+([docs/mcp.md](/hearth-windows/concepts/mcp/)), and a signed updater
 ([docs/updates.md](/hearth-windows/concepts/updates/)). The model shop has a screen now rather than
 only an API.
 
 **Still not done.** The installer is **not code signed**, so Windows shows a
 full-screen SmartScreen warning on first run;
 [docs/code-signing-policy.md](/hearth-windows/reference/code-signing/) covers what signing
-would and would not prove. There is no cloud API key support. AMD and Intel
-GPU detection is incomplete: NVIDIA is detected, others fall back to CPU.
+would and would not prove. There is no cloud API key support.
 
 **Downloading it.** Installers are published on the
 [GitHub releases page](https://github.com/EricFinland/hearth-windows/releases/latest),
@@ -130,9 +133,9 @@ built by GitHub Actions from this repository. [docs/download.md](/hearth-windows
 walks through installing one, including getting past the SmartScreen warning,
 with no programming knowledge needed. To build it yourself instead,
 [docs/getting-started.md](/hearth-windows/getting-started/install/) walks through that from an empty
-folder. There is no automatic update feed yet: `release/trust.json` points at
-`releases.hearth.invalid`, a name reserved so it cannot resolve, so updating
-means downloading the next installer from the releases page.
+folder. From the version after 0.1.1 on, Hearth checks the releases page on
+launch and installs a signed update in one click; 0.1.1 itself has to be
+updated by hand once. [docs/updates.md](/hearth-windows/concepts/updates/) has the details.
 
 ## What you need
 
@@ -193,14 +196,26 @@ difference the KV-cache math makes over just picking "the biggest number
 that sounds safe."
 
 One honesty note that matters: on Windows, VRAM is read through
-`nvidia-smi` when it's available, which is precise. When it isn't,
-detection falls back to PowerShell or `wmic`, both of which read
-`Win32_VideoController.AdapterRAM`, a signed 32-bit field. That field wraps
-above roughly 4GB, so a 24GB card can report a small or even negative
-number through that path. Every reading from the fallback path is marked
-approximate, and the shop's verdicts are deliberately softened when they're
-built on an approximate reading rather than a precise one - a confident
-"this runs great" is never shown on a guessed number.
+`nvidia-smi` when it's available, which is precise. When it isn't (every
+AMD and Intel machine, and NVIDIA ones without the tool), Hearth lists the
+adapters through PowerShell or `wmic` and then reads each one's memory size
+from its display driver's own registry entry
+(`HardwareInformation.qwMemorySize`), the same 64-bit figure Task Manager
+shows. That is exact too, for every vendor. Only when the driver has not
+written that value does Hearth fall back to
+`Win32_VideoController.AdapterRAM`, a 32-bit field that tops out just under
+4GB (a 16GB card reads as 4GB) and can wrap to a small or even negative
+number. A reading from that last path is marked approximate, and the
+shop's verdicts are deliberately softened when they're built on one - a
+confident "this runs great" is never shown on a guessed number.
+
+An integrated GPU's figure is exact and still small: a Radeon 880M reports
+the 512MB slice of system RAM its driver reserves. Hearth knows that slice
+is not dedicated VRAM and grades it as shared memory, whichever way it was
+read.
+
+The hardware reading is taken once and reused for ten minutes, so browsing
+the shop does not launch PowerShell on every search.
 
 ## Getting a model onto your machine
 
@@ -247,6 +262,54 @@ them:
 
 There is still no button for any of this. It is driven directly today, the
 same as the rest of the engine described on this page.
+
+## Freeing the memory a model holds
+
+A loaded model is the biggest thing Hearth keeps on your machine: a 7B
+model at a useful context holds several GB of graphics memory (or of RAM,
+on a machine without a usable GPU) for as long as it stays loaded. The
+first prompt loads it, and it used to stay loaded until you quit Hearth.
+
+The model chip in the title bar, next to the connection dot, says what is
+loaded right now: a green dot and "Loaded" with a rough memory figure, or
+"Not loaded". Click it for the details and two controls:
+
+- **Unload now** frees that memory immediately. Nothing else changes: your
+  session, transcript and settings stay as they are, and the next prompt
+  loads the model again. That reload takes a few seconds (longer for a big
+  model on a slow disk), and the message box says "Loading model..." while
+  it happens, so a reload does not look like a hang.
+- **Unload when idle for** frees it automatically after a stretch without
+  use: 5, 15, 30 or 60 minutes, or never. The default is 15 minutes. The
+  setting is saved in `model_residency.json` in Hearth's data folder and
+  survives a restart.
+
+Neither ever happens in the middle of work. While a turn, the work loop or
+an agent swarm is running (in the chat on screen or in one you switched
+away from while it was still going), while a cancelled tool call is still
+finishing, or while the model is loading or answering, the Unload button is disabled
+(hover it to see why) and the idle timer waits. The idle clock starts again
+from the end of that work, so a model is not dropped a moment after a long
+tool call finishes.
+
+The memory figure is approximate and says which kind it is. On an NVIDIA
+card where `nvidia-smi` can see the engine it is graphics memory.
+Otherwise it is the RAM the engine process holds, which for a
+memory-mapped model moves with what Windows has paged in. The Vulkan build
+is often in this second group, because `nvidia-smi` does not always
+attribute its graphics memory to the process. Hearth asks `nvidia-smi` at
+most about once a minute, and stops asking for an engine it has already
+seen running without graphics memory, because on a laptop with two GPUs
+each query can wake the discrete one and cost battery.
+
+If you run models through Ollama instead of Hearth's own engine, the chip
+shows the Ollama model Hearth last used, and Unload asks Ollama to drop
+that one model (never any other model Ollama is holding). The idle timer
+does not apply there: Ollama unloads models on its own keep-alive schedule
+(five minutes by default), and the chip says so. If you have used both
+in one session, Unload frees only the one the chip is showing, and the
+idle timer only ever frees Hearth's own engine, so a long
+`OLLAMA_KEEP_ALIVE` you set yourself is left alone.
 
 ## What the permission modes mean
 
@@ -339,9 +402,49 @@ It annotates one the permission mode had already decided to ask for:
   that scored `high` is dropped from view entirely if the very next tool
   call is one the mode allows without asking.
 
-There is also no UI reading any of this yet (see "Where this actually
-stands today"): today these are fields on events the sidecar emits, not
-something on a screen.
+The approval card shows each finding in its own block under the call it
+belongs to; nothing else in the window reacts to them.
+
+**What a file write would actually change.** An approval for `write_file`,
+`edit_file` or `replace_in_files` shows a diff rather than the raw file
+body: a `+N -M` summary, each file's path and whether it is new or
+modified, removed and added lines with old and new line numbers, and three
+unchanged lines either side of each change (more are a click away). The
+exact arguments are still on the card, folded underneath, because the diff
+is the readable answer and the arguments are what will literally be
+written. The sidecar works the diff out, not the window, because only the
+sidecar can read the file on disk:
+
+- It resolves the path exactly the way the tool will (workspace
+  containment, then `.hearthignore`) and shows nothing for a write the tool
+  is going to refuse anyway; the tool's own error says why.
+- `write_file` over an existing file is compared against what is there now.
+  A CRLF file stays CRLF (the tool converts for you), so it does not show
+  every line changed; a genuine line-ending change is stated as a note
+  instead. `edit_file` whose `find` text is not in the file says so rather
+  than showing a diff of nothing.
+- Unchanged context lines come from the file already on disk, and that file
+  can hold a credential the write never mentions. Both sides are run
+  through the secret scanner above and every finding is replaced with
+  `[REDACTED:kind]` before a line is shown, and a file matching the secret
+  patterns undo excludes (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `*.pfx`,
+  `credentials*`) is named with its line counts but never shown. The
+  redaction applies to the preview only: approving still writes the real
+  text.
+- A preview is capped (2,000 lines and 64 KB per approval, file names
+  included, 20 files diffed for `replace_in_files`) because the approval is
+  saved with the session and replayed when the window reconnects. Whatever a
+  cap cut off, the card says so.
+- Working the diff out is bounded in time as well as size, because the card
+  waits for it. Most of a large file is matched quickly on the lines it
+  shares with the new version; a stretch that is still too big to compare
+  line by line within that bound (a long, highly repetitive file, say) is
+  shown as whole blocks removed and added, with a note saying so, rather
+  than holding the card back. A secret too long for the scanner to redact
+  cleanly hides that file's content entirely.
+
+The diff is computed when the card appears. If the file changes on disk
+before you click, the tool writes against the file as it is then.
 
 **The prompt-injection scanner** (`agent/hearth_injection.py`) looks at
 content the agent reads: repo files, web pages, dependency READMEs, tool
@@ -465,6 +568,94 @@ directly in the module's own tests, not just asserted here. If you edit
 that reads it (it is cached per workspace, keyed on the file's own
 modification time), not on a delay or a restart.
 
+## Attaching files to a message
+
+In a chat session you can hand the model files to read: click the paperclip
+beside the message box, drop files anywhere on the chat, or paste a file
+(a copied file or a screenshot) into the message box. Each file shows as a
+chip above the box with its size and status while it imports, then says
+how it will reach the model. Files go with the next message you send; one
+that is still importing waits for the message after. Attaching is for chat
+sessions only: a work loop or a swarm reads your message as its goal, so
+the paperclip is hidden there.
+
+**Where the files go.** Each file is copied into an `imports` folder at the
+top of the session's workspace (`<workspace>\imports\`), created when
+first needed. Names are cleaned up for Windows on the way in: folder parts,
+control and invisible characters, `:` (alternate data streams), trailing
+dots and spaces, and reserved device names such as `CON` or `NUL.txt` are
+removed or prefixed with `_`, square brackets become parentheses (the model's
+prompt uses brackets for its own notes), and very long names are shortened
+to 120 characters. A name that is already taken gets ` (2)`, ` (3)` and so on;
+nothing already in `imports` is ever overwritten. While a file uploads its
+bytes are staged in Hearth's own data folder, not the workspace, so the
+agent never sees a half-written file. This copy is your action, so it does
+not ask for the write approval the agent's own writes do, but it is held to
+the same workspace boundary: if `imports` is a file, a symbolic link or a
+junction, attaching is refused rather than written through.
+
+**The limits.** 20 MB per file, 10 files and 50 MB in total per message.
+
+**What the model is shown.** Text is read out of each file and placed
+after your message, fenced with markers that say it is the content of a
+file you attached and is untrusted data, not instructions. File names are
+shown to the model in quotes, as data, never as part of the prompt's own
+wording. All the files on one message share a budget of about 40% of the
+model's context window, less if the conversation so far (or the message you
+type with them) already fills much of it, so there is room left for the
+conversation and the reply. Everything Hearth adds counts against that
+budget, the files' names and notes included. With the
+model set to `auto` the router can pick a different model for each step, so
+the budget assumes the smallest context any of them runs with (4096
+tokens). A file that fits is
+included whole; one that does not is included as an excerpt from its start,
+with a note telling the agent the full file is at `imports\<name>` so it
+can read the rest with its own tools. The chip says which you will get
+(`full text` or `excerpt`) before you send. With many files, long names or
+a small context there may be room only for a list of the files' paths: the
+chips then say `too big to inline` and the agent reads the files with its
+own tools. When not even that list fits, Hearth refuses to send: the files
+go back to the tray, and the hint above them asks you to remove some,
+shorten the message, or start a new chat. Only your newest message keeps
+its files in the conversation: when you send another message with files,
+the earlier files' text is replaced by a one-line note naming them and
+where they are in `imports`, so the agent can read them again with its own
+tools if it needs to. Your message itself stays
+exactly what you typed: the transcript shows your words with the attached
+files as chips underneath, and so does a saved chat when you reopen it (the
+chips name the files, which stay in `imports` for the agent to read
+again).
+
+**Formats it can read.** Plain text and source code of every common kind
+(markdown, CSV, JSON, logs, XML, HTML, YAML and so on), in UTF-8, UTF-16 or
+UTF-32 with a byte order mark, or the older Windows cp1252 encoding; Word
+`.docx` documents (the text of every paragraph); and PDFs, best effort.
+PDF text is pulled from the page content directly, which works for most
+documents exported from a word processor and fails for scanned pages and
+for PDFs whose fonts store glyph numbers instead of letters. When that
+happens the chip says "no text found" and the model is told the same,
+rather than being handed noise. Encrypted PDFs and password-protected Word
+documents are named as such. Images and other binary files are stored and
+the model is told where they are, but their contents are not shown: there
+is no vision support yet.
+
+**Warnings before you send.** Attached text is treated like any other
+content the agent reads from outside: its text and its name are scanned
+for prompt injection, and if they score high the chip warns you. The
+finding is also carried into the turn the same way a suspicious tool
+result's is, so the approval card shows it if the agent's first gated
+action comes before it reads anything else; once another tool result
+arrives, the card shows that result's scan instead. It is also scanned for credentials (API keys, private keys,
+passwords in connection strings), and the chip warns you if it finds one,
+showing a masked preview, never the value. Neither scan removes or blocks
+anything; they tell you, and you decide whether to remove the file.
+
+**Two things to know.** Imported files are ordinary workspace files, so the
+checkpoint taken at the start of each turn captures them like anything
+else, large ones included. And if your `.hearthignore` covers `imports/`,
+whatever fits in the message is still sent, but the agent's file tools
+will refuse to open the full file; the chip says so.
+
 ## How undo works
 
 Local models get things wrong often enough that cheap, reliable recovery is
@@ -506,6 +697,22 @@ restore look complete when it wasn't. A checkpoint taken before this
 existed has no baseline to compare against; restore says so explicitly
 (`excluded_manifest_available: false`) rather than reporting a false "no
 changes."
+
+You can see what a restore would do before you do it. Clicking restore on a
+checkpoint opens a dialog that shows the actual per-file diff: the same
+comparison restore makes, run without the step that writes anything, drawn
+the same way an approval card draws a write. Lines marked `-` are on disk
+now and will go; lines marked `+` come back from the checkpoint. The dialog
+also lists any secret-pattern file that changed since the checkpoint (the
+gap described above), so you learn that before clicking rather than after.
+The same rules as the approval card apply: credentials are redacted, secret
+files and files your `.hearthignore` excludes are named without their
+content, and binary files are named only. If a checkpoint is being written
+at that moment the preview says to reopen it in a moment; the Restore
+button works either way. While a turn is still working in the workspace
+there is no preview, for the same reason restore itself waits: the preview
+has to take stock of the whole workspace, which would hold up that turn's
+own checkpoint.
 
 ## Staying out of your way
 
@@ -550,6 +757,52 @@ losing the conversation, the workspace/model/mode in use, and the record
 of what was approved. `desktop/server/session_state.py` persists the
 conversation, the workspace, model, and mode, and a bounded tail of recent
 events, so a restart is a resumption rather than a reset.
+
+Every session is also one saved conversation among many. Starting a
+session, pressing New chat (or Ctrl+N), or restarting a session from the
+sidebar form starts a new conversation and leaves the previous one under
+Chats, on the left of the Chat tab, grouped by Today, Previous 7 days and
+Older. Click one to reopen it; its history replays into the transcript and
+the model picks up the same context it had. Rename a chat inline (the
+pencil, or F2) and delete it with the bin (or Del), which asks first.
+After a restart, whichever chat was open last is the one that reopens.
+Switching chats, starting a new one, and deleting the open one are refused
+while a turn is still running, because the turn and any tool call it
+started would otherwise carry on behind a session nothing can reach: stop
+it first (Esc). Restarting the session into a different folder is allowed
+mid-turn, and that turn keeps running in its own folder and is saved into
+its own chat when it ends; until then, that chat cannot be reopened and no
+new session can start in its folder, so two turns never work in one folder
+at once. Deleting the open chat ends its session; deleting any chat never
+touches the files in its workspace or its checkpoints.
+
+Where it lives: one file per conversation in
+`%LOCALAPPDATA%\Hearth\desktop\conversations\`, plus an `index.json` that
+is only a cache. If the index is lost or damaged it is rebuilt from the
+conversation files, and a conversation file that cannot be read is skipped
+(and left where it is) rather than hiding the others. An older Hearth's
+single `session_state.json` is copied in on first start and the original is
+renamed to `session_state.json.migrated`, never deleted. A chat is titled
+from its first prompt, with control characters and text-direction overrides
+removed, and that title is still treated as untrusted text by the UI.
+
+How much of a chat replays: the model's own context is saved whole, but
+the on-screen history is a bounded tail, at most 400 entries and 2 MB,
+with each streamed reply stored as one entry. Each save extends the tail
+the previous save kept, so history is not lost just because the live
+event buffer (500 raw events, and a streamed reply produces about ten a
+second) has moved past it. A long chat reopened from disk starts with a
+note saying earlier messages are not shown, rather than looking like it
+began part way through. If one stretch between two saves outran the live
+buffer on its own (a turn that streams or runs tools for minutes without
+asking for an approval), the part that was never saved is marked in place
+with a note, not silently skipped.
+
+These files sit in a folder the agent's own `run_command` could write to,
+so reopening a chat is treated exactly like a restart: a saved session in
+`bypass` mode is refused, a saved conversation whose system prompt Hearth
+did not write is dropped, and a saved work loop or swarm has its bounds
+re-checked rather than believed.
 
 What is deliberately not persisted matters as much as what is. A pending
 approval is never resurrected: an approval is a live question with a

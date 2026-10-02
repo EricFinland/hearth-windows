@@ -28,13 +28,18 @@
 
 const SIDECAR_ROUTES = new Set([
   "/healthz", "/session", "/prompt", "/events", "/approve",
+  "/conversations", "/conversations/new", "/conversations/open", "/conversations/rename", "/conversations/delete",
   "/cancel", "/models", "/checkpoints", "/restore", "/setup", "/idle",
   "/shop", "/shop/quants",
+  "/checkpoints/diff",
   "/downloads", "/downloads/events", "/downloads/cancel", "/downloads/dismiss",
   "/engine", "/engine/events",
+  "/model", "/model/unload", "/model/autounload",
   "/loop", "/loop/events",
   "/swarm", "/swarm/events",
+  "/attach", "/attach/chunk", "/attach/finish", "/attach/cancel",
   "/update", "/update/events",
+  "/mcp", "/mcp/save", "/mcp/toggle", "/mcp/remove", "/mcp/test",
 ]);
 
 export class HttpError extends Error {
@@ -111,11 +116,18 @@ export class Sidecar {
   models()                 { return this.request("GET", "/models"); }
   getSession()             { return this.request("GET", "/session"); }
   createSession(body)      { return this.request("POST", "/session", body); }
-  prompt(message)          { return this.request("POST", "/prompt", { message }); }
+  prompt(message, attachments) { return this.request("POST", "/prompt", attachments && attachments.length ? { message, attachments } : { message }); }
   approve(id, decision)    { return this.request("POST", "/approve", { id, decision }); }
   cancel()                 { return this.request("POST", "/cancel"); }
   checkpoints()            { return this.request("GET", "/checkpoints"); }
   restore(checkpointId)    { return this.request("POST", "/restore", { checkpoint_id: checkpointId }); }
+  /** Attaching a file (desktop/server/attachments.py): begin, then base64
+   *  chunks of at most `chunk_bytes` each, then finish. Chunked because the
+   *  packaged shell's proxy refuses any request body over 4 MiB. */
+  beginAttach(name, size)        { return this.request("POST", "/attach", { name, size }); }
+  attachChunk(id, offset, data)  { return this.request("POST", "/attach/chunk", { id, offset, data }); }
+  finishAttach(id)               { return this.request("POST", "/attach/finish", { id }); }
+  cancelAttach(id)               { return this.request("POST", "/attach/cancel", { id }); }
 
   /** Search the shop. The query is a user-typed string and goes in the query
    *  string, which is fine: it is not a secret. The bearer token never does --
@@ -172,6 +184,17 @@ export class Sidecar {
    *  the fetch runs on the sidecar's own thread and Hearth stays usable on
    *  the bundled CPU engine while it happens. */
   fetchEngine(force = false) { return this.request("POST", "/engine", { force }); }
+
+  /** The resident model: what it is, loaded or not, roughly how much memory
+   *  it holds, whether anything is using it, and the idle auto-unload delay.
+   *  Polled with plain GETs on purpose (see model-chip.js): the page already
+   *  holds as many event streams as WebView2 will give it. */
+  model()              { return this.request("GET", "/model"); }
+  /** Free the model's memory now. A 409 HttpError carries the reason it is
+   *  in use; the next prompt reloads the model. */
+  unloadModel()        { return this.request("POST", "/model/unload", {}); }
+  /** Set the idle delay: 5, 15, 30 or 60 minutes, or null for never. */
+  setModelAutoUnload(minutes) { return this.request("POST", "/model/autounload", { minutes }); }
 
   /** Open GET /engine/events and call `onSnapshot(snapshot)` per frame.
    *  Same contract as streamDownloads: every frame is the whole state. */

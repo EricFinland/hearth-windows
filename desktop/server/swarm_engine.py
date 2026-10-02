@@ -75,6 +75,7 @@ for _p in (_AGENT_DIR, _HERE):
         sys.path.insert(0, _p)
 
 import hearth_contain  # noqa: E402
+import hearth_diff  # noqa: E402
 import hearth_swarmloop  # noqa: E402
 import hearth_workloop  # noqa: E402
 import permissions  # noqa: E402
@@ -879,7 +880,12 @@ class SwarmEngine:
             return None
 
         def approve(tool, args):
-            decision = ctx.request_approval(tool, args, timeout=self._gate_timeout)
+            # The same write preview an interactive card gets (see
+            # engine.py's gate): a person woken by an unattended run's
+            # card deserves to see what it would change, not a file body.
+            decision = ctx.request_approval(
+                tool, args, timeout=self._gate_timeout,
+                diff=hearth_diff.approval_preview(tool, args, getattr(ctx, "workspace", None)))
             self._status.note_gate(decision)
             return decision == "allow"
         return approve

@@ -13,7 +13,7 @@ is a TurnContext offering:
   ctx.workspace, ctx.model, ctx.mode, ctx.message   -- the turn's inputs
   ctx.emit(kind, data)                              -- push an SSE event
   ctx.request_approval(tool, args, injection_finding=None,
-                        secrets_finding=None) -> "allow"|"deny"
+                        secrets_finding=None, diff=None) -> "allow"|"deny"
                                                      -- gate a tool call,
                                                         blocking until
                                                         POST /approve
@@ -188,6 +188,13 @@ STATUS_RUNNING = "running"
 
 EVENTS_CAP = 500  # bounded ring for Session._events; see module docstring
 APPROVALS_CAP = 200  # bounded dict for Session._approvals; see module docstring
+USER_PROMPT_ECHO_CHARS = 32 * 1024  # see submit_prompt's `echo`
+# The files attached to an echoed prompt (attachments.PromptText's
+# attachment_meta), so a replay draws the same chips under the user's words
+# that the page drew when it sent them. Only what those chips show is kept,
+# each string bounded, so a pasted-in name cannot crowd the saved tail.
+ECHO_ATTACHMENTS_MAX = 16
+ECHO_ATTACHMENT_FIELD_CHARS = 512
 
 
 class Approval:
@@ -216,10 +223,10 @@ class TurnContext:
         self.session._emit(self.turn_id, kind, data or {})
 
     def request_approval(self, tool, args=None, injection_finding=None, secrets_finding=None,
-                         timeout=None):
+                         timeout=None, diff=None):
         return self.session._request_approval(self.turn_id, tool, args or {},
                                                injection_finding, secrets_finding,
-                                               timeout=timeout)
+                                               timeout=timeout, diff=diff)
 
     def cancelled(self):
         return self.session._is_cancelled(self.turn_id)
@@ -234,6 +241,30 @@ class NullEngine:
     def run(self, ctx):
         ctx.emit("error", {"message": "no engine configured"})
 
+
+
+def _echo_attachments(meta):
+    """The JSON-safe part of a prompt's attachment_meta that a replay needs
+    to draw its chips: name, path, size, kind and how it was inlined
+    ("full", "excerpt" or "none"). Anything that is not a list of dicts, as
+    a plain str prompt has, gives an empty list."""
+    if not isinstance(meta, (list, tuple)):
+        return []
+    out = []
+    for item in meta[:ECHO_ATTACHMENTS_MAX]:
+        if not isinstance(item, dict):
+            continue
+        kept = {}
+        for key in ("name", "path", "kind", "inlined"):
+            value = item.get(key)
+            if isinstance(value, str):
+                kept[key] = value[:ECHO_ATTACHMENT_FIELD_CHARS]
+        size = item.get("size")
+        if type(size) is int and size >= 0:  # noqa: E721 - not bool
+            kept["size"] = size
+        if kept.get("name") or kept.get("path"):
+            out.append(kept)
+    return out
 
 class Session:
     """One live agent session: workspace + model + permission mode, plus the
@@ -409,9 +440,19 @@ class Session:
 
     # ---- driving a turn ----
 
-    def submit_prompt(self, message):
+    def submit_prompt(self, message, echo=False):
         """Start a new turn on a background thread and return its id
-        immediately. Raises RuntimeError if a turn is already running."""
+        immediately. Raises RuntimeError if a turn is already running.
+
+        `echo` also records the prompt itself as a "user_prompt" event, ahead
+        of anything the engine emits for the turn. app.py's POST /prompt asks
+        for it; nothing else does, so a caller driving a Session directly
+        sees exactly the events it always saw. Without it the event log held
+        only the agent's half of a conversation, and a page that replays the
+        log -- a reload, a restart, reopening a saved chat -- showed answers
+        to questions nobody could see. Capped at USER_PROMPT_ECHO_CHARS with
+        a `truncated` flag, because a pasted log file must not crowd the rest
+        of the history out of the persisted tail."""
         with self._lock:
             if self.status == STATUS_RUNNING:
                 raise RuntimeError("a turn is already running")
@@ -426,6 +467,17 @@ class Session:
             self._cancel_flags[turn_id] = threading.Event()
 
         ctx = TurnContext(self, turn_id, message)
+        if echo:
+            # Emitted before the worker thread exists, so it can never land
+            # after the engine's first event for this turn.
+            text = message if isinstance(message, str) else str(message)
+            echoed = {"text": text[:USER_PROMPT_ECHO_CHARS]}
+            if len(text) > USER_PROMPT_ECHO_CHARS:
+                echoed["truncated"] = True
+            files = _echo_attachments(getattr(message, "attachment_meta", None))
+            if files:
+                echoed["attachments"] = files
+            self._emit(turn_id, "user_prompt", echoed)
 
         def _run():
             try:
@@ -591,7 +643,7 @@ class Session:
                 del self._approvals[appr_id]
 
     def _request_approval(self, turn_id, tool, args, injection_finding=None, secrets_finding=None,
-                          timeout=None):
+                          timeout=None, diff=None):
         """Raise an approval card and block until it is answered.
 
         `timeout` (seconds, or None for the interactive default of "wait
@@ -643,6 +695,13 @@ class Session:
             event_data["injection_finding"] = injection_finding
         if secrets_finding is not None:
             event_data["secrets_finding"] = secrets_finding
+        # `diff` follows the same rule: present only when the engine computed
+        # a preview of a file write (agent/hearth_diff.py), so a gated
+        # run_command's event is shaped exactly as it always was. It is
+        # already capped and redacted by the time it gets here, which matters
+        # because this event is persisted below and replayed on reconnect.
+        if diff is not None:
+            event_data["diff"] = diff
         self._emit(turn_id, "approval_request", event_data)
         # Persist right here, before blocking on the wait below: this is
         # deliberately the exact moment a crash would otherwise strand an
@@ -943,6 +1002,38 @@ def _self_test():
     appr_no_finding = next(e for e in no_finding_events if e["kind"] == "approval_request")
     assert "injection_finding" not in appr_no_finding["data"], appr_no_finding
     assert "secrets_finding" not in appr_no_finding["data"], appr_no_finding
+    assert "diff" not in appr_no_finding["data"], appr_no_finding
+
+    # a write preview rides through to the event untouched, under its own key.
+    sample_diff = {"files": [{"path": "d.txt", "status": "added", "added": 1, "removed": 0,
+                              "hunks": [{"old_start": 0, "old_count": 0, "new_start": 1,
+                                         "new_count": 1, "lines": [["+", "hello"]]}],
+                              "truncated": False}],
+                   "added": 1, "removed": 0, "truncated": False, "files_total": 1,
+                   "files_omitted": 0}
+
+    class DiffEngine:
+        def run(self, ctx):
+            decision = ctx.request_approval("write_file", {"path": "d.txt", "content": "hello\n"},
+                                             diff=sample_diff)
+            ctx.emit("tool_call", {"tool": "write_file", "decision": decision})
+
+    s_diff = Session("/tmp/ws-diff", "m", "edit", engine=DiffEngine())
+    s_diff.submit_prompt("write a file")
+    deadline = time.monotonic() + 5
+    appr_diff_data = None
+    while appr_diff_data is None and time.monotonic() < deadline:
+        for e in s_diff.events_after(0, timeout=1):
+            if e["kind"] == "approval_request":
+                appr_diff_data = e["data"]
+                break
+    assert appr_diff_data is not None, "approval_request never arrived"
+    assert appr_diff_data.get("diff") == sample_diff, appr_diff_data
+    assert "secrets_finding" not in appr_diff_data, appr_diff_data
+    s_diff.resolve_approval(appr_diff_data["id"], True)
+    deadline = time.monotonic() + 5
+    while s_diff.to_dict()["status"] != STATUS_IDLE and time.monotonic() < deadline:
+        time.sleep(0.01)
 
     # --- cancellation wakes a blocked approval and reports "deny" ---
     class WaitingEngine:
@@ -1360,6 +1451,60 @@ def _self_test():
     ri2_kinds = [e["kind"] for e in s_ri2.events_after(0, timeout=1)]
     assert ri2_kinds == ["turn_interrupted"], \
         "no approval_abandoned marker when nothing was actually pending: {}".format(ri2_kinds)
+
+    # submit_prompt(echo=True) records the prompt FIRST, before anything the
+    # engine says, and caps a huge one; the default leaves the log alone.
+    class _SaysDone:
+        def run(self, ctx):
+            ctx.emit("done", {})
+
+    s_echo = Session("/tmp/ws-echo", "m", "edit", engine=_SaysDone())
+    s_echo.submit_prompt("what does main.py do?", echo=True)
+    deadline = time.monotonic() + 5
+    echo_events = s_echo.events_after(0, timeout=2)
+    while echo_events[-1]["kind"] != "done" and time.monotonic() < deadline:
+        time.sleep(0.01)
+        echo_events = s_echo.events_after(0, timeout=2)
+    assert [e["kind"] for e in echo_events] == ["user_prompt", "done"], echo_events
+    assert echo_events[0]["data"] == {"text": "what does main.py do?"}, echo_events[0]
+    deadline = time.monotonic() + 5
+    while s_echo.to_dict()["status"] != STATUS_IDLE and time.monotonic() < deadline:
+        time.sleep(0.01)
+    s_echo.submit_prompt("x" * (USER_PROMPT_ECHO_CHARS + 5), echo=True)
+    big = [e for e in s_echo.events_after(0, timeout=2) if e["kind"] == "user_prompt"][-1]
+    assert len(big["data"]["text"]) == USER_PROMPT_ECHO_CHARS and big["data"]["truncated"] is True
+
+    # A prompt carrying attached files (attachments.PromptText) echoes the
+    # typed words as its text, as before, plus what the chips under it show;
+    # never the files' content, and nothing that is not plain JSON.
+    class _Attached(str):
+        pass
+
+    with_files = _Attached("summarise these")
+    with_files.attachment_text = "<<<BEGIN ATTACHMENT secret body>>>"
+    with_files.attachment_meta = [
+        {"name": "notes.md", "path": "imports/notes.md", "size": 120, "kind": "text",
+         "inlined": "full", "note": None, "warnings": [{"type": "secret"}]},
+        {"name": "n" * 2000, "path": "imports/x.bin", "size": True, "inlined": "none"},
+        "not a dict",
+    ]
+    deadline = time.monotonic() + 5
+    while s_echo.to_dict()["status"] != STATUS_IDLE and time.monotonic() < deadline:
+        time.sleep(0.01)
+    s_echo.submit_prompt(with_files, echo=True)
+    got = [e for e in s_echo.events_after(0, timeout=2) if e["kind"] == "user_prompt"][-1]["data"]
+    assert got["text"] == "summarise these" and "BEGIN ATTACHMENT" not in repr(got), got
+    assert got["attachments"][0] == {"name": "notes.md", "path": "imports/notes.md",
+                                     "kind": "text", "inlined": "full", "size": 120}, got
+    assert len(got["attachments"]) == 2, got
+    assert len(got["attachments"][1]["name"]) == ECHO_ATTACHMENT_FIELD_CHARS, got
+    assert "size" not in got["attachments"][1], "a bool is not a size"
+    assert _echo_attachments(None) == [] and _echo_attachments("x") == []
+
+    s_quiet = Session("/tmp/ws-echo-2", "m", "edit", engine=_SaysDone())
+    s_quiet.submit_prompt("not echoed")
+    quiet_events = s_quiet.events_after(0, timeout=2)
+    assert [e["kind"] for e in quiet_events] == ["done"], quiet_events
 
     print("hearth-desktop-session self-test OK")
     return 0

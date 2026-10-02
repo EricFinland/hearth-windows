@@ -3,12 +3,26 @@ title: Signed updates
 description: The Ed25519 trust anchor, what it protects, and what it deliberately does not.
 ---
 
-How Hearth decides whether to replace itself, what it verifies before it does,
-and what an operator would have to do to publish an update feed. Installers
-are published by hand on the
-[GitHub releases page](https://github.com/EricFinland/hearth-windows/releases),
-but there is no update feed yet, so the in-app updater has nothing to fetch;
-this document describes a mechanism, not an operation.
+How Hearth finds a new version, what it verifies before it installs one, and
+how a release is published so that installed copies can find it. The feed is
+this repository's
+[GitHub releases page](https://github.com/EricFinland/hearth-windows/releases):
+every release carries a signed `manifest-stable.json` next to its installer,
+and Hearth checks for it once each time it starts.
+
+**Updating, for people using Hearth:** when a new version is out, a banner
+says so at the top of the window. Click **Install now**. Hearth downloads it,
+checks it, asks once more with the version and its fingerprint in front of
+you, then closes, updates and opens again. Your models, chats and settings are
+kept. If a turn, the work loop or a swarm is still running (in any chat),
+that last question says so first, because installing stops that work
+partway. **Later** hides the banner until the next launch; the Updates panel in
+the sidebar always has the full picture and a **Check for updates** button.
+
+Hearth 0.1.1 and older cannot do this: they were built with a placeholder feed
+and a key that has since been retired. Anyone on 0.1.1 installs the next
+version by hand once (download it from the releases page and run it), and
+every update after that happens inside the app.
 
 ## The short version
 
@@ -64,8 +78,18 @@ trusted host. It is a statement that Hearth is neither of those yet.
 imports no process spawning, no foreign-function machinery, no dynamic
 evaluation, and its own self-test scans its source to keep it that way.
 
-1. **Fetch the manifest.** One HTTPS GET of `<feed>/<channel>/manifest.json`,
-   capped at 64 KiB, redirects allowed only within the feed's own origin.
+1. **Fetch the manifest.** One HTTPS GET of
+   `<feed>latest/download/manifest-<channel>.json`, capped at 64 KiB, with no
+   query string and no header that identifies anybody (the User-Agent is the
+   fixed string `hearth-updater`). GitHub answers with redirects to the
+   versioned release and then to its asset host; those are followed at most
+   five times, only over https on the default port, and only to `github.com`,
+   `release-assets.githubusercontent.com` (where GitHub sends asset downloads
+   today) or `objects.githubusercontent.com` (where it sent them until 2025).
+   That list limits where a request can go. It is not part of deciding whether
+   anything is trustworthy, which is still steps 2 to 7. A trust file without
+   a `layout` uses the older directory layout, `<feed><channel>/manifest.json`,
+   and redirects only within its own origin.
 2. **Verify the signature**, over the canonical serialization of the manifest's
    `signed` block, against an *active* key in the shipped `release/trust.json`.
    Nothing inside the block is inspected before this passes. A revoked key, an
@@ -86,7 +110,10 @@ evaluation, and its own self-test scans its source to keep it that way.
    when an update installs, so a user who declines 0.2.0 still cannot be walked
    back to 0.1.0. A manifest whose release date is older than the newest one
    already seen is refused too.
-6. **Download and hash.** Bytes stream to a `.part` file and are hashed as they
+6. **Download and hash.** The installer is fetched from the path the signed
+   manifest names, `download/v<version>/<file>`, never through `latest/`, so a
+   release published halfway through an update cannot change which file
+   arrives. Bytes stream to a `.part` file and are hashed as they
    arrive, capped at exactly the signed size plus one byte. Free disk space is
    checked first. A mismatch, a short read, an over-long response, a full disk
    or a cancellation all delete the partial file; nothing outside the staging
@@ -118,9 +145,21 @@ of its own:
   editing a file next to it.
 
 Then the user is shown the version and the full SHA-256 in a native dialog and
-asked. Only a yes spawns the installer, detached, with NSIS's `/S`; Hearth quits
-immediately afterwards so the sidecar, and with it `llama-server` and its VRAM,
-is gone before the files are replaced.
+asked. Only a yes spawns the installer, detached, with `/S /UPDATE /R`: silent
+(the user has just been asked), as an update over the existing install (no
+shortcuts re-created, no WebView2 bootstrap, and the uninstaller's optional
+"delete app data" step never runs), and relaunching Hearth when it is done.
+These are the switches `tauri-plugin-updater` passes to the same installer
+template. Hearth quits immediately afterwards so the sidecar, and with it
+`llama-server` and its VRAM, is gone before the files are replaced.
+
+Nothing the user made is in the way of the installer. The program lives in
+`%LOCALAPPDATA%\Programs\Hearth` (see `desktop/tauri/installer-hooks.nsi`);
+models, chats, checkpoints, settings and the updater's own state live in
+`%LOCALAPPDATA%\Hearth`, which neither the installer nor the uninstaller
+touches. The only folder Tauri's template can ever delete is the WebView2
+profile under the bundle id, `com.hearthlocal.hearth`, and only when somebody
+uninstalls through the GUI and ticks the box.
 
 The renderer cannot name a file and cannot pass a path. `window.hearth.installUpdate()`
 is a request with no arguments.
@@ -129,7 +168,7 @@ is a request with no arguments.
 
 | | default | can be changed |
 | --- | --- | --- |
-| check for updates | **yes**, once per launch and at most every 6 hours | yes, a checkbox |
+| check for updates | **yes**, once per launch (a page reload inside one run does not check again for 6 hours) | yes, the checkbox in the Updates panel |
 | download automatically | **no** | no |
 | install automatically | **no** | no |
 
@@ -141,7 +180,25 @@ an updater, so the check is on by default; it is one GET of a small signed JSON
 document to a pinned host, with no identifier of any kind attached, and it can
 be turned off. Downloading 117 MB unprompted onto a metered connection is rude,
 and a staged installer sitting on disk is one more thing for a local attacker to
-race, so neither happens without an explicit action.
+race, so neither happens without an explicit action. **Install now** in the
+banner is that action: it downloads, verifies and hands over to the shell's
+dialog in one go.
+
+The setting is stored as `auto_check` in `%LOCALAPPDATA%\Hearth\update\state.json`,
+beside the downgrade floor. Every change to that file goes through one lock
+and a uniquely named temporary file, so turning the check off while a check is
+writing cannot lose either change; losing the floor that way would quietly
+reopen the rollback it exists to close.
+
+**When a check fails.** A launch check that cannot reach GitHub (offline, a
+captive portal, a firewall) says so in grey in the Updates panel, "Could not
+reach GitHub to check for updates. Hearth will try again next launch.", and
+shows no banner. So does a newest release that was published without a signed
+manifest. Clicking **Check for updates** gives the precise reason. None of
+these is ever shown as "up to date", because a check that did not happen is not
+evidence of anything. A refused signature, a rollback or a hash mismatch is
+different: it is shown as a warning, in full, because it means something is
+wrong rather than missing.
 
 ## What protection exists, before and after code signing
 
@@ -178,89 +235,140 @@ executable, and the code that disowns WebView2's environment present in the
 shipped bytes. It is a hard build failure and it applies to every build the
 updater ships, not only the first one.
 
-## No update feed has been published
+## The feed: GitHub Releases
 
-`release/trust.json` pins the feed at `releases.hearth.invalid`. `.invalid` is
-reserved by RFC 2606 and can never resolve, so a shipped Hearth cannot fetch an
-update from anywhere at all. Installers are published by hand on the GitHub
-releases page instead, and the Updates panel says exactly that: *"This build
-of Hearth carries no release feed, so it cannot check for updates
-automatically. New versions are posted at
-github.com/EricFinland/hearth-windows/releases."* It does not say "up to date", because "we did not look"
-and "we looked and there is nothing" are different facts, and reporting the
-first as the second is the most common way an updater lies to people.
+`release/trust.json` pins the feed at
+`https://github.com/EricFinland/hearth-windows/releases/` with
+`"layout": "github-releases"`. A GitHub release's assets share one flat
+namespace, so the feed is two files per release:
 
-## What an operator would have to do to publish
+| asset | fetched as |
+| --- | --- |
+| `manifest-stable.json` | `releases/latest/download/manifest-stable.json` |
+| `Hearth-Setup-<version>.exe` | `releases/download/v<version>/Hearth-Setup-<version>.exe`, the path inside the signed manifest |
 
-None of this has been done. In order:
+`latest/download/` always means the newest *published* release. A draft is
+not served through it until it is published, so a release created as a draft
+is invisible to installed copies until somebody clicks **Publish**.
 
-1. **Get a real signing key onto a machine that is not the release host.**
-   The key currently in `release/trust.json` was generated on a development
-   machine; its private half has never left that machine, and it should be
-   replaced before anything is published:
+## Publishing a release
 
-       python scripts/release_manifest.py keygen --key-id hearth-release-<date>
+Pushing a version tag runs `.github/workflows/release.yml`, which builds the
+installer, writes the release notes and, in the step **Sign the update
+manifest**, signs `manifest-stable.json` and attaches it to the release next
+to the installer. Nothing else is needed per release.
 
-   That writes `release/keys/<id>.key` (mode 0600, and `release/keys/` is
-   gitignored) and adds the public half to `release/trust.json`. Move the key
-   file to removable media or a password manager. It is never printed and never
-   needed again until the next release.
+### The signing secret
 
-2. **Decide on a host and put it in `release/trust.json`** as `feed`, ending in
-   a slash. It must be https. Static file hosting is all that is required; the
-   feed has no server-side logic.
+The step reads the repository secret **`HEARTH_UPDATE_SIGNING_KEY`**. It holds
+exactly the 64 hexadecimal characters of the `private_seed` value from a key
+file written by `release_manifest.py keygen`: no quotes, no JSON, no other
+fields. To set it, open the repository's **Settings**, **Secrets and
+variables**, **Actions**, **New repository secret**, name it
+`HEARTH_UPDATE_SIGNING_KEY`, and paste the value.
 
-3. **Rebuild.** `python scripts/build_windows.py`. The trust file is copied into
-   the payload, and the build fails if it is missing or carries no active key.
-   Every user who is to receive updates has to be running a build that carries
-   the key, which is why key rotation means *ship first, sign later*.
+In the workflow the seed is written to a temporary file only the runner's user
+can read, passed to the signer as a path (never as a command-line argument,
+which every process can see), and shredded on every exit path. Nothing echoes
+it, and GitHub masks it in logs as well. The signer derives the public key
+from the seed and looks it up in `release/trust.json`: a secret that does not
+belong to an **active** key there fails the job with a message that says so,
+rather than publishing a manifest every client would refuse.
 
-4. **Sign the installer into a feed directory:**
+Without the secret, the release still publishes, with a warning on the run
+that in-app updates are disabled for that release. Installed copies then find
+no manifest in the newest release, say so calmly in the Updates panel, and
+keep checking on each launch.
 
-       python scripts/release_manifest.py sign \
-         --installer build/dist/Hearth-Setup-0.1.1.exe \
-         --version 0.1.1 --key release/keys/<id>.key --out build/feed
+### Release notes in the app
 
-   That reads the size and SHA-256 off the file (never from an argument),
-   builds the signed block, signs it, lays out
+The banner and the Updates panel show a short note from the signed manifest
+(at most 4000 characters). By default it is one line, "Hearth X.Y.Z. What
+changed:" and a link to the release page. To say more, commit
+`release/notes/v<version>.txt` before tagging; the workflow uses it instead.
 
-       build/feed/stable/manifest.json
-       build/feed/stable/0.1.1/Hearth-Setup-0.1.1.exe
-       build/feed/index.html          a plain download page
+### Expiry, and re-signing
 
-   and then re-checks the result with the *client's* own verifier.
+Each manifest is valid for 180 days from its release. That bound is what turns
+a frozen feed (somebody replaying an old manifest forever) into a visible
+failure. It also means that if there is no new release within 180 days, every
+install's check starts failing, calmly ("the newest update information ...
+expired"), until there is. Before that happens, either publish a release or
+re-sign the current one with a fresh date and replace the asset:
 
-5. **Test it locally before it exists in public:**
+    python scripts/release_manifest.py sign \
+      --installer Hearth-Setup-<version>.exe --version <version> \
+      --seed-file <file holding the seed> --out <folder holding the installer>
+    gh release upload v<version> <folder>/manifest-stable.json --clobber
 
-       python scripts/release_manifest.py serve --feed build/feed
-       HEARTH_UPDATE_FEED=http://127.0.0.1:<port>/ "%LOCALAPPDATA%\Programs\Hearth\Hearth.exe"
+The installer itself is unchanged, so its hash is unchanged, and nobody who
+already has that version is offered anything.
 
-6. **Upload the feed directory** to the host from step 2, verbatim. Upload the
-   installer before the manifest: a manifest that names an artifact which is not
-   there yet is a broken feed, and the other order is never broken.
+### Trying a release before it is public
 
-7. **Verify from outside**, with a client that is not the one that made it:
+`scripts/release_manifest.py serve` answers the way GitHub does, redirects
+included, so the shipped client can be pointed at a folder of release assets
+on this machine:
 
-       python scripts/release_manifest.py verify --feed <a fresh download> --installed 0.1.0
+    python scripts/release_manifest.py sign --installer build/dist/Hearth-Setup-<v>.exe \
+      --version <v> --key <key file> --out build/feed
+    python scripts/release_manifest.py serve --feed build/feed --port 8799
+    set HEARTH_UPDATE_FEED=http://127.0.0.1:8799/
+    "%LOCALAPPDATA%\Programs\Hearth\Hearth.exe"
 
-`scripts/release_manifest.py` uploads nothing, has no credentials for any host,
-and its `serve` binds loopback. Publishing is a deliberate, separate, human act.
-It is also not staged into the installer, so a compromised Hearth install
-contains no signing code and no path to a key.
+Plain http is accepted only for a loopback address given through
+`HEARTH_UPDATE_FEED`; the signature is checked exactly as it is against GitHub.
+To check a downloaded set of assets with a client that is not the one that
+made them:
+
+    python scripts/release_manifest.py verify --feed <folder> --installed 0.1.1
+
+### The keys, and rotating them
+
+The active key is `hearth-release-2026-10`. Its private seed was generated with
+`keygen` into a folder outside every checkout and outside anything that syncs
+to a cloud service, and it exists in exactly two places: that file, and the
+GitHub secret. `hearth-release-2026-08`, the key 0.1.1 shipped with, is marked
+`revoked`: its seed sat in a cloud-synced folder, so it cannot be treated as
+private. It never signed a published release.
+
+On Windows, the key file gets the permissions of the folder it is in (the
+`0600` mode `keygen` asks for has no effect there). Restricting that folder to
+your own account, for example with `icacls <folder> /inheritance:r /grant:r
+"%USERNAME%:(OI)(CI)F"`, is worth doing once.
+
+To rotate:
+
+1. `python scripts/release_manifest.py keygen --key-id hearth-release-<date> --out <private folder>\hearth-release-<date>.key`.
+   It adds the new public key to `release/trust.json` as `active`; commit that.
+2. Ship one release still signed with the old key. Installed copies only trust
+   the keys they were built with, so the new key has to reach them inside a
+   release the old key vouches for.
+3. Replace the `HEARTH_UPDATE_SIGNING_KEY` secret with the new seed.
+4. Once nobody is running a build older than step 2, mark the old key
+   `revoked` in `release/trust.json`.
+
+If a seed may have leaked, do not wait for step 4: revoke it at once and sign
+with the new key. Installs that only know the leaked key stop accepting
+updates, and their owners install the next version by hand once, which is the
+price of not trusting a key somebody else may hold.
 
 ## Where things live
 
 | | |
 | --- | --- |
-| `release/trust.json` | the pinned public key and feed. Committed, and shipped. |
-| `release/keys/*.key` | private signing seeds. Gitignored, and must not be on the release host. |
+| `release/trust.json` | the pinned public keys, the feed and its layout. Committed, and shipped. |
+| `release/keys/*.key` | where `keygen` writes by default. Gitignored; the real key lives outside every checkout. |
+| `HEARTH_UPDATE_SIGNING_KEY` | the repository secret holding the active key's seed, for the release workflow. |
+| `.github/workflows/release.yml` | builds, signs `manifest-stable.json` and publishes the release. |
 | `agent/hearth_ed25519.py` | Ed25519, standard library only. Checked against the RFC 8032 vectors and against OpenSSL. |
 | `agent/hearth_update.py` | fetch, verify, refuse, stage. Cannot execute anything. |
 | `scripts/release_manifest.py` | the operator's tool. Not shipped. |
 | `desktop/tauri/src/update.rs` | the only code that runs an installer. |
 | `desktop/ui/js/update.js` | the Updates panel. |
+| `desktop/ui/js/update-banner.js` | the "Hearth X.Y.Z is available" banner. |
 | `GET /update`, `POST /update`, `GET /update/events` | the sidecar's surface. |
-| `%LOCALAPPDATA%\Hearth\update\` | the persisted floor, the settings, and staged installers. |
+| `%LOCALAPPDATA%\Hearth\update\` | the persisted floor, the auto-check setting, and staged installers. |
 
 ## Why Ed25519 is written out by hand
 
@@ -275,10 +383,11 @@ Verification involves no secret, so a pure-Python verifier is exactly as safe as
 a C one and only slower, by about ten milliseconds per signature, once per
 update check. **Signing** is different: Python's integer arithmetic is not
 constant time, and signing multiplies the base point by a secret scalar. That is
-acceptable because signing happens on the operator's own machine, offline, a
-handful of times a year, with nobody measuring. If signing ever moves onto a
-shared or network-facing machine it must move to a real implementation at the
-same time.
+acceptable because of where signing happens: on a GitHub-hosted Actions
+runner, a fresh virtual machine that runs one job, signs one manifest a handful
+of times a year, and is then destroyed, with no other tenant on it to time
+anything. If signing ever moves to a self-hosted or otherwise shared runner it
+must move to a constant-time implementation at the same time.
 
 Correctness is asserted three ways: the RFC 8032 §7.1 test vectors (bytes
 produced by other people's implementations, so passing them means agreeing with
