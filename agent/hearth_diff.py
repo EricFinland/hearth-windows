@@ -49,12 +49,22 @@ event log, and into session state. So:
     emits is taken from the redacted copy. Diffing redacted text would make a
     rotated key (old value -> new value) look like no change at all, which
     is precisely the change a person most needs to see happen.
-  - hearth_secrets scans a bounded head-and-tail window of a large file. The
-    lines actually shown are therefore scanned again, after each has been cut
-    to about the length it will be shown at, in windows small enough that
-    scan() reads every character of them. Every character a preview emits has
-    been through a scan of its own, wherever in the file it came from and
-    however long the lines around it are. See _rescan_hunk.
+  - hearth_secrets scans a bounded head-and-tail window of a large file, and
+    its PEM detector needs a key's BEGIN and END markers both inside what it
+    reads. So, independent of that window, one linear pass over the WHOLE of
+    each side finds every private-key block (BEGIN through the matching END,
+    or through the run of key material after a BEGIN that has no END) and
+    redacts every line of base64 key material in it, wherever the file's
+    size puts it. See _pem_block_findings.
+  - The lines of each hunk are then scanned again, cut to about the length
+    they will be shown at (later, for a shown line whose token crosses the
+    display cut), in windows small enough that scan() reads every character
+    of them, by scan() and by a check that also finds a known-format token
+    (a JWT, an sk- key) too long for scan() to report. That catches a
+    single-line secret anywhere in the file; it does not see past the
+    hunk's own lines, which is why the PEM pass above exists. See
+    _rescan_hunk.
+  - A line identical on both sides is redacted if either side redacts it.
   - A finding too long for hearth_secrets to redact (MAX_REDACT_SPAN) hides
     the whole file rather than being shown; see _redact_keep_lines.
 
@@ -105,6 +115,7 @@ import difflib
 import fnmatch
 import json
 import os
+import re
 import sys
 import time
 
@@ -136,6 +147,19 @@ RESCAN_SLACK = 256             # kept past MAX_LINE_CHARS for the second scan, s
 RESCAN_WINDOW = hearth_secrets.MAX_HEAD_CHARS  # under scan()'s window: read in full
 RESCAN_OVERLAP = 2 * hearth_secrets.MAX_REDACT_SPAN  # repeated between windows, so a
                                # multi-line key across a window edge is seen whole
+RESCAN_LONG_LINE = 20_000      # how far past the display cut a shown line is read
+                               # when a run of non-space text crosses the cut; small
+                               # enough that two such lines and RESCAN_OVERLAP still
+                               # fit one RESCAN_WINDOW, so the windows keep moving
+
+# The private-key block markers, matched over the whole of a file whatever its
+# size (see _pem_block_findings). Any label naming a PRIVATE KEY: RSA, EC, DSA,
+# OPENSSH, ENCRYPTED, PGP ... BLOCK, and the four-dash SSH2 form.
+_PEM_BEGIN_RE = re.compile(r"-{4,5} ?BEGIN ((?:[A-Z0-9]+ )*?PRIVATE KEY(?: [A-Z0-9]+)*) ?-{4,5}")
+_PEM_B64_RE = re.compile(r"[A-Za-z0-9+/=]+")
+_PEM_ESCAPED_EOL_RE = re.compile(r"\\+[nr]")  # a key kept on one line, as JSON does
+_PEM_HEADER_RE = re.compile(r"(?:Proc-Type|DEK-Info|Comment): ")
+_NON_SPACE_RUN_RE = re.compile(r"\S*")
 
 HIDDEN_SECRET_FILE = ("this looks like a secrets file (.env, a key, credentials), "
                       "so its content is not shown")
@@ -266,16 +290,20 @@ def _redact_keep_lines(norm, findings, line_count):
     content being written. Here the run may be a context line from a file on
     disk that nobody asked to see, which is exactly what this module exists
     to keep off the screen, so the caller hides the whole file (or blanks the
-    whole hunk) instead of showing the span or guessing at a partial cut."""
+    whole hunk) instead of showing the span or guessing at a partial cut.
+    A finding marked "uncapped" (one line of key material from
+    _pem_block_findings, or a token from _long_token_findings: by
+    construction nothing but a fixed alphabet with no spaces) is exempt: it
+    can always be redacted cleanly, however long it is."""
     spans = sorted(
-        (f["start"], f["end"], f["kind"]) for f in findings
+        (f["start"], f["end"], f["kind"], bool(f.get("uncapped"))) for f in findings
         if 0 <= f["start"] < f["end"] <= len(norm))
     # Overlapping findings merge into one span reaching the furthest end, so
     # a second finding that starts inside the first and runs past it is not
     # left half shown.
     merged = []
-    for start, end, kind in spans:
-        if end - start > hearth_secrets.MAX_REDACT_SPAN:
+    for start, end, kind, uncapped in spans:
+        if not uncapped and end - start > hearth_secrets.MAX_REDACT_SPAN:
             return None, None
         if merged and start < merged[-1][1]:
             merged[-1][1] = max(merged[-1][1], end)
@@ -284,10 +312,13 @@ def _redact_keep_lines(norm, findings, line_count):
     out = []
     touched = set()
     cursor = 0
+    line_at_cursor = 0  # counted on from the last span, never from the top:
+                        # a key body is thousands of spans, one per line
     for start, end, kind in merged:
         out.append(norm[cursor:start])
-        first_line = norm.count("\n", 0, start)
+        first_line = line_at_cursor + norm.count("\n", cursor, start)
         breaks = norm.count("\n", start, end)
+        line_at_cursor = first_line + breaks
         touched.update(range(first_line, first_line + breaks + 1))
         # One marker per line the finding covers, not one marker and then
         # blank lines: a run of empty context lines would claim the file has
@@ -305,11 +336,122 @@ def _redact_keep_lines(norm, findings, line_count):
     return lines, touched
 
 
+def _pem_block_findings(norm):
+    """Findings for every line of key material inside a private-key block
+    anywhere in `norm`, read in one linear pass over the whole text.
+
+    hearth_secrets.scan() reads only a head and a tail of a large text, and
+    its PEM detector needs both the BEGIN and the END marker inside what it
+    reads. The second scan in _rescan_hunk reads only the lines of one hunk.
+    Neither can see a key in the middle of a large file whose BEGIN or END
+    line sits outside the hunk being shown, so an edit next to one marker
+    would show half the key and two edits either side of it all of it. This
+    pass does not depend on either window: it finds each BEGIN marker whose
+    label names a PRIVATE KEY, the END marker with the same label after it,
+    and marks every line between them that is key material.
+
+    Key material means what hearth_secrets means by it: a line that is pure
+    base64 once trimmed (a key kept on one line with escaped "\\n" between
+    its rows, as JSON stores one, counts too). The markers stay visible, as
+    does any line holding anything else, so a block cannot be used to hide a
+    command or a sentence from the approval card; only base64 is ever
+    covered. The text after a BEGIN marker on its own line and before an END
+    marker on its own line is judged the same way.
+
+    A BEGIN with no matching END covers the contiguous run of key material
+    after it (blank lines and Proc-Type / DEK-Info / Comment headers do not
+    end the run), up to the end of the file. It stops at the first other
+    line, so a source file that only quotes a BEGIN marker does not lose
+    every short word after it to redaction.
+
+    Each finding is one line's material and is marked "uncapped"; see
+    _redact_keep_lines. Linear in len(norm): substring and regex searches
+    that only move forward, plus one look at each line inside a block."""
+    if "PRIVATE KEY" not in norm:
+        return []
+    kind = hearth_secrets.KIND_PRIVATE_KEY_PEM
+    findings = []
+    end_res = {}
+    n = len(norm)
+    pos = 0
+    while True:
+        begin = _PEM_BEGIN_RE.search(norm, pos)
+        if begin is None:
+            break
+        label = begin.group(1)
+        end_re = end_res.get(label)
+        if end_re is None:
+            end_re = end_res[label] = re.compile(
+                r"-{4,5} ?END " + re.escape(label) + r" ?-{4,5}")
+        end = end_re.search(norm, begin.end())
+        body_end = end.start() if end is not None else n
+        cursor = begin.end()
+        while cursor <= body_end:
+            newline = norm.find("\n", cursor, body_end)
+            seg_end = body_end if newline == -1 else newline
+            piece = norm[cursor:seg_end]
+            stripped = piece.strip()
+            material = _PEM_ESCAPED_EOL_RE.sub("", stripped)
+            if material and _PEM_B64_RE.fullmatch(material):
+                lead = len(piece) - len(piece.lstrip())
+                findings.append({"start": cursor + lead, "end": cursor + lead + len(stripped),
+                                 "kind": kind, "uncapped": True})
+            elif end is None and stripped and not _PEM_HEADER_RE.match(stripped):
+                # An unterminated block's run of key material is over (or,
+                # on the BEGIN line itself, the marker is only quoted).
+                break
+            if newline == -1:
+                break
+            cursor = newline + 1
+        if end is None:
+            break
+        pos = end.end()
+    return findings
+
+
+_TOKEN_JUDGE_WINDOW = 120  # hearth_secrets judges PEM bodies in windows this long
+
+
+def _token_is_placeholder(value):
+    """is_placeholder(), as the known-format detectors call it, judged on
+    each _TOKEN_JUDGE_WINDOW slice of `value`: a placeholder only if every
+    slice is one. hearth_secrets judges a known-format value whole, and one
+    of its checks (distinct characters over length) cannot pass for a long
+    value drawn from a small alphabet: a 200-character JWT, or an sk- key of
+    that length, is always called a placeholder and never found. Judged in
+    slices, the check works at the length it was tuned for, the same remedy
+    hearth_secrets applies to PEM bodies (_pem_body_is_placeholder)."""
+    for i in range(0, len(value), _TOKEN_JUDGE_WINDOW):
+        window = value[i:i + _TOKEN_JUDGE_WINDOW]
+        if i and len(window) < 20:
+            continue  # a trailing scrap too short to judge on its own
+        if not hearth_secrets.is_placeholder(window, check_entropy=False):
+            return False
+    return True
+
+
+def _long_token_findings(text):
+    """Findings for known-format tokens (JWT, sk-, github_pat_, Stripe, ...)
+    in `text`, judged by _token_is_placeholder. Every match hearth_secrets
+    itself would report is reported here too; the difference is a long
+    token, which it misses. The values are a fixed alphabet with no spaces,
+    so nothing readable can hide behind one of these redactions."""
+    out = []
+    formats = [(kind, regex) for kind, _sev, _conf, regex, _why in hearth_secrets._KNOWN_FORMATS]
+    formats.append((hearth_secrets.KIND_STRIPE_KEY, hearth_secrets._STRIPE_RE))
+    for kind, regex in formats:
+        for m in regex.finditer(text):
+            if not _token_is_placeholder(m.group(1)):
+                out.append({"start": m.start(1), "end": m.end(1), "kind": kind,
+                            "uncapped": True})
+    return out
+
+
 def _redacted_lines(norm, line_count):
-    """_redact_keep_lines over hearth_secrets.scan(norm)'s findings. Returns
-    (None, set()) when there is nothing to redact, so the caller can keep
-    using the lines it already has."""
-    findings = hearth_secrets.scan(norm)["findings"]
+    """_redact_keep_lines over hearth_secrets.scan(norm)'s findings and
+    _pem_block_findings(norm)'s. Returns (None, set()) when there is nothing
+    to redact, so the caller can keep using the lines it already has."""
+    findings = hearth_secrets.scan(norm)["findings"] + _pem_block_findings(norm)
     if not findings:
         return None, set()
     return _redact_keep_lines(norm, findings, line_count)
@@ -318,8 +460,8 @@ def _redacted_lines(norm, line_count):
 def _rescan_windows(texts):
     """[(offset, chunk), ...] covering "\n".join(texts), each chunk whole
     lines and at most RESCAN_WINDOW characters (one line longer than that is a
-    chunk of its own; callers cut lines well below it first), consecutive
-    chunks sharing at least RESCAN_OVERLAP characters of lines."""
+    chunk of its own; callers cut lines to at most RESCAN_LONG_LINE first),
+    consecutive chunks sharing at least RESCAN_OVERLAP characters of lines."""
     starts = []
     pos = 0
     for text in texts:
@@ -345,28 +487,52 @@ def _rescan_windows(texts):
 
 
 def _rescan_hunk(lines, emit):
-    """Second scan over what one hunk will actually show, then the final cut.
+    """Second scan over the lines of one hunk, then the final cut.
 
-    `lines` holds [tag, text] pairs at full length: the first `emit` are to
-    be shown and any after them are read only as context for the scan (a key
-    whose BEGIN line is shown and whose END line is not is still a key).
-    hearth_secrets.scan() reads only a head and a tail of a long text, so
-    scanning the hunk joined at full length would skip the middle of it when
-    its lines are long (a log, a CSV, minified data) and could then emit an
-    unscanned line. Instead each line is first cut to MAX_LINE_CHARS plus
-    RESCAN_SLACK, and the cut lines are scanned in _rescan_windows chunks,
-    each of which scan() reads in full. Every finding is redacted, the list
-    is trimmed to `emit`, and only then is each line cut to MAX_LINE_CHARS,
-    with the characters not sent counted as [tag, text, cut].
+    `lines` holds [tag, text] pairs at full length, already redacted by the
+    whole-file pass in file_diff. The first `emit` are to be shown. Any after
+    them are lines of the same hunk the budget could not take; up to
+    RESCAN_OVERLAP characters of those are read as context for the scan and
+    then dropped unshown. Nothing outside the hunk is read: no lines before
+    its first, none after its last.
+
+    What this catches is a secret that lies wholly inside the hunk's text: a
+    single-line credential anywhere in a file, including the middle of one
+    too large for hearth_secrets.scan() to read in full, and a multi-line
+    key whose BEGIN and END lines are both in the hunk. It does NOT see a
+    key that starts above the hunk or ends below it, because its markers are
+    not in the text scanned. Private-key blocks are therefore found by
+    _pem_block_findings over the whole file before this runs, and that pass,
+    not this one, is what keeps a key's body out of a hunk that shows only
+    part of it.
+
+    scan() reads only a head and a tail of a long text, so scanning the hunk
+    joined at full length would skip the middle of it when its lines are long
+    (a log, a CSV, minified data). Instead each line is first cut to
+    MAX_LINE_CHARS plus RESCAN_SLACK, and the cut lines are scanned in
+    _rescan_windows chunks, each of which scan() reads in full. A shown line
+    whose run of non-space text crosses the display cut is cut later
+    instead, at the end of that run plus RESCAN_SLACK (at most
+    RESCAN_LONG_LINE): a token that starts just before the cut and is longer
+    than the slack (a long JWT) would otherwise be scanned cut short, fail
+    to match, and show its first characters. Each window is read by scan()
+    and by _long_token_findings, which also finds a known-format token too
+    long for scan() to report. Every finding is redacted, the
+    list is trimmed to `emit`, and only then is each line cut to
+    MAX_LINE_CHARS, with the characters not sent counted as [tag, text, cut].
 
     Mutates `lines` in place; returns how many shown lines were redacted."""
     keep = MAX_LINE_CHARS + RESCAN_SLACK
     dropped = []
-    for entry in lines:
+    for index, entry in enumerate(lines):
         text = entry[1]
-        dropped.append(max(0, len(text) - keep))
-        if len(text) > keep:
-            entry[1] = text[:keep]
+        cut = keep
+        if index < emit and len(text) > keep:
+            run = _NON_SPACE_RUN_RE.match(text, MAX_LINE_CHARS, RESCAN_LONG_LINE)
+            cut = min(len(text), RESCAN_LONG_LINE, max(keep, run.end() + RESCAN_SLACK))
+        dropped.append(max(0, len(text) - cut))
+        if len(text) > cut:
+            entry[1] = text[:cut]
     # Context read past the shown lines, up to RESCAN_OVERLAP characters.
     end = emit
     extra = 0
@@ -376,7 +542,7 @@ def _rescan_hunk(lines, emit):
     texts = [entry[1] for entry in lines[:end]]
     findings = []
     for offset, chunk in _rescan_windows(texts):
-        for f in hearth_secrets.scan(chunk)["findings"]:
+        for f in hearth_secrets.scan(chunk)["findings"] + _long_token_findings(chunk):
             findings.append({"start": f["start"] + offset, "end": f["end"] + offset,
                              "kind": f["kind"]})
     del lines[emit:]
@@ -700,7 +866,16 @@ def file_diff(path, old, new, budget=None, context=CONTEXT_LINES, hidden_reason=
             if len(raw) > room:
                 break
             if tag == "equal":
-                raw.extend([" ", a_shown[i], i in a_touched] for i in range(i1, min(i2, i1 + room + 1)))
+                # The same raw line on both sides, but it may be a secret on
+                # only one: a BEGIN marker the edit adds above existing
+                # base64 lines makes them key material in the new file
+                # alone. Redacted on either side is redacted.
+                for i in range(i1, min(i2, i1 + room + 1)):
+                    j = j1 + (i - i1)
+                    if i not in a_touched and j in b_touched:
+                        raw.append([" ", b_shown[j], True])
+                    else:
+                        raw.append([" ", a_shown[i], i in a_touched])
                 continue
             if tag in ("replace", "delete"):
                 raw.extend(["-", a_shown[i], i in a_touched] for i in range(i1, min(i2, i1 + room + 1)))
@@ -1245,6 +1420,91 @@ def _self_test():
             "0123456789\nabc\n", [{"start": 2, "end": 6, "kind": "a"},
                                   {"start": 4, "end": 9, "kind": "b"}], 2)
         assert merged_lines == ["01[REDACTED:a]9", "abc"] and merged_touched == {0}, merged_lines
+
+        # (9) a private key in the middle of a file far larger than scan()'s
+        #     window, so scan() of the file never sees it, and the hunk shows
+        #     only part of the block: next to its BEGIN line, next to its
+        #     END line, both (two hunks, half the key each), and a BEGIN with
+        #     no END at all. Not one line of key material may be shown.
+        rows = [hearth_secrets._rand_alnum(64) for _ in range(26)]
+        begin, end = "-----BEGIN RSA " + "PRIVATE KEY-----", "-----END RSA " + "PRIVATE KEY-----"
+        pad = "".join("pad {}\n".format(i) for i in range(14000))
+        mid_key = pad + "a = 1\n" + begin + "\n" + "\n".join(rows) + "\n" + end + "\nb = 1\n" + pad
+        assert len(mid_key) > 250_000, len(mid_key)
+        assert not any(f["kind"] == hearth_secrets.KIND_PRIVATE_KEY_PEM
+                       for f in hearth_secrets.scan(mid_key)["findings"]), "layout no longer tests the gap"
+        unterminated = pad + "a = 1\n" + begin + "\n" + "\n".join(rows) + "\nb = 1\n" + pad
+        layouts = {
+            "next to BEGIN": (mid_key, mid_key.replace("a = 1", "a = 2")),
+            "next to END": (mid_key, mid_key.replace("b = 1", "b = 2")),
+            "two edits": (mid_key, mid_key.replace("a = 1", "a = 2").replace("b = 1", "b = 2")),
+            "unterminated": (unterminated, unterminated.replace("a = 1", "a = 2")),
+            # and as the NEW side, a key the write itself brings in
+            "written": (pad + "a = 1\n" + pad, mid_key.replace("a = 1", "a = 2")),
+        }
+        for name, (old_t, new_t) in layouts.items():
+            res = file_diff("keys.txt", old_t, new_t)
+            dumped = json.dumps(res)
+            leaked = [r for r in rows if r[:24] in dumped]
+            assert not leaked, "{}: {} key rows shown".format(name, len(leaked))
+            rf = res["files"][0] if "files" in res else res
+            assert rf["hunks"] and rf.get("redacted_lines"), (name, rf.get("redacted_lines"))
+            # the markers stay, so the card still says a key is there
+            assert begin in dumped or end in dumped, name
+            # redaction kept every line in place: each hunk's own counts hold
+            for h in rf["hunks"]:
+                assert sum(1 for x in h["lines"] if x[0] != "+") == h["old_count"], (name, h)
+                assert sum(1 for x in h["lines"] if x[0] != "-") == h["new_count"], (name, h)
+        # (9b) a key kept on one line with escaped newlines, as JSON stores one.
+        one_line = ('"private_key": "' + begin + "\\n" + "\\n".join(rows) + "\\n" + end + '\\n",')
+        js_old = pad + "{\n" + one_line + "\n\"id\": 1\n}\n" + pad
+        js = file_diff("svc.json", js_old, js_old.replace('"id": 1', '"id": 2'))
+        assert not any(r[:24] in json.dumps(js) for r in rows), "a one-line JSON key was shown"
+        # (9c) only key material is covered: a line inside a block that is not
+        #     base64 stays visible (a block cannot hide a command from the
+        #     card), and a source file that only quotes a BEGIN marker keeps
+        #     its later lines.
+        trap = (pad + "a = 1\n" + begin + "\n" + rows[0] + "\nrm -rf /tmp/victim\n" + rows[1]
+                + "\n" + end + "\n" + pad)
+        tr = json.dumps(file_diff("trap.txt", trap, trap.replace("a = 1", "a = 2")))
+        assert "rm -rf /tmp/victim" in tr and rows[0] not in tr and rows[1] not in tr, tr[:400]
+        quoted = 'x = "' + begin + '\\n"\npass\nreturn\nkeep = 1\n'
+        qd = file_diff("quote.py", quoted, quoted.replace("keep = 1", "keep = 2"))
+        assert [ln[1] for h in qd["hunks"] for ln in h["lines"]][1:3] == ["pass", "return"], qd
+        assert "redacted_lines" not in qd, qd
+        # (9d) the write adds a BEGIN above base64 lines already on disk: the
+        #     unchanged lines are key material in the new file only, and are
+        #     redacted though the old side would have shown them.
+        bare = pad + "a = 1\n" + "\n".join(rows) + "\n" + pad
+        added = file_diff("bare.txt", bare, bare.replace("a = 1\n", "a = 1\n" + begin + "\n"))
+        assert not any(r[:24] in json.dumps(added) for r in rows), "context from the old side leaked"
+        # (9e) the whole-file pass stays quick on the largest input allowed:
+        #     an unterminated BEGIN followed by key material to the end.
+        huge_key = begin + "\n" + "\n".join(hearth_secrets._rand_alnum(64) for _ in range(29000)) + "\n"
+        assert len(huge_key) < MAX_INPUT_CHARS
+        started = time.monotonic()
+        hk = file_diff("huge.key.txt", huge_key, huge_key.replace(begin, begin + "\nx"))
+        assert time.monotonic() - started < 5.0, time.monotonic() - started
+        assert huge_key.split("\n")[5] not in json.dumps(hk) and hk["hunks"], hk.get("hidden_reason")
+
+        # (10) a long token starting just before the display cut, in the
+        #     middle of a large file: scanned cut at the usual length it would
+        #     not match, and scan() calls any JWT that long a placeholder, so
+        #     neither half may be relied on. None of it may be shown.
+        jwt = ("eyJ" + hearth_secrets._rand_alnum(200) + "." + hearth_secrets._rand_alnum(200)
+               + "." + hearth_secrets._rand_alnum(40))
+        assert not hearth_secrets.scan(jwt)["findings"], "scan() now finds long JWTs; revisit"
+        for lead in (MAX_LINE_CHARS - 9, MAX_LINE_CHARS - 200, 0):
+            jl = pad + "x" * (lead - 1) + " " + jwt + " tail\nkeep = 1\n" + pad if lead else (
+                pad + jwt + "\nkeep = 1\n" + pad)
+            jd = json.dumps(file_diff("tok.txt", jl, jl.replace("keep = 1", "keep = 2")))
+            assert jwt[:9] not in jd and jwt[-20:] not in jd, "a long JWT was shown (lead {})".format(lead)
+        long_sk = "sk-" + hearth_secrets._rand_alnum(300)
+        sk_file = pad + "OPENAI = '" + long_sk + "'\nkeep = 1\n" + pad
+        skd = json.dumps(file_diff("sk.py", sk_file, sk_file.replace("keep = 1", "keep = 2")))
+        assert long_sk[:30] not in skd, "a long sk- key was shown"
+        # A long token judged in slices is still a placeholder when it is one.
+        assert _token_is_placeholder("eyJ" + "a" * 300)
 
         # -- .hearthignore and containment: the tool would refuse, so there
         #    is no preview at all. ------------------------------------------
