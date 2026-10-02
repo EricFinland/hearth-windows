@@ -86,6 +86,10 @@ pub const SIDECAR_ROUTES: &[&str] = &[
     "/loop/events",
     "/swarm",
     "/swarm/events",
+    "/attach",
+    "/attach/chunk",
+    "/attach/finish",
+    "/attach/cancel",
     "/update",
     "/update/events",
 ];
