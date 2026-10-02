@@ -38,6 +38,9 @@ All of it, unless a section further down says otherwise.
 - **Checkpoints.** `agent/hearth_checkpoint.py` keeps a shadow git store on
   your disk so a turn can be undone. It never has a remote.
 - **Downloaded models.** Stored locally and reused.
+- **Files you attach to a message.** Copied into an `imports` folder inside
+  your workspace and read on your machine; nothing about them is uploaded.
+  Like any other workspace file they are captured by checkpoints.
 
 ## What leaves your machine, and only when it has to
 
