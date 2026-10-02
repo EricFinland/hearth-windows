@@ -50,9 +50,11 @@ event log, and into session state. So:
     rotated key (old value -> new value) look like no change at all, which
     is precisely the change a person most needs to see happen.
   - hearth_secrets scans a bounded head-and-tail window of a large file. The
-    hunks actually shown are therefore scanned again on their own, which
-    covers a secret sitting in the unscanned middle of a big file as long as
-    it lies within one hunk.
+    lines actually shown are therefore scanned again, after each has been cut
+    to about the length it will be shown at, in windows small enough that
+    scan() reads every character of them. Every character a preview emits has
+    been through a scan of its own, wherever in the file it came from and
+    however long the lines around it are. See _rescan_hunk.
   - A finding too long for hearth_secrets to redact (MAX_REDACT_SPAN) hides
     the whole file rather than being shown; see _redact_keep_lines.
 
@@ -85,7 +87,9 @@ anything:
      "added": N, "removed": M, "truncated": bool,
      "files_total": N, "files_omitted": N}
 
-tag is "+", "-" or " ". Line numbers are 1-based. `added`/`removed` count the
+tag is "+", "-" or " ". Line numbers are 1-based; a hunk side with no lines
+(count 0, as in the old side of a new file) starts at the line before it,
+so 0 at the top of a file, as unified diffs write it. `added`/`removed` count the
 whole change even when the lines shown were cut short; they are None for a
 file whose content could not be compared at all.
 
@@ -127,6 +131,11 @@ LISTING_RESERVE = 16 * 1024  # of MAX_DIFF_BYTES, kept back from line text for f
 MATCH_CALL_CELLS = 1_000_000   # one SequenceMatcher call: old lines * new lines it compares
 MATCH_TOTAL_CELLS = 8_000_000  # every such call in one preview, all files together
 PREVIEW_SECONDS = 2.0          # wall-clock belt over the comparing for one preview
+RESCAN_SLACK = 256             # kept past MAX_LINE_CHARS for the second scan, so a
+                               # secret straddling the cut is still recognised
+RESCAN_WINDOW = hearth_secrets.MAX_HEAD_CHARS  # under scan()'s window: read in full
+RESCAN_OVERLAP = 2 * hearth_secrets.MAX_REDACT_SPAN  # repeated between windows, so a
+                               # multi-line key across a window edge is seen whole
 
 HIDDEN_SECRET_FILE = ("this looks like a secrets file (.env, a key, credentials), "
                       "so its content is not shown")
@@ -306,24 +315,112 @@ def _redacted_lines(norm, line_count):
     return _redact_keep_lines(norm, findings, line_count)
 
 
-def _rescan_hunk(lines):
-    """Second pass over the lines one hunk will actually show. See the module
-    docstring: covers the middle of a file too large for scan()'s window.
-    Mutates `lines` ([tag, text] pairs) in place; returns how many changed."""
-    joined = "\n".join(entry[1] for entry in lines)
-    findings = hearth_secrets.scan(joined)["findings"]
-    if not findings:
-        return 0
-    redacted, touched = _redact_keep_lines(joined, findings, len(lines))
-    if redacted is None:
-        # Could not keep the alignment: blank every line rather than show any.
-        for entry in lines:
-            entry[1] = "[REDACTED]"
-        return len(lines)
-    for i in touched:
-        if i < len(lines):
-            lines[i][1] = redacted[i]
-    return len(touched)
+def _rescan_windows(texts):
+    """[(offset, chunk), ...] covering "\n".join(texts), each chunk whole
+    lines and at most RESCAN_WINDOW characters (one line longer than that is a
+    chunk of its own; callers cut lines well below it first), consecutive
+    chunks sharing at least RESCAN_OVERLAP characters of lines."""
+    starts = []
+    pos = 0
+    for text in texts:
+        starts.append(pos)
+        pos += len(text) + 1
+    starts.append(pos)  # one past the end, so starts[j] works for j == len(texts)
+    windows = []
+    i, n = 0, len(texts)
+    while i < n:
+        j = i + 1
+        while j < n and starts[j + 1] - starts[i] - 1 <= RESCAN_WINDOW:
+            j += 1
+        windows.append((starts[i], "\n".join(texts[i:j])))
+        if j >= n:
+            break
+        # Step back so the next window repeats the tail of this one, but
+        # always forward of where this one began.
+        k = j
+        while k - 1 > i and starts[j] - starts[k] < RESCAN_OVERLAP:
+            k -= 1
+        i = k
+    return windows
+
+
+def _rescan_hunk(lines, emit):
+    """Second scan over what one hunk will actually show, then the final cut.
+
+    `lines` holds [tag, text] pairs at full length: the first `emit` are to
+    be shown and any after them are read only as context for the scan (a key
+    whose BEGIN line is shown and whose END line is not is still a key).
+    hearth_secrets.scan() reads only a head and a tail of a long text, so
+    scanning the hunk joined at full length would skip the middle of it when
+    its lines are long (a log, a CSV, minified data) and could then emit an
+    unscanned line. Instead each line is first cut to MAX_LINE_CHARS plus
+    RESCAN_SLACK, and the cut lines are scanned in _rescan_windows chunks,
+    each of which scan() reads in full. Every finding is redacted, the list
+    is trimmed to `emit`, and only then is each line cut to MAX_LINE_CHARS,
+    with the characters not sent counted as [tag, text, cut].
+
+    Mutates `lines` in place; returns how many shown lines were redacted."""
+    keep = MAX_LINE_CHARS + RESCAN_SLACK
+    dropped = []
+    for entry in lines:
+        text = entry[1]
+        dropped.append(max(0, len(text) - keep))
+        if len(text) > keep:
+            entry[1] = text[:keep]
+    # Context read past the shown lines, up to RESCAN_OVERLAP characters.
+    end = emit
+    extra = 0
+    while end < len(lines) and extra < RESCAN_OVERLAP:
+        extra += len(lines[end][1]) + 1
+        end += 1
+    texts = [entry[1] for entry in lines[:end]]
+    findings = []
+    for offset, chunk in _rescan_windows(texts):
+        for f in hearth_secrets.scan(chunk)["findings"]:
+            findings.append({"start": f["start"] + offset, "end": f["end"] + offset,
+                             "kind": f["kind"]})
+    del lines[emit:]
+    touched_shown = 0
+    if findings:
+        joined = "\n".join(texts)
+        redacted, touched = _redact_keep_lines(joined, findings, len(texts))
+        if redacted is None:
+            # Could not keep the alignment: blank every line rather than show any.
+            for entry in lines:
+                entry[1] = "[REDACTED]"
+            touched = set(range(len(lines)))
+        else:
+            for i in touched:
+                if i < len(lines):
+                    lines[i][1] = redacted[i]
+        touched_shown = sum(1 for i in touched if i < len(lines))
+    for entry, lost in zip(lines, dropped):
+        # How long the line would be, redacted and whole: what is left of it
+        # plus what the first cut already took off.
+        full = len(entry[1]) + lost
+        if full > MAX_LINE_CHARS:
+            entry[1] = entry[1][:MAX_LINE_CHARS]
+            entry.append(full - MAX_LINE_CHARS)
+    return touched_shown
+
+
+def _fits(lines, room, line_bytes):
+    """How many of `lines` ([tag, text] pairs) the budget could still take,
+    each costed at the length it will be shown at before any redaction. An
+    estimate (a redaction marker can be shorter or longer than what it
+    replaces), and that is fine in either direction: a line past it is
+    dropped unshown by _rescan_hunk, never emitted without its scan, and
+    budget.take() still has the final word on the lines inside it."""
+    n = 0
+    spent = 0
+    for entry in lines:
+        if n >= room:
+            break
+        spent += len(json.dumps([entry[0], entry[1][:MAX_LINE_CHARS]])) + 2
+        if spent > line_bytes:
+            break
+        n += 1
+    return n
 
 
 def _eol_notes(old, new, old_final, new_final):
@@ -584,8 +681,12 @@ def file_diff(path, old, new, budget=None, context=CONTEXT_LINES, hidden_reason=
     redacted = 0
     for group in _grouped(codes, context):
         first, last = group[0], group[-1]
-        hunk = {"old_start": first[1] + 1, "old_count": last[2] - first[1],
-                "new_start": first[3] + 1, "new_count": last[4] - first[3], "lines": []}
+        old_count, new_count = last[2] - first[1], last[4] - first[3]
+        # An empty side starts at the line before it, 0 at the top of a file,
+        # as unified diffs write it (the old side of a new file is "-0,0").
+        hunk = {"old_start": first[1] + (1 if old_count else 0), "old_count": old_count,
+                "new_start": first[3] + (1 if new_count else 0), "new_count": new_count,
+                "lines": []}
         if not budget.charge(hunk, diff_share=True):
             entry["truncated"] = True
             break
@@ -606,16 +707,17 @@ def file_diff(path, old, new, budget=None, context=CONTEXT_LINES, hidden_reason=
             if tag in ("replace", "insert"):
                 raw.extend(["+", b_shown[j], j in b_touched] for j in range(j1, min(j2, j1 + room + 1)))
         if len(raw) > room:
-            raw = raw[:room]
             entry["truncated"] = True
         lines = [[tag, text] for tag, text, _hit in raw]
-        redacted += sum(1 for _tag, _text, hit in raw if hit)
-        redacted += _rescan_hunk(lines)
+        # Only the lines the budget could take are shown; the rest stay in
+        # `lines` as context for the second scan and are dropped unshown.
+        emit = _fits(lines, room, budget.line_bytes_left)
+        if emit < min(len(raw), room):
+            entry["truncated"] = True
+            budget.exhausted = True
+        redacted += sum(1 for _tag, _text, hit in raw[:emit] if hit)
+        redacted += _rescan_hunk(lines, emit)
         for line in lines:
-            text = line[1]
-            if len(text) > MAX_LINE_CHARS:
-                line[1] = text[:MAX_LINE_CHARS]
-                line.append(len(text) - MAX_LINE_CHARS)
             if not budget.take(line):
                 entry["truncated"] = True
                 break
@@ -926,7 +1028,9 @@ def _self_test():
         nf = new["files"][0]
         assert nf["status"] == "added" and nf["path"] == "sub/new.py", nf
         assert tagged(new) == [("+", "print(1)"), ("+", "print(2)")], tagged(new)
-        assert nf["hunks"][0]["new_start"] == 1, nf
+        # The empty old side is "-0,0", as a unified diff writes a new file.
+        assert (nf["hunks"][0]["old_start"], nf["hunks"][0]["old_count"]) == (0, 0), nf
+        assert (nf["hunks"][0]["new_start"], nf["hunks"][0]["new_count"]) == (1, 2), nf
 
         # -- write_file over an existing file diffs against what is there. --
         over = preview_tool_call("write_file", {"path": "a.txt",
@@ -1094,6 +1198,34 @@ def _self_test():
         mid = preview_tool_call("edit_file", {"path": "huge.py", "find": "keep = 1",
                                               "replace": "keep = 2"}, ws)
         assert key not in json.dumps(mid), "the hunk re-scan missed a mid-file secret"
+        # (6b) ... including when the hunk around it holds very long lines.
+        #     Scanned at full length, the 70k and 30k lines push the key out
+        #     of both of scan()'s windows over the hunk as well as over the
+        #     file; the rescan must read the lines as they will be shown.
+        filler = "".join("p{}\n".format(i) for i in range(20000))
+        layout = (filler + "x" * 70000 + "\nTOKEN = '" + key + "'\n" + "y" * 30000
+                  + "\nkeep = 1\n" + filler)
+        write("long_lines.jsonl", layout)
+        wide = preview_tool_call("edit_file", {"path": "long_lines.jsonl", "find": "keep = 1",
+                                               "replace": "keep = 2"}, ws)
+        assert key not in json.dumps(wide), "a long-line hunk leaked a context-line secret"
+        wl = wide["files"][0]
+        assert (wl["added"], wl["removed"]) == (1, 1), wl
+        assert any("[REDACTED:" in line[1] for h in wl["hunks"] for line in h["lines"]), wl
+        assert any(len(line) == 3 and line[2] == 70000 - MAX_LINE_CHARS
+                   for h in wl["hunks"] for line in h["lines"]), "a long line lost its cut count"
+        assert key not in json.dumps(file_diff("long_lines.jsonl", layout,
+                                               layout.replace("keep = 1", "keep = 2")))
+        # ... and the windows the rescan reads cover every character, each
+        # inside scan()'s full-read size, overlapping where they meet.
+        texts = ["z" * 1256] * 200
+        joined = "\n".join(texts)
+        wins = _rescan_windows(texts)
+        assert all(len(c) <= RESCAN_WINDOW for _o, c in wins), [len(c) for _o, c in wins]
+        assert all(joined[o:o + len(c)] == c for o, c in wins)
+        assert wins[0][0] == 0 and wins[-1][0] + len(wins[-1][1]) == len(joined), wins[-1][0]
+        for (o1, c1), (o2, _c2) in zip(wins, wins[1:]):
+            assert o1 < o2 and o1 + len(c1) - o2 >= RESCAN_OVERLAP - 1257, (o1, o2)
         # (7) a finding too long for hearth_secrets to redact, sitting in an
         #     existing file's unchanged lines: the whole file is hidden, not
         #     shown because redact() would have left it in place.
