@@ -462,7 +462,11 @@ class ConversationStore:
             return dict(item)
 
     def delete(self, cid):
-        """Remove one conversation for good. True if there was one."""
+        """Remove one conversation for good. True if there was one, False
+        if there was not. A file that exists but cannot be removed (held
+        open by antivirus or a sync client, say) raises the OSError instead
+        of looking like "there was nothing to delete": the caller has to be
+        able to tell a delete that did not happen from one that did."""
         if not valid_id(cid):
             return False
         with self._lock:
@@ -479,7 +483,7 @@ class ConversationStore:
                 print("[hearth-conversations] could not delete {}: {}".format(cid, exc),
                       file=sys.stderr)
                 self._deleted.discard(cid)
-                return False
+                raise
             if item is not None:
                 index["items"].remove(item)
             if index["active_id"] == cid:
@@ -758,6 +762,19 @@ def _self_test_body(scratch):
     assert store.save(b, _snap(prompt="the worker finished after the delete")) is False
     assert not os.path.exists(os.path.join(root, b + ".json"))
     assert store.delete(b) is False
+    # A file that cannot be removed is an error, not "nothing to delete". A
+    # directory wearing a conversation's name stands in for a file another
+    # process holds open: os.remove fails on it on every platform.
+    stuck = new_id()
+    os.makedirs(os.path.join(root, stuck + ".json"))
+    try:
+        store.delete(stuck)
+    except OSError:
+        pass
+    else:
+        raise AssertionError("a delete that did not happen must not pass for one that did")
+    assert stuck not in store._deleted, "a failed delete must not block later saves"
+    os.rmdir(os.path.join(root, stuck + ".json"))
 
     # === pruning: only a conversation nothing ever happened in ===========
     e = new_id()

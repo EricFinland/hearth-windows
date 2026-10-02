@@ -102,8 +102,10 @@ Endpoints:
   POST /conversations/delete  {"id"}: permanent. Deleting the OPEN
                   conversation ends the live session too (GET /session goes
                   404), and is refused with 409 while it is busy; the
-                  workspace and its checkpoints are not touched.
-                  Answers {"deleted", "cleared_session", "active_id"}.
+                  workspace and its checkpoints are not touched. 500, with
+                  the session left as it was, if the file could not be
+                  removed. Answers {"deleted", "cleared_session",
+                  "active_id"}.
   POST /prompt    submit a user turn: {"message"}. Returns {"turn_id"}
                   immediately; the turn runs on a background thread.
   GET  /events    a Server-Sent Events stream of turn events (token deltas,
@@ -1016,7 +1018,14 @@ class SidecarState:
         """Delete one conversation. Deleting the open one also ends the live
         session -- the alternative, a session that keeps running and saving
         into a conversation that no longer exists, would quietly undo the
-        delete. Refused while that session is busy, like a switch."""
+        delete. Refused while that session is busy, like a switch.
+
+        The open session is taken out of service before the file is
+        removed, so no prompt can start on it in between, but it is only
+        ended once the file is actually gone. If the removal fails (the
+        file held open by antivirus or a sync client), the session is put
+        back and the request fails with a 500: the conversation still
+        exists, so the answer must not say it was deleted."""
         store = self._store()
         if not conversations_mod.valid_id(cid):
             raise ValueError("id must be a conversation id")
@@ -1031,11 +1040,20 @@ class SidecarState:
                 cleared = current
                 self.session = None
                 self.active_conversation_id = None
+        try:
+            existed = store.delete(cid)
+        except OSError as exc:
+            if cleared is not None:
+                with self._lock:
+                    if self.session is None:
+                        self.session, self.active_conversation_id = cleared, cid
+            raise ConversationRefused(
+                500, "this conversation's file could not be deleted ({}); it was left as "
+                     "it is".format(exc.strerror or type(exc).__name__))
         if cleared is not None:
             cleared.cancel()
             self._loop_status.touch()
             self._swarm_status.touch()
-        existed = store.delete(cid)
         if not existed and cleared is None:
             raise ConversationRefused(404, "no such conversation")
         with self._lock:
@@ -3106,6 +3124,26 @@ def _self_test():
             fresh._emit("t", "user_prompt", {"text": "just sent"})  # not persisted yet
             st, _ = _c("POST", "/session", {"workspace": "/tmp/ws-next", "model": "m"})
             assert st == 200 and conv_store.get(fresh.conversation_id) is not None
+
+            # A delete the disk refuses is an error, and the open chat and its
+            # session are both left exactly as they were.
+            open_now = conv_state.get_session()
+            open_id = open_now.conversation_id
+            real_delete = conv_store.delete
+
+            def _refusing_delete(cid):
+                raise PermissionError(13, "held open by another process")
+
+            conv_store.delete = _refusing_delete
+            try:
+                st, body = _c("POST", "/conversations/delete", {"id": open_id})
+            finally:
+                conv_store.delete = real_delete
+            assert st == 500 and "could not be deleted" in body["error"], (st, body)
+            assert conv_state.get_session() is open_now
+            assert conv_state.active_conversation_id == open_id
+            st, body = _c("GET", "/session")
+            assert st == 200, (st, body)
 
             # Malformed JSON, and history-off states answer cleanly.
             st, _ = _raw_request(cport, "POST", "/conversations/open", headers=ch, body="{nope")
