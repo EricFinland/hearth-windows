@@ -282,8 +282,9 @@ loaded right now: a green dot and "Loaded" with a rough memory figure, or
   survives a restart.
 
 Neither ever happens in the middle of work. While a turn, the work loop or
-an agent swarm is running, while a cancelled tool call is still finishing,
-or while the model is loading or answering, the Unload button is disabled
+an agent swarm is running (in the chat on screen or in one you switched
+away from while it was still going), while a cancelled tool call is still
+finishing, or while the model is loading or answering, the Unload button is disabled
 (hover it to see why) and the idle timer waits. The idle clock starts again
 from the end of that work, so a model is not dropped a moment after a long
 tool call finishes.

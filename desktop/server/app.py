@@ -660,13 +660,34 @@ class SidecarState:
 
     def model_busy_reason(self):
         """Why the model must stay loaded right now, as a sentence for the
-        Unload button's tooltip, or None. Reads the live session only; the
-        backend's own in-flight count covers model calls from anywhere else.
+        Unload button's tooltip, or None. The backend's own in-flight count
+        covers a model call that is actually under way; this covers the gaps
+        between a turn's model calls, while its tools run.
 
-        is_workspace_busy rather than status, for the reason its docstring
-        gives: a cancelled turn's abandoned call can still be running after
-        status has gone back to idle, and that call may be a model call."""
-        session = self.get_session()
+        Not only the session on screen: switching to another chat (or
+        workspace) while a turn is going leaves that turn running in the
+        session it replaced (self._retired), and between two of its model
+        calls nothing else would stop the idle timer, or the Unload button,
+        from freeing the model it is about to ask again. The same reasoning
+        as any_turn_running, which the MCP restart check uses."""
+        reason = self._busy_reason_of(self.get_session())
+        if reason:
+            return reason
+        with self._lock:
+            self._prune_retired_locked()
+            replaced = list(self._retired.values())
+        for old in replaced:
+            reason = self._busy_reason_of(old)
+            if reason:
+                return reason + " in another chat"
+        return None
+
+    @staticmethod
+    def _busy_reason_of(session):
+        """model_busy_reason for one session. is_workspace_busy rather than
+        status, for the reason its docstring gives: a cancelled turn's
+        abandoned call can still be running after status has gone back to
+        idle, and that call may be a model call."""
         if session is None:
             return None
         try:
@@ -4217,6 +4238,18 @@ def _self_test():
             # An idle session is not a reason.
             state_mdl.session = _MdlSession(False, session_mod.STATUS_IDLE)
             assert state_mdl.model_busy_reason() is None
+            # A turn still running in a chat the person switched away from
+            # is: between its model calls nothing else holds the model, so
+            # neither the button nor the timer may free it.
+            state_mdl._retired["c" * 32] = _MdlSession(True, session_mod.STATUS_RUNNING)
+            status, data = _raw_request(port_m, "POST", "/model/unload",
+                                        headers=headers_m, body="{}")
+            assert status == 409 and json.loads(data) == {
+                "error": "a turn is running in another chat"}, (status, data)
+            assert mdl_backend.unloads == 0, "an unload ran under another chat's turn"
+            state_mdl._retired["c" * 32]._busy = False
+            assert state_mdl.model_busy_reason() is None
+            assert not state_mdl._retired, "a settled replaced session is pruned"
             # A model call in flight on the backend is, with no session busy.
             mdl_backend.state["inflight_total"] = 1
             status, data = _raw_request(port_m, "POST", "/model/unload",
