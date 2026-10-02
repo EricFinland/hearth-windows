@@ -1021,17 +1021,19 @@ def _self_test():
             for name in files:
                 with open(os.path.join(dirpath, name), "r", encoding="utf-8",
                           errors="replace") as fh:
-                    written.append((name, fh.read()))
+                    written.append((dirpath, name, fh.read()))
         assert written, "sanity: the server wrote nothing at all"
-        for name, raw_on_disk in written:
+        for _dir, name, raw_on_disk in written:
             assert secret_token not in raw_on_disk, \
                 "the bearer token must NEVER appear on disk, found it in {}".format(name)
-        conv_files = [raw for name, raw in written
-                      if name.endswith(".json") and name != "index.json"]
-        assert conv_files, [name for name, _ in written]
-        parsed_on_disk = json.loads(conv_files[0])
-        assert "token" not in parsed_on_disk and "bearer_token" not in parsed_on_disk, parsed_on_disk
-        assert "hello there" in json.dumps(parsed_on_disk), \
+        conv_files = [json.loads(raw) for dirpath, name, raw in written
+                      if os.path.basename(dirpath) == "conversations"
+                      and name.endswith(".json") and name != "index.json"]
+        assert conv_files, [name for _dir, name, _raw in written]
+        for parsed_on_disk in conv_files:
+            assert "token" not in parsed_on_disk and "bearer_token" not in parsed_on_disk, \
+                parsed_on_disk
+        assert any("hello there" in json.dumps(c) for c in conv_files), \
             "sanity: the conversation itself DID get persisted (so the token's absence " \
             "above is meaningful, not just an empty file)"
 

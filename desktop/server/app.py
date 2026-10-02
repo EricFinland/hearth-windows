@@ -65,6 +65,39 @@ Endpoints:
                   any) simply keeps running against its own, different,
                   workspace path, unaffected.
   GET  /session   the current session's state, or 404 if none exists yet.
+  GET  /conversations  every saved conversation (conversations.py), newest
+                  activity first, plus `active_id`: the one the live session
+                  belongs to. Each entry is {id, title, title_source,
+                  workspace, model, mode, engine, created_at, updated_at};
+                  titles are cleaned server-side (no controls, no bidi
+                  overrides) and are still untrusted text to a UI. Every
+                  session is a conversation: POST /session STARTS A NEW ONE
+                  and the session it replaces stays in this list, which is
+                  the one change to that route's behaviour; its request and
+                  response are as they were.
+  POST /conversations/new  {}: a fresh chat with the live session's
+                  workspace, model and mode (a chat engine; a work loop or a
+                  swarm is started from POST /session, which needs its
+                  bounds). 409 with no live session to copy, or while it is
+                  busy. Answers {"session", "conversation", "active_id"}.
+  POST /conversations/open  {"id"}: make a saved conversation the live
+                  session. It is rebuilt through
+                  session_state.restore_session -- the same path, and the
+                  same checks, as a restart: a saved "bypass" mode is
+                  refused (422), a conversation whose system prompt this
+                  process did not write is dropped, a loop or swarm config
+                  is re-validated (main.py injects that loader). 409 while
+                  the live session is running or still has an abandoned
+                  worker (Session.is_workspace_busy), exactly as POST
+                  /restore is refused. Opening the already-open one is a
+                  no-op. Same answer shape as /new.
+  POST /conversations/rename  {"id", "title"}: cleaned and capped
+                  (conversations.RENAME_MAX); 400 if nothing is left of it.
+  POST /conversations/delete  {"id"}: permanent. Deleting the OPEN
+                  conversation ends the live session too (GET /session goes
+                  404), and is refused with 409 while it is busy; the
+                  workspace and its checkpoints are not touched.
+                  Answers {"deleted", "cleared_session", "active_id"}.
   POST /prompt    submit a user turn: {"message"}. Returns {"turn_id"}
                   immediately; the turn runs on a background thread.
   GET  /events    a Server-Sent Events stream of turn events (token deltas,
@@ -254,6 +287,8 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import auth
+import conversations as conversations_mod
+import session_state as session_state_mod
 import downloads as downloads_mod
 import engine as engine_mod
 import loop_engine as loop_mod
@@ -312,6 +347,18 @@ class WorkspaceBusyError(RuntimeError):
     SidecarHandler turns this into a 409."""
 
 
+class ConversationRefused(RuntimeError):
+    """A conversation route that cannot do what was asked, with the HTTP
+    status that says why: 409 for "not now" (no live session to copy, or
+    the live one is busy), 404 for an unknown conversation, 422 for one that
+    exists but cannot be restored. Raised by SidecarState's conversation
+    methods so the handlers stay one try/except each."""
+
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+
+
 def _engine_kind(engine):
     """What kind of engine a session is running, as the UI names it.
 
@@ -340,7 +387,7 @@ class SidecarState:
                  local_models_fetcher=None, model_checker=None,
                  shop_searcher=None, shop_quanter=None, download_manager=None,
                  engine_acquirer=None, loop_builder=None, swarm_builder=None,
-                 updater=None):
+                 updater=None, conversation_store=None, conversation_loader=None):
         self.token = token
         self.port = port  # main.py sets this to the real bound port after listen
         self.engine_factory = engine_factory or (lambda: session_mod.NullEngine())
@@ -437,6 +484,23 @@ class SidecarState:
         # self._raw_persist_hook. main.py is the only production caller
         # that supplies a real one.
         self._raw_persist_hook = persist_hook
+        # Conversation history (conversations.py). Every session this state
+        # creates or adopts is stamped with a conversation id, and
+        # active_conversation_id is the one the live session belongs to --
+        # read under self._lock like `session`, because the two change
+        # together. The store is None for a state with no persistence (most
+        # tests): the history routes then answer that history is off rather
+        # than reading the real user's data directory.
+        #
+        # conversation_loader rebuilds a saved conversation into a live
+        # Session. main.py injects one that goes through its own
+        # restore_engine_factory (a loop comes back as a loop, with its
+        # config re-validated), which this module cannot import -- main
+        # imports app, not the other way around. Without one, the process's
+        # default engine factory is used, which is right for chat sessions.
+        self._conversations = conversation_store
+        self.conversation_loader = conversation_loader
+        self.active_conversation_id = None
 
     def get_session(self):
         with self._lock:
@@ -547,17 +611,51 @@ class SidecarState:
         if is_current:
             self._raw_persist_hook(session)
 
-    def set_restored_session(self, session):
+    def set_restored_session(self, session, conversation_id=None):
         """Adopt a session session_state.restore_session() rebuilt from a
         prior process's disk snapshot as the live one -- main.py's startup
         path, called once, before the server starts accepting requests.
         Wired up exactly like a session born from create_session: the same
         _persist_if_current guard, so a session recovered from disk is not
         treated any differently than one created fresh over HTTP for every
-        purpose persistence cares about afterward."""
+        purpose persistence cares about afterward.
+
+        `conversation_id` is the saved conversation it came from, so its
+        next persist lands back in the same file; None (a caller that
+        loaded the snapshot from somewhere else) gives it a fresh one."""
+        cid = conversation_id if conversations_mod.valid_id(conversation_id) \
+            else conversations_mod.new_id()
+        session.conversation_id = cid
         with self._lock:
             self.session = session
+            self.active_conversation_id = cid
         session.set_persist_hook(self._persist_if_current if self._raw_persist_hook else None)
+        self._remember_active(cid)
+
+    def _remember_active(self, cid):
+        """Record in the index which conversation is open, so the next start
+        reopens it. Best-effort: losing this costs which chat reopens after
+        a restart, never a live session."""
+        store = self._conversations
+        if store is None:
+            return
+        try:
+            store.set_active(cid)
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            print("[hearth-app] could not record the open conversation: {}: {}".format(
+                type(exc).__name__, exc), file=sys.stderr)
+
+    def _prune_conversation(self, cid):
+        """Drop the conversation the live session just left, if nothing ever
+        happened in it (conversations.prune_if_empty). Best-effort."""
+        store = self._conversations
+        if store is None or cid is None:
+            return
+        try:
+            store.prune_if_empty(cid)
+        except Exception as exc:  # noqa: BLE001 - tidying must never fail a request
+            print("[hearth-app] could not tidy an empty conversation: {}: {}".format(
+                type(exc).__name__, exc), file=sys.stderr)
 
     def get_idle_status(self):
         """hearth_idle.is_good_time(), cached for self.idle_cache_seconds
@@ -632,7 +730,14 @@ class SidecarState:
         `engine_factory` overrides self.engine_factory for THIS session only.
         POST /session passes one when {"engine": "loop"} was asked for; the
         process-wide default (a chat engine) is untouched, so a loop session
-        does not turn every later session into a loop."""
+        does not turn every later session into a loop.
+
+        Every session made here starts a NEW conversation: it gets a fresh
+        conversation id, is saved once straight away (so it is in the
+        history list before its first prompt, and a restart reopens it),
+        and becomes the open one. The conversation it replaces is left in
+        the history -- unless nothing ever happened in it, in which case
+        it is tidied away rather than left as a blank entry."""
         with self._lock:
             old = self.session
             if old is not None:
@@ -649,14 +754,177 @@ class SidecarState:
             factory = engine_factory or self.engine_factory
             s = session_mod.Session(workspace, model, mode, engine=factory(),
                                     persist_hook=hook)
+            s.conversation_id = conversations_mod.new_id()
+            previous_cid = self.active_conversation_id
             self.session = s
+            self.active_conversation_id = s.conversation_id
         # Outside the lock: the gauge has its own, and holding two at once in
         # a fixed order is a rule someone eventually breaks. `engine` and
         # `config` in loop_snapshot() just changed, so a watcher blocked on
         # GET /loop/events must wake for it.
         self._loop_status.touch()
         self._swarm_status.touch()
+        # Also outside: these touch disk, and a slow disk must not hold the
+        # lock every request takes.
+        self._persist_if_current(s)
+        self._remember_active(s.conversation_id)
+        self._prune_conversation(previous_cid)
         return s
+
+    # ---- conversation history (conversations.py) ----
+
+    def _store(self):
+        if self._conversations is None:
+            raise ConversationRefused(409, "conversation history is not enabled in this process")
+        return self._conversations
+
+    def conversations_snapshot(self):
+        """GET /conversations' body. `active_id` is read off this state
+        rather than the index: the live session is the truth about which
+        conversation is open, the index only remembers it for the next
+        start."""
+        with self._lock:
+            active = self.active_conversation_id
+        if self._conversations is None:
+            return {"enabled": False, "active_id": active, "items": []}
+        listing = self._conversations.list()
+        listing["active_id"] = active
+        listing["enabled"] = True
+        return listing
+
+    def new_conversation(self):
+        """A fresh chat with the live session's workspace, model and mode.
+        create_session does the work, including its own same-workspace busy
+        check under the lock; the check here only gives the refusal a
+        sentence about chats rather than about workspaces."""
+        self._store()
+        with self._lock:
+            current = self.session
+        if current is None:
+            raise ConversationRefused(
+                409, "there is no session to start a new chat from; start one first")
+        if current.is_workspace_busy():
+            raise ConversationRefused(
+                409, "a turn is still running in this chat; stop it or let it finish first")
+        if current.mode not in session_state_mod.RESTORABLE_MODES:
+            raise ConversationRefused(409, "this session's mode cannot be carried into a new chat")
+        try:
+            return self.create_session(current.workspace, current.model, current.mode)
+        except WorkspaceBusyError as exc:
+            raise ConversationRefused(409, str(exc))
+
+    def _default_conversation_loader(self, persisted):
+        return session_state_mod.restore_session(persisted, self.engine_factory)
+
+    def open_conversation(self, cid):
+        """Make saved conversation `cid` the live session.
+
+        Refused while the live session is busy, for the reason POST
+        /restore is: an abandoned worker can still be writing to the
+        workspace, and it would keep doing so behind a session nothing can
+        reach any more. The rebuild goes through the injected loader (main.py:
+        session_state.restore_session with its restore_engine_factory), so a
+        conversation file gets every check a restart gives it -- this
+        directory is writable by the agent's own run_command."""
+        store = self._store()
+        if not conversations_mod.valid_id(cid):
+            raise ValueError("id must be a conversation id")
+        with self._lock:
+            current, active = self.session, self.active_conversation_id
+        if cid == active and current is not None:
+            return current
+        if current is not None and current.is_workspace_busy():
+            raise ConversationRefused(
+                409, "a turn is still running in this chat; stop it or let it finish "
+                     "before switching")
+        if store.get(cid) is None:
+            raise ConversationRefused(404, "no such conversation")
+        persisted = store.load(cid)
+        if persisted is None:
+            raise ConversationRefused(422, "this conversation's saved file could not be read")
+        loader = self.conversation_loader or self._default_conversation_loader
+        try:
+            restored = loader(persisted)
+        except Exception as exc:  # noqa: BLE001 - a bad file must cost the switch, not the process
+            print("[hearth-app] could not rebuild conversation {}: {}: {}".format(
+                cid, type(exc).__name__, exc), file=sys.stderr)
+            restored = None
+        if restored is None:
+            raise ConversationRefused(
+                422, "this conversation cannot be reopened (its saved settings are not "
+                     "allowed here, or it is damaged); it was left as it is")
+        restored.conversation_id = cid
+        with self._lock:
+            old = self.session
+            # Re-checked under the lock: a prompt may have started on the old
+            # session while the file was being read.
+            if old is not None and old.is_workspace_busy():
+                raise ConversationRefused(
+                    409, "a turn started in this chat while switching; stop it first")
+            if old is not None:
+                old.cancel()
+            previous_cid = self.active_conversation_id
+            self.session = restored
+            self.active_conversation_id = cid
+        restored.set_persist_hook(self._persist_if_current if self._raw_persist_hook else None)
+        self._loop_status.touch()
+        self._swarm_status.touch()
+        self._remember_active(cid)
+        # An inherited unfinished work loop or relay goes on its gauge now,
+        # exactly as main.py does at startup -- otherwise it is discovered
+        # only when the user types something, which is the moment the chance
+        # to resume it is destroyed.
+        publish = getattr(restored.engine, "publish_pending", None)
+        if callable(publish):
+            try:
+                publish()
+            except Exception as exc:  # noqa: BLE001 - never fail a switch over the gauge
+                print("[hearth-app] could not read the run journal: {}: {}".format(
+                    type(exc).__name__, exc), file=sys.stderr)
+        if previous_cid != cid:
+            self._prune_conversation(previous_cid)
+        return restored
+
+    def rename_conversation(self, cid, title):
+        store = self._store()
+        if not conversations_mod.valid_id(cid):
+            raise ValueError("id must be a conversation id")
+        if not isinstance(title, str):
+            raise ValueError("title must be text")
+        item = store.rename(cid, title)  # ValueError for an empty title
+        if item is None:
+            raise ConversationRefused(404, "no such conversation")
+        return item
+
+    def delete_conversation(self, cid):
+        """Delete one conversation. Deleting the open one also ends the live
+        session -- the alternative, a session that keeps running and saving
+        into a conversation that no longer exists, would quietly undo the
+        delete. Refused while that session is busy, like a switch."""
+        store = self._store()
+        if not conversations_mod.valid_id(cid):
+            raise ValueError("id must be a conversation id")
+        cleared = None
+        with self._lock:
+            if cid == self.active_conversation_id:
+                current = self.session
+                if current is not None and current.is_workspace_busy():
+                    raise ConversationRefused(
+                        409, "a turn is still running in this chat; stop it or let it "
+                             "finish before deleting it")
+                cleared = current
+                self.session = None
+                self.active_conversation_id = None
+        if cleared is not None:
+            cleared.cancel()
+            self._loop_status.touch()
+            self._swarm_status.touch()
+        existed = store.delete(cid)
+        if not existed and cleared is None:
+            raise ConversationRefused(404, "no such conversation")
+        with self._lock:
+            active = self.active_conversation_id
+        return {"deleted": cid, "cleared_session": cleared is not None, "active_id": active}
 
 
 class SidecarHandler(BaseHTTPRequestHandler):
@@ -792,6 +1060,8 @@ class SidecarHandler(BaseHTTPRequestHandler):
             return
         if path == "/session":
             self._get_session()
+        elif path == "/conversations":
+            self._send_json(200, self.state.conversations_snapshot())
         elif path == "/events":
             self._get_events()
         elif path == "/models":
@@ -840,6 +1110,9 @@ class SidecarHandler(BaseHTTPRequestHandler):
         path = self._path()
         if path == "/session":
             self._post_session()
+        elif path in ("/conversations/new", "/conversations/open",
+                      "/conversations/rename", "/conversations/delete"):
+            self._post_conversation(path.rsplit("/", 1)[1])
         elif path == "/prompt":
             self._post_prompt()
         elif path == "/approve":
@@ -877,6 +1150,53 @@ class SidecarHandler(BaseHTTPRequestHandler):
             # which shape of manifest it is holding.
             out[kind] = s.engine.manifest()
         self._send_json(200, out)
+
+    # ---- conversation history ----
+
+    @staticmethod
+    def _session_body(s):
+        """A session as GET /session describes it, for the conversation
+        routes that hand back a new live session."""
+        out = s.to_dict()
+        kind = _engine_kind(s.engine)
+        out["engine"] = kind
+        if kind in ("loop", "swarm"):
+            out[kind] = s.engine.manifest()
+        return out
+
+    def _post_conversation(self, action):
+        """POST /conversations/{new,open,rename,delete}. Thin on purpose: the
+        rules live on SidecarState and the storage in conversations.py."""
+        body = self._read_json()
+        if body is None:
+            self._send_json(400, {"error": "invalid_json"})
+            return
+        state = self.state
+        try:
+            if action == "new":
+                s = state.new_conversation()
+            elif action == "open":
+                s = state.open_conversation(body.get("id"))
+            elif action == "rename":
+                self._send_json(200, {"conversation": state.rename_conversation(
+                    body.get("id"), body.get("title"))})
+                return
+            else:
+                self._send_json(200, state.delete_conversation(body.get("id")))
+                return
+        except ConversationRefused as exc:
+            self._send_json(exc.status, {"error": str(exc)})
+            return
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        cid = getattr(s, "conversation_id", None)
+        store = state._conversations
+        self._send_json(200, {
+            "session": self._session_body(s),
+            "conversation": store.get(cid) if store is not None else None,
+            "active_id": cid,
+        })
 
     def _post_session(self):
         body = self._read_json()
@@ -2422,6 +2742,222 @@ def _self_test():
         thread_get.join(timeout=5)
         assert state_atomic.get_session().workspace == "/tmp/ws-atomic-a", \
             "thread A's session must be the one left live"
+
+        # === conversation history: GET /conversations and the four =======
+        # === POST /conversations/* routes, over real HTTP, against a real ==
+        # === store in a scratch directory. ================================
+        import conversations as conversations_mod_t  # noqa: PLC0415
+
+        conv_tmp = tempfile.mkdtemp(prefix="hearth-app-conversations-")
+        conv_gate = threading.Event()
+
+        class _ConvEngine:
+            """Remembers its conversation like RealEngine does, and blocks on
+            conv_gate when asked to, so a 'busy' session can be held open."""
+
+            def __init__(self):
+                self._messages = None
+
+            def get_state(self):
+                return None if self._messages is None else {"messages": self._messages,
+                                                            "turn_starts": [0]}
+
+            def load_state(self, st):
+                self._messages = st.get("messages")
+
+            def expected_system_prompt(self, mode):  # noqa: ARG002
+                return "sys"
+
+            def run(self, ctx):
+                self._messages = (self._messages or [{"role": "system", "content": "sys"}]) + [
+                    {"role": "user", "content": ctx.message}]
+                if ctx.message == "hold":
+                    conv_gate.wait(timeout=10)
+                ctx.emit("delta", {"text": "ok", "stream_id": 1, "index": 0})
+                ctx.emit("done", {})
+
+        conv_store = conversations_mod_t.ConversationStore(root=os.path.join(conv_tmp, "c"))
+        conv_state = SidecarState("conv-token", engine_factory=lambda: _ConvEngine(),
+                                  model_checker=lambda model: {"ok": True},
+                                  persist_hook=conv_store.save_session,
+                                  conversation_store=conv_store)
+        conv_server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(conv_state))
+        conv_state.port = conv_server.server_address[1]
+        threading.Thread(target=conv_server.serve_forever, kwargs={"poll_interval": 0.05},
+                         daemon=True).start()
+        cport = conv_state.port
+        ch = {"Host": "127.0.0.1:{}".format(cport), "Authorization": "Bearer conv-token",
+              "Content-Type": "application/json"}
+
+        def _c(method, path, body=None):
+            st, raw = _raw_request(cport, method, path, headers=ch,
+                                   body=None if body is None else json.dumps(body))
+            return st, (json.loads(raw) if raw else None)
+
+        def _idle(sess):
+            deadline = time.monotonic() + 5
+            while sess.is_workspace_busy() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert not sess.is_workspace_busy()
+
+        try:
+            # Every route needs the token, like every other route.
+            st, _ = _raw_request(cport, "GET", "/conversations",
+                                 headers={"Host": "127.0.0.1:{}".format(cport)})
+            assert st == 401, st
+            st, _ = _raw_request(cport, "POST", "/conversations/new",
+                                 headers={"Host": "127.0.0.1:{}".format(cport)}, body="{}")
+            assert st == 401, st
+
+            st, listing = _c("GET", "/conversations")
+            assert st == 200 and listing == {"enabled": True, "active_id": None, "items": []}, \
+                listing
+            st, body = _c("POST", "/conversations/new", {})
+            assert st == 409, ("nothing to copy a new chat from", st, body)
+
+            # POST /session keeps its contract and starts a conversation.
+            st, body = _c("POST", "/session", {"workspace": "/tmp/ws-conv", "model": "m"})
+            assert st == 200 and body == {"workspace": "/tmp/ws-conv", "model": "m",
+                                          "mode": "edit", "status": "idle",
+                                          "turn_id": None, "engine": "chat"}, body
+            first = conv_state.get_session()
+            first_id = first.conversation_id
+            st, listing = _c("GET", "/conversations")
+            assert listing["active_id"] == first_id, listing
+            assert [i["id"] for i in listing["items"]] == [first_id], listing
+            assert listing["items"][0]["title"] == "", "untitled until the first prompt"
+
+            # The first prompt names it, deterministically, and is echoed
+            # into the event log as a user_prompt event.
+            st, _ = _c("POST", "/prompt",
+                       {"message": "  Explain the\nretry loop in api.js\u202e please  "})
+            assert st == 200
+            _idle(first)
+            item = conv_store.get(first_id)
+            assert item["title"] == "Explain the retry loop in api.js please", item
+            kinds = [e["kind"] for e in first.events_after(0, timeout=1)]
+            assert kinds[0] == "user_prompt", kinds
+
+            # New chat: same workspace/model/mode, fresh conversation; the
+            # old one stays in the list.
+            st, body = _c("POST", "/conversations/new", {})
+            assert st == 200, (st, body)
+            second_id = body["active_id"]
+            assert second_id != first_id and conversations_mod_t.valid_id(second_id)
+            assert body["session"]["workspace"] == "/tmp/ws-conv", body
+            assert body["session"]["engine"] == "chat" and body["conversation"]["id"] == second_id
+            assert conv_state.get_session().engine.get_state() is None, "a NEW chat is empty"
+            st, listing = _c("GET", "/conversations")
+            assert [i["id"] for i in listing["items"]] == [second_id, first_id], listing
+
+            # Pressing it again does not pile up blank chats.
+            st, body = _c("POST", "/conversations/new", {})
+            third_id = body["active_id"]
+            st, listing = _c("GET", "/conversations")
+            assert [i["id"] for i in listing["items"]] == [third_id, first_id], listing
+
+            # Open the first one again: its conversation and history come back,
+            # and the empty one it left is tidied away.
+            st, body = _c("POST", "/conversations/open", {"id": first_id})
+            assert st == 200, (st, body)
+            reopened = conv_state.get_session()
+            assert reopened.conversation_id == first_id and reopened is not first
+            assert reopened.engine.get_state()["messages"][1]["content"].startswith("  Explain")
+            replay = [e["kind"] for e in reopened.events_after(0, timeout=1)]
+            assert replay[0] == "user_prompt" and "delta" in replay, replay
+            st, listing = _c("GET", "/conversations")
+            assert [i["id"] for i in listing["items"]] == [first_id], listing
+            # Opening the open one is a no-op, not a rebuild.
+            st, body = _c("POST", "/conversations/open", {"id": first_id})
+            assert st == 200 and conv_state.get_session() is reopened
+
+            # Rename: cleaned and capped; empty, unknown and malformed refused.
+            st, body = _c("POST", "/conversations/rename",
+                          {"id": first_id, "title": " Retry\u2066 loop\n notes "})
+            assert st == 200 and body["conversation"]["title"] == "Retry loop notes", body
+            st, body = _c("POST", "/conversations/rename", {"id": first_id, "title": " \u200b "})
+            assert st == 400, (st, body)
+            st, body = _c("POST", "/conversations/rename", {"id": first_id, "title": 5})
+            assert st == 400, (st, body)
+            st, body = _c("POST", "/conversations/rename",
+                          {"id": conversations_mod_t.new_id(), "title": "x"})
+            assert st == 404, (st, body)
+            for bad in ("../../etc/passwd", None, 3, "A" * 32):
+                for route in ("open", "rename", "delete"):
+                    st, body = _c("POST", "/conversations/" + route, {"id": bad, "title": "t"})
+                    assert st == 400, (route, bad, st, body)
+            st, body = _c("POST", "/conversations/open", {"id": conversations_mod_t.new_id()})
+            assert st == 404, (st, body)
+
+            # While a turn runs, switching, starting and deleting the open
+            # chat are all refused -- and nothing changes.
+            st, body = _c("POST", "/conversations/new", {})
+            other_id = body["active_id"]
+            conv_state.get_session().submit_prompt("not empty any more")
+            _idle(conv_state.get_session())
+            st, body = _c("POST", "/conversations/open", {"id": first_id})
+            assert st == 200
+            busy = conv_state.get_session()
+            busy.submit_prompt("hold")
+            for route, payload in (("open", {"id": other_id}), ("new", {}),
+                                   ("delete", {"id": first_id})):
+                st, body = _c("POST", "/conversations/" + route, payload)
+                assert st == 409, (route, st, body)
+                assert conv_state.get_session() is busy, route
+            # Renaming and deleting a DIFFERENT chat is fine while it runs.
+            st, body = _c("POST", "/conversations/rename", {"id": other_id, "title": "other"})
+            assert st == 200, (st, body)
+            conv_gate.set()
+            _idle(busy)
+
+            # Delete a chat that is not open.
+            st, body = _c("POST", "/conversations/delete", {"id": other_id})
+            assert st == 200 and body == {"deleted": other_id, "cleared_session": False,
+                                          "active_id": first_id}, body
+            assert conv_store.get(other_id) is None
+            st, body = _c("POST", "/conversations/delete", {"id": other_id})
+            assert st == 404, (st, body)
+
+            # A planted bypass-mode file is refused on open (422), and the
+            # live session is left alone.
+            planted = conversations_mod_t.new_id()
+            assert conv_store.save(planted, {
+                "version": session_state_mod.STATE_VERSION, "saved_at": time.time(),
+                "workspace": "C:\\", "model": "m", "mode": "bypass",
+                "engine_state": None, "recent_events": []})
+            st, body = _c("POST", "/conversations/open", {"id": planted})
+            assert st == 422, (st, body)
+            assert conv_state.get_session() is busy
+            # A file corrupted after it was listed is a 422 too, not a 500.
+            with open(os.path.join(conv_store.root(), planted + ".json"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("{torn")
+            st, body = _c("POST", "/conversations/open", {"id": planted})
+            assert st in (404, 422), (st, body)
+
+            # Deleting the OPEN chat ends the live session.
+            st, body = _c("POST", "/conversations/delete", {"id": first_id})
+            assert st == 200 and body["cleared_session"] is True and body["active_id"] is None
+            st, _ = _c("GET", "/session")
+            assert st == 404, st
+            st, listing = _c("GET", "/conversations")
+            assert listing["active_id"] is None and first_id not in {
+                i["id"] for i in listing["items"]}, listing
+            assert not os.path.exists(os.path.join(conv_store.root(), first_id + ".json"))
+
+            # Malformed JSON, and history-off states answer cleanly.
+            st, _ = _raw_request(cport, "POST", "/conversations/open", headers=ch, body="{nope")
+            assert st == 400, st
+            st, listing = _raw_request(port, "GET", "/conversations", headers=auth_headers)
+            assert st == 200 and json.loads(listing)["enabled"] is False, listing
+            st, body = _raw_request(port, "POST", "/conversations/new", headers=auth_headers,
+                                    body="{}")
+            assert st == 409, (st, body)
+        finally:
+            conv_gate.set()
+            conv_server.shutdown()
+            conv_server.server_close()
+            shutil.rmtree(conv_tmp, ignore_errors=True)
 
         # === restart survival wiring: SidecarState only ever persists on ===
         # === behalf of whichever session is CURRENTLY self.session -- a ===
