@@ -167,11 +167,12 @@ jobs:
 
           ### Updating
 
-          There is no automatic update feed yet. To update, download the
-          newest installer from the
-          [releases page](https://github.com/${{ github.repository }}/releases)
-          and run it; your models and settings are kept. Click **Watch**,
-          **Custom**, **Releases** on the repository to be told when one is out.
+          Hearth checks this page for a new version each time it starts, and
+          shows **Install now** when there is one; it verifies the download
+          against its own release key before anything runs, and your models
+          and settings are kept. Hearth 0.1.1 and older cannot update
+          themselves: download the installer below and run it once, and every
+          update after that happens inside the app.
 
           ### Known gaps
 
@@ -183,6 +184,74 @@ jobs:
           EOF
           echo "--- notes ---"; cat NOTES.md
 
+      # The in-app updater's feed. Installed copies of Hearth fetch
+      # manifest-stable.json from releases/latest/download/ and accept it only
+      # when it carries a signature from a key in release/trust.json, so this
+      # step is what makes a release reachable from inside the app.
+      #
+      # The secret HEARTH_UPDATE_SIGNING_KEY holds exactly the 64 hex
+      # characters of the "private_seed" value from a key file written by
+      # `release_manifest.py keygen`, nothing else. It is written to a file
+      # that only this user can read (umask 077), passed to the signer as a
+      # path (never as an argument, which every process can see), and removed
+      # on every exit path. There is no `set -x` here, so no line of this
+      # script is echoed with the secret expanded; GitHub also masks it.
+      #
+      # Without the secret the release still publishes, with a warning, and
+      # in-app updates simply do not see it. A secret that IS set but does not
+      # belong to an active key in release/trust.json fails the job, because
+      # that is a mistake to fix rather than a release to ship.
+      - name: Sign the update manifest
+        id: manifest
+        shell: bash
+        env:
+          HEARTH_UPDATE_SIGNING_KEY: ${{ secrets.HEARTH_UPDATE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HEARTH_UPDATE_SIGNING_KEY:-}" ]; then
+            echo "::warning::HEARTH_UPDATE_SIGNING_KEY is not set, so this release carries no signed update manifest and in-app updates are disabled for this release. Installed copies of Hearth will not offer it; people have to download it by hand. See docs/updates.md."
+            echo "assets=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          umask 077
+          seed_file=$(mktemp)
+          notes_file=""
+          trap 'shred -u "$seed_file" 2>/dev/null || rm -f "$seed_file"; rm -f "$notes_file"' EXIT
+          printf '%s' "$HEARTH_UPDATE_SIGNING_KEY" > "$seed_file"
+          unset HEARTH_UPDATE_SIGNING_KEY
+
+          tag="${{ steps.meta.outputs.tag }}"
+          version="${{ steps.meta.outputs.version }}"
+          exe="${{ steps.meta.outputs.exe }}"
+          # Short notes for the in-app banner and panel (at most 4000
+          # characters; the client refuses more). release/notes/<tag>.txt
+          # overrides the default one-liner when a release wants to say more.
+          notes_file=$(mktemp)
+          if [ -f "release/notes/$tag.txt" ]; then
+            cp "release/notes/$tag.txt" "$notes_file"
+          else
+            printf 'Hearth %s. What changed: https://github.com/%s/releases/tag/%s\n' \
+              "$version" "${{ github.repository }}" "$tag" > "$notes_file"
+          fi
+
+          # 180 days: comfortably longer than the gap between releases, well
+          # under the client's 400-day ceiling. When the newest manifest
+          # expires, checks fail (calmly) until a new release or a re-signed
+          # manifest is published; docs/updates.md says how to re-sign.
+          python scripts/release_manifest.py sign \
+            --installer "$exe" \
+            --version "$version" \
+            --seed-file "$seed_file" \
+            --layout github-releases \
+            --valid-days 180 \
+            --notes-file "$notes_file" \
+            --out "$(dirname "$exe")"
+
+          manifest="$(dirname "$exe")/manifest-stable.json"
+          test -f "$manifest"
+          echo "assets=$manifest" >> "$GITHUB_OUTPUT"
+
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -192,7 +261,7 @@ jobs:
             --title "Hearth for Windows ${{ steps.meta.outputs.tag }}" \
             --notes-file NOTES.md \
             $([ "${{ github.event.inputs.draft }}" = "true" ] && echo --draft || echo --latest) \
-            dist/*.exe dist/SHA256SUMS.txt
+            dist/*.exe dist/SHA256SUMS.txt ${{ steps.manifest.outputs.assets }}
 
       - name: Where to look
         run: |
