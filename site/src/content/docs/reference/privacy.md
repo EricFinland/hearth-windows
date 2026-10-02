@@ -17,8 +17,9 @@ which are either started by you or needed to fetch software you asked for.
 
 Nothing.
 
-There is no analytics SDK, no crash reporter, no usage ping, no update
-heartbeat that carries an identifier, and no account system. There is no server
+There is no analytics SDK, no crash reporter, no usage ping, no account
+system, and the one update check carries no identifier, no version and no
+query string. There is no server
 operated by this project that receives anything from an install. You can verify
 the negative the same way anyone else can: every network call in the shipped
 code goes through the modules listed below, and there is no other outbound path.
@@ -47,19 +48,21 @@ All of it, unless a section further down says otherwise.
 
 ## What leaves your machine, and only when it has to
 
-Every item here is triggered by something you did, and none of it carries an
-identifier the project assigned to you.
+Every item here is triggered by something you did, except the update check,
+which runs once each time Hearth starts unless you turn it off. None of it
+carries an identifier the project assigned to you.
 
 | Destination | When | What is sent |
 | --- | --- | --- |
 | `huggingface.co` | you browse or download a model in the model shop | ordinary HTTPS requests for repository metadata and model files. No account is required and none is used unless you supply a token yourself |
 | `github.com` | first launch, and when you change GPU engine | a download of the pinned llama.cpp release named in `vendor/llama_manifest.json`, verified by checksum |
-| the update feed in `release/trust.json` | an update check | a request for a signed release manifest. **This is currently pointed at a reserved name that can never resolve**, so no install can reach an update host at all. See [updates.md](/hearth-windows/concepts/updates/) |
+| `github.com` (this project's releases page, the feed named in `release/trust.json`), redirected to GitHub's asset host `release-assets.githubusercontent.com` | once each time Hearth starts, unless you untick **Check for updates automatically** in the Updates panel; and whenever you click **Check for updates** | one plain HTTPS GET for a small signed manifest, with the User-Agent `hearth-updater` and nothing else: no version, no install id, no query string. The installer is downloaded from the same release only when you click **Install now**. See [updates.md](/hearth-windows/concepts/updates/) |
 | `html.duckduckgo.com` | you (or the agent, with your approval) use the web search tool | the search query |
 | a URL you give it | the agent fetches a page you or it named, with your approval under the active permission mode | an ordinary HTTPS request |
 | `ntfy.sh`, or a Telegram bot | only if you configure notifications yourself | the notification text you configured |
 
-Nothing in that table happens on a schedule you did not set, and nothing in it
+Apart from the launch update check above, which you can turn off, nothing in
+that table happens on a schedule you did not set, and nothing in it
 sends your prompts, your files, or your audit database.
 
 ## Third-party services and their own terms

@@ -4462,6 +4462,26 @@ def _self_test():
                                                       "enabled": "yes"}))
             assert status == 400, "a non-boolean must not be accepted as a setting"
 
+            # A feed that cannot be reached is a failure the panel can word
+            # calmly: the snapshot says why ("offline") and whether it was the
+            # launch check or a click, and it is never "up to date".
+            class _UpdOffline:
+                def open(self, target, timeout=None):
+                    raise urllib.error.URLError(OSError(10061, "connection refused"))
+
+            updater._opener_fn = lambda _base: _UpdOffline()
+            status, _ = _raw_request(port_u, "POST", "/update", headers=headers_u,
+                                     body=json.dumps({"action": "check", "force": True}))
+            assert status == 200, status
+            updater.join(timeout=20)
+            status, data = _raw_request(port_u, "GET", "/update", headers=headers_u)
+            snap = json.loads(data)
+            assert snap["state"] == update_mod.STATE_FAILED, snap
+            assert snap["failure"] == "offline" and snap["background"] is False, snap
+            assert "could not check for updates" in snap["error"], snap["error"]
+            assert snap["layout"] == update_mod.LAYOUT_DIRECTORY, snap
+            updater._opener_fn = lambda _base: _UpdFeed()
+
             # An unknown action is a 400, and a malformed body is a 400 --
             # neither is a 500 and neither starts anything.
             status, _ = _raw_request(port_u, "POST", "/update", headers=headers_u,

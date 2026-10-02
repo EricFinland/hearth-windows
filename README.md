@@ -310,8 +310,11 @@ repository.
 
 **Privacy.** Hearth does not transfer information to other networked systems
 unless specifically requested by the user or the person installing or operating
-it. Model downloads and update checks are the only network destinations, both
-user-initiated, and [docs/privacy.md](docs/privacy.md) lists every one.
+it. Model downloads and the update check are the only network destinations.
+Model downloads are user-initiated; the update check is one plain request to
+this repository's releases page each time Hearth starts, carries nothing that
+identifies the user or the install, and can be turned off.
+[docs/privacy.md](docs/privacy.md) lists every one.
 
 **Uninstall.** The installer registers a standard Windows uninstall entry.
 Remove Hearth through Settings, Apps, Installed apps, or from Add/Remove
