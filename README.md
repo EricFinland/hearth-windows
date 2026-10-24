@@ -12,6 +12,7 @@
 ![Contained](https://img.shields.io/badge/tools-workspace%20contained-4a9eff?style=flat-square&labelColor=182029)
 ![Unsigned](https://img.shields.io/badge/installer-unsigned-4a9eff?style=flat-square&labelColor=182029)
 ![License](https://img.shields.io/badge/license-Apache--2.0-4a9eff?style=flat-square&labelColor=182029)
+[![Discord](https://img.shields.io/discord/1535552732889612348?style=flat-square&logo=discord&logoColor=white&label=discord&labelColor=182029&color=4a9eff)](https://discord.gg/8bathX4UQY)
 
 ### Local LLMs and an autonomous coding agent on your own Windows machine, at zero cost.
 
@@ -327,7 +328,9 @@ of this page.
 ## Contributing and security
 
 Contributions are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md) for the build
-and self-test workflow. Found a security issue? Please follow
+and self-test workflow. Questions, ideas, or just want to follow along? Join the
+[Hearth Discord](https://discord.gg/8bathX4UQY), which covers both the NixOS and Windows editions and
+posts every push to this repo live. Found a security issue? Please follow
 [SECURITY.md](SECURITY.md) rather than opening a public issue. The Windows
 build's threat model is at
 [docs/security/windows-threat-model.md](docs/security/windows-threat-model.md),

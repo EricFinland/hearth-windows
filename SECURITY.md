@@ -6,7 +6,7 @@ and how to report a problem.
 
 ## Reporting a vulnerability
 
-Please do not open a public issue for a security problem.
+Please do not open a public issue or post in the Discord about a security problem.
 
 Open a private report through GitHub Security Advisories: the **Security** tab
 on this repository, then **Report a vulnerability**. That channel is private
