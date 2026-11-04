@@ -67,6 +67,24 @@ Endpoints:
   GET  /session   the current session's state, or 404 if none exists yet.
   POST /prompt    submit a user turn: {"message"}. Returns {"turn_id"}
                   immediately; the turn runs on a background thread.
+                  Optional "attachments": ["imports/<name>", ...], the paths
+                  POST /attach/finish returned, at most 10 files and 50 MB
+                  per message. Each is re-validated inside the workspace and
+                  re-read, and its text is appended to what the MODEL is
+                  sent (fenced, budgeted to the context window); the message
+                  itself, and everything that echoes it, stays the typed
+                  words. Chat sessions only: a 400 for a loop or a swarm,
+                  whose engines read the message as a goal.
+  POST /attach    begin uploading a file the user is attaching: {"name",
+                  "size"} -> {"id", "chunk_bytes", "name"}. At most 20 MB.
+  POST /attach/chunk  {"id", "offset", "data"}: base64 of at most
+                  chunk_bytes raw bytes, appended at exactly `offset`. Staged
+                  OUTSIDE the workspace until it is complete.
+  POST /attach/finish  {"id"}: move the complete file into
+                  <workspace>/imports/ (sanitised name, never overwriting)
+                  and return what was stored, what can be read out of it,
+                  and any injection or secret warning. See attachments.py.
+  POST /attach/cancel  {"id"}: drop an upload in progress.
   GET  /events    a Server-Sent Events stream of turn events (token deltas,
                   tool calls, approval requests, completion, error). Accepts
                   ?since=<event id> or a Last-Event-ID header to resume.
@@ -253,6 +271,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import attachments as attachments_mod
 import auth
 import downloads as downloads_mod
 import engine as engine_mod
@@ -848,6 +867,8 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._post_cancel()
         elif path == "/restore":
             self._post_restore()
+        elif path in ("/attach", "/attach/chunk", "/attach/finish", "/attach/cancel"):
+            self._post_attach(path)
         elif path == "/downloads":
             self._post_download()
         elif path in ("/downloads/cancel", "/downloads/dismiss"):
@@ -998,12 +1019,68 @@ class SidecarHandler(BaseHTTPRequestHandler):
         if not isinstance(message, str) or not message:
             self._send_json(400, {"error": "message is required"})
             return
+        message = self._with_attachments(s, message, body)
+        if message is None:
+            return
         try:
             turn_id = s.submit_prompt(message)
         except RuntimeError as exc:
             self._send_json(409, {"error": str(exc)})
             return
         self._send_json(200, {"turn_id": turn_id})
+
+    def _with_attachments(self, s, message, body):
+        """POST /prompt's message with any attached files composed onto it
+        (attachments.PromptText: the str value stays the typed words). The
+        plain str passes through untouched when nothing is attached. Returns
+        None after sending the error response itself."""
+        paths = body.get("attachments")
+        if paths is None or paths == []:
+            return message
+        if _engine_kind(s.engine) != "chat":
+            self._send_json(400, {"error": "attachments can only be sent in a chat session"})
+            return None
+        try:
+            # The budget leaves room for the conversation already in the
+            # engine's history, and for the typed words, which share one user
+            # message with the files, so a long chat or a long pasted prompt
+            # shrinks it rather than overflowing the model's context.
+            used = attachments_mod.engine_history_chars(s.engine) + len(message)
+            return attachments_mod.compose(message, paths, s.workspace, s.model, used_chars=used)
+        except attachments_mod.AttachError as exc:
+            self._send_json(exc.status, exc.payload())
+            return None
+
+    def _post_attach(self, path):
+        """POST /attach, /attach/chunk, /attach/finish, /attach/cancel.
+
+        The file is the user's own and the write is their own action, so it
+        does not wait on the agent's write approval; it is held to the
+        workspace boundary all the same (attachments.store). Chat sessions
+        only, for the reason _with_attachments gives. Cancel needs no
+        session: dropping an orphaned upload must always be possible."""
+        body = self._read_json()
+        if body is None:
+            self._send_json(400, {"error": "invalid_json"})
+            return
+        s = self.state.get_session()
+        try:
+            if path == "/attach/cancel":
+                out = attachments_mod.get_stager().cancel(body.get("id"))
+            elif s is None:
+                self._send_json(400, {"error": "no_session"})
+                return
+            elif _engine_kind(s.engine) != "chat":
+                self._send_json(400, {"error": "attachments can only be sent in a chat session"})
+                return
+            else:
+                out = attachments_mod.handle(
+                    path, body, s.workspace, s.model,
+                    used_chars=attachments_mod.engine_history_chars(s.engine))
+        except attachments_mod.AttachError as exc:
+            self._send_json(exc.status, exc.payload())
+            return
+        self._send_json(200, out)
 
     def _post_approve(self):
         s = self.state.get_session()
@@ -3624,6 +3701,157 @@ def _self_test():
                                                           sorted(missing)))
             assert not extra, ("{} allows {}, which this router does not "
                                "serve".format(os.path.basename(rel), sorted(extra)))
+
+        # === POST /attach* and POST /prompt with attachments ============
+        # Over real HTTP, end to end: a file is staged in chunks outside the
+        # workspace, lands in <workspace>/imports/ under a sanitised name,
+        # and a prompt that attaches it reaches the engine as the typed
+        # words with the file block carried alongside. The model's context
+        # size is pinned so this never probes the machine's GPU or a daemon.
+        import base64 as _b64
+
+        class _RecordingEngine:
+            def __init__(self):
+                self.messages = []
+
+            def run(self, ctx):
+                self.messages.append(ctx.message)
+                ctx.emit("done", {})
+
+        class _SwarmShapedEngine(_RecordingEngine):
+            ENGINE_KIND = "swarm"
+
+        att_data = _tempfile.mkdtemp(prefix="hearth-app-attach-data-")
+        att_ws = _tempfile.mkdtemp(prefix="hearth-app-attach-ws-")
+        prev_att_data = os.environ.get("HEARTH_DATA_DIR")
+        os.environ["HEARTH_DATA_DIR"] = att_data
+        real_ctx_tokens = attachments_mod.context_tokens
+        attachments_mod.context_tokens = lambda model: 4096
+        rec_engine = _RecordingEngine()
+        server_a, state_a = _start(token="attach-token", engine_factory=lambda: rec_engine)
+        try:
+            port_a = state_a.port
+            headers_a = {"Host": "127.0.0.1:{}".format(port_a),
+                         "Authorization": "Bearer attach-token",
+                         "Content-Type": "application/json"}
+
+            def _att(path, obj, raw_body=None):
+                status, data = _raw_request(port_a, "POST", path, headers=headers_a,
+                                            body=raw_body if raw_body is not None else json.dumps(obj))
+                return status, json.loads(data or b"{}")
+
+            # No session yet: refused, and cancel still answers.
+            status, out = _att("/attach", {"name": "a.txt", "size": 1})
+            assert status == 400 and out["error"] == "no_session", (status, out)
+            status, out = _att("/attach/cancel", {"id": "0" * 32})
+            assert status == 200 and out == {"cancelled": False}, (status, out)
+
+            status, out = _att("/session", {"workspace": att_ws, "model": "fake-model"})
+            assert status == 200, (status, out)
+
+            # A full-size chunk (1 MiB raw, ~1.4 MB of JSON) is accepted: under
+            # both the 4 MiB proxy cap and this server's own cap.
+            content = ("attached line\n" * 80000).encode("utf-8")[:attachments_mod.CHUNK_BYTES + 5000]
+            status, began = _att("/attach", {"name": "..\\CON.txt", "size": len(content)})
+            assert status == 200 and began["chunk_bytes"] == attachments_mod.CHUNK_BYTES, (status, began)
+            upload_id = began["id"]
+            first = content[:attachments_mod.CHUNK_BYTES]
+            status, out = _att("/attach/chunk", {"id": upload_id, "offset": 0,
+                                                 "data": _b64.b64encode(first).decode()})
+            assert status == 200 and out["received"] == len(first), (status, out)
+            assert not os.path.exists(os.path.join(att_ws, "imports")), \
+                "nothing reaches the workspace before the upload is complete"
+            # Out-of-order offset: a 409 naming the expected one.
+            status, out = _att("/attach/chunk", {"id": upload_id, "offset": 7, "data": "AAAA"})
+            assert status == 409 and out["expected"] == len(first), (status, out)
+            status, out = _att("/attach/finish", {"id": upload_id})
+            assert status == 409, (status, out)
+            status, out = _att("/attach/chunk", {"id": upload_id, "offset": len(first),
+                                                 "data": _b64.b64encode(content[len(first):]).decode()})
+            assert status == 200, (status, out)
+            status, rec = _att("/attach/finish", {"id": upload_id})
+            assert status == 200 and rec["path"] == "imports/_CON.txt", (status, rec)
+            assert rec["readable"] and rec["budget_chars"] == attachments_mod.budget_chars(4096), rec
+            assert rec["overhead_chars"] > 0, rec
+            with open(os.path.join(att_ws, "imports", "_CON.txt"), "rb") as fh:
+                assert fh.read() == content
+            # Over the per-file cap, and garbage bodies.
+            status, out = _att("/attach", {"name": "huge.bin",
+                                           "size": attachments_mod.MAX_FILE_BYTES + 1})
+            assert status == 413, (status, out)
+            status, out = _att("/attach/chunk", None, raw_body="{not json")
+            assert status == 400, (status, out)
+            status, out = _att("/attach/chunk", {"id": "nope", "offset": 0, "data": ""})
+            assert status == 400, (status, out)
+
+            # POST /prompt with the attachment: the engine sees the typed
+            # words as the message's value, and the file only alongside it.
+            status, out = _att("/prompt", {"message": "what is in it?",
+                                           "attachments": [rec["path"]]})
+            assert status == 200, (status, out)
+            deadline_a = time.monotonic() + 5
+            while not rec_engine.messages and time.monotonic() < deadline_a:
+                time.sleep(0.02)
+            got = rec_engine.messages[-1]
+            assert str(got) == "what is in it?", repr(str(got))
+            assert "<<<BEGIN ATTACHMENT " in got.attachment_text, got.attachment_text[:200]
+            assert "attached line" in got.attachment_text
+            assert got.attachment_meta[0]["path"] == "imports/_CON.txt", got.attachment_meta
+            # Without attachments the engine gets the plain str, exactly as before.
+            deadline_a = time.monotonic() + 5
+            while state_a.get_session().status != "idle" and time.monotonic() < deadline_a:
+                time.sleep(0.02)
+            status, out = _att("/prompt", {"message": "plain"})
+            assert status == 200, (status, out)
+            deadline_a = time.monotonic() + 5
+            while len(rec_engine.messages) < 2 and time.monotonic() < deadline_a:
+                time.sleep(0.02)
+            assert type(rec_engine.messages[-1]) is str and rec_engine.messages[-1] == "plain"
+            deadline_a = time.monotonic() + 5
+            while state_a.get_session().status != "idle" and time.monotonic() < deadline_a:
+                time.sleep(0.02)
+            # The typed words share the user message with the files, so they
+            # count against the budget: a pasted prompt that already fills
+            # the ceiling leaves no room for even the compact listing.
+            long_words = "w" * (int(4096 * attachments_mod.CHARS_PER_TOKEN
+                                    * attachments_mod.HISTORY_CEILING) - 100)
+            status, out = _att("/prompt", {"message": long_words, "attachments": [rec["path"]]})
+            assert status == 413 and "attach fewer files" in out["error"], (status, out)
+            assert rec["ceiling_chars"] == int(4096 * attachments_mod.CHARS_PER_TOKEN
+                                               * attachments_mod.HISTORY_CEILING), rec
+            # A path that is not an import, or escapes, is refused before a turn starts.
+            for bad in (["../outside.txt"], ["imports/missing.txt"], "imports/_CON.txt",
+                        ["imports/x"] * 11):
+                status, out = _att("/prompt", {"message": "m", "attachments": bad})
+                assert status == 400, (bad, status, out)
+            assert len(rec_engine.messages) == 2, "a refused prompt must not start a turn"
+
+            # Attachments are chat-only: a loop or swarm reads the message as a goal.
+            status, out = _att("/session", {"workspace": att_ws, "model": "fake-model"})
+            state_a.get_session().engine = _SwarmShapedEngine()
+            status, out = _att("/attach", {"name": "a.txt", "size": 1})
+            assert status == 400 and "chat session" in out["error"], (status, out)
+            status, out = _att("/prompt", {"message": "goal", "attachments": [rec["path"]]})
+            assert status == 400 and "chat session" in out["error"], (status, out)
+
+            # A session whose workspace folder has gone is refused, not created.
+            gone_ws = _tempfile.mkdtemp(prefix="hearth-app-attach-gone-")
+            status, out = _att("/session", {"workspace": gone_ws, "model": "fake-model"})
+            assert status == 200, (status, out)
+            shutil.rmtree(gone_ws)
+            status, out = _att("/attach", {"name": "a.txt", "size": 1})
+            assert status == 409, (status, out)
+            assert not os.path.exists(gone_ws)
+        finally:
+            server_a.shutdown()
+            server_a.server_close()
+            attachments_mod.context_tokens = real_ctx_tokens
+            if prev_att_data is None:
+                os.environ.pop("HEARTH_DATA_DIR", None)
+            else:
+                os.environ["HEARTH_DATA_DIR"] = prev_att_data
+            shutil.rmtree(att_data, ignore_errors=True)
+            shutil.rmtree(att_ws, ignore_errors=True)
 
         # === malformed JSON body is rejected, not a 500 ===
         status, data = _raw_request(port, "POST", "/session", headers=auth_headers, body="{not json")

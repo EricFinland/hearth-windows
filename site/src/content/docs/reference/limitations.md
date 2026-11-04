@@ -314,6 +314,23 @@ a clean list while a corrupted `.env` stays corrupted. Naming a gap is not
 the same as closing it - if `excluded_changed` names a file, that file is
 not back to what it was, and nothing currently in Hearth can put it there.
 
+## Attached files: PDFs are best effort, and images are not read
+
+Text is pulled out of an attached PDF by reading its page content streams
+directly, with no PDF library and no OCR. A scanned document has no text
+to pull, and a PDF whose fonts are stored as glyph numbers produces codes
+rather than letters; both are reported as "no text found" instead of being
+passed to the model, but the check is a heuristic, so an unusual PDF can
+still come through with scrambled spacing, columns run together, or
+tables flattened into lines. Images are stored in `imports` and named to
+the model, never shown to it: Hearth has no vision support. Attached text
+is bounded by about 40% of the model's context window across one message
+(less when the conversation or the message typed with them already fills
+the window; too many files for what is left are refused), and only the newest
+message's files stay in the conversation, so a long document arrives as an
+excerpt, an earlier one is reduced to its name and path, and the agent has
+to read the rest with its own tools, which it may or may not decide to do.
+
 ## Read this before you flip to `bypass`
 
 `bypass` mode exists to let you skip every prompt. If you choose a model
