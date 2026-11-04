@@ -188,6 +188,7 @@ STATUS_RUNNING = "running"
 
 EVENTS_CAP = 500  # bounded ring for Session._events; see module docstring
 APPROVALS_CAP = 200  # bounded dict for Session._approvals; see module docstring
+USER_PROMPT_ECHO_CHARS = 32 * 1024  # see submit_prompt's `echo`
 
 
 class Approval:
@@ -409,9 +410,19 @@ class Session:
 
     # ---- driving a turn ----
 
-    def submit_prompt(self, message):
+    def submit_prompt(self, message, echo=False):
         """Start a new turn on a background thread and return its id
-        immediately. Raises RuntimeError if a turn is already running."""
+        immediately. Raises RuntimeError if a turn is already running.
+
+        `echo` also records the prompt itself as a "user_prompt" event, ahead
+        of anything the engine emits for the turn. app.py's POST /prompt asks
+        for it; nothing else does, so a caller driving a Session directly
+        sees exactly the events it always saw. Without it the event log held
+        only the agent's half of a conversation, and a page that replays the
+        log -- a reload, a restart, reopening a saved chat -- showed answers
+        to questions nobody could see. Capped at USER_PROMPT_ECHO_CHARS with
+        a `truncated` flag, because a pasted log file must not crowd the rest
+        of the history out of the persisted tail."""
         with self._lock:
             if self.status == STATUS_RUNNING:
                 raise RuntimeError("a turn is already running")
@@ -426,6 +437,14 @@ class Session:
             self._cancel_flags[turn_id] = threading.Event()
 
         ctx = TurnContext(self, turn_id, message)
+        if echo:
+            # Emitted before the worker thread exists, so it can never land
+            # after the engine's first event for this turn.
+            text = message if isinstance(message, str) else str(message)
+            echoed = {"text": text[:USER_PROMPT_ECHO_CHARS]}
+            if len(text) > USER_PROMPT_ECHO_CHARS:
+                echoed["truncated"] = True
+            self._emit(turn_id, "user_prompt", echoed)
 
         def _run():
             try:
@@ -1360,6 +1379,33 @@ def _self_test():
     ri2_kinds = [e["kind"] for e in s_ri2.events_after(0, timeout=1)]
     assert ri2_kinds == ["turn_interrupted"], \
         "no approval_abandoned marker when nothing was actually pending: {}".format(ri2_kinds)
+
+    # submit_prompt(echo=True) records the prompt FIRST, before anything the
+    # engine says, and caps a huge one; the default leaves the log alone.
+    class _SaysDone:
+        def run(self, ctx):
+            ctx.emit("done", {})
+
+    s_echo = Session("/tmp/ws-echo", "m", "edit", engine=_SaysDone())
+    s_echo.submit_prompt("what does main.py do?", echo=True)
+    deadline = time.monotonic() + 5
+    echo_events = s_echo.events_after(0, timeout=2)
+    while echo_events[-1]["kind"] != "done" and time.monotonic() < deadline:
+        time.sleep(0.01)
+        echo_events = s_echo.events_after(0, timeout=2)
+    assert [e["kind"] for e in echo_events] == ["user_prompt", "done"], echo_events
+    assert echo_events[0]["data"] == {"text": "what does main.py do?"}, echo_events[0]
+    deadline = time.monotonic() + 5
+    while s_echo.to_dict()["status"] != STATUS_IDLE and time.monotonic() < deadline:
+        time.sleep(0.01)
+    s_echo.submit_prompt("x" * (USER_PROMPT_ECHO_CHARS + 5), echo=True)
+    big = [e for e in s_echo.events_after(0, timeout=2) if e["kind"] == "user_prompt"][-1]
+    assert len(big["data"]["text"]) == USER_PROMPT_ECHO_CHARS and big["data"]["truncated"] is True
+
+    s_quiet = Session("/tmp/ws-echo-2", "m", "edit", engine=_SaysDone())
+    s_quiet.submit_prompt("not echoed")
+    quiet_events = s_quiet.events_after(0, timeout=2)
+    assert [e["kind"] for e in quiet_events] == ["done"], quiet_events
 
     print("hearth-desktop-session self-test OK")
     return 0

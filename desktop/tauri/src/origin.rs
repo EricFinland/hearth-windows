@@ -65,6 +65,11 @@ use std::time::Duration;
 pub const SIDECAR_ROUTES: &[&str] = &[
     "/healthz",
     "/session",
+    "/conversations",
+    "/conversations/new",
+    "/conversations/open",
+    "/conversations/rename",
+    "/conversations/delete",
     "/prompt",
     "/events",
     "/approve",
