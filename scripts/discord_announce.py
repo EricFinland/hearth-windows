@@ -85,8 +85,13 @@ def pr_embed(env=None):
     edition, color = _edition(repo)
     number, title = _get(env, "PR_NUMBER"), _get(env, "PR_TITLE")
     heading = "#{} {}".format(number, title) if number else (title or "Untitled pull request")
+    # The workflow only fires on a merged pull request, so PR_MERGED is true
+    # there. Running this by hand against an open one must not claim a merge
+    # that has not happened, so the state is read rather than assumed.
+    base = _get(env, "PR_BASE") or "main"
+    merged = _get(env, "PR_MERGED").lower() == "true"
     embed = {
-        "author": {"name": "Merged into {}".format(_get(env, "PR_BASE") or "main")},
+        "author": {"name": ("Merged into {}" if merged else "Open against {}").format(base)},
         "title": _clip(heading, EMBED_TITLE),
         "description": _lead(_get(env, "PR_BODY")),
         "color": color,
@@ -181,7 +186,7 @@ def _self_test():
     # pr_embed: reads the event out of the environment it is handed
     env = {"GITHUB_REPOSITORY": "EricFinland/hearth-windows", "PR_NUMBER": "10",
            "PR_TITLE": "Discord alerts", "PR_URL": "https://github.com/x/y/pull/10",
-           "PR_AUTHOR": "ericfinland", "PR_BASE": "main",
+           "PR_AUTHOR": "ericfinland", "PR_BASE": "main", "PR_MERGED": "true",
            "PR_BODY": "Adds a channel.\n\n## Testing\n\nself-test"}
     e = pr_embed(env)
     assert e["title"] == "#10 Discord alerts", e["title"]
@@ -191,6 +196,17 @@ def _self_test():
     assert e["footer"] == {"text": "Hearth for Windows"}
     assert e["author"] == {"name": "Merged into main"}
     assert [f["name"] for f in e["fields"]] == ["Repository", "By"], e["fields"]
+
+    # an open pull request is never described as merged, however it is run
+    for state in ("false", "", "False", "yes", "1"):
+        openish = pr_embed(dict(env, PR_MERGED=state))
+        assert openish["author"] == {"name": "Open against main"}, (state, openish)
+    # only a plain true, in any case, counts as merged
+    for state in ("true", "TRUE", "True"):
+        assert pr_embed(dict(env, PR_MERGED=state))["author"] == {"name": "Merged into main"}
+    # the base branch is carried through, and defaults when absent
+    assert pr_embed({"PR_BASE": "release", "PR_MERGED": "true"})["author"] == {
+        "name": "Merged into release"}
 
     # an empty environment still produces a postable embed, never a crash
     bare = pr_embed({})
