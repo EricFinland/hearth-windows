@@ -239,12 +239,30 @@ fn sha256_of(path: &Path) -> std::io::Result<String> {
         .collect())
 }
 
-/// Run the verified installer. `/S` is the NSIS silent switch: the user has
-/// already been asked, with the version and the hash in front of them, and
-/// asking twice trains people to click through.
+/// The switches the installer is run with, and why each one is there.
+///
+/// * `/S` is the NSIS silent switch: the user has already been asked, with the
+///   version and the hash in front of them, and asking twice trains people to
+///   click through.
+/// * `/UPDATE` tells Tauri's NSIS template this is an update over an existing
+///   install: it does not re-create shortcuts the user may have deleted, skips
+///   the WebView2 bootstrap, and never runs the uninstaller's optional "delete
+///   app data" step. Models and settings live in %LOCALAPPDATA%\Hearth, which
+///   no part of the installer or uninstaller touches either way (see
+///   installer-hooks.nsi).
+/// * `/R` relaunches Hearth once the files are in place. Without it a silent
+///   update ends with no window at all, and "Install and restart" would only
+///   be half true.
+///
+/// These are the switches tauri-plugin-updater passes to the same template,
+/// so this is the template's supported update path rather than a reading of
+/// its internals.
+pub const INSTALLER_ARGS: [&str; 3] = ["/S", "/UPDATE", "/R"];
+
+/// Run the verified installer, detached, with INSTALLER_ARGS.
 pub fn launch(staged: &Staged) -> Result<(), String> {
     Command::new(&staged.path)
-        .arg("/S")
+        .args(INSTALLER_ARGS)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -275,6 +293,11 @@ mod tests {
         assert!(newer_than([1, 0, 0], [0, 99, 99]));
         assert!(!newer_than([0, 1, 0], [0, 1, 0]));
         assert!(!newer_than([0, 0, 9], [0, 1, 0]));
+    }
+
+    #[test]
+    fn the_installer_runs_silently_as_an_update_and_relaunches() {
+        assert_eq!(INSTALLER_ARGS, ["/S", "/UPDATE", "/R"]);
     }
 
     #[test]

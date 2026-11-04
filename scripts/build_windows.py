@@ -428,9 +428,9 @@ def verify_stage():
     #    an application that cannot verify an update -- which, unlike a missing
     #    GPU engine, is not a performance problem: it is a build with no way to
     #    deliver a security fix, and no user would ever see an error saying so.
-    #    The `configured` assertion is the other half: nothing has been
-    #    published, so a build whose pinned feed points at a resolvable host is
-    #    a build that was configured by accident.
+    #    The `configured` note is the other half: release builds check GitHub
+    #    Releases, so a build whose pinned feed cannot resolve is a build that
+    #    will never be offered an update, and that is worth saying out loud.
     probe = (
         "import sys, json; sys.path.insert(0, sys.argv[1]);"
         "import hearth_update as u;"
@@ -452,9 +452,10 @@ def verify_stage():
         raise SystemExit(
             "the staged payload cannot tell which version it is; the updater "
             "would refuse to run at all")
-    if updater["configured"]:
-        print("  NOTE: this build's update feed is {}, a resolvable host. Make "
-              "sure that is deliberate.".format(updater["feed"]))
+    if not updater["configured"]:
+        print("  NOTE: this build's update feed is {}, which cannot resolve, so "
+              "it will never find an update. Release builds point at GitHub "
+              "Releases.".format(updater["feed"]))
 
     # 5. The licence texts are in the payload. A build that silently drops
     #    them ships an installer that is out of compliance and looks

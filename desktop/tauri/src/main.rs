@@ -397,7 +397,8 @@ async fn install_update(
     // recomputed from the bytes on disk.
     let message = format!(
         "Install Hearth {}?\n\n\
-         Hearth {} will close and the installer will run.\n\n\
+         Hearth {} will close, the installer will run, and Hearth will open \
+         again when it is done. Your models, chats and settings are kept.\n\n\
          This installer was signed by {} and its contents match that signature.\n\n\
          {:.1} MB\nSHA-256: {}",
         staged.version,

@@ -12,6 +12,7 @@ import { blob } from "./safe-text.js";
 import { ShopView } from "./shop.js";
 import { LoopConfigPanel, LoopRunBar, account as loopAccount } from "./loop.js";
 import { SwarmConfigPanel, SwarmRunBar, account as swarmAccount } from "./swarm.js";
+import { renderUpdateBanner, showUpdateBannerAgain } from "./update-banner.js";
 import { renderUpdate } from "./update.js";
 
 const RECENTS_KEY = "hearth.recentWorkspaces"; // workspace paths only; the bearer token is never stored
@@ -435,7 +436,13 @@ const UPDATE_POLL_MS = 1000;
 
 /** True while the sidecar is doing something whose progress is worth watching. */
 function updateInFlight(snap) {
-  return Boolean(snap) && (snap.state === "checking" || snap.state === "downloading");
+  // `running` as well as the state: POST /update answers the instant the
+  // worker thread starts, which can be before that thread has set
+  // "checking" or "downloading". Reading only the state there would stop
+  // polling on a snapshot that is already out of date, and the launch
+  // check's answer would never be drawn.
+  return Boolean(snap) && (snap.state === "checking" || snap.state === "downloading"
+    || snap.running === true);
 }
 
 function scheduleUpdatePoll() {
@@ -466,6 +473,23 @@ function scheduleUpdatePoll() {
  *  with the hash in front of them. This page cannot name a file and cannot
  *  make anything run. */
 function renderUpdatePanel() {
+  renderUpdateBanner(updateSnapshot, {
+    onInstall: (button) => {
+      button.disabled = true;
+      installFromBanner();
+    },
+  });
+  // "Install now" on an update that still had to be downloaded: the click
+  // asked for the whole thing, so once the download is verified and staged,
+  // hand straight on to the shell (which still asks, with the hash shown).
+  if (updateInstallPending && updateSnapshot) {
+    if (updateSnapshot.state === "ready" && updateSnapshot.staged) {
+      updateInstallPending = false;
+      runUpdateInstall();
+    } else if (updateSnapshot.state !== "downloading" && updateSnapshot.state !== "available") {
+      updateInstallPending = false; // failed or cancelled; the panel says which
+    }
+  }
   renderUpdate(ui.updateBody, updateSnapshot, {
     onCheck: async (button) => {
       button.disabled = true;
@@ -503,23 +527,58 @@ function renderUpdatePanel() {
     },
     onInstall: async (button) => {
       button.disabled = true;
-      const result = await installUpdate();
-      if (result && result.error) {
-        updateSnapshot = { ...(updateSnapshot ?? {}), state: "failed", error: result.error };
-        renderUpdatePanel();
-        return;
-      }
-      if (result && result.cancelled) {
-        button.disabled = false;
-        return;
-      }
-      // Success means this window is about to close. Say so rather than
-      // leaving a dead button behind.
-      updateSnapshot = { ...(updateSnapshot ?? {}), state: "ready",
-        message: "Closing Hearth and starting the installer…" };
-      renderUpdatePanel();
+      const cancelled = await runUpdateInstall();
+      if (cancelled) button.disabled = false;
     },
   });
+}
+
+/** Set by the banner's "Install now" while the download it started is still
+ *  running; renderUpdatePanel hands over to runUpdateInstall once the
+ *  snapshot says the installer is verified and staged. */
+let updateInstallPending = false;
+
+/** Ask the shell to run the staged installer. Returns true when the user
+ *  said "Not now" in the shell's own dialog. */
+async function runUpdateInstall() {
+  const result = await installUpdate();
+  if (result && result.error) {
+    updateSnapshot = { ...(updateSnapshot ?? {}), state: "failed", failure: "error",
+      error: result.error };
+    renderUpdatePanel();
+    return false;
+  }
+  if (result && result.cancelled) {
+    renderUpdatePanel();
+    return true;
+  }
+  // Success means this window is about to close. Say so rather than
+  // leaving a dead button behind.
+  updateSnapshot = { ...(updateSnapshot ?? {}), state: "ready",
+    message: "Closing Hearth and starting the installer…" };
+  renderUpdatePanel();
+  return false;
+}
+
+/** The banner's "Install now": install a staged update at once, or download
+ *  one first and install it when it is verified. Same requests as the
+ *  panel's two buttons, in sequence; nothing here can run a file. */
+async function installFromBanner() {
+  showUpdateBannerAgain();
+  if (updateSnapshot && updateSnapshot.state === "ready" && updateSnapshot.staged) {
+    await runUpdateInstall();
+    return;
+  }
+  updateInstallPending = true;
+  try {
+    updateSnapshot = await sidecar.downloadUpdate();
+  } catch (err) {
+    updateInstallPending = false;
+    updateSnapshot = { ...(updateSnapshot ?? {}), state: "failed", failure: "error",
+      error: errorText(err) };
+  }
+  renderUpdatePanel();
+  scheduleUpdatePoll();
 }
 
 /** Read the updater's state once, kick off the one automatic check per

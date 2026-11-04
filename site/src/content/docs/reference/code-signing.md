@@ -117,9 +117,9 @@ The two protect different things and neither replaces the other:
 | Authenticode signature | a forged installer downloaded by a person | no certificate |
 | Ed25519 release signature | a forged update fetched by an install | already |
 
-[updates.md](/hearth-windows/concepts/updates/) documents the update path in full, including the fact
-that the shipped feed URL is a reserved name that can never resolve, so no
-install can currently fetch an update from anywhere at all.
+[updates.md](/hearth-windows/concepts/updates/) documents the update path in full, including how the
+release workflow signs each release's manifest with the key held in the
+`HEARTH_UPDATE_SIGNING_KEY` secret, and how that key is rotated.
 
 ## Verifying a release
 

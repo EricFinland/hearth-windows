@@ -130,9 +130,9 @@ built by GitHub Actions from this repository. [docs/download.md](/hearth-windows
 walks through installing one, including getting past the SmartScreen warning,
 with no programming knowledge needed. To build it yourself instead,
 [docs/getting-started.md](/hearth-windows/getting-started/install/) walks through that from an empty
-folder. There is no automatic update feed yet: `release/trust.json` points at
-`releases.hearth.invalid`, a name reserved so it cannot resolve, so updating
-means downloading the next installer from the releases page.
+folder. From the version after 0.1.1 on, Hearth checks the releases page on
+launch and installs a signed update in one click; 0.1.1 itself has to be
+updated by hand once. [docs/updates.md](/hearth-windows/concepts/updates/) has the details.
 
 ## What you need
 
