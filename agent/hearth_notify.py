@@ -9,6 +9,11 @@ that is configured, and stays silent when none are. Channels:
             (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID), sent via hearth_telegram.
   ntfy      plain-text POST to {HEARTH_NTFY_URL or https://ntfy.sh}/{topic}
             when HEARTH_NTFY_TOPIC is set.
+  Discord   JSON POST to a channel webhook, taken from the credentials
+            channel (discord_webhook) with env fallback
+            (DISCORD_WEBHOOK_URL). Only a real discord.com /api/webhooks/
+            endpoint is accepted, so a typo cannot quietly hand operator
+            alerts to a stranger.
 
 Kinds in use: done, error, tripwire, budget. Network I/O is injectable
 (post_fn) so it is testable with no real services. Best-effort throughout:
@@ -16,8 +21,10 @@ a notification failure must never break the caller. Standard library only.
 """
 
 import argparse
+import json
 import os
 import sys
+import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -26,6 +33,9 @@ import hearth_tools  # noqa: E402
 
 DEFAULT_NTFY_URL = "https://ntfy.sh"
 HTTP_TIMEOUT = 10
+DISCORD_HOSTS = ("discord.com", "discordapp.com", "ptb.discord.com",
+                 "canary.discord.com")
+DISCORD_LIMIT = 2000  # Discord rejects a message body longer than this
 
 
 def _telegram_creds():
@@ -34,6 +44,23 @@ def _telegram_creds():
     token = hearth_tools._resolve_cred("telegram_token") or os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat = hearth_tools._resolve_cred("telegram_chat") or os.environ.get("TELEGRAM_CHAT_ID", "")
     return token, chat
+
+
+def _discord_webhook():
+    """Resolve the Discord channel webhook: named credential first, env
+    fallback. Returns "" unless the value really is a Discord webhook
+    endpoint, so a misconfigured or swapped-in URL leaves the channel dormant
+    instead of posting operator alerts somewhere else."""
+    url = (hearth_tools._resolve_cred("discord_webhook")
+           or os.environ.get("DISCORD_WEBHOOK_URL", "")).strip()
+    if not url:
+        return ""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" or parts.hostname not in DISCORD_HOSTS:
+        return ""
+    if not parts.path.startswith("/api/webhooks/"):
+        return ""
+    return url
 
 
 def _default_post(url, data, headers):
@@ -67,13 +94,23 @@ def notify(kind, text, post_fn=None):
             sent += 1
     except Exception:  # noqa: BLE001 - alerting must never break the caller
         pass
+    # Discord (dormant until a channel webhook is configured)
+    try:
+        hook = _discord_webhook()
+        if hook:
+            body = json.dumps({"content": line[:DISCORD_LIMIT]}).encode("utf-8")
+            (post_fn or _default_post)(hook, body,
+                                       {"Content-Type": "application/json"})
+            sent += 1
+    except Exception:  # noqa: BLE001 - alerting must never break the caller
+        pass
     return sent
 
 
 def _self_test():
     saved = {}
     for k in ("HEARTH_NTFY_TOPIC", "HEARTH_NTFY_URL", "TELEGRAM_BOT_TOKEN",
-              "TELEGRAM_CHAT_ID", "CREDENTIALS_DIRECTORY"):
+              "TELEGRAM_CHAT_ID", "DISCORD_WEBHOOK_URL", "CREDENTIALS_DIRECTORY"):
         saved[k] = os.environ.pop(k, None)
     try:
         calls = []
@@ -99,6 +136,31 @@ def _self_test():
         notify("tripwire", "t", post_fn=spy)
         assert calls[-1][0] == "https://ntfy.example.com/alerts", calls[-1]
         assert calls[-1][2] == {"Title": "hearth tripwire"}, calls[-1]
+
+        # discord: a real webhook gets the line as JSON
+        os.environ.pop("HEARTH_NTFY_TOPIC")
+        os.environ["DISCORD_WEBHOOK_URL"] = "https://discord.com/api/webhooks/1/abc"
+        assert notify("error", "agent b crashed", post_fn=spy) == 1, "discord -> 1"
+        url, data, headers = calls[-1]
+        assert url == "https://discord.com/api/webhooks/1/abc", url
+        assert headers == {"Content-Type": "application/json"}, headers
+        assert json.loads(data.decode())["content"] == "hearth error: agent b crashed", data
+
+        # a long line is clipped to what Discord will accept
+        notify("done", "x" * 4000, post_fn=spy)
+        assert len(json.loads(calls[-1][1].decode())["content"]) == DISCORD_LIMIT
+
+        # not a Discord webhook endpoint: dormant, and no request made at all
+        for bad in ("http://discord.com/api/webhooks/1/a",
+                    "https://evil.example/api/webhooks/1/a",
+                    "https://discord.com/channels/1/2",
+                    "https://notdiscord.com/api/webhooks/1/a"):
+            os.environ["DISCORD_WEBHOOK_URL"] = bad
+            before = len(calls)
+            assert notify("done", "y", post_fn=spy) == 0, bad
+            assert len(calls) == before, bad
+        os.environ.pop("DISCORD_WEBHOOK_URL")
+        os.environ["HEARTH_NTFY_TOPIC"] = "alerts"
 
         # a raising post_fn is swallowed and simply not counted
         def boom(url, data, headers):
