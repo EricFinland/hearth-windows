@@ -234,7 +234,7 @@ it: `--resume` continues from the last turn that actually completed.
 
 | | |
 | --- | --- |
-| `agent/` | the engine: the agent loop, the permission gate, workspace containment, contained subprocesses, hardware detection, the model shop, checkpoint and undo, the injection and secret scanners, the signed updater, the cost ledger, the model fingerprint, the context autopsy |
+| `agent/` | the engine: the agent loop, the permission gate, workspace containment, contained subprocesses, hardware detection, the model shop, checkpoint and undo, the injection and secret scanners, the signed updater, and a shelf of instruments: the cost ledger, the model fingerprint, the context autopsy, transcript and timeline rendering, change attribution and workspace manifests, the status digest, scoped quotas and per-tool rate limits, the response cache, output condensing and tool-menu selection, transcript redaction, path allowlists, version eligibility, diff risk scoring, plan linting, the retry policy, JSON recovery, the stall watchdog, near-duplicate detection and the prompt store |
 | `desktop/server/` | the sidecar: a localhost HTTP layer over the engine, token-authenticated, started and owned by the shell |
 | `desktop/shell/` | the Electron shell, its fuse configuration, and the electron-builder packaging |
 | `desktop/ui/` | the interface: plain HTML, CSS and modules, no framework and no build step |
