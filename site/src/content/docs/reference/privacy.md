@@ -51,7 +51,7 @@ identifier the project assigned to you.
 | the update feed in `release/trust.json` | an update check | a request for a signed release manifest. **This is currently pointed at a reserved name that can never resolve**, so no install can reach an update host at all. See [updates.md](/hearth-windows/concepts/updates/) |
 | `html.duckduckgo.com` | you (or the agent, with your approval) use the web search tool | the search query |
 | a URL you give it | the agent fetches a page you or it named, with your approval under the active permission mode | an ordinary HTTPS request |
-| `ntfy.sh`, or a Telegram bot | only if you configure notifications yourself | the notification text you configured |
+| `ntfy.sh`, a Telegram bot, or a Discord channel webhook | only if you configure notifications yourself | the notification text you configured |
 
 Nothing in that table happens on a schedule you did not set, and nothing in it
 sends your prompts, your files, or your audit database.
