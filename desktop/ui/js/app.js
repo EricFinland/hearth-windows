@@ -10,6 +10,7 @@ import { Transcript } from "./transcript.js";
 import { el, icon, appendAll, clear, setText, neutralize, $ } from "./dom.js";
 import { blob } from "./safe-text.js";
 import { ShopView } from "./shop.js";
+import { startModelChip, modelLoadingHint } from "./model-chip.js";
 import { LoopConfigPanel, LoopRunBar, account as loopAccount } from "./loop.js";
 import { SwarmConfigPanel, SwarmRunBar, account as swarmAccount } from "./swarm.js";
 import { renderUpdate } from "./update.js";
@@ -1094,7 +1095,7 @@ function updateTurnUi() {
   if (state.running) {
     setComposerEnabled(false, loop
       ? "The work loop is running. Press Esc or Stop to end it."
-      : "Working. Press Esc or the stop button to interrupt.");
+      : (modelLoadingHint() || "Working. Press Esc or the stop button to interrupt."));
     setConn("busy", loop ? "work loop running" : "running");
   } else {
     const pending = state.loop && state.loop.pending;
@@ -1587,6 +1588,9 @@ async function boot() {
   // downloads or installs anything on its own: the automatic part is one
   // signed-JSON GET, and only if the user has left that on.
   watchUpdates();
+
+  // The titlebar model chip; it polls GET /model and never opens a stream.
+  startModelChip({ sidecar, isRunning: () => state.running, onChange: updateTurnUi });
 
   // The work loop gauge, likewise started before any session exists. Two
   // things depend on that: an unfinished run inherited from a restart has to

@@ -67,6 +67,7 @@ const SIDECAR_ROUTES = new Set([
   "/shop", "/shop/quants",
   "/downloads", "/downloads/events", "/downloads/cancel", "/downloads/dismiss",
   "/engine", "/engine/events",
+  "/model", "/model/unload", "/model/autounload",
   "/loop", "/loop/events",
   "/swarm", "/swarm/events",
   "/update", "/update/events",

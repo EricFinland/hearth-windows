@@ -32,6 +32,7 @@ const SIDECAR_ROUTES = new Set([
   "/shop", "/shop/quants",
   "/downloads", "/downloads/events", "/downloads/cancel", "/downloads/dismiss",
   "/engine", "/engine/events",
+  "/model", "/model/unload", "/model/autounload",
   "/loop", "/loop/events",
   "/swarm", "/swarm/events",
   "/update", "/update/events",
@@ -172,6 +173,17 @@ export class Sidecar {
    *  the fetch runs on the sidecar's own thread and Hearth stays usable on
    *  the bundled CPU engine while it happens. */
   fetchEngine(force = false) { return this.request("POST", "/engine", { force }); }
+
+  /** The resident model: what it is, loaded or not, roughly how much memory
+   *  it holds, whether anything is using it, and the idle auto-unload delay.
+   *  Polled with plain GETs on purpose (see model-chip.js): the page already
+   *  holds as many event streams as WebView2 will give it. */
+  model()              { return this.request("GET", "/model"); }
+  /** Free the model's memory now. A 409 HttpError carries the reason it is
+   *  in use; the next prompt reloads the model. */
+  unloadModel()        { return this.request("POST", "/model/unload", {}); }
+  /** Set the idle delay: 5, 15, 30 or 60 minutes, or null for never. */
+  setModelAutoUnload(minutes) { return this.request("POST", "/model/autounload", { minutes }); }
 
   /** Open GET /engine/events and call `onSnapshot(snapshot)` per frame.
    *  Same contract as streamDownloads: every frame is the whole state. */
