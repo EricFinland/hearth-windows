@@ -273,6 +273,7 @@ if _AGENT_DIR not in sys.path:
 
 import hearth_backend  # noqa: E402
 import hearth_checkpoint  # noqa: E402
+import hearth_diff  # noqa: E402
 import hearth_engine  # noqa: E402
 import hearth_hw  # noqa: E402
 import hearth_idle  # noqa: E402
@@ -1432,6 +1433,17 @@ class RealEngine:
                                 display_args[_SECRET_SCAN_ARG_KEY[name]] = hearth_secrets.redact(
                                     write_content, secrets_scan["findings"])
 
+                        # What the write would actually change, worked out from
+                        # the REAL cargs (display_args may be a redacted copy, and
+                        # a diff of redaction markers is not the write) against
+                        # the file on disk. hearth_diff redacts its own output and
+                        # caps it, and approval_preview never raises: a preview
+                        # that fails leaves the card showing raw arguments, as it
+                        # did before previews existed. None for every tool that
+                        # does not write files, and for a write the tool itself
+                        # is going to refuse.
+                        write_diff = hearth_diff.approval_preview(name, cargs, ctx.workspace)
+
                         # Each scanner's finding rides as its own honestly-
                         # named argument -- session.py's own to edit this
                         # iteration, see the module docstring's point 4 --
@@ -1441,7 +1453,8 @@ class RealEngine:
                         decision = ctx.request_approval(
                             name, display_args,
                             injection_finding=injection_finding,
-                            secrets_finding=secrets_finding)
+                            secrets_finding=secrets_finding,
+                            diff=write_diff)
                         if decision != "allow":
                             cancelled_now = ctx.cancelled()
                             result_text = "denied: turn cancelled" if cancelled_now else "denied by user"
@@ -1632,6 +1645,15 @@ def _self_test():
     # injection_finding at all -- an ordinary approval's event shape is
     # unchanged from before this iteration's wiring existed.
     assert "injection_finding" not in appr_event["data"], appr_event
+    # The write is previewed against the real workspace: x.txt does not
+    # exist yet, so the card gets a one-file, all-added diff of exactly the
+    # content the tool will write.
+    appr_diff = appr_event["data"].get("diff")
+    assert appr_diff is not None, "a gated write_file must carry a diff preview: {}".format(appr_event)
+    assert [f["path"] for f in appr_diff["files"]] == ["x.txt"], appr_diff
+    assert appr_diff["files"][0]["status"] == "added", appr_diff
+    assert appr_diff["files"][0]["hunks"][0]["lines"] == [["+", "hi"]], appr_diff
+    json.dumps(appr_event)  # the persisted, replayed event stays serialisable
     assert sess.resolve_approval(approval_id, True) is True
 
     _wait_for_kind(sess, "done")
@@ -2383,6 +2405,13 @@ def _self_test():
         "the approval_request event's own args still carried the raw secret: {}".format(apprN)
     )
     assert "[REDACTED:" in apprN["data"]["args"]["content"], apprN
+    # ... and so must the diff preview, which is computed from the REAL
+    # arguments (it has to be, to be a diff of the actual write) and is
+    # therefore the one field on this event that saw the raw key at all.
+    diffN = apprN["data"].get("diff")
+    assert diffN is not None, apprN
+    assert real_key not in json.dumps(diffN), "the raw secret leaked into the diff preview"
+    assert "[REDACTED:" in json.dumps(diffN), diffN
 
     sessN.resolve_approval(apprN["data"]["id"], True)
     _wait_for_kind(sessN, "done")

@@ -34,6 +34,7 @@
 
 import { renderProse, blob, labelledBlob } from "./safe-text.js";
 import { Transcript } from "./transcript.js";
+import { renderDiff } from "./diff.js";
 import { el } from "./dom.js";
 import {
   renderModelCard, renderQuantRow, renderDownloadRow, renderDownloads,
@@ -505,6 +506,72 @@ for (const payload of [PAYLOADS[0], PAYLOADS[5]]) {
       completion: { done: true, verified: false, detail: payload },
     }, payload, HOSTILE_BLIND))));
 }
+
+// ---------------------------------------------------------------------------
+// The diff component.
+//
+// A file-write approval card now leads with a diff (js/diff.js), and the
+// restore dialog draws the same component. Every string in it comes from a
+// file or from the model: the path, every line, the notes and the hidden
+// reason the sidecar attaches, and the status field too (an unknown status
+// must fall back to a fixed label, not be echoed). Each payload is planted in
+// all of them at once, in every row shape the renderer has (added, removed,
+// context, a folded run, a cut line, a gap), and every fold and "show more"
+// button is clicked, so the rows drawn lazily are inspected as well as the
+// first screen.
+// ---------------------------------------------------------------------------
+
+function hostileDiff(payload) {
+  const context = Array.from({ length: 12 }, () => [" ", payload]);
+  return {
+    added: 2, removed: 1, truncated: true, files_total: 2, files_omitted: 0,
+    files: [
+      {
+        path: payload, status: "modified", added: 2, removed: 1, truncated: true,
+        notes: [payload], redacted_lines: 1,
+        hunks: [
+          { old_start: 1, old_count: 13, new_start: 1, new_count: 14,
+            lines: [...context.slice(0, 6), ["-", payload], ["+", payload], ["+", payload, 40],
+                    ...context.slice(6)] },
+          { old_start: 40, old_count: 1, new_start: 41, new_count: 1, lines: [[" ", payload]] },
+        ],
+      },
+      { path: payload, status: payload, added: null, removed: null, hunks: [],
+        truncated: false, hidden_reason: payload },
+    ],
+  };
+}
+
+function expandDiff(host) {
+  for (let i = 0; i < 50; i++) {
+    const button = host.querySelector(".dv-fold, .dv-more");
+    if (!button) break;
+    button.click();
+  }
+}
+
+for (const payload of PAYLOADS) {
+  check("diff (path, lines, notes, hidden reason)", payload, probe((host) => {
+    host.appendChild(renderDiff(hostileDiff(payload)));
+    expandDiff(host);
+  }));
+  check("approval card with a diff", payload, probe((host) => {
+    new Transcript(host).addApproval({
+      id: "appr-diff", tool: "edit_file",
+      args: { path: payload, find: payload, replace: payload },
+      diff: hostileDiff(payload),
+    }, () => {});
+    expandDiff(host);
+  }));
+}
+
+// A diff whose fields are the wrong shape entirely must still draw (a card
+// that throws is a card nobody can answer) and still keep its text inert.
+check("diff with malformed fields", PAYLOADS[0], probe((host) => host.appendChild(renderDiff({
+  files: [null, "x", { path: PAYLOADS[0], hunks: [null, { lines: [null, [PAYLOADS[0]],
+    ["+", { toString: () => PAYLOADS[1] }], ["?", PAYLOADS[2], -5]] }] }],
+  added: "lots", files_total: -1,
+}))));
 
 // ---------------------------------------------------------------------------
 // The Updates panel.
@@ -993,6 +1060,35 @@ BIDI_SURFACES.push(
     build: (host, text) => host.appendChild(updateCard(bidiUpdate("current_version", text), {})) },
 );
 
+/* The diff component. A line of a diff is now the approval card's payload, so
+ * it is measured on its own, inside an approval card as well as bare; the path
+ * header names the file being written; the hidden reason is sidecar prose but
+ * is still measured, since it sits where file text otherwise would. */
+function bidiDiff(field, text) {
+  const file = {
+    path: "src/app.py", status: "modified", added: 1, removed: 0, truncated: false,
+    hunks: [{ old_start: 1, old_count: 0, new_start: 1, new_count: 1, lines: [["+", "x = 1"]] }],
+  };
+  if (field === "line") file.hunks[0].lines = [["+", text]];
+  if (field === "path") file.path = text;
+  if (field === "hidden") { file.hunks = []; file.hidden_reason = text; }
+  return { files: [file], added: 1, removed: 0, truncated: false, files_total: 1, files_omitted: 0 };
+}
+
+BIDI_SURFACES.push(
+  { label: "diff line text", selector: ".dv-line .dv-text",
+    build: (host, text) => host.appendChild(renderDiff(bidiDiff("line", text))) },
+  { label: "diff file path", selector: ".dv-path",
+    build: (host, text) => host.appendChild(renderDiff(bidiDiff("path", text))) },
+  { label: "diff hidden reason", selector: ".dv-hidden",
+    build: (host, text) => host.appendChild(renderDiff(bidiDiff("hidden", text))) },
+  { label: "approval card diff line", selector: ".card-approval .dv-text",
+    build: (host, text) => new Transcript(host).addApproval({
+      id: "b", tool: "write_file", args: { path: "a.txt", content: text },
+      diff: bidiDiff("line", text),
+    }, () => {}) },
+);
+
 function bidiHost(label) {
   const host = el("div", { class: "bidi-probe" }, [el("div", { class: "bidi-label", text: label })]);
   bidiProbes.appendChild(host);
@@ -1072,6 +1168,7 @@ const LEGIT_SURFACE_LABELS = new Set([
   "renderProse paragraph", "blob (tool output, file bodies)",
   "approval card subtitle", "approval card command payload",
   "tool card argument row", "shop model name", "shop model description",
+  "diff line text", "diff file path",
 ]);
 
 for (const surface of BIDI_SURFACES.filter((s) => LEGIT_SURFACE_LABELS.has(s.label))) {

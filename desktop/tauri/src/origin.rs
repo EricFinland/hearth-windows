@@ -71,6 +71,7 @@ pub const SIDECAR_ROUTES: &[&str] = &[
     "/cancel",
     "/models",
     "/checkpoints",
+    "/checkpoints/diff",
     "/restore",
     "/setup",
     "/idle",
