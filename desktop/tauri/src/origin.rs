@@ -88,6 +88,11 @@ pub const SIDECAR_ROUTES: &[&str] = &[
     "/swarm/events",
     "/update",
     "/update/events",
+    "/mcp",
+    "/mcp/save",
+    "/mcp/toggle",
+    "/mcp/remove",
+    "/mcp/test",
 ];
 
 /// The UI loads nothing from anywhere but itself and talks to nothing but its

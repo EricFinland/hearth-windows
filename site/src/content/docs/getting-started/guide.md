@@ -114,7 +114,8 @@ Since that list was written, the parts it called missing were built: a Tauri
 shell in Rust (`desktop/tauri/`), the interface (`desktop/ui/`, plain HTML and
 ES modules, no framework and no build step), an installer that
 `scripts/build_windows.py` produces in one command, a bundled inference
-engine, an MCP client ([docs/mcp.md](/hearth-windows/concepts/mcp/)), and a signed updater
+engine, an MCP client with a Tools tab for adding and testing servers
+([docs/mcp.md](/hearth-windows/concepts/mcp/)), and a signed updater
 ([docs/updates.md](/hearth-windows/concepts/updates/)). The model shop has a screen now rather than
 only an API.
 

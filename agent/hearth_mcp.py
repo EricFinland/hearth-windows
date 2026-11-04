@@ -258,34 +258,44 @@ def _clean_server(key, raw):
     Rejects rather than coerces: a config that does not say exactly what to run
     should not be guessed at, because the guess is a process launch.
     """
-    def bad(why):
+    entry, why = check_server(key, raw)
+    if entry is None:
         print("[hearth-mcp] ignoring server {!r}: {}".format(key, why), file=sys.stderr)
-        return None
+    return entry
 
+
+def check_server(key, raw):
+    """(entry, None) for a usable server entry, or (None, reason).
+
+    The same rules load_config applies, returned instead of printed, so the
+    app's MCP panel can tell a person WHY a hand-edited entry is being
+    ignored rather than just leaving it out of the list. One function, so the
+    panel and the loader cannot come to disagree about what is runnable.
+    """
     if not isinstance(raw, dict):
-        return bad("entry is not an object")
+        return None, "entry is not an object"
     command = raw.get("command")
     if not isinstance(command, str) or not command.strip():
-        return bad("missing a string 'command'")
+        return None, "missing a string 'command'"
     args = raw.get("args", [])
     if not isinstance(args, list) or any(not isinstance(a, str) for a in args):
-        return bad("'args' must be a list of strings")
+        return None, "'args' must be a list of strings"
     env = raw.get("env", {})
     if not isinstance(env, dict) or any(
             not isinstance(k, str) or not isinstance(v, str) for k, v in env.items()):
-        return bad("'env' must be an object of string to string")
+        return None, "'env' must be an object of string to string"
     risk = raw.get("risk", {})
     if not isinstance(risk, dict):
-        return bad("'risk' must be an object of tool name to risk class")
+        return None, "'risk' must be an object of tool name to risk class"
     cwd = raw.get("cwd")
     if cwd is not None and not isinstance(cwd, str):
-        return bad("'cwd' must be a string")
+        return None, "'cwd' must be a string"
     try:
         timeout = float(raw.get("timeout", CALL_TIMEOUT))
     except (TypeError, ValueError):
-        return bad("'timeout' must be a number")
+        return None, "'timeout' must be a number"
     if timeout <= 0:
-        return bad("'timeout' must be positive")
+        return None, "'timeout' must be positive"
     return {
         "key": sanitize(key),
         "command": command,
@@ -295,7 +305,7 @@ def _clean_server(key, raw):
         "enabled": raw.get("enabled", True) is not False,
         "timeout": timeout,
         "risk": {str(k): str(v) for k, v in risk.items()},
-    }
+    }, None
 
 
 def load_config(path=None):
@@ -311,7 +321,12 @@ def load_config(path=None):
               file=sys.stderr)
         return {}
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        # utf-8-sig, not utf-8: this file is meant to be edited by hand, and
+        # Notepad (among others) saves UTF-8 with a byte-order mark that plain
+        # utf-8 decoding hands to json.load as a stray U+FEFF, which it then
+        # refuses. That used to switch MCP off with nothing but a stderr line
+        # to say why. utf-8-sig reads both, and writes are never this path.
+        with open(path, "r", encoding="utf-8-sig") as fh:
             data = json.load(fh)
     except (OSError, ValueError) as exc:
         print("[hearth-mcp] could not read {}: {}".format(path, exc), file=sys.stderr)
@@ -442,9 +457,10 @@ class MCPClient(object):
         threading.Thread(target=self._read_stderr, daemon=True,
                          name="mcp-{}-err".format(self.key)).start()
 
-    def start(self):
+    def start(self, timeout=None):
         """Spawn and complete the initialize handshake. Returns the server's own
-        description of itself."""
+        description of itself. `timeout` defaults to START_TIMEOUT; the app's
+        Test button passes a shorter one, because a person is watching it."""
         if self.proc is not None:
             raise MCPError("client for {!r} already started".format(self.key))
         self._spawn()
@@ -453,7 +469,7 @@ class MCPClient(object):
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {},
                 "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION},
-            }, timeout=START_TIMEOUT)
+            }, timeout=START_TIMEOUT if timeout is None else timeout)
         except MCPError:
             self.stop()
             raise
@@ -666,18 +682,20 @@ class MCPClient(object):
 
     # -- protocol ----------------------------------------------------------
 
-    def list_tools(self):
+    def list_tools(self, timeout=None):
         """Every tool the server offers, following `nextCursor` pagination.
 
         The page loop is bounded: a server that returns the same cursor forever
         would otherwise be an infinite loop wearing a protocol's clothes.
+        `timeout` bounds each page and defaults to LIST_TIMEOUT.
         """
+        timeout = LIST_TIMEOUT if timeout is None else timeout
         tools = []
         cursor = None
         seen_cursors = set()
         for _ in range(50):
             params = {"cursor": cursor} if cursor else {}
-            result = self._request("tools/list", params, timeout=LIST_TIMEOUT)
+            result = self._request("tools/list", params, timeout=timeout)
             if not isinstance(result, dict):
                 raise MCPError("MCP server {!r} sent a malformed tools/list".format(self.key))
             page = result.get("tools")
@@ -932,6 +950,155 @@ def shutdown():
             _registry = None
 
 
+def invalidate():
+    """Forget everything the process-wide registry knows, after a config change.
+
+    shutdown() stops the servers, which is half of it. The other half is the
+    risk classes _register_risks wrote into permissions.RISK: left behind,
+    a tool from a server that was just removed would keep its old class. It
+    would not be callable (it is no longer in any manifest, and the manifest
+    caps every mode), but a table that describes tools which no longer exist
+    is how a later bug turns into a permission one. Clearing every `mcp__`
+    entry is safe in the other direction too: a tool that has not been
+    re-registered yet is unknown, and unknown is already "dangerous".
+
+    The next descriptors() call builds a fresh Registry from the file as it
+    now stands, which is what makes "a disabled server is never launched"
+    hold for the server that was just disabled, not only for the ones that
+    were disabled when hearth started.
+    """
+    shutdown()
+    for name in [n for n in list(permissions.RISK) if n.startswith(PREFIX)]:
+        permissions.RISK.pop(name, None)
+
+
+MAX_REPORTED_TOOLS = 200   # tools described per server by status() and probe_server()
+
+
+def _tool_summary(tool_def, risk, full=None):
+    """One MCP tool as plain data a UI can show: its names, the risk class it
+    landed in, and a one-paragraph description. Everything except `risk` and
+    `derived` is text from the server, so it is bounded here and rendered as
+    text, never markup, wherever it is shown."""
+    schema = tool_def.get("inputSchema") if isinstance(tool_def, dict) else None
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    required = schema.get("required") if isinstance(schema, dict) else None
+    props = [str(p)[:100] for p in props][:50] if isinstance(props, dict) else []
+    required = [str(r)[:100] for r in required][:50] if isinstance(required, list) else []
+    desc = tool_def.get("description") or tool_def.get("title") or ""
+    return {
+        "name": str(tool_def.get("name", ""))[:200],
+        "full_name": full or "",
+        "risk": risk,
+        "derived": derive_risk(tool_def),
+        "description": _one_paragraph(desc, 300) if desc else "",
+        "required": required,
+        "optional": [p for p in props if p not in required],
+    }
+
+
+def status():
+    """What the process-wide registry is doing, per server, WITHOUT starting
+    anything. The app's MCP panel calls this on every refresh, so it must
+    never be the thing that launches a server.
+
+    `loaded` is False until the first turn that needed tools has connected to
+    every enabled server. `busy` means the registry lock was held when we
+    looked: it is connecting right now (a handshake can take a while), or a
+    tool call is in flight. Neither is waited for, because a status read that
+    queued behind a two-minute tool call would freeze the panel. The
+    dictionaries are copied without the lock instead; list() over a dict's
+    items is a single step under CPython's GIL, so the worst a racing read
+    can show is the state of a moment earlier.
+    """
+    with _registry_lock:
+        reg = _registry
+    if reg is None:
+        return {"loaded": False, "busy": False, "servers": {}}
+    got = reg._lock.acquire(blocking=False)
+    try:
+        loaded = reg._loaded
+        errors = list(reg.errors.items())
+        clients = list(reg.clients.items())
+        tools = sorted(list(reg.tools.items()))
+    finally:
+        if got:
+            reg._lock.release()
+    servers = {}
+    for key, why in errors:
+        servers[key] = {"state": "error", "error": str(why), "guarded": False,
+                        "tool_count": 0, "tools": []}
+    for key, client in clients:
+        alive = client.alive
+        servers[key] = {
+            "state": "running" if alive else "exited",
+            "error": None if alive else "the server exited{}".format(client._stderr_note()),
+            "guarded": bool(client.guarded),
+            "tool_count": 0,
+            "tools": [],
+        }
+    for full, meta in tools:
+        srv = servers.get(meta["server"])
+        if srv is None:
+            continue
+        srv["tool_count"] += 1
+        if len(srv["tools"]) < MAX_REPORTED_TOOLS:
+            srv["tools"].append(_tool_summary(meta["def"], meta["risk"], full))
+    return {"loaded": bool(loaded), "busy": not got, "servers": servers}
+
+
+def probe_server(entry, start_timeout=START_TIMEOUT, list_timeout=LIST_TIMEOUT):
+    """Start ONE server on its own, handshake, list its tools, stop it, and
+    say what happened: the operator's question "what does this actually
+    expose, and how risky is each tool?" answered as data, for `--live` and
+    for the app's Test button alike.
+
+    Always a private MCPClient, never the shared registry: a test must not
+    leave a process behind for the next turn to inherit, and must not swap
+    out a server a turn is in the middle of using. The client is stopped in
+    `finally`, so a failed or timed-out probe leaves nothing running either.
+
+    Never raises for the server's own failures; `ok` is False and `error`
+    says why. A disabled entry is refused without being started. Callers are
+    expected to refuse it first; this is the second lock on the same door.
+    """
+    t0 = time.monotonic()
+    out = {"ok": False, "error": None, "server_info": {}, "protocol": None,
+           "capabilities": [], "instructions": "", "guarded": False,
+           "tool_count": 0, "tools": [], "elapsed": 0.0}
+    if not entry.get("enabled", True):
+        out["error"] = "this server is disabled; enable it before testing it"
+        return out
+    client = MCPClient(entry["key"], entry["command"], entry.get("args") or [],
+                       entry.get("env") or {}, entry.get("cwd"),
+                       entry.get("timeout", CALL_TIMEOUT))
+    try:
+        info = client.start(timeout=start_timeout)
+        srv = client.server_info if isinstance(client.server_info, dict) else {}
+        out["server_info"] = {"name": str(srv.get("name", ""))[:200],
+                              "version": str(srv.get("version", ""))[:100]}
+        out["protocol"] = str(info.get("protocolVersion", ""))[:50]
+        caps = client.capabilities if isinstance(client.capabilities, dict) else {}
+        out["capabilities"] = sorted(str(k)[:50] for k in caps)[:20]
+        if isinstance(client.instructions, str) and client.instructions:
+            out["instructions"] = _one_paragraph(client.instructions, 600)
+        out["guarded"] = bool(client.guarded)
+        tools = client.list_tools(timeout=list_timeout)
+        risks = entry.get("risk") or {}
+        out["tool_count"] = len(tools)
+        out["tools"] = [
+            _tool_summary(t, clamp_risk(derive_risk(t), risks.get(t["name"])),
+                          tool_name(entry["key"], t["name"]))
+            for t in tools[:MAX_REPORTED_TOOLS]]
+        out["ok"] = True
+    except MCPError as exc:
+        out["error"] = str(exc)
+    finally:
+        client.stop()
+        out["elapsed"] = round(time.monotonic() - t0, 2)
+    return out
+
+
 # --------------------------------------------------------------------------
 # Tests
 # --------------------------------------------------------------------------
@@ -1156,6 +1323,20 @@ def _self_test():
         assert cfg["good"]["args"] == ["a"] and cfg["good"]["enabled"] is True
         assert cfg["off"]["enabled"] is False
         assert cfg["good"]["timeout"] == CALL_TIMEOUT
+
+        # check_server says WHY, for the app's panel, and agrees with the
+        # loader about what is runnable because the loader is built on it
+        assert check_server("x", {"command": "x"})[1] is None
+        assert check_server("x", {"args": []}) == (None, "missing a string 'command'")
+        assert "list of strings" in check_server("x", {"command": "x", "args": [1]})[1]
+        assert check_server("x", ["x"])[1] == "entry is not an object"
+
+        # A byte-order mark is how Notepad saves UTF-8. It must not switch MCP
+        # off: this is a file people are told to edit by hand.
+        with open(cfg_path, "wb") as fh:
+            fh.write(b"\xef\xbb\xbf" + json.dumps(
+                {"servers": {"bom": {"command": "x"}}}).encode("utf-8"))
+        assert sorted(load_config()) == ["bom"], "a UTF-8 BOM must not hide the config"
 
         if not hearth_paths.is_windows():
             os.chmod(cfg_path, 0o666)
@@ -1415,6 +1596,74 @@ def _self_test():
         finally:
             reg3.close()
 
+        # --- probe_server: the Test button and --live -------------------
+        entry = {"key": "fake", "command": sys.executable, "args": [server_py, "ok"],
+                 "env": {}, "cwd": None, "enabled": True, "timeout": 20,
+                 "risk": {"peek": "dangerous", "poke": "safe"}}
+        rep = probe_server(entry, start_timeout=20, list_timeout=20)
+        assert rep["ok"] is True and rep["error"] is None, rep
+        assert rep["server_info"] == {"name": "fake", "version": "0.0.1"}, rep
+        assert rep["tool_count"] == 4 and "tools" in rep["capabilities"], rep
+        by = {t["name"]: t for t in rep["tools"]}
+        assert by["peek"]["risk"] == "dangerous" and by["peek"]["derived"] == "safe", \
+            "a probe must report the clamped class, and what the server claimed"
+        assert by["poke"]["risk"] == "dangerous", "config must not loosen a probe either"
+        assert by["peek"]["full_name"] == "mcp__fake__peek"
+        assert by["peek"]["required"] == ["q"] and by["peek"]["description"] == "read something"
+        # a disabled entry is refused without a process ever being started
+        rep = probe_server(dict(entry, enabled=False))
+        assert rep["ok"] is False and "disabled" in rep["error"], rep
+        assert rep["elapsed"] == 0.0, "a disabled server must not be started to be refused"
+        # a silent server fails inside the short bound the Test button uses
+        t0 = time.monotonic()
+        rep = probe_server(dict(entry, key="silent", args=[server_py, "silent"]),
+                           start_timeout=2, list_timeout=2)
+        assert rep["ok"] is False and "did not answer" in rep["error"], rep
+        assert time.monotonic() - t0 < 30, "a probe of a silent server overran its bound"
+        # a command that does not exist is a reported failure, not an exception
+        rep = probe_server(dict(entry, command=os.path.join(ws, "nope.exe")))
+        assert rep["ok"] is False and rep["error"], rep
+
+        # --- status() and invalidate(): what the app's panel relies on ----
+        shutdown()
+        assert status() == {"loaded": False, "busy": False, "servers": {}}, \
+            "status() must report, never start, a registry"
+        _write(cfg_path, json.dumps({"servers": {
+            "fake": {"command": sys.executable, "args": [server_py, "ok"], "timeout": 20},
+            "off": {"command": sys.executable, "args": [server_py, "ok"],
+                    "enabled": False}}}))
+        saved_risk = dict(permissions.RISK)
+        try:
+            names = sorted(d["name"] for d in descriptors())
+            assert names == ["mcp__fake__peek", "mcp__fake__plain",
+                             "mcp__fake__poke", "mcp__fake__surf"], names
+            st = status()
+            assert st["loaded"] is True and st["busy"] is False, st
+            assert sorted(st["servers"]) == ["fake"], "a disabled server must never start"
+            assert st["servers"]["fake"]["state"] == "running", st
+            assert st["servers"]["fake"]["tool_count"] == 4, st
+            assert permissions.risk_of("mcp__fake__peek") == "safe"
+            live = registry().clients["fake"]
+
+            # disable it in the file, as the panel would, and invalidate
+            _write(cfg_path, json.dumps({"servers": {
+                "fake": {"command": sys.executable, "args": [server_py, "ok"],
+                         "enabled": False}}}))
+            invalidate()
+            assert not live.alive, "invalidate() must stop the old server"
+            assert not [n for n in permissions.RISK if n.startswith(PREFIX)], \
+                "invalidate() must forget every MCP risk entry"
+            assert status()["servers"] == {}
+            assert descriptors() == [], \
+                "a server disabled after startup must not be relaunched"
+            assert status()["servers"] == {}, status()
+            assert permissions.risk_of("mcp__fake__peek") == "dangerous", \
+                "a forgotten tool must read as unknown, which is dangerous"
+        finally:
+            invalidate()
+            permissions.RISK.clear()
+            permissions.RISK.update(saved_risk)
+
         # no config at all: no tools, no subprocess, no cost
         os.environ["HEARTH_MCP_CONFIG"] = os.path.join(ws, "absent.json")
         shutdown()
@@ -1436,7 +1685,8 @@ def _live_report():
 
     The operator-facing half of this module: it is how you find out what a
     server actually exposes, and what risk class each tool lands in, before
-    letting a model near it.
+    letting a model near it. The work is probe_server's, the same function
+    behind the app's Test button, so the two cannot report differently.
     """
     cfg = load_config()
     if not cfg:
@@ -1449,31 +1699,22 @@ def _live_report():
         if not entry["enabled"]:
             print("  (disabled)")
             continue
-        client = MCPClient(key, entry["command"], entry["args"], entry["env"],
-                           entry["cwd"], entry["timeout"])
-        try:
-            info = client.start()
-            print("  initialize: protocol={} name={} version={}".format(
-                info.get("protocolVersion"),
-                client.server_info.get("name"), client.server_info.get("version")))
-            print("  capabilities: {}".format(json.dumps(client.capabilities)))
-            if client.instructions:
-                print("  instructions: {}".format(client.instructions))
-            print("  orphan guard engaged: {}".format(client.guarded))
-            tools = client.list_tools()
-            print("  {} tools:".format(len(tools)))
-            for t in tools:
-                derived = derive_risk(t)
-                final = clamp_risk(derived, entry["risk"].get(t["name"]))
-                props = list((t.get("inputSchema") or {}).get("properties") or {})
-                req = (t.get("inputSchema") or {}).get("required") or []
-                print("    {:<28} risk={:<9} required={} optional={}".format(
-                    t["name"], final, req, [p for p in props if p not in req]))
-        except MCPError as exc:
-            print("  FAILED: {}".format(exc))
+        report = probe_server(entry)
+        if not report["ok"]:
+            print("  FAILED: {}".format(report["error"]))
             rc = 1
-        finally:
-            client.stop()
+            continue
+        print("  initialize: protocol={} name={} version={}".format(
+            report["protocol"], report["server_info"].get("name"),
+            report["server_info"].get("version")))
+        print("  capabilities: {}".format(", ".join(report["capabilities"]) or "(none)"))
+        if report["instructions"]:
+            print("  instructions: {}".format(report["instructions"]))
+        print("  orphan guard engaged: {}".format(report["guarded"]))
+        print("  {} tools:".format(report["tool_count"]))
+        for t in report["tools"]:
+            print("    {:<28} risk={:<9} required={} optional={}".format(
+                t["name"], t["risk"], t["required"], t["optional"]))
     return rc
 
 
