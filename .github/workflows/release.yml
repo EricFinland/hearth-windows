@@ -175,8 +175,6 @@ jobs:
 
           ### Known gaps
 
-          - AMD and Intel GPU memory is under-reported, so those machines
-            offload less than they could and run slower than they should.
           - No cloud API keys. Local models only.
 
           Built from \`${{ github.sha }}\`.

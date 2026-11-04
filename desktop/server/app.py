@@ -1505,6 +1505,12 @@ class SidecarHandler(BaseHTTPRequestHandler):
             return
         try:
             checkpoints = engine_mod.hearth_checkpoint.list_checkpoints(s.workspace)
+        except engine_mod.hearth_checkpoint.CheckpointBusy:
+            # A checkpoint or restore is writing the store right now. That
+            # is "ask again in a moment", not a broken history, and the
+            # page retries a 503 once rather than reporting it.
+            self._send_json(503, {"error": "checkpoint_store_busy"})
+            return
         except Exception as exc:  # noqa: BLE001
             self._send_json(500, {"error": "checkpoint_list_failed: {}".format(exc)})
             return

@@ -144,16 +144,28 @@ shop has an interface to show it in.
 
 Every verdict is graded against a VRAM reading, and that reading is not
 always precise. On Windows, `nvidia-smi` gives an exact figure when it's
-available. When it isn't, detection falls back to PowerShell or the
-deprecated `wmic`, both of which read
-`Win32_VideoController.AdapterRAM` - a signed 32-bit field that misreports
-any card above roughly 4GB, sometimes reading low, sometimes reading a
+available. When it isn't, which is every AMD and Intel machine, detection
+lists the adapters through PowerShell or the deprecated `wmic` and reads
+each one's memory from its display driver's registry entry
+(`HardwareInformation.qwMemorySize`, a 64-bit value and the one Task
+Manager shows). That is exact for every vendor. The adapter is matched to
+its own driver entry through its device instance, so the entry a removed
+card left behind is never mistaken for the card in the machine.
+
+Only when the driver has written no such value does detection fall back to
+`Win32_VideoController.AdapterRAM` - a 32-bit field that misreports any
+card above roughly 4GB, sometimes capping at 4GB, sometimes reading a
 wrapped or even negative value. Every reading that comes from that fallback
 path is marked `approximate`, and the verdict logic checks that flag
 explicitly: a result that would otherwise be `great` on an approximate
 reading is downgraded to `good`, because a confident "great" built on a
 guessed VRAM number isn't actually great. Anywhere the shop shows you a
 verdict, it's obligated to also say when the number behind it is a guess.
+
+Exact is not the same as dedicated. An integrated GPU's figure is the
+small slice of system RAM its driver reserves (512MB on a Radeon 880M),
+read precisely, and the shop still grades it as shared memory rather than
+VRAM.
 
 ## What's built, what's still just data
 

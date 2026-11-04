@@ -123,7 +123,12 @@ KNOWN CORRECTNESS HOLES, HANDLED HERE, NOT LEFT FOR SOMEONE TO DISCOVER:
   directory, held for the whole staging+commit or staging+diff+read-tree
   critical section of checkpoint() and restore() against the same workspace,
   rather than leaning on git's unrelated locking or leaving the race
-  undocumented.
+  undocumented. list_checkpoints() takes the same lock around its `git log`,
+  with a much shorter wait: a reader that runs while a commit or a config
+  rewrite is in flight is racing git's own lockfile renames, which on
+  Windows can make it fail outright, and the interface used to paper over
+  that by retrying blindly. A reader that cannot get
+  the lock in time raises CheckpointBusy instead of waiting a minute.
 
 GIT PLUMBING NOTES:
 
@@ -208,6 +213,11 @@ MAX_EXCLUDED_MANIFEST_BYTES = 8192  # a second, independent cap on the
 _LOCK_TIMEOUT_S = 60.0   # how long a caller will wait for another
                           # checkpoint/restore on the same workspace before
                           # giving up, rather than blocking forever.
+_LIST_LOCK_TIMEOUT_S = 15.0  # list_checkpoints() is a read behind an HTTP
+                              # GET. It waits out an ordinary checkpoint (a
+                              # few seconds even on a large tree) but not a
+                              # minute: past this it says "busy" and the
+                              # caller can try again.
 _LOCK_POLL_S = 0.05
 _LOCK_STALE_SECONDS = 600  # a lock file older than this is assumed to be
                             # left behind by a crashed process (nothing
@@ -322,6 +332,17 @@ def _gitdir_for(ws_real):
     return os.path.join(_store_root(ws_real), "gitdir")
 
 
+class CheckpointBusy(RuntimeError):
+    """Another checkpoint or restore held the store for longer than the
+    caller was willing to wait.
+
+    A RuntimeError, so every caller that already handled a lock timeout as
+    one keeps working; a distinct type, so a caller that can say something
+    better than "failed" (the sidecar answers 503 checkpoint_store_busy)
+    can tell "try again in a moment" apart from a broken store.
+    """
+
+
 class _StoreLock:
     """A mutex over one workspace's shadow store.
 
@@ -362,7 +383,7 @@ class _StoreLock:
                 except OSError:
                     continue  # lock vanished between the check and now; retry
                 if time.monotonic() >= deadline:
-                    raise RuntimeError(
+                    raise CheckpointBusy(
                         "checkpoint store is locked by another operation "
                         "(timed out after {}s waiting for {})".format(self.timeout, self.path)
                     )
@@ -738,7 +759,7 @@ def _extract_trailer(body, key):
     return m.group(1).strip() if m else None
 
 
-def list_checkpoints(workspace):
+def list_checkpoints(workspace, lock_timeout=_LIST_LOCK_TIMEOUT_S):
     """Every checkpoint recorded for `workspace`, newest first.
 
     Returns [] in exactly two "there is genuinely no history yet" cases:
@@ -755,12 +776,21 @@ def list_checkpoints(workspace):
     empty list would present a broken store to the user as "you have no
     checkpoints", in a module whose own standard (see the module docstring)
     is that nothing here is silently swallowed.
+
+    The `git log` runs under the store lock, so it never reads a store that
+    checkpoint() or restore() is halfway through writing. That race was
+    real: the interface refreshes this list the moment a `checkpoint` event
+    arrives, and in a work loop the next turn's checkpoint is already
+    running by then. If the lock is not free within `lock_timeout` seconds
+    this raises CheckpointBusy, a RuntimeError the caller can report as
+    "busy, try again" rather than as a failure.
     """
     ws = _validate_workspace(workspace)
     gitdir = _gitdir_for(ws)
     if not os.path.isdir(os.path.join(gitdir, "objects")):
         return []
-    rc, out, err = _git(gitdir, ws, ["log", "--format=%H%x1f%ct%x1f%B%x1e"])
+    with _StoreLock(_store_root(ws), timeout=lock_timeout):
+        rc, out, err = _git(gitdir, ws, ["log", "--format=%H%x1f%ct%x1f%B%x1e"])
     if rc != 0:
         # git's own wording for "the store exists but nothing has been
         # committed to it yet" (a bare repo with no HEAD commit) -- the one
@@ -1457,6 +1487,67 @@ def _self_test():
         for t in threads:
             t.join()
         assert max(overlap) == 1, "two threads held the store lock at the same time: {}".format(overlap)
+
+        # -- 11b. list_checkpoints() reads under the same lock. A writer
+        #     holds a store's lock and commits a checkpoint while holding
+        #     it; the reader that started in the middle must wait and then
+        #     see the finished commit, never a half-written store. And a
+        #     writer that holds on past the reader's patience gets
+        #     CheckpointBusy, a RuntimeError, rather than a minute's wait. --
+        ws_ll = os.path.join(base, "ws-list-lock")
+        os.makedirs(ws_ll)
+        _write(os.path.join(ws_ll, "f.txt"), "x\n")
+        checkpoint(ws_ll, label="before")
+        ws_ll_real = _validate_workspace(ws_ll)
+        ll_store = _store_root(ws_ll_real)
+        ll_gitdir = _gitdir_for(ws_ll_real)
+        before_list = list_checkpoints(ws_ll)
+        holding = threading.Event()
+
+        def _write_under_lock():
+            with _StoreLock(ll_store, timeout=10):
+                holding.set()
+                time.sleep(0.4)
+                msg = "held\n\nHearth-Timestamp: 1\nHearth-Label: held\n"
+                rc_w, _o, err_w = _git(ll_gitdir, ws_ll_real,
+                                       ["commit", "--allow-empty", "--quiet", "-m", msg])
+                assert rc_w == 0, err_w
+        writer = threading.Thread(target=_write_under_lock)
+        writer.start()
+        assert holding.wait(5), "writer never took the lock"
+        t_wait = time.monotonic()
+        after_list = list_checkpoints(ws_ll, lock_timeout=10)
+        waited = time.monotonic() - t_wait
+        writer.join(10)
+        assert waited >= 0.2, "list_checkpoints did not wait for the writer ({:.3f}s)".format(waited)
+        assert len(after_list) == len(before_list) + 1, (before_list, after_list)
+        assert after_list[0]["label"] == "held", after_list[0]
+
+        release = threading.Event()
+
+        def _hold_until_released():
+            with _StoreLock(ll_store, timeout=10):
+                holding.set()
+                release.wait(10)
+        holding.clear()
+        holder = threading.Thread(target=_hold_until_released)
+        holder.start()
+        assert holding.wait(5), "holder never took the lock"
+        try:
+            t_busy = time.monotonic()
+            try:
+                list_checkpoints(ws_ll, lock_timeout=0.3)
+            except CheckpointBusy as exc:
+                assert isinstance(exc, RuntimeError), exc
+            else:
+                raise AssertionError("a held store must read as busy, not succeed")
+            assert time.monotonic() - t_busy < 5, "busy took far longer than its timeout"
+        finally:
+            release.set()
+            holder.join(10)
+        # Released, the store reads normally again and the lock file is gone.
+        assert len(list_checkpoints(ws_ll)) == len(after_list)
+        assert not os.path.exists(os.path.join(ll_store, ".lock"))
 
         # -- 12. sub_repos()'s scan reports when MAX_SCAN_DIRS truncated it,
         #     instead of silently under-reporting a pathological tree; and
