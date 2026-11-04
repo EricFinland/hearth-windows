@@ -122,7 +122,8 @@ jobs:
           # build_windows.py and e2e_live.py have no --self-test by design: the
           # first IS the build and the second needs a real model. Every other
           # script in scripts/ carries one.
-          for m in scripts/loop_bench.py scripts/make_icon.py \
+          for m in scripts/discord_announce.py scripts/loop_bench.py \
+                   scripts/make_icon.py \
                    scripts/release_manifest.py scripts/third_party_notices.py \
                    scripts/vendor_llama.py scripts/vendor_python.py; do
             echo "--- $m"
