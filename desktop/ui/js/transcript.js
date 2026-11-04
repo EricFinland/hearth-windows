@@ -40,10 +40,19 @@
  * intact in `stream.full`, because the delta bookkeeping indexes into it and
  * because it is what closeAgent has to re-tokenize; only what reaches a text
  * node is neutralized.
+ *
+ * Diffs. An approval for a file write carries `diff` when the sidecar could
+ * work out what the write changes (agent/hearth_diff.py). The card then leads
+ * with that, drawn by diff.js, and keeps the exact arguments one click away in
+ * a fold: the diff is the readable answer to "what will this do", the
+ * arguments are the literal truth of what will be written, and a card that
+ * dropped either would be worse. Without `diff` the card is what it always
+ * was.
  */
 
 import { el, icon, appendAll, clear, textNode, neutralize } from "./dom.js";
 import { renderProse, blob, labelledBlob } from "./safe-text.js";
+import { renderDiff, hasDiff } from "./diff.js";
 
 const READ_TOOLS = new Set(["read_file", "list_files", "list_tree", "git_status", "git_diff"]);
 const WRITE_TOOLS = new Set(["write_file", "edit_file", "replace_in_files"]);
@@ -90,8 +99,11 @@ const ARG_ORDER = {
 /** Render a tool call's arguments. Short scalars become a key/value row; long
  *  or multi-line values become their own labelled block, because for a write
  *  the argument IS the thing being authorized and burying it in a one-line
- *  row would defeat the point of showing it at all. */
-function renderArgs(tool, args) {
+ *  row would defeat the point of showing it at all.
+ *
+ *  `scalarsOnly` keeps just the key/value rows (path, all, glob): used beside
+ *  a diff, which already shows the payload better than the payload does. */
+function renderArgs(tool, args, { scalarsOnly = false } = {}) {
   const frag = document.createDocumentFragment();
   if (!args || typeof args !== "object" || Array.isArray(args)) {
     frag.appendChild(blob(args === undefined ? "(no arguments)" : args));
@@ -120,6 +132,7 @@ function renderArgs(tool, args) {
     }
   }
   if (rows.length) frag.appendChild(appendAll(el("div", { class: "kv" }), rows));
+  if (scalarsOnly) return frag;
   for (const { key, value } of blocks) {
     frag.appendChild(labelledBlob(key, value === null || value === undefined ? String(value) : value,
       { tall: key === "content" }));
@@ -318,6 +331,35 @@ export class Transcript {
       el("span", { class: "msg-role", text: "you" }),
       el("div", { class: "bubble", text: String(text) }),
     ]));
+  }
+
+  /** Chips under the most recent user message naming the files sent with
+   *  it (js/attach.js). A filename came off somebody's disk and is untrusted
+   *  text, so each one goes in through el({text}), never as markup, and a
+   *  bidi override in it shows as a visible marker rather than reversing the
+   *  extension. `files` are {name, path, plan}; plan is "full", "excerpt" or
+   *  anything else for a file the model is pointed at but not shown. */
+  addUserAttachments(files) {
+    const list = Array.isArray(files) ? files.filter(Boolean) : [];
+    const users = this.root.querySelectorAll(".msg-user");
+    const msg = users[users.length - 1];
+    if (!list.length || !msg) return null;
+    const row = el("div", { class: "att-sent", role: "list", "aria-label": "attached files" });
+    for (const file of list) {
+      const name = String(file.name ?? "attachment");
+      const how = file.plan === "full" ? "full text" : file.plan === "excerpt" ? "excerpt" : "stored";
+      row.appendChild(el("span", {
+        class: "att-sent-chip", role: "listitem",
+        title: file.path ? `${name}\n${String(file.path)}` : name,
+      }, [
+        icon("i-clip"),
+        el("span", { class: "att-sent-name", text: name }),
+        el("span", { class: "att-sent-meta", text: how }),
+      ]));
+    }
+    msg.appendChild(row);
+    this._autoscroll();
+    return row;
   }
 
   /** Render one delta into the active agent bubble, opening one if needed.
@@ -519,7 +561,16 @@ export class Transcript {
           ? "hearth wants to run a shell command. run_command is not confined to the workspace."
           : "hearth wants to run this tool.",
     }));
-    body.appendChild(renderArgs(tool, data.args));
+    if (hasDiff(data.diff)) {
+      body.appendChild(renderArgs(tool, data.args, { scalarsOnly: true }));
+      body.appendChild(renderDiff(data.diff, { scroll: true }));
+      const exact = el("details", { class: "fold approval-exact" });
+      exact.appendChild(el("summary", { text: "exact arguments" }));
+      exact.appendChild(renderArgs(tool, data.args));
+      body.appendChild(exact);
+    } else {
+      body.appendChild(renderArgs(tool, data.args));
+    }
     const injection = findingBlock("injection", data.injection_finding);
     if (injection) body.appendChild(injection);
     const secret = findingBlock("secret", data.secrets_finding);

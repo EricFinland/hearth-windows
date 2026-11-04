@@ -123,7 +123,12 @@ KNOWN CORRECTNESS HOLES, HANDLED HERE, NOT LEFT FOR SOMEONE TO DISCOVER:
   directory, held for the whole staging+commit or staging+diff+read-tree
   critical section of checkpoint() and restore() against the same workspace,
   rather than leaning on git's unrelated locking or leaving the race
-  undocumented.
+  undocumented. list_checkpoints() takes the same lock around its `git log`,
+  with a much shorter wait: a reader that runs while a commit or a config
+  rewrite is in flight is racing git's own lockfile renames, which on
+  Windows can make it fail outright, and the interface used to paper over
+  that by retrying blindly. A reader that cannot get
+  the lock in time raises CheckpointBusy instead of waiting a minute.
 
 GIT PLUMBING NOTES:
 
@@ -208,6 +213,11 @@ MAX_EXCLUDED_MANIFEST_BYTES = 8192  # a second, independent cap on the
 _LOCK_TIMEOUT_S = 60.0   # how long a caller will wait for another
                           # checkpoint/restore on the same workspace before
                           # giving up, rather than blocking forever.
+_LIST_LOCK_TIMEOUT_S = 15.0  # list_checkpoints() is a read behind an HTTP
+                              # GET. It waits out an ordinary checkpoint (a
+                              # few seconds even on a large tree) but not a
+                              # minute: past this it says "busy" and the
+                              # caller can try again.
 _LOCK_POLL_S = 0.05
 _LOCK_STALE_SECONDS = 600  # a lock file older than this is assumed to be
                             # left behind by a crashed process (nothing
@@ -322,6 +332,17 @@ def _gitdir_for(ws_real):
     return os.path.join(_store_root(ws_real), "gitdir")
 
 
+class CheckpointBusy(RuntimeError):
+    """Another checkpoint or restore held the store for longer than the
+    caller was willing to wait.
+
+    A RuntimeError, so every caller that already handled a lock timeout as
+    one keeps working; a distinct type, so a caller that can say something
+    better than "failed" (the sidecar answers 503 checkpoint_store_busy)
+    can tell "try again in a moment" apart from a broken store.
+    """
+
+
 class _StoreLock:
     """A mutex over one workspace's shadow store.
 
@@ -362,7 +383,7 @@ class _StoreLock:
                 except OSError:
                     continue  # lock vanished between the check and now; retry
                 if time.monotonic() >= deadline:
-                    raise RuntimeError(
+                    raise CheckpointBusy(
                         "checkpoint store is locked by another operation "
                         "(timed out after {}s waiting for {})".format(self.timeout, self.path)
                     )
@@ -738,7 +759,7 @@ def _extract_trailer(body, key):
     return m.group(1).strip() if m else None
 
 
-def list_checkpoints(workspace):
+def list_checkpoints(workspace, lock_timeout=_LIST_LOCK_TIMEOUT_S):
     """Every checkpoint recorded for `workspace`, newest first.
 
     Returns [] in exactly two "there is genuinely no history yet" cases:
@@ -755,12 +776,21 @@ def list_checkpoints(workspace):
     empty list would present a broken store to the user as "you have no
     checkpoints", in a module whose own standard (see the module docstring)
     is that nothing here is silently swallowed.
+
+    The `git log` runs under the store lock, so it never reads a store that
+    checkpoint() or restore() is halfway through writing. That race was
+    real: the interface refreshes this list the moment a `checkpoint` event
+    arrives, and in a work loop the next turn's checkpoint is already
+    running by then. If the lock is not free within `lock_timeout` seconds
+    this raises CheckpointBusy, a RuntimeError the caller can report as
+    "busy, try again" rather than as a failure.
     """
     ws = _validate_workspace(workspace)
     gitdir = _gitdir_for(ws)
     if not os.path.isdir(os.path.join(gitdir, "objects")):
         return []
-    rc, out, err = _git(gitdir, ws, ["log", "--format=%H%x1f%ct%x1f%B%x1e"])
+    with _StoreLock(_store_root(ws), timeout=lock_timeout):
+        rc, out, err = _git(gitdir, ws, ["log", "--format=%H%x1f%ct%x1f%B%x1e"])
     if rc != 0:
         # git's own wording for "the store exists but nothing has been
         # committed to it yet" (a bare repo with no HEAD commit) -- the one
@@ -977,6 +1007,254 @@ def restore(workspace, checkpoint_id):
         "excluded_changed": excluded_changed,
         "excluded_manifest_available": excluded_manifest_available,
     }
+
+
+PREVIEW_LOCK_TIMEOUT_S = 5.0  # a preview is a convenience shown while a
+                              # dialog is open; it waits a few seconds for a
+                              # running checkpoint, not restore()'s full minute.
+PREVIEW_MAX_FILES = 50        # files given a full diff; the rest are named
+PREVIEW_MAX_TOTAL_BYTES = 16 * 1024 * 1024  # blob content read for one preview,
+                              # both sides of every file together; past it a
+                              # file is named as too large rather than read
+
+
+def _parse_raw_diff_z(raw):
+    """Parse `git diff --raw --no-renames --no-abbrev -z` into a list of
+    (old_mode, new_mode, old_sha, new_sha, status, path). -z rather than
+    _parse_raw_diff's line format because the preview has to look paths up
+    again, and only the NUL-separated form gives them back byte for byte
+    (the line format quotes anything outside ASCII)."""
+    out = []
+    parts = raw.split("\x00")
+    i = 0
+    while i + 1 < len(parts):
+        meta, path = parts[i], parts[i + 1]
+        i += 2
+        if not meta.startswith(":"):
+            continue
+        fields = meta[1:].split()
+        if len(fields) < 5:
+            continue
+        out.append((fields[0], fields[1], fields[2], fields[3], fields[4][:1], path))
+    return out
+
+
+def _cat_blobs(gitdir, ws, shas, max_bytes, max_total=PREVIEW_MAX_TOTAL_BYTES):
+    """{sha: bytes or None} for every sha, via one `git cat-file --batch`.
+    None for a blob larger than max_bytes (sized first with --batch-check, so
+    a huge blob is never read just to be thrown away), for one that would
+    take the running total past max_total, or for one git could not produce.
+    Blobs are taken in the order given, so the files listed first are the
+    ones read when the total runs out; without the total, fifty files of two
+    sides each just under max_bytes would be some 200 MB through one pipe.
+    The all-zero sha (the missing side of an add or delete) is never asked
+    for."""
+    wanted = list(dict.fromkeys(s for s in shas if s and set(s) != {"0"}))
+    if not wanted:
+        return {}
+    exe = _find_git()
+    base = [exe, "--git-dir={}".format(gitdir), "--work-tree={}".format(ws)]
+    stdin = ("\n".join(wanted) + "\n").encode("ascii")
+    try:
+        check = subprocess.run(base + ["cat-file", "--batch-check"], cwd=ws, input=stdin,
+                               capture_output=True, timeout=GIT_TIMEOUT_S)
+    except (subprocess.TimeoutExpired, OSError):
+        return {s: None for s in wanted}
+    sizes = {}
+    for line in check.stdout.decode("ascii", errors="replace").splitlines():
+        bits = line.split()
+        if len(bits) == 3 and bits[1] == "blob" and bits[2].isdigit():
+            sizes[bits[0]] = int(bits[2])
+    small = []
+    total = 0
+    for s in wanted:
+        if s in sizes and sizes[s] <= max_bytes and total + sizes[s] <= max_total:
+            small.append(s)
+            total += sizes[s]
+    result = {s: None for s in wanted}
+    if not small:
+        return result
+    try:
+        proc = subprocess.run(base + ["cat-file", "--batch"], cwd=ws,
+                              input=("\n".join(small) + "\n").encode("ascii"),
+                              capture_output=True, timeout=GIT_TIMEOUT_S)
+    except (subprocess.TimeoutExpired, OSError):
+        return result
+    data = proc.stdout
+    pos = 0
+    for sha in small:
+        nl = data.find(b"\n", pos)
+        if nl < 0:
+            break
+        header = data[pos:nl].decode("ascii", errors="replace").split()
+        pos = nl + 1
+        if len(header) != 3 or header[1] != "blob" or not header[2].isdigit():
+            break  # "missing" or an unexpected type: the stream cannot be trusted past here
+        size = int(header[2])
+        result[header[0]] = data[pos:pos + size]
+        pos += size + 1  # the blob, then the newline cat-file puts after it
+    return result
+
+
+def _preview_text(blob, too_large, not_text):
+    """Decode a blob for display: (text, None), or (None, the reason it cannot
+    be shown). The reasons are hearth_diff's, passed in rather than imported
+    here; see preview_restore's local import."""
+    if blob is None:
+        return None, too_large
+    if b"\x00" in blob:
+        return None, not_text
+    try:
+        return blob.decode("utf-8"), None
+    except UnicodeDecodeError:
+        return None, not_text
+
+
+def preview_restore(workspace, checkpoint_id, max_files=PREVIEW_MAX_FILES,
+                    lock_timeout=None):
+    """What restore(workspace, checkpoint_id) would change, without changing
+    anything in the workspace.
+
+    Shares restore()'s non-destructive prelude exactly -- verify the id, stage
+    the current tree into the shadow index with the same exclusions, write it
+    as a tree -- and then diffs that tree against the checkpoint in the
+    direction restore() would move the files: the current content is the
+    "old" side, the checkpoint's the "new". It stops there. read-tree, the
+    one worktree-writing step, is never reached; the only thing this touches
+    is the shadow store's own index, which restore() and checkpoint() both
+    rebuild from scratch before using.
+
+    The result is a hearth_diff preview (see that module for the shape and
+    its caps) plus:
+      checkpoint_id          the full sha the id resolved to
+      skipped_gitlinks       nested repositories restore() would not touch
+      excluded_changed       secrets-pattern files that differ from what the
+                             checkpoint recorded and that restore() therefore
+                             cannot put back (same comparison restore() makes
+                             afterwards, made beforehand instead)
+      excluded_manifest_available
+                             False when the checkpoint predates that manifest
+
+    Content is shown subject to the same rules as an approval card: secrets
+    redacted, secrets-pattern names never opened, and a path the workspace's
+    .hearthignore excludes is named without its content (it IS captured and
+    will be restored, but the user has said the agent's view should not
+    include it, and this preview is drawn in the same window).
+
+    Errors come back as a dict with "error", like restore(). A store lock
+    that another checkpoint or restore holds past `lock_timeout` (default
+    PREVIEW_LOCK_TIMEOUT_S, a few seconds rather than a minute) comes back
+    with "busy": True as well, so a caller can say "try again" rather than
+    "something is broken".
+
+    Like restore(), this holds the store lock for the whole of the staging
+    step, a full `git add -A` of the workspace, which on a large tree is the
+    slow part. A checkpoint() or restore() wanting the store waits for it,
+    and git reads every file while the agent may be replacing some of them.
+    So a caller should not run it while work is live in the workspace: the
+    sidecar's GET /checkpoints/diff refuses then, exactly as POST /restore
+    does. The diffing itself (hearth_diff.build_preview) happens after the
+    lock is released.
+    """
+    import hearth_diff  # local: hearth_diff imports this module for its secret patterns
+
+    ws = _validate_workspace(workspace)
+    gitdir = _gitdir_for(ws)
+    store_root = _store_root(ws)
+    if not os.path.isdir(os.path.join(gitdir, "objects")):
+        return {"error": "no checkpoint store for this workspace"}
+
+    # Read at call time, not bound as a default, so a caller (or a test) can
+    # tune the module-wide wait.
+    lock = _StoreLock(store_root, timeout=PREVIEW_LOCK_TIMEOUT_S if lock_timeout is None
+                      else lock_timeout)
+    try:
+        lock.__enter__()
+    except Exception as exc:  # noqa: BLE001 - any failure to take the lock is "not now"
+        return {"error": "the checkpoint store is busy: {}".format(exc), "busy": True}
+    try:
+        rc, out, err = _git(gitdir, ws, ["rev-parse", "--verify", "{}^{{commit}}".format(checkpoint_id)])
+        if rc != 0:
+            return {"error": "unknown checkpoint: {}".format(checkpoint_id)}
+        target = out.strip()
+
+        rc, out, err, subs, _subs_truncated = _add_all(gitdir, ws)
+        if rc != 0:
+            return {"error": "could not capture the current state to compare: {}".format(err.strip())}
+        rc, before_tree, err = _git(gitdir, ws, ["write-tree"])
+        if rc != 0:
+            return {"error": "could not snapshot the current state: {}".format(err.strip())}
+        before_tree = before_tree.strip()
+
+        rc, raw, err = _git(gitdir, ws, ["diff", "--raw", "--no-renames", "--no-abbrev", "-z",
+                                         before_tree, target])
+        if rc != 0:
+            return {"error": "could not compute what would change: {}".format(err.strip())}
+        changes = _parse_raw_diff_z(raw)
+
+        skipped = []
+        entries = []
+        for old_mode, new_mode, old_sha, new_sha, status, path in changes:
+            if old_mode == "160000" or new_mode == "160000":
+                skipped.append(path)
+                continue
+            entries.append({"path": path, "status": {"A": "added", "D": "deleted"}.get(status, "modified"),
+                            "old_sha": old_sha if status != "A" else None,
+                            "new_sha": new_sha if status != "D" else None})
+        entries.sort(key=lambda e: e["path"])
+
+        shown = []
+        for e in entries[:max_files]:
+            full = os.path.join(ws, e["path"].replace("/", os.sep))
+            if hearth_contain.is_ignored(ws, full, is_dir=False):
+                e["hidden_reason"] = hearth_diff.HIDDEN_IGNORED
+            elif not hearth_diff.is_secret_path(e["path"]):
+                shown.append(e)
+        blobs = _cat_blobs(gitdir, ws, [s for e in shown for s in (e["old_sha"], e["new_sha"])],
+                           hearth_diff.MAX_INPUT_CHARS)
+
+        items = []
+        for index, e in enumerate(entries):
+            item = {"path": e["path"], "status": e["status"], "old": None, "new": None}
+            if index >= max_files:
+                item["skip_content"] = True
+            elif e.get("hidden_reason"):
+                item["hidden_reason"] = e["hidden_reason"]
+            elif hearth_diff.is_secret_path(e["path"]):
+                # _BUILTIN_EXCLUDES keeps these out of the store, so this only
+                # fires for a store older than one of its patterns; either way
+                # the content is not opened.
+                item["hidden_reason"] = hearth_diff.HIDDEN_SECRET_FILE
+            else:
+                for side in ("old", "new"):
+                    sha = e[side + "_sha"]
+                    if sha is None:
+                        continue
+                    text, reason = _preview_text(blobs.get(sha), hearth_diff.HIDDEN_TOO_LARGE,
+                                                 hearth_diff.HIDDEN_BINARY)
+                    if reason:
+                        item["hidden_reason"] = reason
+                    else:
+                        item[side] = text
+            items.append(item)
+
+        before_manifest = _read_excluded_manifest(store_root, target)
+        if before_manifest is not None:
+            now_manifest, _truncated = _scan_excluded_secrets(gitdir, ws)
+            excluded_changed = _diff_excluded_manifest(before_manifest, now_manifest)
+        else:
+            excluded_changed = []
+    finally:
+        lock.__exit__(None, None, None)
+
+    result = hearth_diff.build_preview(items, max_files=max_files)
+    result.update({
+        "checkpoint_id": target,
+        "skipped_gitlinks": sorted(set(skipped) | set(subs)),
+        "excluded_changed": excluded_changed,
+        "excluded_manifest_available": before_manifest is not None,
+    })
+    return result
 
 
 def scope_limits():
@@ -1458,6 +1736,67 @@ def _self_test():
             t.join()
         assert max(overlap) == 1, "two threads held the store lock at the same time: {}".format(overlap)
 
+        # -- 11b. list_checkpoints() reads under the same lock. A writer
+        #     holds a store's lock and commits a checkpoint while holding
+        #     it; the reader that started in the middle must wait and then
+        #     see the finished commit, never a half-written store. And a
+        #     writer that holds on past the reader's patience gets
+        #     CheckpointBusy, a RuntimeError, rather than a minute's wait. --
+        ws_ll = os.path.join(base, "ws-list-lock")
+        os.makedirs(ws_ll)
+        _write(os.path.join(ws_ll, "f.txt"), "x\n")
+        checkpoint(ws_ll, label="before")
+        ws_ll_real = _validate_workspace(ws_ll)
+        ll_store = _store_root(ws_ll_real)
+        ll_gitdir = _gitdir_for(ws_ll_real)
+        before_list = list_checkpoints(ws_ll)
+        holding = threading.Event()
+
+        def _write_under_lock():
+            with _StoreLock(ll_store, timeout=10):
+                holding.set()
+                time.sleep(0.4)
+                msg = "held\n\nHearth-Timestamp: 1\nHearth-Label: held\n"
+                rc_w, _o, err_w = _git(ll_gitdir, ws_ll_real,
+                                       ["commit", "--allow-empty", "--quiet", "-m", msg])
+                assert rc_w == 0, err_w
+        writer = threading.Thread(target=_write_under_lock)
+        writer.start()
+        assert holding.wait(5), "writer never took the lock"
+        t_wait = time.monotonic()
+        after_list = list_checkpoints(ws_ll, lock_timeout=10)
+        waited = time.monotonic() - t_wait
+        writer.join(10)
+        assert waited >= 0.2, "list_checkpoints did not wait for the writer ({:.3f}s)".format(waited)
+        assert len(after_list) == len(before_list) + 1, (before_list, after_list)
+        assert after_list[0]["label"] == "held", after_list[0]
+
+        release = threading.Event()
+
+        def _hold_until_released():
+            with _StoreLock(ll_store, timeout=10):
+                holding.set()
+                release.wait(10)
+        holding.clear()
+        holder = threading.Thread(target=_hold_until_released)
+        holder.start()
+        assert holding.wait(5), "holder never took the lock"
+        try:
+            t_busy = time.monotonic()
+            try:
+                list_checkpoints(ws_ll, lock_timeout=0.3)
+            except CheckpointBusy as exc:
+                assert isinstance(exc, RuntimeError), exc
+            else:
+                raise AssertionError("a held store must read as busy, not succeed")
+            assert time.monotonic() - t_busy < 5, "busy took far longer than its timeout"
+        finally:
+            release.set()
+            holder.join(10)
+        # Released, the store reads normally again and the lock file is gone.
+        assert len(list_checkpoints(ws_ll)) == len(after_list)
+        assert not os.path.exists(os.path.join(ll_store, ".lock"))
+
         # -- 12. sub_repos()'s scan reports when MAX_SCAN_DIRS truncated it,
         #     instead of silently under-reporting a pathological tree; and
         #     checkpoint() surfaces that as sub_repos_truncated plus a
@@ -1578,6 +1917,93 @@ def _self_test():
 
         # the un-mocked path still works after restoring the real _git.
         assert len(list_checkpoints(ws12)) == 1
+
+        # -- 16. preview_restore says what restore() would change, in
+        #     restore's direction, without changing anything; hides what an
+        #     approval card would hide; and reports a busy store as busy. ----
+        import hearth_diff
+        import hearth_secrets
+        key = hearth_secrets._build_real_secret_fixtures()["aws"]
+        wsp = os.path.join(base, "wsp")
+        os.makedirs(wsp)
+        _write(os.path.join(wsp, "a.txt"), "one\ntwo\nthree\n")
+        _write(os.path.join(wsp, "b.txt"), "bee\n")
+        _write(os.path.join(wsp, "settings.py"), "A = 1\nKEY = '" + key + "'\nB = 2\n")
+        _write(os.path.join(wsp, ".hearthignore"), "priv/\n")
+        _write(os.path.join(wsp, "priv", "x.txt"), "private one\n")
+        _write(os.path.join(wsp, ".env"), "TOKEN=first\n")
+        _write_bytes(os.path.join(wsp, "img.bin"), b"\x00\x01\x02")
+        cpp = checkpoint(wsp, label="before the turn")
+
+        _write(os.path.join(wsp, "a.txt"), "one\nTWO\nthree\n")
+        os.remove(os.path.join(wsp, "b.txt"))
+        _write(os.path.join(wsp, "c.txt"), "brand new\n")
+        _write(os.path.join(wsp, "settings.py"), "A = 1\nKEY = '" + key + "'\nB = 3\n")
+        _write(os.path.join(wsp, "priv", "x.txt"), "private two\n")
+        _write(os.path.join(wsp, ".env"), "TOKEN=second, and longer\n")
+        _write_bytes(os.path.join(wsp, "img.bin"), b"\x00\x01\x03")
+        before_bytes = {name: _read_bytes(os.path.join(wsp, name))
+                        for name in ("a.txt", "c.txt", "settings.py", ".env")}
+
+        pv = preview_restore(wsp, cpp["id"][:7])
+        assert "error" not in pv, pv
+        assert pv["checkpoint_id"] == cpp["id"], pv
+        by_path = {f["path"]: f for f in pv["files"]}
+        assert set(by_path) == {"a.txt", "b.txt", "c.txt", "settings.py", "priv/x.txt",
+                                "img.bin"}, sorted(by_path)
+        a_lines = [(ln[0], ln[1]) for h in by_path["a.txt"]["hunks"] for ln in h["lines"]]
+        # restore's direction: what is there now goes, the checkpoint's arrives
+        assert ("-", "TWO") in a_lines and ("+", "two") in a_lines, a_lines
+        assert by_path["b.txt"]["status"] == "added", by_path["b.txt"]
+        assert by_path["c.txt"]["status"] == "deleted", by_path["c.txt"]
+        assert by_path["priv/x.txt"]["hidden_reason"] == hearth_diff.HIDDEN_IGNORED, by_path
+        assert "private" not in json.dumps(pv), "a .hearthignore'd file's content was shown"
+        assert by_path["img.bin"]["hidden_reason"] == hearth_diff.HIDDEN_BINARY, by_path
+        assert key not in json.dumps(pv), "a context line leaked a secret into the preview"
+        assert "TOKEN" not in json.dumps(pv), ".env content reached the preview"
+        assert [e["path"] for e in pv["excluded_changed"]] == [".env"], pv["excluded_changed"]
+        assert pv["excluded_manifest_available"] is True, pv
+        # Nothing in the workspace moved.
+        for name, data in before_bytes.items():
+            assert _read_bytes(os.path.join(wsp, name)) == data, name
+        assert not os.path.exists(os.path.join(wsp, "b.txt"))
+
+        # The blobs read for one preview are capped in total, not only one
+        # by one: past the running total a blob is not read at all (None,
+        # shown as too large), and the ones listed first are the ones read.
+        gitdir_p = _gitdir_for(os.path.realpath(wsp))
+        rc_b, out_b, _err_b = _git(gitdir_p, os.path.realpath(wsp),
+                                   ["rev-parse", cpp["id"] + ":a.txt", cpp["id"] + ":b.txt"])
+        assert rc_b == 0, _err_b
+        sha_a, sha_b = out_b.split()
+        both = _cat_blobs(gitdir_p, os.path.realpath(wsp), [sha_a, sha_b], 1024)
+        assert both == {sha_a: b"one\ntwo\nthree\n", sha_b: b"bee\n"}, both
+        first_only = _cat_blobs(gitdir_p, os.path.realpath(wsp), [sha_a, sha_b], 1024,
+                                max_total=len(b"one\ntwo\nthree\n"))
+        assert first_only == {sha_a: b"one\ntwo\nthree\n", sha_b: None}, first_only
+
+        # A real restore afterwards still works and does what was previewed.
+        done = restore(wsp, cpp["id"])
+        assert "error" not in done, done
+        assert {r["path"] for r in done["restored"]} == set(by_path), done
+        assert _read_bytes(os.path.join(wsp, "a.txt")) == b"one\ntwo\nthree\n"
+        nothing = preview_restore(wsp, cpp["id"])
+        assert nothing["files"] == [] and nothing["added"] == 0, nothing
+
+        # The file cap names the rest without reading them.
+        for i in range(3):
+            _write(os.path.join(wsp, "extra{}.txt".format(i)), "x\n")
+        capped = preview_restore(wsp, cpp["id"], max_files=1)
+        assert len(capped["files"]) == 3 and capped["truncated"], capped
+        assert sum(1 for f in capped["files"] if f.get("hidden_reason")
+                   == hearth_diff.HIDDEN_NOT_PREVIEWED) == 2, capped
+
+        # Errors: unknown id, no store at all, and a held lock.
+        assert "error" in preview_restore(wsp, "0" * 40)
+        assert "error" in preview_restore(ws7, "deadbeef")
+        with _StoreLock(_store_root(os.path.realpath(wsp))):
+            held = preview_restore(wsp, cpp["id"], lock_timeout=0.2)
+        assert held.get("busy") is True and "error" in held, held
     finally:
         if old_data_dir is None:
             os.environ.pop("HEARTH_DATA_DIR", None)

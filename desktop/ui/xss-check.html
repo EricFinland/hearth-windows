@@ -4,11 +4,14 @@
 <meta charset="utf-8" />
 <title>hearth UI - untrusted content check</title>
 <link rel="stylesheet" href="./styles.css" />
+  <script type="module" src="./js/xss-check.update-banner.js"></script>
 <link rel="stylesheet" href="./xss-check.css" />
+<link rel="stylesheet" href="./diff.css" />
 </head>
 <body>
 <div class="wrap">
   <h1>Untrusted content check</h1>
+  <script type="module" src="./js/xss-check.modelchip.js"></script>
   <p class="lede">
     Feeds hostile payloads through every rendering path the UI uses for model output,
     tool output, file content, and tool arguments, then inspects the resulting DOM.
@@ -25,6 +28,7 @@
     checked in the same way and must still read right to left: the fix removes the
     explicit override controls, not the bidi algorithm.
   </p>
+  <script type="module" src="./js/xss-check.history.js"></script>
   <div class="verdict" id="verdict">running...</div>
   <table>
     <thead><tr><th>Surface</th><th>Payload</th><th>Result</th></tr></thead>
@@ -32,6 +36,7 @@
   </table>
 
   <div id="probes"></div>
+  <script type="module" src="./js/xss-check.attach.js"></script>
 
   <!-- Laid out rather than display:none, because a hidden element has no
        geometry and the whole point of these probes is to read geometry. -->
@@ -47,5 +52,6 @@
 </div>
 
 <script type="module" src="./js/xss-check.js"></script>
+<script type="module" src="./js/xss-check.mcp.js"></script>
 </body>
 </html>

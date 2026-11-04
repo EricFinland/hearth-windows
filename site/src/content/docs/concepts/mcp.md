@@ -12,6 +12,104 @@ There is no MCP server configured by default. Without a config file Hearth
 behaves exactly as it did before this existed: no subprocess, no extra tools,
 not even an import.
 
+You can manage servers from the **Tools** tab in the app, or by editing the
+config file by hand. Both change the same file. See
+[Managing servers from the app](#managing-servers-from-the-app).
+
+## Managing servers from the app
+
+The Tools tab, next to Chat and Model shop, lists every server in the config
+file as a card:
+
+* a status: running, starting, ready (enabled, and starts with the next turn
+  that needs tools), disabled, could not start (with the server's error), or
+  ignored (with the reason the loader skips a hand-edited entry);
+* an on/off switch;
+* the command and each argument as a separate pill, so an argument that
+  contains a space cannot pass for two;
+* the environment variables, with anything that looks like a credential
+  hidden (see below);
+* once a turn has started the server, its tools, each with the risk class it
+  landed in.
+
+**Test** starts a separate copy of the server, does the handshake, asks for
+its tools, and stops it again. It shows the server's name and version, how
+long the handshake took, the server's description of itself, and every tool
+with its risk class, so you can see what a server would expose before any
+model sees it. Each step has a 15 second limit. Test never touches the copy a
+turn is using, and a disabled server cannot be tested, because testing runs
+it: switch it on first.
+
+**Add** and **Edit** open a form with a name, a command, one row per
+argument and one row per environment variable. What the form accepts is
+stricter than what the file accepts, because a value arriving over the
+sidecar's HTTP connection is not the same as one you typed into the file:
+
+* The name becomes part of every tool name (`mcp__<name>__<tool>`), so it is
+  letters, digits, `-` and `_`, starting with a letter or digit, without `__`.
+* The command is one program: a name on your `PATH` like `npx`, or a full
+  path. It is never a command line. Hearth does not split it into arguments
+  and never runs it through a shell, so `npx -y some-server` is refused with
+  a message to put the arguments in their own rows. Relative paths, network
+  paths, quotes, shell characters and unexpanded `%VARIABLES%` are refused
+  too.
+* Arguments and values cannot contain line breaks or control characters, and
+  two variable names that differ only by case are refused, because Windows
+  treats them as one.
+
+On Windows, `npx` is a batch script (`npx.cmd`), which Windows will not start
+directly. Use `cmd` as the command, with `/c`, `npx`, `-y` and the package as
+the first arguments. The card says so when it spots this.
+
+### Adding a server asks first
+
+Adding a server lets a program run on your computer with your permissions.
+Before a server is added, or before a change to what it runs (command,
+arguments, environment, working directory) is saved, Hearth shows a dialog
+that says so in those words, shows exactly what will run, names the
+environment variables it will set, and lists any warnings: for example that
+`cmd` or `powershell` reads its arguments as a command line, or that a
+variable like `NODE_OPTIONS` changes which code a program loads. A new server
+is saved switched off unless you tick **Enable it now** in that dialog.
+
+This is enforced by the sidecar, not only by the page: a save without the
+explicit acknowledgement is refused. That does not make the sidecar's token
+less powerful, since whoever holds it can still choose what Hearth runs. It
+makes using it that way deliberate and visible.
+
+### Credentials stay hidden
+
+An environment variable whose name contains `key`, `token`, `secret`,
+`pass`, `auth`, `cred`, `session` or `cookie`, or whose value Hearth's secret
+scanner recognises, is shown as at most its first two characters and its
+length. Arguments are treated the same way: `--api-key=...`, the value after
+`--token`, or anything the scanner flags. The full value never leaves the
+sidecar. When you save without touching a hidden value, the page asks the
+sidecar to keep the stored one; to change it, press **Replace** and type the
+new value.
+
+### A change takes effect at once
+
+Hearth keeps MCP servers running between turns. When you switch a server off,
+remove it, or change one that is on, Hearth stops its running MCP servers and
+forgets their tools, and the next turn that needs tools starts them again
+from the file as it now stands. A server you switched off is never started
+again. Because that would cut off a tool call in the middle, such a change is
+refused while a turn is running (or while a cancelled turn's tool call is
+still finishing); the panel says so, and you can try again when the turn ends
+or after pressing Stop. Changes to a server that is off before and after are
+always allowed.
+
+### How the file is written
+
+The panel writes the same file in the same format. Writes are atomic (a
+temporary file, then a rename), UTF-8 without a byte-order mark, readable and
+writable by your user only where the file system has permissions, and keep
+everything the panel does not edit: other top-level keys, and each server's
+`risk`, `cwd`, `timeout` and anything else you put there. A file that cannot
+be parsed is reported and never overwritten, so a typo cannot cost you your
+hand edits.
+
 ## Where config lives
 
 | Platform | Path |
@@ -47,7 +145,12 @@ holds the audit database and the checkpoints. `HEARTH_MCP_CONFIG` overrides it.
 
 Run `python agent/hearth_mcp.py --live` to connect to everything in the file
 and print each server's handshake, its tools, their schemas, and the risk class
-each one landed in. Do that before letting a model near a new server.
+each one landed in. Do that before letting a model near a new server. The
+**Test** button in the Tools tab does the same for one server, using the same
+code.
+
+The file may be saved with or without a byte-order mark (Notepad adds one);
+Hearth reads both.
 
 ## Why that location, and what it does not protect
 
@@ -61,8 +164,8 @@ runs the next time it starts a server. So the location is a security decision:
 * It is not inside any workspace, so `write_file`, `edit_file` and
   `replace_in_files`, which are contained to the workspace, cannot reach it.
 
-Two things it does not protect against, stated plainly rather than left to be
-discovered:
+Three things it does not protect against, stated plainly rather than left to
+be discovered:
 
 1. **`run_command` is not sandboxed against writing this file.** At any level
    below `workspace` there is no write boundary at all, and at `workspace` the
@@ -74,6 +177,12 @@ discovered:
 2. **`HEARTH_MCP_CONFIG` moves the file.** Anything that can set Hearth's
    environment can already choose its Python path, so this adds no exposure,
    but it is a knob and it is worth knowing about.
+3. **The Tools tab can write it.** Anything holding the sidecar's bearer
+   token can add a server through the same routes the tab uses. The sidecar
+   insists on the explicit acknowledgement described above and starts new
+   servers switched off, which makes that a deliberate act rather than a
+   side effect, but the token is still enough. The token lives only in the
+   shell's memory and is regenerated on every start.
 
 ## Tool names
 
@@ -143,6 +252,7 @@ Every wait is bounded, so no server can hang Hearth:
 | `tools/list` | 60s |
 | one tool call | `timeout` from config, default 120s |
 | polite shutdown before a tree-kill | 5s |
+| the Tools tab's **Test** | 15s for the handshake, 15s for `tools/list` |
 | longest single output line kept | 4 MiB, then discarded to the next newline |
 | unparseable lines tolerated | 200 |
 | result text kept | 8000 characters, then truncated with a note |

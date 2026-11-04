@@ -239,12 +239,61 @@ fn sha256_of(path: &Path) -> std::io::Result<String> {
         .collect())
 }
 
-/// Run the verified installer. `/S` is the NSIS silent switch: the user has
-/// already been asked, with the version and the hash in front of them, and
-/// asking twice trains people to click through.
+/// The switches the installer is run with, and why each one is there.
+///
+/// * `/S` is the NSIS silent switch: the user has already been asked, with the
+///   version and the hash in front of them, and asking twice trains people to
+///   click through.
+/// * `/UPDATE` tells Tauri's NSIS template this is an update over an existing
+///   install: it does not re-create shortcuts the user may have deleted, skips
+///   the WebView2 bootstrap, and never runs the uninstaller's optional "delete
+///   app data" step. Models and settings live in %LOCALAPPDATA%\Hearth, which
+///   no part of the installer or uninstaller touches either way (see
+///   installer-hooks.nsi).
+/// * `/R` relaunches Hearth once the files are in place. Without it a silent
+///   update ends with no window at all, and "Install and restart" would only
+///   be half true.
+///
+/// These are the switches tauri-plugin-updater passes to the same template,
+/// so this is the template's supported update path rather than a reading of
+/// its internals.
+pub const INSTALLER_ARGS: [&str; 3] = ["/S", "/UPDATE", "/R"];
+
+/// What the confirmation should say about work an install would cut short,
+/// from the sidecar's GET /model reply, or None when nothing is running.
+///
+/// Installing quits Hearth at once, and with it any turn, work loop or swarm
+/// that is still going, in the chat on screen or in one the user switched
+/// away from. The model chip's busy rule already knows about all of those
+/// (and about a model that is loading or answering), so its `busy_reason` is
+/// what is asked rather than a second copy of the rule here. Best effort by
+/// design: a sidecar that cannot say is not a reason to refuse an install
+/// the user is about to confirm anyway. The reason is one of the sidecar's
+/// own fixed sentences; it is still bounded and stripped of control
+/// characters before it reaches a native dialog.
+pub fn busy_note(model: &serde_json::Value) -> Option<String> {
+    let reason: String = model
+        .get("busy_reason")?
+        .as_str()?
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Hearth is busy right now: {}. Installing stops that work partway. \
+         Your chats are kept, but it will not finish.",
+        reason
+    ))
+}
+
+/// Run the verified installer, detached, with INSTALLER_ARGS.
 pub fn launch(staged: &Staged) -> Result<(), String> {
     Command::new(&staged.path)
-        .arg("/S")
+        .args(INSTALLER_ARGS)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -275,6 +324,35 @@ mod tests {
         assert!(newer_than([1, 0, 0], [0, 99, 99]));
         assert!(!newer_than([0, 1, 0], [0, 1, 0]));
         assert!(!newer_than([0, 0, 9], [0, 1, 0]));
+    }
+
+    #[test]
+    fn the_installer_runs_silently_as_an_update_and_relaunches() {
+        assert_eq!(INSTALLER_ARGS, ["/S", "/UPDATE", "/R"]);
+    }
+
+    #[test]
+    fn busy_note_names_running_work_and_nothing_else() {
+        let busy = serde_json::json!({
+            "busy": true,
+            "busy_reason": "a turn is running in another chat"
+        });
+        let note = busy_note(&busy).unwrap();
+        assert!(note.contains("a turn is running in another chat"));
+        assert!(note.contains("will not finish"));
+        assert_eq!(
+            busy_note(&serde_json::json!({"busy": false, "busy_reason": null})),
+            None
+        );
+        assert_eq!(busy_note(&serde_json::json!({"busy_reason": "  "})), None);
+        assert_eq!(busy_note(&serde_json::json!({})), None);
+        assert_eq!(busy_note(&serde_json::json!({"busy_reason": 7})), None);
+        let noisy = serde_json::json!({
+            "busy_reason": format!("a\u{7}b\n{}", "x".repeat(500))
+        });
+        let note = busy_note(&noisy).unwrap();
+        assert!(!note.chars().any(|c| c.is_control()));
+        assert!(note.len() < 400);
     }
 
     #[test]

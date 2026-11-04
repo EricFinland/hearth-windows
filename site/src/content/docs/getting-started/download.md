@@ -195,12 +195,32 @@ big online AI services, and that page is honest about where the edges are.
 
 ## Updating
 
-When a new version comes out, it will appear on the
-[releases page](https://github.com/EricFinland/hearth-windows/releases). To
-update, download the new installer and run it the same way. Your models and
-settings are kept.
+**From the version after 0.1.1 on, Hearth updates itself.** Each time it
+starts, it checks the
+[releases page](https://github.com/EricFinland/hearth-windows/releases) for a
+newer version. When there is one, a banner at the top of the window says
+**Hearth X.Y.Z is available**:
 
-To hear about new versions, click **Watch** at the top of
+1. Click **Install now**. Hearth downloads the update and checks that it
+   really came from this project (it is signed with a key built into Hearth).
+2. A small window shows the version and asks once more. Click
+   **Install and restart**.
+3. Hearth closes, updates, and opens again by itself. Your models, chats and
+   settings are kept.
+
+Click **Later** to be reminded next time instead. If your computer is offline,
+nothing pops up; Hearth simply tries again next time. The **Updates** panel at
+the bottom of the left sidebar always shows where things stand, has a
+**Check for updates** button, and has a checkbox to turn the automatic check
+off.
+
+**If you have Hearth 0.1.1 (or older), update by hand once.** Those versions
+cannot update themselves. Download the newest installer from the
+[releases page](https://github.com/EricFinland/hearth-windows/releases) and run
+it the same way you installed Hearth the first time. Your models and settings
+are kept. After that, every update happens inside the app.
+
+To hear about new versions by email as well, click **Watch** at the top of
 [the repository](https://github.com/EricFinland/hearth-windows), then
 **Custom**, then tick **Releases**.
 

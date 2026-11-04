@@ -21,8 +21,9 @@
  * are four different things this panel can be looking at and they must never
  * be confused with each other:
  *
- *   * "this build has no release feed"  -- no update feed is published, so
- *     Hearth cannot check. It says so, and where to look instead.
+ *   * "this build has no release feed"  -- a development build or a fork
+ *     whose trust file names no feed, so Hearth cannot check. It says so,
+ *     and where to look instead. Release builds check GitHub Releases.
  *   * "the check failed"                -- the feed was unreachable, or the
  *     manifest was refused. It says which, and it says what version is
  *     running, because a failed check is not evidence of being up to date.
@@ -49,6 +50,23 @@ const STATE_TEXT = {
   failed: "check failed",
 };
 
+/* Failures that say nothing about Hearth or the release, worded without
+ * alarm. "offline": the launch check could not reach the feed, or the newest
+ * release carries no manifest yet. "expired": a real manifest past its date,
+ * which usually means a release is overdue. Neither is ever drawn as "up to
+ * date" (the honesty rule above still holds: these are failures, and the
+ * label says the check did not succeed), but neither is drawn in the warning
+ * colour either, because an offline laptop is not an incident. A refused
+ * signature or a rollback is NOT on this list and still is. */
+const CALM_TEXT = {
+  offline: "not checked",
+  expired: "update info expired",
+};
+
+function isCalmFailure(snap) {
+  return snap.state === "failed" && Object.hasOwn(CALM_TEXT, String(snap.failure ?? ""));
+}
+
 function megabytes(bytes) {
   const n = Number(bytes) || 0;
   return `${(n / 1e6).toFixed(0)} MB`;
@@ -61,15 +79,16 @@ export function updateCard(snapshot, handlers = {}) {
   const snap = snapshot && typeof snapshot === "object" ? snapshot : {};
   const state = String(snap.state ?? "idle");
   const running = String(snap.current_version ?? "") || "unknown";
-  const root = el("div", { class: "update-body is-" + state });
+  const calm = isCalmFailure(snap);
+  const root = el("div", { class: "update-body is-" + state + (calm ? " is-calm" : "") });
 
   root.appendChild(el("div", { class: "update-head" }, [
     el("span", { class: "update-version", text: `Hearth ${running}` }),
     el("span", {
-      class: "update-state" + (state === "failed" ? " is-bad"
+      class: "update-state" + (state === "failed" && !calm ? " is-bad"
         : state === "available" || state === "ready" ? " is-new"
         : state === "up-to-date" ? " is-ok" : ""),
-      text: STATE_TEXT[state] ?? state,
+      text: calm ? CALM_TEXT[snap.failure] : (STATE_TEXT[state] ?? state),
     }),
   ]));
 
@@ -179,7 +198,11 @@ function buttons(snap, state, handlers) {
     add("Cancel", "btn-ghost", handlers.onCancel);
     return row;
   }
-  add(state === "failed" ? "Try again" : "Check for updates", "btn-ghost", handlers.onCheck,
+  // A calm failure offers the ordinary check rather than "Try again": nothing
+  // went wrong that a retry is fixing, and the click gets the precise reason
+  // if it fails again.
+  add(state === "failed" && !isCalmFailure(snap) ? "Try again" : "Check for updates",
+    "btn-ghost", handlers.onCheck,
     { disabled: state === "checking" });
   return row;
 }

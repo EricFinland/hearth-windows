@@ -146,16 +146,24 @@ and can be turned off. Downloading 117 MB unprompted onto a metered
 connection is rude, and a staged installer sitting on disk is one more thing
 for a local attacker to race, so neither happens without an explicit action.
 
-No update feed has been published
----------------------------------
-Installers are posted by hand on the GitHub releases page; there is no
-update feed. The feed in release/trust.json points at
-`releases.hearth.invalid`, which is an RFC 2606 reserved name that can never
-resolve, so a shipped Hearth cannot fetch an update from anywhere at all
-until an operator puts a real host in the trust file and rebuilds. The UI says
-so in those words rather than pretending to be up to date. docs/updates.md has
-the steps an operator would follow to publish a feed; none of them have been
-performed.
+The feed is GitHub Releases
+---------------------------
+release/trust.json names https://github.com/EricFinland/hearth-windows/releases/
+with "layout": "github-releases". Release assets are a FLAT namespace, so the
+manifest is an asset called manifest-<channel>.json, fetched through
+latest/download/, and the signed artifact path is download/v<version>/<file>:
+versioned, so a release published between the manifest request and the
+installer request cannot change which bytes arrive (the hash would fail, but
+an update that fails for a reason nobody did anything wrong about is still a
+failed update). The older <feed><channel>/manifest.json directory layout is
+still what a trust file without a "layout" gets.
+
+GitHub answers every asset URL with a redirect, first to the versioned path
+and then to a short-lived signed URL on its asset host. Those redirects are
+followed only over https, only to the hosts in GITHUB_REDIRECT_HOSTS, and only
+a bounded number of times. That list limits where this module will send a
+request; it is not part of deciding whether bytes are trustworthy, which is
+still the signature and the SHA-256 and nothing else.
 
 Standard library only. Every network call is bounded by a timeout.
 """
@@ -221,10 +229,43 @@ RECEIPT_NAME = "receipt.json"
 
 MANIFEST_NAME = "manifest.json"
 
-#: Reserved by RFC 2606 and guaranteed never to resolve. The shipped default,
-#: because nothing has been published and a default that quietly pointed at a
-#: real host would be a decision nobody made.
+#: How the feed is laid out. "directory" is a static host with one folder per
+#: channel: <feed><channel>/manifest.json. "github-releases" is a GitHub
+#: repository's releases, whose assets share one flat namespace per release:
+#: <feed>latest/download/manifest-<channel>.json for the manifest, and the
+#: signed manifest names its installer as download/v<version>/<file>.
+LAYOUT_DIRECTORY = "directory"
+LAYOUT_GITHUB = "github-releases"
+LAYOUTS = (LAYOUT_DIRECTORY, LAYOUT_GITHUB)
+
+#: Where GitHub sends a release-asset request. github.com answers
+#: latest/download/<name> with a 302 to download/<tag>/<name>, and that with a
+#: 302 to a signed, short-lived URL on its asset host. Checked with
+#: `curl -sI` against the v0.1.1 installer in October 2026: the asset host was
+#: release-assets.githubusercontent.com. objects.githubusercontent.com is the
+#: host GitHub used for the same purpose until 2025 and is kept so that a
+#: switch back on GitHub's side does not silently stop every install from
+#: updating; it is GitHub's own asset CDN either way.
+#:
+#: This list bounds where a request may GO. It is not part of the trust
+#: decision, and adding a host here cannot make a single byte acceptable that
+#: the signature and the SHA-256 would refuse.
+GITHUB_REDIRECT_HOSTS = ("github.com", "objects.githubusercontent.com",
+                         "release-assets.githubusercontent.com")
+
+#: GitHub needs two hops. Five leaves room for one more without leaving room
+#: for a loop.
+MAX_REDIRECTS = 5
+
+#: Reserved by RFC 2606 and guaranteed never to resolve. A trust file whose
+#: feed is on such a name is a build that deliberately cannot update (a
+#: development build, or a fork that has not set up a feed), and the UI says so
+#: rather than reporting that it is up to date.
 UNCONFIGURED_HOST_SUFFIX = ".invalid"
+
+#: The one header set every request carries. No version, no install id, no
+#: query string: the feed learns that somebody asked, and nothing else.
+_REQUEST_HEADERS = {"User-Agent": "hearth-updater", "Cache-Control": "no-cache"}
 
 MANIFEST_TIMEOUT = 20
 DOWNLOAD_TIMEOUT = 300
@@ -296,6 +337,28 @@ class DowngradeError(UpdateError):
 
 class ChecksumError(UpdateError):
     """The artifact's bytes are not the bytes the signed manifest describes."""
+
+
+class FeedError(UpdateError):
+    """The manifest could not be fetched at all.
+
+    Its own class because it is the failure that says nothing about Hearth or
+    the release: the machine is offline, or the newest release carries no
+    manifest. A launch check that hits it is reported calmly, where a refused
+    signature is not. `reachable` is True when the host answered (with an
+    HTTP error) and False when it could not be reached."""
+
+    def __init__(self, message, reachable=False):
+        super().__init__(message)
+        self.reachable = reachable
+
+
+class ExpiredError(UpdateError):
+    """A validly signed manifest whose expiry has passed.
+
+    Usually a release that is overdue rather than an attack, which is why it
+    is its own class: the panel words it calmly. Hearth still refuses to act
+    on it either way, because the freeze attack looks exactly like this."""
 
 
 # --------------------------------------------------------------------------
@@ -494,6 +557,19 @@ def validate_trust(data):
         raise UpdateError("the trust file's feed must be an https URL, got {!r}".format(feed))
     if not feed.endswith("/"):
         raise UpdateError("the trust file's feed must end with '/', got {!r}".format(feed))
+    layout = data.get("layout", LAYOUT_DIRECTORY)
+    if layout not in LAYOUTS:
+        raise UpdateError("unknown feed layout {!r}; expected one of {}".format(
+            layout, ", ".join(LAYOUTS)))
+    if layout == LAYOUT_GITHUB and (
+            (parts.hostname or "") != "github.com" or parts.port is not None
+            or parts.query or parts.fragment
+            or not re.match(r"^/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/releases/$", parts.path)):
+        # The manifest and installer paths are built by appending to this, so
+        # anything but a repository's own releases URL would produce URLs
+        # GitHub does not serve.
+        raise UpdateError("a github-releases feed must be "
+                          "https://github.com/<owner>/<repo>/releases/, got {!r}".format(feed))
     channels = data.get("channels")
     if not isinstance(channels, list) or not channels:
         raise UpdateError("the trust file lists no channels")
@@ -553,9 +629,30 @@ def feed_base(trust, env=None):
     return base
 
 
+def layout_for(trust):
+    """The feed layout the trust file declares; the directory layout when it
+    declares none, which is what every trust file written before GitHub
+    Releases became the feed looks like."""
+    layout = trust.get("layout", LAYOUT_DIRECTORY)
+    return layout if layout in LAYOUTS else LAYOUT_DIRECTORY
+
+
+def feed_name(trust, env=None):
+    """A short human name for where checks go, for the calm sentences the
+    panel shows. Never used in a decision."""
+    try:
+        host = urllib.parse.urlsplit(feed_base(trust, env)).hostname or ""
+    except UpdateError:
+        return "the update feed"
+    if host == "github.com":
+        return "GitHub"
+    return host or "the update feed"
+
+
 def configured(trust, env=None):
-    """False when this build has no real release feed, which is the shipped
-    state: the pinned host is an RFC 2606 .invalid name that cannot resolve.
+    """False when this build has no real release feed: the pinned host is an
+    RFC 2606 .invalid name that cannot resolve. Release builds point at GitHub
+    Releases; a development build or a fork may not.
 
     Reported honestly rather than presented as "up to date", because "we did
     not look" and "we looked and there is nothing" are different facts.
@@ -770,7 +867,7 @@ def evaluate(signed, trust, channel, installed, floor=None, now=None):
         # the newest manifest they have forever, and version comparison never
         # notices because that manifest really is the newest one it has seen.
         # An expiry turns silence into a visible failure.
-        raise UpdateError(
+        raise ExpiredError(
             "this release manifest expired on {}. Either the release feed is "
             "stale or something is holding back newer ones; Hearth will not "
             "act on it.".format(signed["expires_at"]))
@@ -835,33 +932,88 @@ def _format(version_tuple):
 # Fetching
 # --------------------------------------------------------------------------
 
-class _PinnedRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Follows redirects only within the feed's own origin.
+def _redacted(url):
+    """`url` without its query string or fragment, for error messages.
+
+    GitHub's asset redirects carry a signed, short-lived token in the query.
+    It is not a secret of the user's, but it is a credential of a kind, and a
+    sentence on screen or in a log has no use for it."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return "<an unparseable URL>"
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
+class _FeedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follows a redirect only to the feed's own origin or to a named host.
 
     urllib follows redirects by default and would follow one to any host at
-    all. The signature check means a redirect cannot get code accepted, but a
-    redirect off-origin is still a request this application did not intend to
-    make, to a host it was not told about, and refusing it costs nothing.
+    all, over any scheme, up to ten times. The signature check means a
+    redirect cannot get code accepted, but a redirect elsewhere is still a
+    request this application did not intend to make, to a host it was not told
+    about, and refusing it costs nothing. So a redirect target must be either
+    the feed's own scheme and host (which is how a loopback test feed and a
+    plain static host work), or https on the default port, with no user info,
+    to a host in `hosts` (which is how GitHub's asset host works). The count is
+    bounded by MAX_REDIRECTS.
     """
 
-    def __init__(self, allowed):
-        self.allowed = allowed
+    max_redirections = MAX_REDIRECTS
+
+    def __init__(self, origin, hosts=()):
+        super().__init__()
+        self.origin = origin
+        self.hosts = tuple(h.lower() for h in hosts)
+
+    def allows(self, newurl):
+        try:
+            parts = urllib.parse.urlsplit(newurl)
+            port = parts.port
+        except ValueError:
+            return False
+        if (parts.scheme, parts.netloc) == self.origin:
+            return True
+        if parts.scheme != "https" or port not in (None, 443):
+            return False
+        if parts.username is not None or parts.password is not None:
+            return False
+        return (parts.hostname or "").lower() in self.hosts
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        parts = urllib.parse.urlsplit(newurl)
-        if (parts.scheme, parts.netloc) != self.allowed:
+        if not self.allows(newurl):
+            allowed = ["{}://{}".format(*self.origin)]
+            allowed += ["https://" + h for h in self.hosts]
             raise UpdateError(
-                "refusing a redirect to {!r}; the update feed may only redirect "
-                "within {}://{}".format(newurl.split("?")[0], *self.allowed))
+                "refusing a redirect to {}; the update feed may only redirect to "
+                "{}".format(_redacted(newurl), ", ".join(allowed)))
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def _opener(base):
+def redirect_hosts(layout):
+    """The hosts outside the feed's own origin a redirect may go to."""
+    return GITHUB_REDIRECT_HOSTS if layout == LAYOUT_GITHUB else ()
+
+
+def _opener(base, layout=LAYOUT_DIRECTORY):
     parts = urllib.parse.urlsplit(base)
     return urllib.request.build_opener(
-        _PinnedRedirectHandler((parts.scheme, parts.netloc)),
+        _FeedRedirectHandler((parts.scheme, parts.netloc), redirect_hosts(layout)),
         urllib.request.HTTPSHandler(context=ssl.create_default_context()),
     )
+
+
+def _sentence(text):
+    """`text` ending in a full stop, for splicing an exception into a
+    sentence that carries on after it."""
+    text = str(text).rstrip()
+    return text if text.endswith((".", "!", "?")) else text + "."
+
+
+def _too_many_redirects(exc):
+    """urllib reports a redirect over its limit as an HTTPError with a 3xx
+    code, which reads as a server error. Say what it was."""
+    return isinstance(exc, urllib.error.HTTPError) and 300 <= (exc.code or 0) < 400
 
 
 def check_url(url, base):
@@ -886,8 +1038,26 @@ def check_url(url, base):
     return True
 
 
-def manifest_url(base, channel):
+def flat_manifest_name(channel):
+    """The manifest's asset name in a flat (GitHub Releases) feed. One per
+    channel, because every asset of a release shares one namespace."""
+    return "manifest-{}.json".format(channel)
+
+
+def manifest_url(base, channel, layout=LAYOUT_DIRECTORY):
+    if layout == LAYOUT_GITHUB:
+        # latest/download/ is GitHub's stable name for "this asset of the
+        # newest published release". Drafts and prereleases are not served
+        # through it, which is the behaviour wanted here.
+        return "{}latest/download/{}".format(base, flat_manifest_name(channel))
     return "{}{}/{}".format(base, channel, MANIFEST_NAME)
+
+
+def github_artifact_path(version, name):
+    """The signed artifact path for a GitHub release: the versioned download
+    URL, never latest/. A release published between the manifest request and
+    this one must not change which file arrives."""
+    return "download/v{}/{}".format(version, name)
 
 
 def artifact_url(base, path):
@@ -895,27 +1065,37 @@ def artifact_url(base, path):
     return base + path
 
 
-def fetch_manifest(base, channel, timeout=MANIFEST_TIMEOUT, opener=None):
+def fetch_manifest(base, channel, timeout=MANIFEST_TIMEOUT, opener=None,
+                   layout=LAYOUT_DIRECTORY):
     """The raw manifest document, parsed but NOT verified. Bounded read.
 
     Returns the decoded JSON object. Everything that happens to it afterwards
     happens in verify_document, and nothing at all happens to it before.
+    Raises FeedError when nothing could be fetched, so a caller can tell
+    "offline" from "refused".
     """
-    url = manifest_url(base, channel)
+    url = manifest_url(base, channel, layout)
     check_url(url, base)
-    opener = opener or _opener(base)
-    request = urllib.request.Request(url, headers={
-        "Accept": "application/json",
-        "User-Agent": "hearth-updater",
-        "Cache-Control": "no-cache",
-    })
+    opener = opener or _opener(base, layout)
+    request = urllib.request.Request(url, headers=dict(
+        _REQUEST_HEADERS, Accept="application/json"))
     try:
         with opener.open(request, timeout=timeout) as response:
             raw = response.read(MAX_MANIFEST_BYTES + 1)
     except UpdateError:
         raise
+    except urllib.error.HTTPError as exc:
+        if _too_many_redirects(exc):
+            raise UpdateError("the update feed redirected more than {} times; "
+                              "refusing to follow it further".format(MAX_REDIRECTS)) from exc
+        # The host answered. A 404 here is most often a release that was
+        # published without a signed manifest, which is not an error on this
+        # machine's side and is reported as calmly as being offline.
+        raise FeedError("the update feed answered HTTP {} for {}".format(
+            exc.code, _redacted(url)), reachable=True) from exc
     except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
-        raise UpdateError("could not reach the update feed: {}".format(exc)) from exc
+        reason = getattr(exc, "reason", None) or exc
+        raise FeedError("could not reach the update feed: {}".format(reason)) from exc
     if len(raw) > MAX_MANIFEST_BYTES:
         raise UpdateError("the release manifest is larger than {:,} bytes; "
                           "refusing it".format(MAX_MANIFEST_BYTES))
@@ -953,7 +1133,8 @@ def verify_file(path, expected_sha256, expected_size):
 
 
 def download(url, dest, expected_sha256, expected_size, base, on_progress=None,
-             timeout=DOWNLOAD_TIMEOUT, opener=None, cancelled=None):
+             timeout=DOWNLOAD_TIMEOUT, opener=None, cancelled=None,
+             layout=LAYOUT_DIRECTORY):
     """Fetch the artifact to `dest`, verified before it lands there.
 
     Bytes go to `dest`.part and are hashed as they stream. The file is renamed
@@ -967,15 +1148,19 @@ def download(url, dest, expected_sha256, expected_size, base, on_progress=None,
     because nothing outside `dest` is written at all.
     """
     check_url(url, base)
-    opener = opener or _opener(base)
+    opener = opener or _opener(base, layout)
     part = dest + ".part"
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     digest = hashlib.sha256()
     done = 0
     limit = expected_size + 1  # one byte past the signed size is already too many
+    # The same plain headers as the manifest request, rather than urllib's
+    # default User-Agent, which would tell the host which Python this is.
+    request = urllib.request.Request(url, headers=dict(
+        _REQUEST_HEADERS, Accept="application/octet-stream"))
 
     try:
-        with opener.open(url, timeout=timeout) as response, open(part, "wb") as fh:
+        with opener.open(request, timeout=timeout) as response, open(part, "wb") as fh:
             while True:
                 if cancelled is not None and cancelled():
                     raise UpdateError("the download was cancelled")
@@ -994,6 +1179,13 @@ def download(url, dest, expected_sha256, expected_size, base, on_progress=None,
     except UpdateError:
         _unlink(part)
         raise
+    except urllib.error.HTTPError as exc:
+        _unlink(part)
+        if _too_many_redirects(exc):
+            raise UpdateError("the download redirected more than {} times; refusing "
+                              "to follow it further".format(MAX_REDIRECTS)) from exc
+        raise UpdateError("downloading the update failed: the feed answered HTTP {} "
+                          "for {}".format(exc.code, _redacted(url))) from exc
     except OSError as exc:
         _unlink(part)
         if exc.errno in (errno.ENOSPC, errno.EDQUOT) or "space" in str(exc).lower():
@@ -1029,12 +1221,24 @@ def _unlink(path):
 # Persisted state
 # --------------------------------------------------------------------------
 
+#: Serializes every read-modify-write of the state file in this process.
+#: The auto-check toggle arrives on a request thread while a check writes
+#: last_check_at and the floor from the updater's worker thread; without one
+#: lock around the whole read-change-write, the second writer saves a copy it
+#: read before the first one wrote, and the first change is lost. The change
+#: that can be lost that way includes the downgrade floor. Reentrant so a
+#: mutator can call read_floor. Never held while taking an Updater's own
+#: lock, so the two cannot deadlock.
+_STATE_LOCK = threading.RLock()
+
+
 def read_state(env=None):
-    try:
-        with open(state_path(env), "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return {}
+    with _STATE_LOCK:
+        try:
+            with open(state_path(env), "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return {}
     return data if isinstance(data, dict) else {}
 
 
@@ -1044,16 +1248,35 @@ def write_state(data, env=None):
     A torn state file would be read back as {} by read_state, which silently
     resets the downgrade floor. That is the one piece of state here whose loss
     is a security regression rather than an inconvenience, so it is written to
-    a temporary file in the same directory and renamed over the old one.
+    a temporary file in the same directory and renamed over the old one. The
+    temporary name is unique per write, so two writers can never be halfway
+    through the same file.
     """
     path = state_path(env)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2, sort_keys=True)
-        fh.write("\n")
-    os.replace(tmp, path)
+    with _STATE_LOCK:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        handle, tmp = tempfile.mkstemp(prefix=STATE_NAME + ".", suffix=".tmp",
+                                       dir=os.path.dirname(path))
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2, sort_keys=True)
+                fh.write("\n")
+            os.replace(tmp, path)
+        except BaseException:
+            _unlink(tmp)
+            raise
     return path
+
+
+def update_state(mutate, env=None):
+    """Read the state, let `mutate(state)` change it in place, write it back,
+    all under _STATE_LOCK. Returns the state as written. The only way this
+    module changes the state file, so no change can overwrite another."""
+    with _STATE_LOCK:
+        state = read_state(env)
+        mutate(state)
+        write_state(state, env)
+        return state
 
 
 def read_floor(env=None):
@@ -1070,18 +1293,22 @@ def raise_floor(version, released_at, env=None):
     an attacker must not be able to walk them back to 0.1.0 by waiting for
     them to say no.
     """
-    state = read_state(env)
-    floor = state.get("floor") if isinstance(state.get("floor"), dict) else {}
-    current = parse_version(floor.get("version") or "")
     offered = parse_version(version)
-    if offered is None:
-        return floor
-    if current is not None and offered <= current:
-        return floor
-    floor = {"version": version, "released_at": released_at,
-             "recorded_at": _now().strftime("%Y-%m-%dT%H:%M:%SZ")}
-    state["floor"] = floor
-    write_state(state, env)
+    with _STATE_LOCK:
+        state = read_state(env)
+        floor = state.get("floor") if isinstance(state.get("floor"), dict) else {}
+        current = parse_version(floor.get("version") or "")
+        if offered is None:
+            return floor
+        if current is not None and offered <= current:
+            return floor
+        floor = {"version": version, "released_at": released_at,
+                 "recorded_at": _now().strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+        def _set_floor(st):
+            st["floor"] = floor
+
+        update_state(_set_floor, env)
     return floor
 
 
@@ -1160,7 +1387,7 @@ def prune_staged(installed, env=None):
 
 
 def stage(plan, base, env=None, on_progress=None, opener=None, disk_fn=None,
-          cancelled=None):
+          cancelled=None, layout=LAYOUT_DIRECTORY):
     """Download, verify and record one release. Returns the receipt.
 
     Order of operations, which is the security property:
@@ -1194,7 +1421,7 @@ def stage(plan, base, env=None, on_progress=None, opener=None, disk_fn=None,
     try:
         download(artifact_url(base, plan["path"]), dest, plan["sha256"],
                  plan["size_bytes"], base, on_progress=on_progress,
-                 opener=opener, cancelled=cancelled)
+                 opener=opener, cancelled=cancelled, layout=layout)
         verify_file(dest, plan["sha256"], plan["size_bytes"])
     except Exception:
         # A failed stage leaves nothing behind. There is no half-downloaded
@@ -1263,6 +1490,19 @@ class Updater:
             "last_check_at": None,
             "signed_by": None,
             "checked": False,
+            # Why the last check failed, in a word the UI can choose its tone
+            # by: "offline" (no answer, or no manifest in the newest release),
+            # "expired" (a real manifest past its date), "refused" (a
+            # signature, downgrade or shape refusal) or "error". None when it
+            # did not fail.
+            "failure": None,
+            # True when the last check was the automatic one at launch rather
+            # than a click. An automatic check that could not reach the feed
+            # is reported calmly; a click gets the precise reason.
+            "background": False,
+            # The precise reason behind a calm sentence, so it is still there
+            # for whoever wants it.
+            "detail": None,
         }
 
     # -- snapshot ----------------------------------------------------------
@@ -1288,11 +1528,15 @@ class Updater:
             data["channel"] = channel_for(trust, self._env)
             data["configured"] = configured(trust, self._env)
             data["feed"] = feed_base(trust, self._env) if data["configured"] else None
+            data["feed_name"] = feed_name(trust, self._env) if data["configured"] else None
+            data["layout"] = layout_for(trust)
             data["trust_error"] = None
         except UpdateError as exc:
             data["channel"] = None
             data["configured"] = False
             data["feed"] = None
+            data["feed_name"] = None
+            data["layout"] = None
             data["trust_error"] = str(exc)
         state = read_state(self._env)
         data["auto_check"] = state.get("auto_check", True) is not False
@@ -1307,6 +1551,15 @@ class Updater:
             data["staged"] = None
         if data["staged"] and data["state"] in (STATE_IDLE, STATE_UP_TO_DATE):
             data["state"] = STATE_READY
+        elif (data["staged"] and data["state"] == STATE_FAILED
+              and data["failure"] == "offline"):
+            # Offline at launch with a verified installer already on disk from
+            # an earlier run: the installer does not need the network, and the
+            # shell re-verifies it before running it, so offer it.
+            data["state"] = STATE_READY
+            data["error"] = None
+            data["message"] = "Hearth {} is verified and ready to install.".format(
+                data["staged"].get("version"))
         elif data["staged"] is None and data["state"] == STATE_READY:
             # The staged installer was here a moment ago and is not here now.
             # staged_receipt() re-verifies on every read and deletes a file
@@ -1315,6 +1568,7 @@ class Updater:
             # over a button that cannot work would be the wrong end of an
             # honest failure; say what happened and offer the check again.
             data["state"] = STATE_FAILED
+            data["failure"] = data["failure"] or "refused"
             data["error"] = data["error"] or (
                 "The downloaded installer is no longer the one Hearth verified, "
                 "so it has been deleted and nothing has been installed. Check "
@@ -1346,9 +1600,15 @@ class Updater:
     # -- settings ----------------------------------------------------------
 
     def set_auto_check(self, enabled):
-        state = read_state(self._env)
-        state["auto_check"] = bool(enabled)
-        write_state(state, self._env)
+        """Turn the launch check on or off. Persisted in the state file next
+        to the downgrade floor, through update_state, so a toggle that lands
+        while a check is writing cannot lose either change."""
+        value = bool(enabled)
+
+        def _toggle(state):
+            state["auto_check"] = value
+
+        update_state(_toggle, self._env)
         self._set()
         return self.snapshot()
 
@@ -1395,14 +1655,24 @@ class Updater:
             # failure has to become a state somebody can read.
             self._fail("the update check failed unexpectedly: {}".format(exc))
 
-    def _fail(self, message, state=STATE_FAILED):
-        self._set(state=state, error=message, message=message)
+    def _fail(self, message, state=STATE_FAILED, failure="error", detail=None):
+        self._set(state=state, error=message, message=message, failure=failure,
+                  detail=detail)
         return self.snapshot()
 
     # -- the work ----------------------------------------------------------
 
     def check_once(self, force=False):
-        """One check, synchronously. Never raises: every failure is a state."""
+        """One check, synchronously. Never raises: every failure is a state.
+
+        `force` is what a click sends and the launch check does not. It skips
+        the interval, and it decides how an unreachable feed is worded: a
+        launch check that finds the machine offline says so calmly and waits
+        for the next launch, where a click gets the precise reason. Either way
+        the state is "failed" and never "up to date", because a check that did
+        not happen is not evidence of anything.
+        """
+        background = not force
         try:
             trust = self._trust()
         except UpdateError as exc:
@@ -1410,6 +1680,7 @@ class Updater:
                               "it will not check for updates: {}".format(exc))
         if not configured(trust, self._env):
             self._set(state=STATE_UNCONFIGURED, error=None, available=None,
+                      failure=None, detail=None,
                       message="This build of Hearth carries no release feed, so "
                               "it cannot check for updates automatically. New "
                               "versions are posted at "
@@ -1434,58 +1705,87 @@ class Updater:
 
         channel = channel_for(trust, self._env)
         base = feed_base(trust, self._env)
-        self._set(state=STATE_CHECKING, error=None,
+        layout = layout_for(trust)
+        where = feed_name(trust, self._env)
+        self._set(state=STATE_CHECKING, error=None, failure=None, detail=None,
+                  background=background,
                   message="Checking for updates", bytes_done=0, bytes_total=0)
 
         opener = self._opener_fn(base) if self._opener_fn else None
         try:
-            document = fetch_manifest(base, channel, opener=opener)
-        except UpdateError as exc:
-            # An unreachable feed is not an update problem; say so plainly
-            # rather than implying the installation is up to date.
+            document = fetch_manifest(base, channel, opener=opener, layout=layout)
+        except FeedError as exc:
+            # Not an update problem, and on a launch check not something to
+            # alarm anybody with: the machine is offline, or the newest release
+            # was published without a manifest. Still never "up to date".
+            if background:
+                if exc.reachable:
+                    calm = ("{} has no update information for the newest release "
+                            "yet. Hearth will try again next launch.".format(where))
+                else:
+                    calm = ("Could not reach {} to check for updates. Hearth will "
+                            "try again next launch.".format(where))
+                return self._fail(calm, failure="offline", detail=str(exc))
             return self._fail(
                 "Hearth could not check for updates: {} You are still running "
-                "{}.".format(exc, installed))
+                "{}.".format(_sentence(exc), installed), failure="offline", detail=str(exc))
+        except UpdateError as exc:
+            return self._fail(
+                "Hearth could not check for updates: {} You are still running "
+                "{}.".format(_sentence(exc), installed), failure="refused", detail=str(exc))
 
         try:
             signed, key_id = verify_document(document, trust)
         except SignatureError as exc:
             return self._fail(
                 "Refusing this update: {} ".format(exc) +
-                "Hearth is unchanged.")
+                "Hearth is unchanged.", failure="refused")
         except UpdateError as exc:
-            return self._fail("Refusing this update: {}".format(exc))
+            return self._fail("Refusing this update: {}".format(exc), failure="refused")
 
         floor = read_floor(self._env)
         try:
             plan = evaluate(signed, trust, channel, installed, floor=floor,
                             now=self._now_fn())
+        except ExpiredError as exc:
+            # A real, signed manifest past its date. Usually a release that is
+            # overdue; possibly somebody holding newer ones back. Hearth will
+            # not act on it in either case, and says so without shouting.
+            return self._fail(
+                "The newest update information from {} expired on {}, so Hearth "
+                "will not act on it. A new release normally fixes this; Hearth "
+                "will check again next launch. You are still running {}.".format(
+                    where, signed.get("expires_at"), installed),
+                failure="expired", detail=str(exc))
         except DowngradeError as exc:
-            return self._fail("Refusing this update: {}".format(exc))
+            return self._fail("Refusing this update: {}".format(exc), failure="refused")
         except UpdateError as exc:
-            return self._fail("Refusing this update: {}".format(exc))
+            return self._fail("Refusing this update: {}".format(exc), failure="refused")
 
         # Only now, with a verified and accepted manifest, is anything
         # persisted. A manifest that failed any check above moves nothing.
-        state = read_state(self._env)
-        state["last_check_at"] = self._now_fn().strftime("%Y-%m-%dT%H:%M:%SZ")
-        write_state(state, self._env)
+        stamp = self._now_fn().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def _stamp(st):
+            st["last_check_at"] = stamp
+
+        update_state(_stamp, self._env)
         raise_floor(signed["version"], signed["released_at"], self._env)
 
         if plan["action"] == "current":
             with self._cond:
                 self._plan = None
             self._set(state=STATE_UP_TO_DATE, error=None, available=None,
-                      checked=True, signed_by=key_id,
-                      last_check_at=state["last_check_at"],
+                      failure=None, detail=None,
+                      checked=True, signed_by=key_id, last_check_at=stamp,
                       message="Hearth {} is the newest release.".format(installed))
             return self.snapshot()
 
         plan["signed_by"] = key_id
         with self._cond:
             self._plan = plan
-        self._set(state=STATE_AVAILABLE, error=None, checked=True,
-                  signed_by=key_id, last_check_at=state["last_check_at"],
+        self._set(state=STATE_AVAILABLE, error=None, failure=None, detail=None,
+                  checked=True, signed_by=key_id, last_check_at=stamp,
                   available={"version": plan["version"],
                              "released_at": plan["released_at"],
                              "notes": plan["notes"],
@@ -1508,8 +1808,8 @@ class Updater:
         except UpdateError as exc:
             return self._fail(str(exc))
 
-        self._set(state=STATE_DOWNLOADING, error=None, bytes_done=0,
-                  bytes_total=plan["size_bytes"],
+        self._set(state=STATE_DOWNLOADING, error=None, failure=None, detail=None,
+                  bytes_done=0, bytes_total=plan["size_bytes"],
                   message="Downloading Hearth {}".format(plan["version"]))
 
         last = [0.0]
@@ -1525,9 +1825,9 @@ class Updater:
         try:
             receipt = stage(plan, base, env=self._env, on_progress=progress,
                             opener=opener, disk_fn=self._disk_fn,
-                            cancelled=self._cancel.is_set)
+                            cancelled=self._cancel.is_set, layout=layout_for(trust))
         except ChecksumError as exc:
-            return self._fail("Refusing this update: {}".format(exc))
+            return self._fail("Refusing this update: {}".format(exc), failure="refused")
         except UpdateError as exc:
             return self._fail(str(exc))
 
@@ -1546,8 +1846,8 @@ class Updater:
         clear_staged(self._env)
         with self._cond:
             self._plan = None
-        self._set(state=STATE_IDLE, error=None, available=None,
-                  bytes_done=0, bytes_total=0, message="")
+        self._set(state=STATE_IDLE, error=None, available=None, failure=None,
+                  detail=None, bytes_done=0, bytes_total=0, message="")
         return self.snapshot()
 
 
@@ -1585,16 +1885,144 @@ class _FakeFeed:
     def __init__(self, files):
         self.files = files
         self.opened = []
+        self.headers = []
 
     def open(self, target, timeout=None):
         url = target if isinstance(target, str) else target.full_url
         self.opened.append(url)
+        self.headers.append({} if isinstance(target, str) else dict(target.header_items()))
         body = self.files.get(url)
         if body is None:
             raise urllib.error.HTTPError(url, 404, "not found", {}, None)
         if callable(body):
             return body()
         return _FakeResponse(body)
+
+
+def _github_layout_e2e(tmp, seed, installer, artifact_sha):
+    """Check, download and verify against a loopback server that behaves like
+    GitHub Releases: redirects and all, with real urllib underneath.
+
+    The feed is reached through HEARTH_UPDATE_FEED, the same override an
+    operator uses to try a release before publishing it, and it is plain http
+    only because it is loopback (feed_base refuses http anywhere else)."""
+    import http.server
+
+    version = "0.2.0"
+    name = "Hearth-Setup-{}.exe".format(version)
+    signed = {
+        "schema": 1, "app_id": "com.example.app", "channel": "stable",
+        "version": version, "released_at": "2026-08-01T00:00:00Z",
+        "expires_at": "2026-12-01T00:00:00Z", "minimum_version": "0.0.0",
+        "notes": "Loopback release.",
+        "artifact": {"name": name, "path": github_artifact_path(version, name),
+                     "size_bytes": len(installer), "sha256": artifact_sha},
+    }
+    document = {"signed": signed, "signatures": [{
+        "key_id": "release-1", "algorithm": "ed25519",
+        "signature": hearth_ed25519.to_hex(
+            hearth_ed25519.sign(seed, canonical_bytes(signed)))}]}
+    assets = {flat_manifest_name("stable"): json.dumps(document).encode("utf-8"),
+              name: installer}
+    seen = []
+
+    class _GitHubish(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _redirect(self, location):
+            self.send_response(302)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_GET(self):  # noqa: N802 - the stdlib's name
+            seen.append((self.path, self.headers.get("User-Agent")))
+            path = self.path
+            if path.startswith("/loop/"):
+                # A redirect chain that never ends, one new URL per hop.
+                hop = int(path.rsplit("hop", 1)[-1] or 0) if "hop" in path else 0
+                return self._redirect("/loop/hop{}".format(hop + 1))
+            if path.startswith("/away/"):
+                return self._redirect("http://updates.evil.example/x.json")
+            if path.startswith("/latest/download/"):
+                return self._redirect("/download/v{}/{}".format(
+                    version, path.rsplit("/", 1)[-1]))
+            if path.startswith("/download/v{}/".format(version)):
+                return self._redirect("/asset/{}?token=signed-and-short-lived".format(
+                    path.rsplit("/", 1)[-1]))
+            if path.startswith("/asset/"):
+                body = assets.get(path.split("?", 1)[0].rsplit("/", 1)[-1])
+                if body is not None:
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+            self.send_error(404)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _GitHubish)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        loop_base = "http://127.0.0.1:{}/".format(server.server_address[1])
+        trust = {"schema": 1, "app_id": "com.example.app",
+                 "feed": "https://github.com/o/r/releases/", "layout": LAYOUT_GITHUB,
+                 "channels": ["stable"], "default_channel": "stable",
+                 "keys": [{"key_id": "release-1", "algorithm": "ed25519",
+                           "public_key": hearth_ed25519.to_hex(
+                               hearth_ed25519.public_key(seed)),
+                           "status": "active"}]}
+        assert validate_trust(trust)
+        env = {"HEARTH_DATA_DIR": os.path.join(tmp, "data-github"),
+               ENV_VERSION: "0.1.0", ENV_FEED: loop_base}
+        now = datetime.datetime(2026, 8, 5, tzinfo=datetime.timezone.utc)
+        updater = Updater(trust=trust, env=env, disk_fn=lambda _p: 10 ** 12,
+                          now_fn=lambda: now)
+        snap = updater.check_once(force=True)
+        assert snap["state"] == STATE_AVAILABLE, snap
+        assert snap["layout"] == LAYOUT_GITHUB, snap
+        assert seen[0][0] == "/latest/download/manifest-stable.json", seen
+        assert seen[1][0] == "/download/v0.2.0/manifest-stable.json", seen
+        snap = updater.download_once()
+        assert snap["state"] == STATE_READY, snap
+        receipt = staged_receipt(env)
+        assert receipt["version"] == version and receipt["sha256"] == artifact_sha, receipt
+        with open(receipt["path"], "rb") as fh:
+            assert fh.read() == installer
+        # The installer came from the VERSIONED path, never through latest/.
+        downloads = [p for p, _ua in seen if p.endswith(".exe")]
+        assert downloads[0] == "/download/v0.2.0/" + name, seen
+        assert not any(p.startswith("/latest/") and p.endswith(".exe") for p in downloads)
+        # Every request carried the plain product name and nothing else that
+        # identifies anybody.
+        assert all(ua == "hearth-updater" for _p, ua in seen), seen
+
+        # A redirect off the allowlist is refused before it is followed.
+        before = len(seen)
+        try:
+            fetch_manifest(loop_base + "away/", "stable", layout=LAYOUT_GITHUB)
+            raise AssertionError("a redirect to plain http elsewhere must be refused")
+        except FeedError:
+            raise AssertionError("a refused redirect is not an offline feed")
+        except UpdateError as exc:
+            assert "refusing a redirect" in str(exc), str(exc)
+        assert len(seen) == before + 1, "the refused redirect must not be followed"
+
+        # A redirect chain longer than MAX_REDIRECTS is cut off.
+        before = len(seen)
+        try:
+            fetch_manifest(loop_base + "loop/", "stable", layout=LAYOUT_GITHUB)
+            raise AssertionError("an endless redirect chain must be refused")
+        except FeedError:
+            raise AssertionError("a redirect loop is not an offline feed")
+        except UpdateError as exc:
+            assert "redirected more than" in str(exc), str(exc)
+        assert len(seen) - before == MAX_REDIRECTS + 1, (len(seen) - before, seen[before:])
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(5)
 
 
 def _self_test():
@@ -1614,12 +2042,17 @@ def _self_test():
         real_trust = load_trust()
         assert real_trust["app_id"] == "com.hearthlocal.hearth", real_trust["app_id"]
         assert any(k["status"] == "active" for k in real_trust["keys"])
-        # Shipped, nothing is published: the pinned feed must be a name that
-        # cannot resolve, so a build that was never configured cannot talk to
-        # anything at all.
-        assert not configured(real_trust, {}), (
-            "the committed trust file points at a real feed; nothing has been "
-            "published and the shipped default must not pretend otherwise")
+        # Shipped, the feed is this repository's GitHub Releases, in the flat
+        # layout, and checks really go somewhere.
+        assert configured(real_trust, {}), real_trust["feed"]
+        assert real_trust["feed"] == "https://github.com/EricFinland/hearth-windows/releases/", (
+            real_trust["feed"])
+        assert layout_for(real_trust) == LAYOUT_GITHUB, real_trust.get("layout")
+        assert feed_name(real_trust, {}) == "GitHub"
+        # The 2026-08 key's seed sat in a cloud-synced folder. It must never
+        # verify anything again, whatever else changes in this file.
+        statuses = {k["key_id"]: k["status"] for k in real_trust["keys"]}
+        assert statuses.get("hearth-release-2026-08") == "revoked", statuses
 
         # -- a broken trust file is refused --------------------------------
         good_key = {"key_id": "k1", "algorithm": "ed25519",
@@ -1642,6 +2075,17 @@ def _self_test():
             lambda t: t["keys"][0].update(status="maybe"),
             lambda t: t.update(keys=[dict(good_key), dict(good_key)]),
             lambda t: t.update(keys=[dict(good_key, status="revoked")]),
+            lambda t: t.update(layout="ftp-site"),
+            # A github-releases feed has to be a repository's releases URL,
+            # because the asset paths are appended to it.
+            lambda t: t.update(layout=LAYOUT_GITHUB),
+            lambda t: t.update(layout=LAYOUT_GITHUB, feed="https://github.com/o/r/"),
+            lambda t: t.update(layout=LAYOUT_GITHUB,
+                               feed="https://github.com.evil.example/o/r/releases/"),
+            lambda t: t.update(layout=LAYOUT_GITHUB,
+                               feed="https://github.com:8443/o/r/releases/"),
+            lambda t: t.update(layout=LAYOUT_GITHUB,
+                               feed="https://github.com/o/r/releases/x/"),
         ):
             broken = json.loads(json.dumps(base_trust))
             mutate(broken)
@@ -1650,6 +2094,11 @@ def _self_test():
                 raise AssertionError("a broken trust file must be refused: {}".format(broken))
             except UpdateError:
                 pass
+        assert validate_trust(dict(json.loads(json.dumps(base_trust)), layout=LAYOUT_GITHUB,
+                                   feed="https://github.com/o/r/releases/"))
+        # No layout is the directory layout, so every trust file written
+        # before the feed moved to GitHub still means what it meant.
+        assert layout_for(base_trust) == LAYOUT_DIRECTORY
 
         # -- versions ------------------------------------------------------
         assert parse_version("0.1.0") == (0, 1, 0)
@@ -1935,13 +2384,61 @@ def _self_test():
                 raise AssertionError("must refuse {}".format(bad))
             except UpdateError:
                 pass
-        handler = _PinnedRedirectHandler(("https", "updates.example.com"))
-        for bad in ("https://evil.example/x", "http://updates.example.com/x"):
+        # A directory feed redirects only within its own origin, and not to
+        # GitHub's hosts either: those are allowed for a GitHub feed only.
+        handler = _FeedRedirectHandler(("https", "updates.example.com"),
+                                       redirect_hosts(LAYOUT_DIRECTORY))
+        assert handler.allows("https://updates.example.com/u/elsewhere")
+        for bad in ("https://evil.example/x", "http://updates.example.com/x",
+                    "https://release-assets.githubusercontent.com/x"):
             try:
                 handler.redirect_request(None, None, 302, "Found", {}, bad)
                 raise AssertionError("must refuse a redirect to {}".format(bad))
             except UpdateError:
                 pass
+
+        # -- the GitHub redirect allowlist -----------------------------------
+        gh = _FeedRedirectHandler(("https", "github.com"), redirect_hosts(LAYOUT_GITHUB))
+        assert gh.max_redirections == MAX_REDIRECTS
+        for good_url in (
+                "https://github.com/o/r/releases/download/v0.2.0/manifest-stable.json",
+                "https://release-assets.githubusercontent.com/github-production-release-asset/1/2?sp=r&sig=abc",
+                "https://objects.githubusercontent.com/github-production-release-asset-2e65be/1/2",
+                "https://RELEASE-ASSETS.githubusercontent.com:443/x"):
+            assert gh.allows(good_url), good_url
+            req = urllib.request.Request("https://github.com/o/r/releases/latest/download/x")
+            assert gh.redirect_request(req, None, 302, "Found", {}, good_url) is not None
+        for bad in ("http://release-assets.githubusercontent.com/x",       # not https
+                    "http://github.com/o/r/releases/x",                   # downgraded
+                    "https://release-assets.githubusercontent.com:8443/x", # odd port
+                    "https://user@release-assets.githubusercontent.com/x", # userinfo
+                    "https://github.com.evil.example/x",                  # suffix trick
+                    "https://evil.githubusercontent.com/x",               # sibling host
+                    "https://githubusercontent.com/x",
+                    "ftp://github.com/x",
+                    "https://[::1]/x"):
+            assert not gh.allows(bad), bad
+            try:
+                gh.redirect_request(None, None, 302, "Found", {}, bad + "?token=SECRET")
+                raise AssertionError("must refuse a redirect to {}".format(bad))
+            except UpdateError as exc:
+                # The refusal names where, but never repeats the signed query.
+                assert "SECRET" not in str(exc), str(exc)
+        assert _redacted("https://h/p/x.exe?sig=abc#f") == "https://h/p/x.exe"
+
+        # -- the flat (GitHub Releases) layout -------------------------------
+        ghbase = "https://github.com/o/r/releases/"
+        assert manifest_url(ghbase, "stable", LAYOUT_GITHUB) == (
+            ghbase + "latest/download/manifest-stable.json")
+        assert manifest_url(base, "stable") == base + "stable/manifest.json", (
+            "the directory layout must keep working for trust files without a layout")
+        art_path = github_artifact_path("0.2.0", "Hearth-Setup-0.2.0.exe")
+        assert art_path == "download/v0.2.0/Hearth-Setup-0.2.0.exe", art_path
+        # The versioned path is a legal signed path, sits inside the feed, and
+        # is not latest/: a release published mid-update cannot swap it.
+        assert _check_relative_path(art_path)
+        assert check_url(artifact_url(ghbase, art_path), ghbase)
+        assert "latest" not in art_path
 
         # feed_base: an http override is loopback-only, and a pinned http feed
         # is refused outright.
@@ -2148,14 +2645,79 @@ def _self_test():
         assert snap["available"] is None
 
         # -- an unreachable feed is honest ---------------------------------
+        # A click gets the precise reason and names what is running.
         empty_feed = _FakeFeed({})
         u5 = Updater(trust=trust, env=env, opener_fn=lambda _b: empty_feed,
                      disk_fn=lambda _p: 10 ** 12, now_fn=lambda: now)
-        snap = u5.check_once()
+        snap = u5.check_once(force=True)
         assert snap["state"] == STATE_FAILED, snap
         assert "could not check for updates" in snap["error"], snap["error"]
         assert snap["available"] is None
         assert "0.1.0" in snap["error"], "an honest failure names what is running"
+        assert snap["failure"] == "offline" and snap["background"] is False, snap
+
+        # -- quiet failure on launch -----------------------------------------
+        # The automatic launch check, offline: calm, honest, and still a
+        # failure rather than "up to date".
+        class _Offline:
+            def open(self, target, timeout=None):
+                raise urllib.error.URLError(OSError(11001, "getaddrinfo failed"))
+
+        env_quiet = {"HEARTH_DATA_DIR": os.path.join(tmp, "data-quiet"), ENV_VERSION: "0.1.0"}
+        gh_trust = dict(trust, feed="https://github.com/o/r/releases/", layout=LAYOUT_GITHUB)
+        u_off = Updater(trust=gh_trust, env=env_quiet, opener_fn=lambda _b: _Offline(),
+                        now_fn=lambda: now)
+        snap = u_off.check_once()
+        assert snap["state"] == STATE_FAILED, snap
+        assert snap["state"] != STATE_UP_TO_DATE
+        assert snap["failure"] == "offline" and snap["background"] is True, snap
+        assert snap["error"] == ("Could not reach GitHub to check for updates. Hearth "
+                                 "will try again next launch."), snap["error"]
+        assert "getaddrinfo" in snap["detail"], snap["detail"]
+        assert snap["available"] is None
+        # Nothing was persisted by a check that did not happen.
+        assert "last_check_at" not in read_state(env_quiet), read_state(env_quiet)
+        # GitHub answered, but the newest release carries no manifest (it was
+        # published without the signing secret): calm too, and says so.
+        snap = Updater(trust=gh_trust, env=env_quiet, opener_fn=lambda _b: _FakeFeed({}),
+                       now_fn=lambda: now).check_once()
+        assert snap["failure"] == "offline", snap
+        assert "no update information" in snap["error"], snap["error"]
+        # A click on the same machine gets the precise reason.
+        snap = u_off.check_once(force=True)
+        assert "getaddrinfo" in snap["error"] and "0.1.0" in snap["error"], snap["error"]
+        assert snap["background"] is False
+
+        # A refused signature on a launch check is NOT calm: it is the failure
+        # that means somebody is trying.
+        snap = Updater(trust=trust, env=env_quiet, opener_fn=lambda _b: forged_feed,
+                       now_fn=lambda: now).check_once()
+        assert snap["failure"] == "refused", snap
+        assert "no trusted key" in snap["error"], snap["error"]
+
+        # An expired manifest is refused, worded calmly, and says when.
+        stale = _FakeFeed({base + "stable/manifest.json": manifest_bytes})
+        later = datetime.datetime(2026, 10, 1, tzinfo=datetime.timezone.utc)
+        snap = Updater(trust=trust, env=env_quiet, opener_fn=lambda _b: stale,
+                       now_fn=lambda: later).check_once()
+        assert snap["state"] == STATE_FAILED and snap["failure"] == "expired", snap
+        assert "expired on 2026-09-01T00:00:00Z" in snap["error"], snap["error"]
+        assert snap["available"] is None
+        assert read_floor(env_quiet) == {}, "an expired manifest must move nothing"
+
+        # Offline at launch with a verified installer already staged from an
+        # earlier run: the installer needs no network, so it is offered.
+        u_stage = Updater(trust=trust, env=env_quiet, opener_fn=lambda _b: feed,
+                          disk_fn=lambda _p: 10 ** 12, now_fn=lambda: now)
+        u_stage.check_once(force=True)
+        assert u_stage.download_once()["state"] == STATE_READY
+        u_off2 = Updater(trust=trust, env=env_quiet, opener_fn=lambda _b: _Offline(),
+                         now_fn=lambda: now)
+        snap = u_off2.check_once()
+        assert snap["state"] == STATE_READY, snap
+        assert snap["staged"]["version"] == "0.2.0", snap
+        assert snap["error"] is None, snap
+        clear_staged(env_quiet)
 
         # -- an oversized manifest is cut off ------------------------------
         huge = _FakeFeed({base + "stable/manifest.json":
@@ -2216,6 +2778,64 @@ def _self_test():
         raise_floor("not a version", "2026-08-01T00:00:00Z", env)
         assert read_floor(env)["version"] == "0.5.0"
 
+        # -- the check sends nothing about this machine -----------------------
+        # Every request the updater made in this test, manifest and installer
+        # alike: no query string, and the only identifying header is the
+        # fixed product name.
+        for url, headers in zip(feed.opened, feed.headers):
+            assert "?" not in url, url
+            names = {k.lower() for k in headers}
+            assert names <= {"user-agent", "cache-control", "accept"}, headers
+            assert headers.get("User-agent") == "hearth-updater", headers
+
+        # -- the toggle and the floor cannot lose each other's writes ---------
+        # set_auto_check runs on a request thread and a check writes the floor
+        # and last_check_at from the worker thread. Before update_state, both
+        # read-modified-wrote the same file through one fixed temp name, and
+        # the loser of the race silently dropped the other's change, floor
+        # included.
+        env_race = {"HEARTH_DATA_DIR": os.path.join(tmp, "data-race"), ENV_VERSION: "0.1.0"}
+        racer = Updater(trust=trust, env=env_race, now_fn=lambda: now)
+        errors = []
+
+        def _toggle_many():
+            try:
+                for i in range(60):
+                    racer.set_auto_check(i % 2 == 1)  # ends on True
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def _raise_many():
+            try:
+                for minor in range(1, 61):
+                    raise_floor("0.{}.0".format(minor), "2026-08-01T00:00:00Z", env_race)
+
+                    def _stamp(st, m=minor):
+                        st["last_check_at"] = "stamp-{}".format(m)
+                    update_state(_stamp, env_race)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        workers = [threading.Thread(target=_toggle_many), threading.Thread(target=_raise_many)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(60)
+        assert not errors, errors
+        final = read_state(env_race)
+        assert final["floor"]["version"] == "0.60.0", final
+        assert final["auto_check"] is True, final
+        assert final["last_check_at"] == "stamp-60", final
+        leftovers = [n for n in os.listdir(update_dir(env_race)) if n != STATE_NAME]
+        assert not leftovers, "a state write left a temp file behind: {}".format(leftovers)
+
+        # -- end to end over real HTTP, in the GitHub Releases layout ---------
+        # A loopback server that answers the way GitHub does: latest/download
+        # redirects to the versioned download path, which redirects again to
+        # an asset URL carrying a token. No fake opener: this is urllib, the
+        # real redirect handler, the real verifier and the real stage().
+        _github_layout_e2e(tmp, seed, installer, artifact_sha)
+
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -2237,7 +2857,7 @@ def main(argv=None):
         return _self_test()
     if args.check:
         updater = Updater()
-        snap = updater.check_once()
+        snap = updater.check_once(force=True)
         if args.json:
             print(json.dumps(snap, indent=2, sort_keys=True, default=str))
         else:

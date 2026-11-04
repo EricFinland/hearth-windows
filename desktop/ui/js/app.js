@@ -7,12 +7,18 @@
 
 import { Sidecar, HttpError, readHandshake, pickFolder, hasShellBridge, installUpdate } from "./api.js";
 import { Transcript } from "./transcript.js";
+import { HistoryPanel } from "./history.js";
 import { el, icon, appendAll, clear, setText, neutralize, $ } from "./dom.js";
 import { blob } from "./safe-text.js";
+import { renderDiff } from "./diff.js";
 import { ShopView } from "./shop.js";
+import { startModelChip, modelLoadingHint } from "./model-chip.js";
 import { LoopConfigPanel, LoopRunBar, account as loopAccount } from "./loop.js";
+import { initAttachments, takeAttachments, returnAttachments } from "./attach.js";
 import { SwarmConfigPanel, SwarmRunBar, account as swarmAccount } from "./swarm.js";
+import { renderUpdateBanner, showUpdateBannerAgain } from "./update-banner.js";
 import { renderUpdate } from "./update.js";
+import { McpPanel } from "./mcp.js";
 
 const RECENTS_KEY = "hearth.recentWorkspaces"; // workspace paths only; the bearer token is never stored
 const MAX_RECENTS = 8;
@@ -108,21 +114,30 @@ const swarmRunBar = new SwarmRunBar(ui.swarmRunBar);
 
 // ---------------------------------------------------------------------- views
 
-/** Chat and the shop are two panes over one sidebar, not two pages: the
- *  download stream, the session and the event stream all belong to the page,
- *  so switching views must never tear any of them down. That is also what
- *  makes "downloads survive navigating between chat and shop" true by
- *  construction rather than by bookkeeping. */
+/** Chat, the shop and the Tools screen are panes over one sidebar, not
+ *  separate pages: the download stream, the session and the event stream all
+ *  belong to the page, so switching views must never tear any of them down.
+ *  That is also what makes "downloads survive navigating between chat and
+ *  shop" true by construction rather than by bookkeeping. The Tools screen
+ *  holds no stream at all; it polls only while it is the one showing. */
+let mcpPanel = null;
+
 function setView(name) {
+  const views = {
+    chat: [ui.chatView, ui.tabChat],
+    shop: [ui.shopView, ui.tabShop],
+    tools: [$("#tools"), $("#tab-tools")],
+  };
+  if (!views[name]) name = "chat";
   state.view = name;
-  const shop = name === "shop";
-  ui.chatView.hidden = shop;
-  ui.shopView.hidden = !shop;
-  ui.tabChat.classList.toggle("is-active", !shop);
-  ui.tabShop.classList.toggle("is-active", shop);
-  ui.tabChat.setAttribute("aria-pressed", String(!shop));
-  ui.tabShop.setAttribute("aria-pressed", String(shop));
-  if (shop) shopView?.focus();
+  for (const [key, [pane, tab]] of Object.entries(views)) {
+    const on = key === name;
+    pane.hidden = !on;
+    tab.classList.toggle("is-active", on);
+    tab.setAttribute("aria-pressed", String(on));
+  }
+  if (name === "shop") shopView?.focus();
+  if (name === "tools") mcpPanel?.show();
 }
 
 // ---------------------------------------------------------------- connection
@@ -435,7 +450,13 @@ const UPDATE_POLL_MS = 1000;
 
 /** True while the sidecar is doing something whose progress is worth watching. */
 function updateInFlight(snap) {
-  return Boolean(snap) && (snap.state === "checking" || snap.state === "downloading");
+  // `running` as well as the state: POST /update answers the instant the
+  // worker thread starts, which can be before that thread has set
+  // "checking" or "downloading". Reading only the state there would stop
+  // polling on a snapshot that is already out of date, and the launch
+  // check's answer would never be drawn.
+  return Boolean(snap) && (snap.state === "checking" || snap.state === "downloading"
+    || snap.running === true);
 }
 
 function scheduleUpdatePoll() {
@@ -466,6 +487,23 @@ function scheduleUpdatePoll() {
  *  with the hash in front of them. This page cannot name a file and cannot
  *  make anything run. */
 function renderUpdatePanel() {
+  renderUpdateBanner(updateSnapshot, {
+    onInstall: (button) => {
+      button.disabled = true;
+      installFromBanner();
+    },
+  });
+  // "Install now" on an update that still had to be downloaded: the click
+  // asked for the whole thing, so once the download is verified and staged,
+  // hand straight on to the shell (which still asks, with the hash shown).
+  if (updateInstallPending && updateSnapshot) {
+    if (updateSnapshot.state === "ready" && updateSnapshot.staged) {
+      updateInstallPending = false;
+      runUpdateInstall();
+    } else if (updateSnapshot.state !== "downloading" && updateSnapshot.state !== "available") {
+      updateInstallPending = false; // failed or cancelled; the panel says which
+    }
+  }
   renderUpdate(ui.updateBody, updateSnapshot, {
     onCheck: async (button) => {
       button.disabled = true;
@@ -503,23 +541,79 @@ function renderUpdatePanel() {
     },
     onInstall: async (button) => {
       button.disabled = true;
-      const result = await installUpdate();
-      if (result && result.error) {
-        updateSnapshot = { ...(updateSnapshot ?? {}), state: "failed", error: result.error };
-        renderUpdatePanel();
-        return;
-      }
-      if (result && result.cancelled) {
-        button.disabled = false;
-        return;
-      }
-      // Success means this window is about to close. Say so rather than
-      // leaving a dead button behind.
-      updateSnapshot = { ...(updateSnapshot ?? {}), state: "ready",
-        message: "Closing Hearth and starting the installer…" };
-      renderUpdatePanel();
+      const cancelled = await runUpdateInstall();
+      if (cancelled) button.disabled = false;
     },
   });
+}
+
+/** Set by the banner's "Install now" while the download it started is still
+ *  running; renderUpdatePanel hands over to runUpdateInstall once the
+ *  snapshot says the installer is verified and staged. */
+let updateInstallPending = false;
+
+/** True from the moment an install is asked for until the shell answers,
+ *  and for good once it has started the installer (this window is about to
+ *  close). The shell's dialog is not modal to this page, and every redraw
+ *  while it is open puts a fresh, enabled Install button in the banner and
+ *  the panel, so without this a second click opened a second dialog and, if
+ *  both were accepted, started the installer twice. */
+let updateInstallRunning = false;
+
+/** Ask the shell to run the staged installer. Returns true when the user
+ *  said "Not now" in the shell's own dialog. */
+async function runUpdateInstall() {
+  if (updateInstallRunning) return false;
+  updateInstallRunning = true;
+  let outcome = "failed";
+  try {
+    outcome = await askShellToInstall();
+  } finally {
+    if (outcome !== "started") updateInstallRunning = false;
+  }
+  return outcome === "cancelled";
+}
+
+/** One install_update call: "started", "cancelled" or "failed". */
+async function askShellToInstall() {
+  const result = await installUpdate();
+  if (result && result.error) {
+    updateSnapshot = { ...(updateSnapshot ?? {}), state: "failed", failure: "error",
+      error: result.error };
+    renderUpdatePanel();
+    return "failed";
+  }
+  if (result && result.cancelled) {
+    renderUpdatePanel();
+    return "cancelled";
+  }
+  // Success means this window is about to close. Say so rather than
+  // leaving a dead button behind.
+  updateSnapshot = { ...(updateSnapshot ?? {}), state: "ready",
+    message: "Closing Hearth and starting the installer…" };
+  renderUpdatePanel();
+  return "started";
+}
+
+/** The banner's "Install now": install a staged update at once, or download
+ *  one first and install it when it is verified. Same requests as the
+ *  panel's two buttons, in sequence; nothing here can run a file. */
+async function installFromBanner() {
+  showUpdateBannerAgain();
+  if (updateSnapshot && updateSnapshot.state === "ready" && updateSnapshot.staged) {
+    await runUpdateInstall();
+    return;
+  }
+  updateInstallPending = true;
+  try {
+    updateSnapshot = await sidecar.downloadUpdate();
+  } catch (err) {
+    updateInstallPending = false;
+    updateSnapshot = { ...(updateSnapshot ?? {}), state: "failed", failure: "error",
+      error: errorText(err) };
+  }
+  renderUpdatePanel();
+  scheduleUpdatePoll();
 }
 
 /** Read the updater's state once, kick off the one automatic check per
@@ -690,10 +784,11 @@ async function refreshCheckpoints() {
     setText(ui.cpNote, "No session yet.");
     return;
   }
-  // GET /checkpoints runs `git log` against the workspace's shadow store, and
-  // this is refreshed the moment a `checkpoint` event arrives, which is exactly
-  // when that store is being written. Losing that race is a transient 500, not
-  // a broken history, so retry once before reporting anything.
+  // GET /checkpoints reads the workspace's shadow store under the same lock a
+  // checkpoint or restore holds, so it never sees a half-written store. If one
+  // holds it for longer than the sidecar will wait, the answer is a 503
+  // checkpoint_store_busy: ask once more after a moment. Any other failure is
+  // real and is reported straight away rather than retried into hiding.
   let list;
   for (let attempt = 0; ; attempt++) {
     try {
@@ -701,7 +796,7 @@ async function refreshCheckpoints() {
       list = Array.isArray(body.checkpoints) ? body.checkpoints : [];
       break;
     } catch (err) {
-      if (attempt === 0) { await sleep(700); continue; }
+      if (attempt === 0 && err?.status === 503) { await sleep(700); continue; }
       clear(ui.cpList);
       ui.cpNote.className = "panel-note is-error";
       setText(ui.cpNote, "Could not read checkpoint history: " + errorText(err));
@@ -735,19 +830,31 @@ async function refreshCheckpoints() {
 
 /** Show what a restore will do before doing it.
  *
- * The sidecar exposes no route that previews a checkpoint diff, so this does
- * not invent a per-file list it cannot know. It states the operation exactly
- * (hearth_checkpoint.restore resets the workspace's tracked content to this
- * snapshot), says how many later checkpoints it undoes, and warns about the
- * one gap that module documents: files matching its secret-exclusion patterns
- * were never captured, so they cannot be put back. The per-file list of what
- * actually changed comes back in the restore response and is rendered into the
- * transcript afterwards.
+ * The dialog states the operation (hearth_checkpoint.restore resets the
+ * workspace's tracked content to this snapshot), says how many later
+ * checkpoints it undoes, and shows the actual per-file diff from
+ * GET /checkpoints/diff, which runs the same comparison restore makes and
+ * stops before writing anything. The diff is drawn in restore's direction:
+ * "-" lines are what is on disk now and will go, "+" lines are what the
+ * checkpoint puts back. It also names any excluded secrets files (.env and
+ * similar) that changed since the checkpoint, the one gap restore documents:
+ * they were never captured, so they cannot be put back.
+ *
+ * The preview is fetched after the dialog opens and never gates it. Restore
+ * stays clickable while it loads and when it fails, because the preview is an
+ * aid to the decision, and the restore response still reports exactly what
+ * changed in the transcript afterwards. While a turn is live in the workspace
+ * the sidecar refuses the preview, as it refuses the restore itself, and the
+ * dialog says to wait rather than calling it a failure.
  */
 function confirmRestore(cp, index) {
   const when = formatTime(cp.timestamp ?? cp.commit_time);
+  const preview = el("div", {}, [
+    el("p", { class: "panel-note", text: "Working out what this restore would change..." }),
+  ]);
   const body = [
     el("p", { text: `Restore the workspace to "${cp.label || cp.id.slice(0, 12)}"${when ? ` from ${when}` : ""}.` }),
+    preview,
     el("p", { text: "Every tracked file in the workspace is reset to its contents at this checkpoint. Files created since then are removed. This is not itself undoable, though a fresh checkpoint is taken at the start of every turn." }),
     el("p", { text: index > 0
       ? `This undoes ${index} later checkpoint${index === 1 ? "" : "s"}.`
@@ -760,6 +867,53 @@ function confirmRestore(cp, index) {
     { label: "Cancel", variant: "btn-ghost" },
     { label: "Restore", variant: "btn-danger", run: () => doRestore(cp) },
   ]);
+  loadRestorePreview(cp, preview);
+}
+
+/** Fill `holder` with the restore preview, unless the dialog it lives in has
+ *  closed (or been replaced) by the time the answer arrives. */
+async function loadRestorePreview(cp, holder) {
+  let result;
+  try {
+    result = await sidecar.request("GET", "/checkpoints/diff?" + new URLSearchParams({ id: cp.id }));
+  } catch (err) {
+    if (!holder.isConnected) return;
+    clear(holder);
+    holder.appendChild(el("p", {
+      class: "panel-note is-error",
+      text: err instanceof HttpError && err.status === 503
+        ? "A checkpoint is being written right now, so the preview is not available. Reopen this in a moment to see it; Restore itself still works."
+        : err instanceof HttpError && err.body?.workspace_busy
+          ? "A turn is still working in this workspace, so there is nothing settled to preview yet. Restore waits for it too; reopen this once the turn has finished."
+          : "Could not preview this restore (" + errorText(err) + "). Restore itself still works, and its result lists every file it changed.",
+    }));
+    return;
+  }
+  if (!holder.isConnected) return;
+  clear(holder);
+  holder.appendChild(el("p", {
+    class: "panel-note",
+    text: "What restoring changes: lines marked - are on disk now and will go, lines marked + come back from the checkpoint.",
+  }));
+  holder.appendChild(renderDiff(result, {
+    emptyText: "No tracked file differs from this checkpoint, so restoring it would change nothing.",
+  }));
+  const excluded = Array.isArray(result?.excluded_changed) ? result.excluded_changed : [];
+  if (excluded.length) {
+    holder.appendChild(el("p", {
+      class: "panel-note is-warn",
+      text: "These files match the checkpoint's secret-exclusion patterns and changed since it was taken. They were never captured, so restore cannot put them back:",
+    }));
+    holder.appendChild(blob(excluded.map((e) => `${e.status}  ${e.path}`).join("\n")));
+  }
+  const skipped = Array.isArray(result?.skipped_gitlinks) ? result.skipped_gitlinks : [];
+  if (skipped.length) {
+    holder.appendChild(el("p", {
+      class: "panel-note",
+      text: "These are nested git repositories, which restore leaves alone:",
+    }));
+    holder.appendChild(blob(skipped.join("\n")));
+  }
 }
 
 async function doRestore(cp) {
@@ -988,10 +1142,59 @@ function applySession(session) {
 
   setText(ui.connect, "Restart session");
   ui.sessionNote.className = "panel-note";
-  setText(ui.sessionNote, "Restarting replaces the session and clears its transcript.");
+  setText(ui.sessionNote,
+    "Restarting starts a new chat with these settings. The current one stays under Chats.");
 
   updateTurnUi();
   if (isNew) refreshCheckpoints();
+}
+
+// The Chats sidebar (history.js). Built in boot(), once the sidecar answers.
+let historyPanel = null;
+
+/** Make `session` the one this page shows: a session just started from the
+ *  form, a new chat, or a saved conversation reopened from Chats. Every one
+ *  of those is a different session with its own event log, so the old stream
+ *  is torn down, the transcript cleared, and the new log replayed from its
+ *  first event. That replay is the whole transcript of a reopened chat. */
+function adoptSession(session, placeholderTitle, placeholderBody) {
+  stopEventStream();
+  state.lastEventId = 0;
+  state.accountShownFor = null;
+  state.swarmAccountShownFor = null;
+  localEchoes.length = 0;
+  transcript.reset();
+  transcript.showPlaceholder(placeholderTitle, placeholderBody);
+  // The form follows the open chat, so "Restart session" and the next "New
+  // chat" describe the session on screen rather than the one before it.
+  ui.workspace.value = session.workspace;
+  if ([...ui.model.options].some((option) => option.value === session.model)) {
+    ui.model.value = session.model;
+  }
+  // Treated as new even in the same workspace, so applySession re-reads the
+  // checkpoint list for it.
+  state.session = null;
+  applySession(session);
+  startEventStream();
+}
+
+/** The open conversation was deleted, which ended the session with it. */
+function clearSession() {
+  stopEventStream();
+  state.session = null;
+  state.running = false;
+  state.lastEventId = 0;
+  localEchoes.length = 0;
+  transcript.showPlaceholder("No chat open",
+    "Start a new chat, or open one from Chats. The chat you deleted is gone; "
+    + "the files in its workspace were not touched.");
+  setChip(ui.chipWorkspace, "no workspace", false);
+  setChip(ui.chipModel, "no model");
+  setText(ui.connect, "Start session");
+  ui.sessionNote.className = "panel-note";
+  setText(ui.sessionNote, "");
+  updateTurnUi();
+  refreshCheckpoints();
 }
 
 async function startSession() {
@@ -1050,21 +1253,16 @@ async function startSession() {
     if (engine === "loop") body.loop = loopConfigPanel.read();
     if (engine === "swarm") body.swarm = swarmConfigPanel.read();
     const session = await sidecar.createSession(body);
-    state.lastEventId = 0;
-    state.accountShownFor = null;
-    state.swarmAccountShownFor = null;
-    transcript.reset();
-    transcript.showPlaceholder(
+    // A new session is a new conversation; the one it replaced stays in Chats.
+    adoptSession(session,
       session.engine === "loop" ? "Work loop ready" : "Session ready",
       session.engine === "loop"
         ? `Give it one goal. It will keep working until it is done, hits a `
           + `ceiling, stops making progress, or you stop it. ${session.mode} mode `
           + `in ${session.workspace}.`
         : `${session.mode} mode in ${session.workspace}`);
-    applySession(session);
     rememberWorkspace(session.workspace);
-    startEventStream();
-    await refreshCheckpoints();
+    historyPanel?.refresh();
   } catch (err) {
     ui.sessionNote.className = "panel-note is-error";
     setText(ui.sessionNote, errorText(err));
@@ -1094,7 +1292,7 @@ function updateTurnUi() {
   if (state.running) {
     setComposerEnabled(false, loop
       ? "The work loop is running. Press Esc or Stop to end it."
-      : "Working. Press Esc or the stop button to interrupt.");
+      : (modelLoadingHint() || "Working. Press Esc or the stop button to interrupt."));
     setConn("busy", loop ? "work loop running" : "running");
   } else {
     const pending = state.loop && state.loop.pending;
@@ -1112,19 +1310,48 @@ function autosize() {
   ui.composer.style.height = Math.min(ui.composer.scrollHeight, 220) + "px";
 }
 
+/* Prompts this page has already drawn, waiting for the sidecar's own
+ * `user_prompt` echo of them. POST /prompt records every prompt in the event
+ * log so a replay (a reload, a restart, a reopened chat) shows both sides of
+ * the conversation; the page that sent it has drawn it already, so the echo
+ * of its own prompt is skipped exactly once. */
+const localEchoes = [];
+
+function takeLocalEcho(data) {
+  const text = typeof data.text === "string" ? data.text : "";
+  const i = localEchoes.findIndex((sent) => sent === text
+    || (data.truncated && sent.startsWith(text)));
+  if (i === -1) return false;
+  localEchoes.splice(i, 1);
+  return true;
+}
+
 async function send() {
   const message = ui.composer.value.trim();
   if (!message || !state.session || state.running) return;
+  const attached = takeAttachments();
   ui.composer.value = "";
   autosize();
   transcript.addUser(message);
+  localEchoes.push(message);
   state.running = true;
   updateTurnUi();
+  if (attached.length) transcript.addUserAttachments(attached);
   try {
-    await sidecar.prompt(message);
+    await sidecar.prompt(message, attached.map((a) => a.path));
   } catch (err) {
+    const i = localEchoes.indexOf(message);
+    if (i !== -1) localEchoes.splice(i, 1);
     state.running = false;
     updateTurnUi();
+    // Give the words back with the files, so a refusal (files that no
+    // longer fit the context, a 413) costs nothing to retry and the tray's
+    // hint can say what to change rather than asking for a message.
+    if (!ui.composer.value.trim()) {
+      ui.composer.value = message;
+      autosize();
+    }
+    returnAttachments(attached);
     transcript.addNotice("error", "Could not submit that prompt.", errorText(err));
   }
 }
@@ -1209,6 +1436,30 @@ function startEventStream() {
 function handleEvent(event) {
   const data = event.data || {};
   switch (event.kind) {
+    // The user's own prompt, recorded by the sidecar. Drawn on replay; the
+    // live copy this page drew in send() is not drawn twice.
+    case "user_prompt":
+      // A first prompt is what names a chat in the sidebar.
+      historyPanel?.refreshSoon();
+      if (takeLocalEcho(data)) break;
+      transcript.addUser(data.truncated
+        ? `${data.text || ""}\n\n(shortened: the full prompt was sent to the model)`
+        : data.text || "");
+      // The files sent with it, as the chips send() drew. A saved chat is a
+      // file the agent's own commands can rewrite, so this is untrusted
+      // too: only strings go through, and addUserAttachments renders them
+      // as text.
+      if (Array.isArray(data.attachments)) {
+        transcript.addUserAttachments(data.attachments
+          .filter((f) => f && typeof f === "object")
+          .map((f) => ({
+            name: typeof f.name === "string" ? f.name : "attachment",
+            path: typeof f.path === "string" ? f.path : "",
+            plan: typeof f.inlined === "string" ? f.inlined : "none",
+          })));
+      }
+      break;
+
     // A delta is a fragment of assistant text, emitted by engine.py as
     // tokens arrive (coalesced on a short window, see its module docstring's
     // point 7). stream_id names which assistant message it belongs to and
@@ -1280,6 +1531,23 @@ function handleEvent(event) {
     }
 
     case "events_dropped":
+      // `restored` marks the front of a saved conversation's history: only
+      // its most recent part is kept on disk (session_state.persisted_tail),
+      // and a chat that starts mid-way must say so rather than pass for whole.
+      // `gap` marks a hole in the middle of one instead: a stretch between
+      // two saves that outran the live event buffer (session_state.merge_tail).
+      if (data.restored && data.gap) {
+        transcript.addNotice("quiet", "Part of this chat was not saved.",
+          "A long stretch of activity happened between two saves and only its end "
+          + "was kept. The model's own context was saved separately and is not affected.");
+        break;
+      }
+      if (data.restored) {
+        transcript.addNotice("quiet", "Earlier messages are not shown.",
+          "Only the most recent part of a saved conversation's activity is kept. "
+          + "The model's own context was saved separately and is not affected.");
+        break;
+      }
       transcript.addNotice("quiet", "Some earlier events were dropped.",
         "The session's event buffer wrapped while this window was disconnected.");
       break;
@@ -1473,6 +1741,7 @@ async function browseForFolder() {
 
 ui.tabChat.addEventListener("click", () => setView("chat"));
 ui.tabShop.addEventListener("click", () => setView("shop"));
+$("#tab-tools").addEventListener("click", () => setView("tools"));
 ui.connect.addEventListener("click", startSession);
 ui.browse.addEventListener("click", browseForFolder);
 ui.reloadModels.addEventListener("click", refreshModels);
@@ -1480,6 +1749,7 @@ ui.reloadSetup.addEventListener("click", refreshSetup);
 ui.reloadCheckpoints.addEventListener("click", refreshCheckpoints);
 ui.send.addEventListener("click", send);
 ui.stop.addEventListener("click", cancel);
+initAttachments({ sidecar, getSession: () => state.session, isRunning: () => state.running });
 
 // The bounds form appears the moment "work loop" is chosen, not after a
 // session exists: a person deciding whether to run one unattended needs to
@@ -1578,6 +1848,12 @@ async function boot() {
   });
   shopView.startDownloadStream();
 
+  // The Tools screen (MCP servers). Built now so its tab works from the first
+  // click; it reads nothing until it is shown, and never starts a server.
+  mcpPanel = new McpPanel($("#tools"), {
+    sidecar, openModal, closeModal, isRunning: () => state.running,
+  });
+
   // Not awaited: the GPU engine fetch runs for as long as it runs, and the
   // whole point is that nothing waits for it. watchEngine paints the panel
   // from the first snapshot and keeps repainting it from the stream.
@@ -1587,6 +1863,9 @@ async function boot() {
   // downloads or installs anything on its own: the automatic part is one
   // signed-JSON GET, and only if the user has left that on.
   watchUpdates();
+
+  // The titlebar model chip; it polls GET /model and never opens a stream.
+  startModelChip({ sidecar, isRunning: () => state.running, onChange: updateTurnUi });
 
   // The work loop gauge, likewise started before any session exists. Two
   // things depend on that: an unfinished run inherited from a restart has to
@@ -1640,6 +1919,19 @@ async function boot() {
       { label: "Open the model shop", onClick: () => setView("shop") },
     );
   }
+
+  // Saved conversations, in a sidebar on the Chat tab. Built after the
+  // session is read, so its first paint already knows which one is open.
+  historyPanel = new HistoryPanel($("#history"), {
+    sidecar,
+    openModal,
+    closeModal,
+    isRunning: () => state.running,
+    hasSession: () => Boolean(state.session),
+    onSwitched: adoptSession,
+    onCleared: clearSession,
+    startFromForm: startSession,
+  });
 
   // A light poll keeps `status` honest even if an event is missed: the sidecar
   // is the authority on whether a turn is running, not this page's bookkeeping.

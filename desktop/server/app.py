@@ -63,10 +63,69 @@ Endpoints:
                   same directory. A different workspace is always accepted
                   immediately; the old session (and its abandoned worker, if
                   any) simply keeps running against its own, different,
-                  workspace path, unaffected.
+                  workspace path, unaffected -- and until it is done, a new
+                  session in THAT workspace is refused with 409 the same
+                  way, however many sessions have been started since.
   GET  /session   the current session's state, or 404 if none exists yet.
+  GET  /conversations  every saved conversation (conversations.py), newest
+                  activity first, plus `active_id`: the one the live session
+                  belongs to. Each entry is {id, title, title_source,
+                  workspace, model, mode, engine, created_at, updated_at};
+                  titles are cleaned server-side (no controls, no bidi
+                  overrides) and are still untrusted text to a UI. Every
+                  session is a conversation: POST /session STARTS A NEW ONE
+                  and the session it replaces stays in this list, which is
+                  the one change to that route's behaviour; its request and
+                  response are as they were.
+  POST /conversations/new  {}: a fresh chat with the live session's
+                  workspace, model and mode (a chat engine; a work loop or a
+                  swarm is started from POST /session, which needs its
+                  bounds). 409 with no live session to copy, or while it is
+                  busy. Answers {"session", "conversation", "active_id"}.
+  POST /conversations/open  {"id"}: make a saved conversation the live
+                  session. It is rebuilt through
+                  session_state.restore_session -- the same path, and the
+                  same checks, as a restart: a saved "bypass" mode is
+                  refused (422), a conversation whose system prompt this
+                  process did not write is dropped, a loop or swarm config
+                  is re-validated (main.py injects that loader). 409 while
+                  the live session is running or still has an abandoned
+                  worker (Session.is_workspace_busy), exactly as POST
+                  /restore is refused, and also while a session replaced
+                  earlier is still running on that conversation or in its
+                  workspace (POST /session to another folder leaves such a
+                  turn running; it is saved into its own conversation when
+                  it ends). Opening the already-open one is a no-op. Same
+                  answer shape as /new.
+  POST /conversations/rename  {"id", "title"}: cleaned and capped
+                  (conversations.RENAME_MAX); 400 if nothing is left of it.
+  POST /conversations/delete  {"id"}: permanent. Deleting the OPEN
+                  conversation ends the live session too (GET /session goes
+                  404), and is refused with 409 while it is busy; the
+                  workspace and its checkpoints are not touched. 500, with
+                  the session left as it was, if the file could not be
+                  removed. Answers {"deleted", "cleared_session",
+                  "active_id"}.
   POST /prompt    submit a user turn: {"message"}. Returns {"turn_id"}
                   immediately; the turn runs on a background thread.
+                  Optional "attachments": ["imports/<name>", ...], the paths
+                  POST /attach/finish returned, at most 10 files and 50 MB
+                  per message. Each is re-validated inside the workspace and
+                  re-read, and its text is appended to what the MODEL is
+                  sent (fenced, budgeted to the context window); the message
+                  itself, and everything that echoes it, stays the typed
+                  words. Chat sessions only: a 400 for a loop or a swarm,
+                  whose engines read the message as a goal.
+  POST /attach    begin uploading a file the user is attaching: {"name",
+                  "size"} -> {"id", "chunk_bytes", "name"}. At most 20 MB.
+  POST /attach/chunk  {"id", "offset", "data"}: base64 of at most
+                  chunk_bytes raw bytes, appended at exactly `offset`. Staged
+                  OUTSIDE the workspace until it is complete.
+  POST /attach/finish  {"id"}: move the complete file into
+                  <workspace>/imports/ (sanitised name, never overwriting)
+                  and return what was stored, what can be read out of it,
+                  and any injection or secret warning. See attachments.py.
+  POST /attach/cancel  {"id"}: drop an upload in progress.
   GET  /events    a Server-Sent Events stream of turn events (token deltas,
                   tool calls, approval requests, completion, error). Accepts
                   ?since=<event id> or a Last-Event-ID header to resume.
@@ -133,6 +192,21 @@ Endpoints:
   GET  /engine/events  the same snapshot over SSE (event: "engine"), one
                   frame per change, ?since=<version>. Same bounded slot
                   pool as GET /events.
+  GET  /model     what model is resident and what it costs: backend, model
+                  name, status (loaded / loading / not_loaded / unknown), an
+                  approximate memory figure (VRAM when nvidia-smi answers,
+                  the process's resident RAM otherwise), whether anything is
+                  using it and why, the idle auto-unload delay, and when that
+                  timer would free it. Polled, never streamed: see
+                  model_residency.py. Never builds a backend or loads a model.
+  POST /model/unload  {} frees the model's memory now. 409 {"error": why}
+                  while a turn, the work loop or a swarm is running, or the
+                  model is loading or answering; 200 with the fresh GET
+                  /model body plus "unloaded" (and "reason" when nothing
+                  was loaded) otherwise. The next prompt reloads it.
+  POST /model/autounload  {"minutes": 5|15|30|60|null} sets the idle delay
+                  (null = never), persisted in <data>/model_residency.json.
+                  Anything else is a 400 naming the options, never clamped.
   GET  /loop      the work loop's RUN STATE: which turn it is on, what it has
                   spent against each ceiling, what it is allowed to do, how
                   much of the write budget is gone, whether a stop has been
@@ -172,6 +246,19 @@ Endpoints:
                   hearth_checkpoint.restore() reports, unmodified -- in
                   particular "skipped_gitlinks" is always passed through, so
                   a UI can never present a partial restore as a complete one.
+  GET  /checkpoints/diff  ?id=<7-64 hex chars>: what POST /restore would
+                  change, without changing it --
+                  hearth_checkpoint.preview_restore(), the same shape an
+                  approval card's `diff` uses (agent/hearth_diff.py), plus
+                  the excluded secrets files restore could not put back.
+                  400 for a malformed id (checked before git is run), 404
+                  with no session, 409 for an id the store does not know,
+                  503 while another checkpoint or restore holds the store.
+                  409 with "workspace_busy": true while work is live in the
+                  workspace, the same check POST /restore makes: the
+                  preview stages the whole workspace under the store lock,
+                  which would hold up that turn's own checkpoint, and a
+                  restore it previews would be refused anyway.
   GET  /setup     hearth_setup.diagnose(): can this machine even run a local
                   model right now, and if not, the one concrete next step.
                   Never requires a session to exist -- a UI needs this
@@ -204,6 +291,51 @@ Endpoints:
                   restore that only checked `status` could run `git
                   read-tree -u --reset` while that worker was still mutating
                   the same files underneath it.
+  GET  /mcp       the MCP servers in mcp.json (see agent/hearth_mcp.py and
+                  mcp_admin.py), each with its live status (running, error,
+                  exited, starting, idle, disabled, or invalid with the reason
+                  the loader ignores it), its tools and their risk classes
+                  once a turn has started it, and its last Test result.
+                  Never starts a server. Environment values and arguments
+                  that look like credentials are masked: at most two leading
+                  characters and a length ever leave the sidecar.
+  POST /mcp/save  add ({"create": true}) or edit a server: {"key",
+                  "command", "args", "env", "enabled"?}. The command is one
+                  program, never a command line; mcp_admin.validate_command
+                  says exactly what is refused. A masked value is kept with a
+                  sentinel instead of being sent back.
+
+                  SECURITY: this route chooses an executable Hearth will
+                  launch as the user. It turns a bearer token into "pick
+                  what Hearth runs", the same class of exposure the bypass
+                  refusal above exists for. Two mitigations, both here and
+                  not only in the page: a save that adds a server or
+                  changes what would run (command, args, env, cwd) is 400
+                  with `needs_acknowledge` unless the body carries
+                  "acknowledge": "runs-program", which the UI sends only
+                  from a dialog that says in plain words the program will
+                  run on this computer; and a new server is disabled unless
+                  that same dialog enabled it. It does not make the token
+                  less powerful, it makes using it this way deliberate and
+                  visible. Not a new capability either: a session in auto
+                  mode with run_command can already write mcp.json.
+  POST /mcp/toggle  {"key", "enabled"}. Enabling does not start anything;
+                  the server starts with the next turn that needs tools.
+  POST /mcp/remove  {"key"}.
+
+                  Every change that touches an enabled server stops the
+                  running MCP servers (hearth_mcp.invalidate) so the next
+                  turn sees the file as it now stands -- otherwise a server
+                  disabled here would keep running and its tools would stay
+                  callable. That would kill a tool call in flight, so such a
+                  change is refused with 409 while Session.is_workspace_busy()
+                  is true. A change to a server disabled before and after
+                  touches nothing live and is always accepted.
+  POST /mcp/test  {"key"}: start a private handshake and tools/list against
+                  that server (hearth_mcp.probe_server, 15s bounds) and
+                  return at once; the result appears on GET /mcp. Never the
+                  live registry, and refused with 409 for a disabled server,
+                  because testing launches it.
 
 Every route except GET /healthz requires, in this order: a valid Host header
 (the DNS-rebinding defence), a valid Origin header when one is present, and a
@@ -253,10 +385,14 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import attachments as attachments_mod
 import auth
+import conversations as conversations_mod
+import session_state as session_state_mod
 import downloads as downloads_mod
 import engine as engine_mod
 import loop_engine as loop_mod
+import model_residency as residency_mod
 import session as session_mod
 import swarm_engine as swarm_mod
 
@@ -312,6 +448,18 @@ class WorkspaceBusyError(RuntimeError):
     SidecarHandler turns this into a 409."""
 
 
+class ConversationRefused(RuntimeError):
+    """A conversation route that cannot do what was asked, with the HTTP
+    status that says why: 409 for "not now" (no live session to copy, or
+    the live one is busy), 404 for an unknown conversation, 422 for one that
+    exists but cannot be restored. Raised by SidecarState's conversation
+    methods so the handlers stay one try/except each."""
+
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+
+
 def _engine_kind(engine):
     """What kind of engine a session is running, as the UI names it.
 
@@ -340,7 +488,7 @@ class SidecarState:
                  local_models_fetcher=None, model_checker=None,
                  shop_searcher=None, shop_quanter=None, download_manager=None,
                  engine_acquirer=None, loop_builder=None, swarm_builder=None,
-                 updater=None):
+                 updater=None, conversation_store=None, conversation_loader=None):
         self.token = token
         self.port = port  # main.py sets this to the real bound port after listen
         self.engine_factory = engine_factory or (lambda: session_mod.NullEngine())
@@ -391,6 +539,12 @@ class SidecarState:
         # trust file or the user's data directory.
         self._updater = updater
         self._update_lock = threading.Lock()
+        # The model residency manager (GET/POST /model*). Process-wide, like
+        # the three above: the resident model belongs to the process, not to
+        # a session. Lazy, and its idle watcher thread starts only on first
+        # use; a test injects a fake by assigning _residency before that.
+        self._residency = None
+        self._residency_lock = threading.Lock()
         # The work loop's gauge (GET /loop). Process-wide, like the download
         # queue and the engine acquirer, and for the same reason plus one
         # more: GET /loop/events must not have to chase a session being
@@ -437,6 +591,33 @@ class SidecarState:
         # self._raw_persist_hook. main.py is the only production caller
         # that supplies a real one.
         self._raw_persist_hook = persist_hook
+        # Conversation history (conversations.py). Every session this state
+        # creates or adopts is stamped with a conversation id, and
+        # active_conversation_id is the one the live session belongs to --
+        # read under self._lock like `session`, because the two change
+        # together. The store is None for a state with no persistence (most
+        # tests): the history routes then answer that history is off rather
+        # than reading the real user's data directory.
+        #
+        # conversation_loader rebuilds a saved conversation into a live
+        # Session. main.py injects one that goes through its own
+        # restore_engine_factory (a loop comes back as a loop, with its
+        # config re-validated), which this module cannot import -- main
+        # imports app, not the other way around. Without one, the process's
+        # default engine factory is used, which is right for chat sessions.
+        self._conversations = conversation_store
+        self.conversation_loader = conversation_loader
+        self.active_conversation_id = None
+        # Sessions this state replaced while something of theirs was still
+        # running (a turn on a different workspace, which create_session
+        # allows, or a cancelled turn's abandoned worker), by conversation
+        # id. Read and written under self._lock and pruned as each one
+        # settles (_prune_retired_locked). Two things need them: reopening
+        # that conversation, or starting anything in that workspace, must
+        # wait until they are done (_busy_elsewhere_locked), and the turn
+        # they were running still deserves to be saved into its own
+        # conversation when it ends (_persist_if_current).
+        self._retired = {}
 
     def get_session(self):
         with self._lock:
@@ -464,6 +645,64 @@ class SidecarState:
             if self._updater is None:
                 self._updater = update_mod.Updater()
             return self._updater
+
+    def get_residency(self):
+        """The process-wide ResidencyManager, built (and its idle watcher
+        started) on first use. GET /model is that first use: the page asks
+        at boot."""
+        with self._residency_lock:
+            if self._residency is None:
+                self._residency = residency_mod.ResidencyManager(
+                    state_busy_fn=self.model_busy_reason)
+            manager = self._residency
+        manager.ensure_started()
+        return manager
+
+    def model_busy_reason(self):
+        """Why the model must stay loaded right now, as a sentence for the
+        Unload button's tooltip, or None. The backend's own in-flight count
+        covers a model call that is actually under way; this covers the gaps
+        between a turn's model calls, while its tools run.
+
+        Not only the session on screen: switching to another chat (or
+        workspace) while a turn is going leaves that turn running in the
+        session it replaced (self._retired), and between two of its model
+        calls nothing else would stop the idle timer, or the Unload button,
+        from freeing the model it is about to ask again. The same reasoning
+        as any_turn_running, which the MCP restart check uses."""
+        reason = self._busy_reason_of(self.get_session())
+        if reason:
+            return reason
+        with self._lock:
+            self._prune_retired_locked()
+            replaced = list(self._retired.values())
+        for old in replaced:
+            reason = self._busy_reason_of(old)
+            if reason:
+                return reason + " in another chat"
+        return None
+
+    @staticmethod
+    def _busy_reason_of(session):
+        """model_busy_reason for one session. is_workspace_busy rather than
+        status, for the reason its docstring gives: a cancelled turn's
+        abandoned call can still be running after status has gone back to
+        idle, and that call may be a model call."""
+        if session is None:
+            return None
+        try:
+            if not session.is_workspace_busy():
+                return None
+        except Exception:  # noqa: BLE001 - unknown is busy, never permission
+            return "a turn may still be running"
+        if getattr(session, "status", None) != session_mod.STATUS_RUNNING:
+            return "a cancelled tool call is still finishing"
+        kind = _engine_kind(getattr(session, "engine", None))
+        if kind == "loop":
+            return "the work loop is running"
+        if kind == "swarm":
+            return "an agent swarm is running"
+        return "a turn is running"
 
     def get_loop_status(self):
         """The process-wide work-loop gauge."""
@@ -539,25 +778,138 @@ class SidecarState:
         crash, but a silent one. Comparing against self.session (read
         fresh, under lock, at the moment of the actual write, not captured
         once at hook-creation time) is what makes "current" mean the same
-        thing here as it does to GET /session or POST /cancel."""
+        thing here as it does to GET /session or POST /cancel.
+
+        With conversation history there is one exception, and it is the
+        reason the guard had to grow rather than go: a replaced session
+        that is still in self._retired may write into ITS OWN conversation
+        file, through the store directly. That file is no longer shared
+        with the live session, so the lost-update race above cannot happen
+        there, and without it the answer to a turn that was still running
+        when the user moved to another workspace was never saved at all.
+        self._retired holds a session only until it settles, and
+        open_conversation removes it before adopting that conversation, so
+        a session restored from the same file never races its predecessor;
+        a conversation deleted meanwhile stays deleted (the store refuses
+        to write it back)."""
         if self._raw_persist_hook is None:
             return
+        cid = getattr(session, "conversation_id", None)
         with self._lock:
             is_current = self.session is session
+            is_retired_own = (not is_current and self._conversations is not None
+                              and self._retired.get(cid) is session)
         if is_current:
             self._raw_persist_hook(session)
+        elif is_retired_own:
+            self._conversations.save_session(session)
 
-    def set_restored_session(self, session):
+    @staticmethod
+    def _settled(session):
+        """True once nothing of `session`'s is running any more: no turn, no
+        abandoned worker, and its turn thread (whose last act is a persist)
+        has exited."""
+        if session.is_workspace_busy():
+            return False
+        thread = getattr(session, "_thread", None)
+        return thread is None or not thread.is_alive()
+
+    @staticmethod
+    def _unused(session):
+        """True if nothing ever happened in `session`: idle, and not one
+        event in its log. Decided from the live object, not from its file:
+        a turn that has just started may not have reached the disk yet."""
+        return not session.is_workspace_busy() and not session.recent_events(1)
+
+    @staticmethod
+    def _same_dir(a, b):
+        try:
+            return os.path.realpath(a) == os.path.realpath(b)
+        except (OSError, ValueError, TypeError):
+            return False
+
+    def _retire_locked(self, old):
+        """Remember `old`, which is being replaced, if anything of its is
+        still running. Called with self._lock held."""
+        cid = getattr(old, "conversation_id", None)
+        if conversations_mod.valid_id(cid) and not self._settled(old):
+            self._retired[cid] = old
+
+    def _prune_retired_locked(self):
+        for cid, old in list(self._retired.items()):
+            if self._settled(old):
+                del self._retired[cid]
+
+    def _busy_elsewhere_locked(self, workspace=None, cid=None):
+        """A replaced session still at work on conversation `cid` or in
+        `workspace`, or None. The current session is not considered: every
+        caller checks that one itself, with its own wording."""
+        self._prune_retired_locked()
+        for rcid, old in self._retired.items():
+            if cid is not None and rcid == cid:
+                return old
+            if workspace is not None and self._same_dir(workspace, old.workspace):
+                return old
+        return None
+
+    def any_turn_running(self):
+        """True while any session in this process may be partway through a
+        tool call: the current one, or one it replaced whose turn (or
+        abandoned worker) has not finished yet. The MCP registry is shared
+        by all of them, so restarting it has to wait for every one, not only
+        the session on screen."""
+        with self._lock:
+            self._prune_retired_locked()
+            if self._retired:
+                return True
+            current = self.session
+        return current is not None and current.is_workspace_busy()
+
+    def set_restored_session(self, session, conversation_id=None):
         """Adopt a session session_state.restore_session() rebuilt from a
         prior process's disk snapshot as the live one -- main.py's startup
         path, called once, before the server starts accepting requests.
         Wired up exactly like a session born from create_session: the same
         _persist_if_current guard, so a session recovered from disk is not
         treated any differently than one created fresh over HTTP for every
-        purpose persistence cares about afterward."""
+        purpose persistence cares about afterward.
+
+        `conversation_id` is the saved conversation it came from, so its
+        next persist lands back in the same file; None (a caller that
+        loaded the snapshot from somewhere else) gives it a fresh one."""
+        cid = conversation_id if conversations_mod.valid_id(conversation_id) \
+            else conversations_mod.new_id()
+        session.conversation_id = cid
         with self._lock:
             self.session = session
+            self.active_conversation_id = cid
         session.set_persist_hook(self._persist_if_current if self._raw_persist_hook else None)
+        self._remember_active(cid)
+
+    def _remember_active(self, cid):
+        """Record in the index which conversation is open, so the next start
+        reopens it. Best-effort: losing this costs which chat reopens after
+        a restart, never a live session."""
+        store = self._conversations
+        if store is None:
+            return
+        try:
+            store.set_active(cid)
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            print("[hearth-app] could not record the open conversation: {}: {}".format(
+                type(exc).__name__, exc), file=sys.stderr)
+
+    def _prune_conversation(self, cid):
+        """Drop the conversation the live session just left, if nothing ever
+        happened in it (conversations.prune_if_empty). Best-effort."""
+        store = self._conversations
+        if store is None or cid is None:
+            return
+        try:
+            store.prune_if_empty(cid)
+        except Exception as exc:  # noqa: BLE001 - tidying must never fail a request
+            print("[hearth-app] could not tidy an empty conversation: {}: {}".format(
+                type(exc).__name__, exc), file=sys.stderr)
 
     def get_idle_status(self):
         """hearth_idle.is_good_time(), cached for self.idle_cache_seconds
@@ -632,9 +984,25 @@ class SidecarState:
         `engine_factory` overrides self.engine_factory for THIS session only.
         POST /session passes one when {"engine": "loop"} was asked for; the
         process-wide default (a chat engine) is untouched, so a loop session
-        does not turn every later session into a loop."""
+        does not turn every later session into a loop.
+
+        Every session made here starts a NEW conversation: it gets a fresh
+        conversation id, is saved once straight away (so it is in the
+        history list before its first prompt, and a restart reopens it),
+        and becomes the open one. The conversation it replaces is left in
+        the history -- unless nothing ever happened in it, in which case
+        it is tidied away rather than left as a blank entry.
+
+        The same-workspace refusal also covers sessions replaced EARLIER and
+        still running (self._retired): a turn left running in this
+        workspace two switches ago is just as much a second writer as one
+        on the session being replaced now."""
         with self._lock:
             old = self.session
+            if self._busy_elsewhere_locked(workspace=workspace) is not None:
+                raise WorkspaceBusyError(
+                    "cannot start a session here: a turn from an earlier chat is still "
+                    "running in this workspace; wait for it to finish and try again")
             if old is not None:
                 try:
                     same_workspace = os.path.realpath(workspace) == os.path.realpath(old.workspace)
@@ -645,18 +1013,222 @@ class SidecarState:
                         "cannot replace session: this workspace has running or abandoned "
                         "work in progress; wait for it to finish and try again")
                 old.cancel()
+                self._retire_locked(old)
+            # Whether the chat being left behind was ever used, judged from
+            # the live session now rather than from its file later: a turn
+            # that started a moment ago may not have been saved yet.
+            prune_previous = old is not None and self._unused(old)
             hook = self._persist_if_current if self._raw_persist_hook is not None else None
             factory = engine_factory or self.engine_factory
             s = session_mod.Session(workspace, model, mode, engine=factory(),
                                     persist_hook=hook)
+            s.conversation_id = conversations_mod.new_id()
+            previous_cid = self.active_conversation_id
             self.session = s
+            self.active_conversation_id = s.conversation_id
         # Outside the lock: the gauge has its own, and holding two at once in
         # a fixed order is a rule someone eventually breaks. `engine` and
         # `config` in loop_snapshot() just changed, so a watcher blocked on
         # GET /loop/events must wake for it.
         self._loop_status.touch()
         self._swarm_status.touch()
+        # Also outside: these touch disk, and a slow disk must not hold the
+        # lock every request takes.
+        self._persist_if_current(s)
+        self._remember_active(s.conversation_id)
+        if prune_previous:
+            self._prune_conversation(previous_cid)
         return s
+
+    # ---- conversation history (conversations.py) ----
+
+    def _store(self):
+        if self._conversations is None:
+            raise ConversationRefused(409, "conversation history is not enabled in this process")
+        return self._conversations
+
+    def conversations_snapshot(self):
+        """GET /conversations' body. `active_id` is read off this state
+        rather than the index: the live session is the truth about which
+        conversation is open, the index only remembers it for the next
+        start."""
+        with self._lock:
+            active = self.active_conversation_id
+        if self._conversations is None:
+            return {"enabled": False, "active_id": active, "items": []}
+        listing = self._conversations.list()
+        listing["active_id"] = active
+        listing["enabled"] = True
+        return listing
+
+    def new_conversation(self):
+        """A fresh chat with the live session's workspace, model and mode.
+        create_session does the work, including its own same-workspace busy
+        check under the lock; the check here only gives the refusal a
+        sentence about chats rather than about workspaces."""
+        self._store()
+        with self._lock:
+            current = self.session
+        if current is None:
+            raise ConversationRefused(
+                409, "there is no session to start a new chat from; start one first")
+        if current.is_workspace_busy():
+            raise ConversationRefused(
+                409, "a turn is still running in this chat; stop it or let it finish first")
+        if current.mode not in session_state_mod.RESTORABLE_MODES:
+            raise ConversationRefused(409, "this session's mode cannot be carried into a new chat")
+        try:
+            return self.create_session(current.workspace, current.model, current.mode)
+        except WorkspaceBusyError as exc:
+            raise ConversationRefused(409, str(exc))
+
+    def _default_conversation_loader(self, persisted):
+        return session_state_mod.restore_session(persisted, self.engine_factory)
+
+    def open_conversation(self, cid):
+        """Make saved conversation `cid` the live session.
+
+        Refused while the live session is busy, for the reason POST
+        /restore is: an abandoned worker can still be writing to the
+        workspace, and it would keep doing so behind a session nothing can
+        reach any more. Refused too while a session replaced earlier is
+        still running on THIS conversation or in its workspace (a turn the
+        user walked away from by restarting into another folder): reopening
+        it then would put a second worker in that folder, on the same
+        conversation. The rebuild goes through the injected loader (main.py:
+        session_state.restore_session with its restore_engine_factory), so a
+        conversation file gets every check a restart gives it -- this
+        directory is writable by the agent's own run_command."""
+        store = self._store()
+        if not conversations_mod.valid_id(cid):
+            raise ValueError("id must be a conversation id")
+        with self._lock:
+            current, active = self.session, self.active_conversation_id
+        if cid == active and current is not None:
+            return current
+        if current is not None and current.is_workspace_busy():
+            raise ConversationRefused(
+                409, "a turn is still running in this chat; stop it or let it finish "
+                     "before switching")
+        with self._lock:
+            still_running = self._busy_elsewhere_locked(cid=cid)
+        if still_running is not None:
+            raise ConversationRefused(
+                409, "this chat's last turn is still running in the background; wait for "
+                     "it to finish before reopening it")
+        if store.get(cid) is None:
+            raise ConversationRefused(404, "no such conversation")
+        persisted = store.load(cid)
+        if persisted is None:
+            raise ConversationRefused(422, "this conversation's saved file could not be read")
+        loader = self.conversation_loader or self._default_conversation_loader
+        try:
+            restored = loader(persisted)
+        except Exception as exc:  # noqa: BLE001 - a bad file must cost the switch, not the process
+            print("[hearth-app] could not rebuild conversation {}: {}: {}".format(
+                cid, type(exc).__name__, exc), file=sys.stderr)
+            restored = None
+        if restored is None:
+            raise ConversationRefused(
+                422, "this conversation cannot be reopened (its saved settings are not "
+                     "allowed here, or it is damaged); it was left as it is")
+        restored.conversation_id = cid
+        with self._lock:
+            old = self.session
+            # Re-checked under the lock: a prompt may have started on the old
+            # session while the file was being read.
+            if old is not None and old.is_workspace_busy():
+                raise ConversationRefused(
+                    409, "a turn started in this chat while switching; stop it first")
+            if self._busy_elsewhere_locked(workspace=restored.workspace, cid=cid) is not None:
+                raise ConversationRefused(
+                    409, "a turn from an earlier chat is still running in this chat's "
+                         "workspace; wait for it to finish before reopening it")
+            if old is not None:
+                old.cancel()
+                self._retire_locked(old)
+            prune_previous = old is not None and self._unused(old)
+            # Whatever was retired under this id has settled (checked just
+            # above); from here on the restored session is its only writer.
+            self._retired.pop(cid, None)
+            previous_cid = self.active_conversation_id
+            self.session = restored
+            self.active_conversation_id = cid
+        restored.set_persist_hook(self._persist_if_current if self._raw_persist_hook else None)
+        self._loop_status.touch()
+        self._swarm_status.touch()
+        self._remember_active(cid)
+        # An inherited unfinished work loop or relay goes on its gauge now,
+        # exactly as main.py does at startup -- otherwise it is discovered
+        # only when the user types something, which is the moment the chance
+        # to resume it is destroyed.
+        publish = getattr(restored.engine, "publish_pending", None)
+        if callable(publish):
+            try:
+                publish()
+            except Exception as exc:  # noqa: BLE001 - never fail a switch over the gauge
+                print("[hearth-app] could not read the run journal: {}: {}".format(
+                    type(exc).__name__, exc), file=sys.stderr)
+        if previous_cid != cid and prune_previous:
+            self._prune_conversation(previous_cid)
+        return restored
+
+    def rename_conversation(self, cid, title):
+        store = self._store()
+        if not conversations_mod.valid_id(cid):
+            raise ValueError("id must be a conversation id")
+        if not isinstance(title, str):
+            raise ValueError("title must be text")
+        item = store.rename(cid, title)  # ValueError for an empty title
+        if item is None:
+            raise ConversationRefused(404, "no such conversation")
+        return item
+
+    def delete_conversation(self, cid):
+        """Delete one conversation. Deleting the open one also ends the live
+        session -- the alternative, a session that keeps running and saving
+        into a conversation that no longer exists, would quietly undo the
+        delete. Refused while that session is busy, like a switch.
+
+        The open session is taken out of service before the file is
+        removed, so no prompt can start on it in between, but it is only
+        ended once the file is actually gone. If the removal fails (the
+        file held open by antivirus or a sync client), the session is put
+        back and the request fails with a 500: the conversation still
+        exists, so the answer must not say it was deleted."""
+        store = self._store()
+        if not conversations_mod.valid_id(cid):
+            raise ValueError("id must be a conversation id")
+        cleared = None
+        with self._lock:
+            if cid == self.active_conversation_id:
+                current = self.session
+                if current is not None and current.is_workspace_busy():
+                    raise ConversationRefused(
+                        409, "a turn is still running in this chat; stop it or let it "
+                             "finish before deleting it")
+                cleared = current
+                self.session = None
+                self.active_conversation_id = None
+        try:
+            existed = store.delete(cid)
+        except OSError as exc:
+            if cleared is not None:
+                with self._lock:
+                    if self.session is None:
+                        self.session, self.active_conversation_id = cleared, cid
+            raise ConversationRefused(
+                500, "this conversation's file could not be deleted ({}); it was left as "
+                     "it is".format(exc.strerror or type(exc).__name__))
+        if cleared is not None:
+            cleared.cancel()
+            self._loop_status.touch()
+            self._swarm_status.touch()
+        if not existed and cleared is None:
+            raise ConversationRefused(404, "no such conversation")
+        with self._lock:
+            active = self.active_conversation_id
+        return {"deleted": cid, "cleared_session": cleared is not None, "active_id": active}
 
 
 class SidecarHandler(BaseHTTPRequestHandler):
@@ -792,12 +1364,16 @@ class SidecarHandler(BaseHTTPRequestHandler):
             return
         if path == "/session":
             self._get_session()
+        elif path == "/conversations":
+            self._send_json(200, self.state.conversations_snapshot())
         elif path == "/events":
             self._get_events()
         elif path == "/models":
             self._get_models()
         elif path == "/checkpoints":
             self._get_checkpoints()
+        elif path == "/checkpoints/diff":
+            self._get_checkpoint_diff()
         elif path == "/setup":
             self._get_setup()
         elif path == "/idle":
@@ -814,6 +1390,8 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._send_json(200, self.state.get_engine().snapshot())
         elif path == "/engine/events":
             self._get_engine_events()
+        elif path == "/model":
+            self._get_model()
         elif path == "/loop":
             self._send_json(200, self.state.loop_snapshot())
         elif path == "/loop/events":
@@ -826,6 +1404,8 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._send_json(200, self.state.get_updater().snapshot())
         elif path == "/update/events":
             self._get_update_events()
+        elif path == "/mcp":
+            self._get_mcp()
         else:
             self._send_json(404, {"error": "not_found"})
 
@@ -840,6 +1420,9 @@ class SidecarHandler(BaseHTTPRequestHandler):
         path = self._path()
         if path == "/session":
             self._post_session()
+        elif path in ("/conversations/new", "/conversations/open",
+                      "/conversations/rename", "/conversations/delete"):
+            self._post_conversation(path.rsplit("/", 1)[1])
         elif path == "/prompt":
             self._post_prompt()
         elif path == "/approve":
@@ -848,14 +1431,20 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._post_cancel()
         elif path == "/restore":
             self._post_restore()
+        elif path in ("/attach", "/attach/chunk", "/attach/finish", "/attach/cancel"):
+            self._post_attach(path)
         elif path == "/downloads":
             self._post_download()
         elif path in ("/downloads/cancel", "/downloads/dismiss"):
             self._post_download_action(path.rsplit("/", 1)[1])
         elif path == "/engine":
             self._post_engine()
+        elif path in ("/model/unload", "/model/autounload"):
+            self._post_model(path.rsplit("/", 1)[1])
         elif path == "/update":
             self._post_update()
+        elif path in ("/mcp/save", "/mcp/toggle", "/mcp/remove", "/mcp/test"):
+            self._post_mcp(path.rsplit("/", 1)[1])
         else:
             self._send_json(404, {"error": "not_found"})
 
@@ -877,6 +1466,53 @@ class SidecarHandler(BaseHTTPRequestHandler):
             # which shape of manifest it is holding.
             out[kind] = s.engine.manifest()
         self._send_json(200, out)
+
+    # ---- conversation history ----
+
+    @staticmethod
+    def _session_body(s):
+        """A session as GET /session describes it, for the conversation
+        routes that hand back a new live session."""
+        out = s.to_dict()
+        kind = _engine_kind(s.engine)
+        out["engine"] = kind
+        if kind in ("loop", "swarm"):
+            out[kind] = s.engine.manifest()
+        return out
+
+    def _post_conversation(self, action):
+        """POST /conversations/{new,open,rename,delete}. Thin on purpose: the
+        rules live on SidecarState and the storage in conversations.py."""
+        body = self._read_json()
+        if body is None:
+            self._send_json(400, {"error": "invalid_json"})
+            return
+        state = self.state
+        try:
+            if action == "new":
+                s = state.new_conversation()
+            elif action == "open":
+                s = state.open_conversation(body.get("id"))
+            elif action == "rename":
+                self._send_json(200, {"conversation": state.rename_conversation(
+                    body.get("id"), body.get("title"))})
+                return
+            else:
+                self._send_json(200, state.delete_conversation(body.get("id")))
+                return
+        except ConversationRefused as exc:
+            self._send_json(exc.status, {"error": str(exc)})
+            return
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        cid = getattr(s, "conversation_id", None)
+        store = state._conversations
+        self._send_json(200, {
+            "session": self._session_body(s),
+            "conversation": store.get(cid) if store is not None else None,
+            "active_id": cid,
+        })
 
     def _post_session(self):
         body = self._read_json()
@@ -998,12 +1634,70 @@ class SidecarHandler(BaseHTTPRequestHandler):
         if not isinstance(message, str) or not message:
             self._send_json(400, {"error": "message is required"})
             return
+        message = self._with_attachments(s, message, body)
+        if message is None:
+            return
         try:
-            turn_id = s.submit_prompt(message)
+            # echo: the prompt goes into the event log too, so a page that
+            # replays it (a reload, a reopened conversation) shows both sides.
+            turn_id = s.submit_prompt(message, echo=True)
         except RuntimeError as exc:
             self._send_json(409, {"error": str(exc)})
             return
         self._send_json(200, {"turn_id": turn_id})
+
+    def _with_attachments(self, s, message, body):
+        """POST /prompt's message with any attached files composed onto it
+        (attachments.PromptText: the str value stays the typed words). The
+        plain str passes through untouched when nothing is attached. Returns
+        None after sending the error response itself."""
+        paths = body.get("attachments")
+        if paths is None or paths == []:
+            return message
+        if _engine_kind(s.engine) != "chat":
+            self._send_json(400, {"error": "attachments can only be sent in a chat session"})
+            return None
+        try:
+            # The budget leaves room for the conversation already in the
+            # engine's history, and for the typed words, which share one user
+            # message with the files, so a long chat or a long pasted prompt
+            # shrinks it rather than overflowing the model's context.
+            used = attachments_mod.engine_history_chars(s.engine) + len(message)
+            return attachments_mod.compose(message, paths, s.workspace, s.model, used_chars=used)
+        except attachments_mod.AttachError as exc:
+            self._send_json(exc.status, exc.payload())
+            return None
+
+    def _post_attach(self, path):
+        """POST /attach, /attach/chunk, /attach/finish, /attach/cancel.
+
+        The file is the user's own and the write is their own action, so it
+        does not wait on the agent's write approval; it is held to the
+        workspace boundary all the same (attachments.store). Chat sessions
+        only, for the reason _with_attachments gives. Cancel needs no
+        session: dropping an orphaned upload must always be possible."""
+        body = self._read_json()
+        if body is None:
+            self._send_json(400, {"error": "invalid_json"})
+            return
+        s = self.state.get_session()
+        try:
+            if path == "/attach/cancel":
+                out = attachments_mod.get_stager().cancel(body.get("id"))
+            elif s is None:
+                self._send_json(400, {"error": "no_session"})
+                return
+            elif _engine_kind(s.engine) != "chat":
+                self._send_json(400, {"error": "attachments can only be sent in a chat session"})
+                return
+            else:
+                out = attachments_mod.handle(
+                    path, body, s.workspace, s.model,
+                    used_chars=attachments_mod.engine_history_chars(s.engine))
+        except attachments_mod.AttachError as exc:
+            self._send_json(exc.status, exc.payload())
+            return
+        self._send_json(200, out)
 
     def _post_approve(self):
         s = self.state.get_session()
@@ -1498,6 +2192,37 @@ class SidecarHandler(BaseHTTPRequestHandler):
         finally:
             self.state.release_sse_slot()
 
+    def _get_model(self):
+        """GET /model. A snapshot, cheap enough to poll: the backend part
+        reads attribute snapshots under a short lock, and the memory figure
+        (nvidia-smi, or Ollama's /api/ps) is cached for a few seconds."""
+        self._send_json(200, self.state.get_residency().snapshot())
+
+    def _post_model(self, action):
+        """POST /model/unload and POST /model/autounload."""
+        body = self._read_json()
+        if body is None:
+            self._send_json(400, {"error": "invalid_json"})
+            return
+        manager = self.state.get_residency()
+        if action == "unload":
+            code, out = manager.unload()
+            self._send_json(code, out)
+            return
+        if "minutes" not in body:
+            self._send_json(400, {"error": "minutes is required: one of 5, 15, 30, 60 "
+                                           "or null (never)"})
+            return
+        try:
+            manager.set_minutes(body["minutes"])
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except OSError as exc:
+            self._send_json(500, {"error": "could not save the setting: {}".format(exc)})
+            return
+        self._send_json(200, manager.snapshot())
+
     def _get_checkpoints(self):
         s = self.state.get_session()
         if s is None:
@@ -1505,6 +2230,12 @@ class SidecarHandler(BaseHTTPRequestHandler):
             return
         try:
             checkpoints = engine_mod.hearth_checkpoint.list_checkpoints(s.workspace)
+        except engine_mod.hearth_checkpoint.CheckpointBusy:
+            # A checkpoint or restore is writing the store right now. That
+            # is "ask again in a moment", not a broken history, and the
+            # page retries a 503 once rather than reporting it.
+            self._send_json(503, {"error": "checkpoint_store_busy"})
+            return
         except Exception as exc:  # noqa: BLE001
             self._send_json(500, {"error": "checkpoint_list_failed: {}".format(exc)})
             return
@@ -1542,6 +2273,46 @@ class SidecarHandler(BaseHTTPRequestHandler):
             return
         self._send_json(200, result)
 
+    def _get_checkpoint_diff(self):
+        """GET /checkpoints/diff?id=<sha>: preview_restore() for the current
+        session's workspace. See the module docstring's entry.
+
+        The id is checked here, before anything reaches git, because it is
+        about to be interpolated into a revision expression: hex and a sane
+        length is all a checkpoint id can ever be, and refusing anything else
+        at the door means a value like "HEAD~1" or "--output=x" is never
+        given the chance to be interpreted as something cleverer."""
+        s = self.state.get_session()
+        if s is None:
+            self._send_json(404, {"error": "no_session"})
+            return
+        checkpoint_id = self._query().get("id", "")
+        if not (7 <= len(checkpoint_id) <= 64
+                and all(c in "0123456789abcdefABCDEF" for c in checkpoint_id)):
+            self._send_json(400, {"error": "id must be a checkpoint id: 7 to 64 hex characters"})
+            return
+        if s.is_workspace_busy():
+            # See the module docstring: refused for the same reason and on
+            # the same check as POST /restore, flagged so the page can say
+            # "wait for the turn" rather than "this checkpoint is unknown".
+            self._send_json(409, {
+                "error": "cannot preview a restore while the workspace has running or "
+                         "abandoned work in progress; wait for it to finish and try again",
+                "workspace_busy": True})
+            return
+        try:
+            result = engine_mod.hearth_checkpoint.preview_restore(s.workspace, checkpoint_id)
+        except Exception as exc:  # noqa: BLE001 - a preview bug must not break the route
+            self._send_json(500, {"error": "checkpoint_diff_failed: {}".format(exc)})
+            return
+        if result.get("busy"):
+            self._send_json(503, result)
+            return
+        if "error" in result:
+            self._send_json(409, result)
+            return
+        self._send_json(200, result)
+
     def _get_setup(self):
         """GET /setup: hearth_setup.diagnose(), fresh every call. Does not
         require a session to exist -- a UI needs this before it can show a
@@ -1565,6 +2336,47 @@ class SidecarHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": "idle_probe_failed: {}".format(exc)})
             return
         self._send_json(200, status)
+
+    def _get_mcp(self):
+        """GET /mcp. mcp_admin is imported here rather than at the top for the
+        reason hearth_tools imports hearth_mcp lazily: MCP is optional, and a
+        sidecar that never opens the panel never loads it."""
+        import mcp_admin  # noqa: PLC0415
+        self._send_json(200, mcp_admin.list_servers())
+
+    def _post_mcp(self, action):
+        """POST /mcp/save, /mcp/toggle, /mcp/remove, /mcp/test. The rules all
+        live in mcp_admin; this only maps its refusals onto status codes and
+        tells it how to ask whether a turn is busy."""
+        import mcp_admin  # noqa: PLC0415
+        body = self._read_json()
+        if body is None:
+            self._send_json(400, {"error": "invalid_json"})
+            return
+        try:
+            if action == "save":
+                out = mcp_admin.save(body, busy=self._mcp_busy)
+            elif action == "toggle":
+                out = mcp_admin.toggle(body, busy=self._mcp_busy)
+            elif action == "remove":
+                out = mcp_admin.remove(body, busy=self._mcp_busy)
+            else:
+                out = mcp_admin.start_test(body)
+        except mcp_admin.AdminError as exc:
+            self._send_json(exc.status, exc.body())
+            return
+        except OSError as exc:
+            self._send_json(500, {"error": "mcp_config_write_failed: {}".format(exc)})
+            return
+        self._send_json(200, out)
+
+    def _mcp_busy(self):
+        """Busy in the sense POST /restore uses: a turn running, or a
+        cancelled turn's abandoned worker still executing, either of which
+        may be partway through an MCP tool call. That includes a session
+        the Chats list switched away from while its turn was still going,
+        because it keeps using the same shared registry until it ends."""
+        return self.state.any_turn_running()
 
     def _write_sse(self, ev):
         payload = json.dumps({"turn_id": ev["turn_id"], "kind": ev["kind"],
@@ -2370,6 +3182,83 @@ def _self_test():
         finally:
             _shutil.rmtree(ws_dir, ignore_errors=True)
 
+        # === GET /checkpoints/diff: a restore preview over HTTP, which ======
+        # === validates the id before git sees it and changes nothing ======
+        diff_tmp = _tempfile.mkdtemp(prefix="hearth-app-diff-selftest-")
+        diff_ws = os.path.join(diff_tmp, "ws")
+        os.makedirs(diff_ws)
+        prev_data_dir_diff = os.environ.get("HEARTH_DATA_DIR")
+        os.environ["HEARTH_DATA_DIR"] = os.path.join(diff_tmp, "data")
+        try:
+            status, data = _raw_request(port, "POST", "/session", headers=auth_headers,
+                                        body=json.dumps({"workspace": diff_ws, "model": "m"}))
+            assert status == 200, (status, data)
+            # Malformed ids are refused at the door, whatever they look like
+            # to git: too short, not hex, or a revision expression.
+            for bad_id in ("", "abc", "HEAD", "HEAD~1", "--output=x", "g" * 40, "a" * 65,
+                           "abcdef0%20HEAD"):
+                status, data = _raw_request(port, "GET", "/checkpoints/diff?id=" + bad_id,
+                                            headers=auth_headers)
+                assert status == 400, (bad_id, status, data)
+            # A well-formed id with no store behind it is a 409, not a 500.
+            status, data = _raw_request(port, "GET", "/checkpoints/diff?id=" + "d" * 40,
+                                        headers=auth_headers)
+            assert status == 409 and "error" in json.loads(data), (status, data)
+            # And it needs auth like every other route.
+            no_auth = {k: v for k, v in auth_headers.items() if k != "Authorization"}
+            status, _ = _raw_request(port, "GET", "/checkpoints/diff?id=" + "d" * 40,
+                                     headers=no_auth)
+            assert status == 401, status
+            # Live work in the workspace: refused like POST /restore, and
+            # flagged so the page can tell this apart from an unknown id.
+            busy_sess = state.get_session()
+            with busy_sess._lock:
+                busy_sess._live_workers += 1
+            try:
+                status, data = _raw_request(port, "GET", "/checkpoints/diff?id=" + "d" * 40,
+                                            headers=auth_headers)
+            finally:
+                with busy_sess._lock:
+                    busy_sess._live_workers -= 1
+            assert status == 409 and json.loads(data).get("workspace_busy") is True, (status, data)
+
+            if engine_mod.hearth_checkpoint.is_git_available():
+                note = os.path.join(diff_ws, "note.txt")
+                with open(note, "w", encoding="utf-8", newline="") as fh:
+                    fh.write("first\nsecond\n")
+                cp_d = engine_mod.hearth_checkpoint.checkpoint(diff_ws, label="diff selftest")
+                with open(note, "w", encoding="utf-8", newline="") as fh:
+                    fh.write("first\nSECOND\n")
+                status, data = _raw_request(port, "GET", "/checkpoints/diff?id=" + cp_d["id"][:12],
+                                            headers=auth_headers)
+                assert status == 200, (status, data)
+                body = json.loads(data)
+                assert body["checkpoint_id"] == cp_d["id"], body
+                lines = [ln for f in body["files"] for h in f["hunks"] for ln in h["lines"]]
+                assert ["-", "SECOND"] in lines and ["+", "second"] in lines, body
+                assert "excluded_changed" in body and "skipped_gitlinks" in body, body
+                with open(note, encoding="utf-8") as fh:
+                    assert fh.read() == "first\nSECOND\n", "a preview must not restore anything"
+
+                # The store held by another operation: 503, so the page can
+                # say "try again" rather than "broken".
+                store = engine_mod.hearth_checkpoint._store_root(os.path.realpath(diff_ws))
+                with engine_mod.hearth_checkpoint._StoreLock(store):
+                    real_timeout = engine_mod.hearth_checkpoint.PREVIEW_LOCK_TIMEOUT_S
+                    engine_mod.hearth_checkpoint.PREVIEW_LOCK_TIMEOUT_S = 0.2
+                    try:
+                        status, data = _raw_request(port, "GET", "/checkpoints/diff?id=" + cp_d["id"],
+                                                    headers=auth_headers)
+                    finally:
+                        engine_mod.hearth_checkpoint.PREVIEW_LOCK_TIMEOUT_S = real_timeout
+                assert status == 503 and json.loads(data).get("busy") is True, (status, data)
+        finally:
+            if prev_data_dir_diff is None:
+                os.environ.pop("HEARTH_DATA_DIR", None)
+            else:
+                os.environ["HEARTH_DATA_DIR"] = prev_data_dir_diff
+            _shutil.rmtree(diff_tmp, ignore_errors=True)
+
         # === Minor: SidecarState.create_session is atomic -- the read of ===
         # === the old session, the busy check, cancel(), and the new =======
         # === session's assignment all happen under one uninterrupted hold =
@@ -2420,6 +3309,295 @@ def _self_test():
         thread_get.join(timeout=5)
         assert state_atomic.get_session().workspace == "/tmp/ws-atomic-a", \
             "thread A's session must be the one left live"
+
+        # === conversation history: GET /conversations and the four =======
+        # === POST /conversations/* routes, over real HTTP, against a real ==
+        # === store in a scratch directory. ================================
+        import conversations as conversations_mod_t  # noqa: PLC0415
+
+        conv_tmp = tempfile.mkdtemp(prefix="hearth-app-conversations-")
+        conv_gate = threading.Event()
+        conv_gate2 = threading.Event()  # "hold2": a turn left running across a switch
+
+        class _ConvEngine:
+            """Remembers its conversation like RealEngine does, and blocks on
+            conv_gate when asked to, so a 'busy' session can be held open."""
+
+            def __init__(self):
+                self._messages = None
+
+            def get_state(self):
+                return None if self._messages is None else {"messages": self._messages,
+                                                            "turn_starts": [0]}
+
+            def load_state(self, st):
+                self._messages = st.get("messages")
+
+            def expected_system_prompt(self, mode):  # noqa: ARG002
+                return "sys"
+
+            def run(self, ctx):
+                self._messages = (self._messages or [{"role": "system", "content": "sys"}]) + [
+                    {"role": "user", "content": ctx.message}]
+                if ctx.message == "hold":
+                    conv_gate.wait(timeout=10)
+                if ctx.message == "hold2":
+                    conv_gate2.wait(timeout=10)
+                ctx.emit("delta", {"text": "ok", "stream_id": 1, "index": 0})
+                ctx.emit("done", {})
+
+        conv_store = conversations_mod_t.ConversationStore(root=os.path.join(conv_tmp, "c"))
+        conv_state = SidecarState("conv-token", engine_factory=lambda: _ConvEngine(),
+                                  model_checker=lambda model: {"ok": True},
+                                  persist_hook=conv_store.save_session,
+                                  conversation_store=conv_store)
+        conv_server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(conv_state))
+        conv_state.port = conv_server.server_address[1]
+        threading.Thread(target=conv_server.serve_forever, kwargs={"poll_interval": 0.05},
+                         daemon=True).start()
+        cport = conv_state.port
+        ch = {"Host": "127.0.0.1:{}".format(cport), "Authorization": "Bearer conv-token",
+              "Content-Type": "application/json"}
+
+        def _c(method, path, body=None):
+            st, raw = _raw_request(cport, method, path, headers=ch,
+                                   body=None if body is None else json.dumps(body))
+            return st, (json.loads(raw) if raw else None)
+
+        def _idle(sess):
+            deadline = time.monotonic() + 5
+            while sess.is_workspace_busy() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert not sess.is_workspace_busy()
+
+        try:
+            # Every route needs the token, like every other route.
+            st, _ = _raw_request(cport, "GET", "/conversations",
+                                 headers={"Host": "127.0.0.1:{}".format(cport)})
+            assert st == 401, st
+            st, _ = _raw_request(cport, "POST", "/conversations/new",
+                                 headers={"Host": "127.0.0.1:{}".format(cport)}, body="{}")
+            assert st == 401, st
+
+            st, listing = _c("GET", "/conversations")
+            assert st == 200 and listing == {"enabled": True, "active_id": None, "items": []}, \
+                listing
+            st, body = _c("POST", "/conversations/new", {})
+            assert st == 409, ("nothing to copy a new chat from", st, body)
+
+            # POST /session keeps its contract and starts a conversation.
+            st, body = _c("POST", "/session", {"workspace": "/tmp/ws-conv", "model": "m"})
+            assert st == 200 and body == {"workspace": "/tmp/ws-conv", "model": "m",
+                                          "mode": "edit", "status": "idle",
+                                          "turn_id": None, "engine": "chat"}, body
+            first = conv_state.get_session()
+            first_id = first.conversation_id
+            st, listing = _c("GET", "/conversations")
+            assert listing["active_id"] == first_id, listing
+            assert [i["id"] for i in listing["items"]] == [first_id], listing
+            assert listing["items"][0]["title"] == "", "untitled until the first prompt"
+
+            # The first prompt names it, deterministically, and is echoed
+            # into the event log as a user_prompt event.
+            st, _ = _c("POST", "/prompt",
+                       {"message": "  Explain the\nretry loop in api.js\u202e please  "})
+            assert st == 200
+            _idle(first)
+            item = conv_store.get(first_id)
+            assert item["title"] == "Explain the retry loop in api.js please", item
+            kinds = [e["kind"] for e in first.events_after(0, timeout=1)]
+            assert kinds[0] == "user_prompt", kinds
+
+            # New chat: same workspace/model/mode, fresh conversation; the
+            # old one stays in the list.
+            st, body = _c("POST", "/conversations/new", {})
+            assert st == 200, (st, body)
+            second_id = body["active_id"]
+            assert second_id != first_id and conversations_mod_t.valid_id(second_id)
+            assert body["session"]["workspace"] == "/tmp/ws-conv", body
+            assert body["session"]["engine"] == "chat" and body["conversation"]["id"] == second_id
+            assert conv_state.get_session().engine.get_state() is None, "a NEW chat is empty"
+            st, listing = _c("GET", "/conversations")
+            assert [i["id"] for i in listing["items"]] == [second_id, first_id], listing
+
+            # Pressing it again does not pile up blank chats.
+            st, body = _c("POST", "/conversations/new", {})
+            third_id = body["active_id"]
+            st, listing = _c("GET", "/conversations")
+            assert [i["id"] for i in listing["items"]] == [third_id, first_id], listing
+
+            # Open the first one again: its conversation and history come back,
+            # and the empty one it left is tidied away.
+            st, body = _c("POST", "/conversations/open", {"id": first_id})
+            assert st == 200, (st, body)
+            reopened = conv_state.get_session()
+            assert reopened.conversation_id == first_id and reopened is not first
+            assert reopened.engine.get_state()["messages"][1]["content"].startswith("  Explain")
+            replay = [e["kind"] for e in reopened.events_after(0, timeout=1)]
+            assert replay[0] == "user_prompt" and "delta" in replay, replay
+            st, listing = _c("GET", "/conversations")
+            assert [i["id"] for i in listing["items"]] == [first_id], listing
+            # Opening the open one is a no-op, not a rebuild.
+            st, body = _c("POST", "/conversations/open", {"id": first_id})
+            assert st == 200 and conv_state.get_session() is reopened
+
+            # Rename: cleaned and capped; empty, unknown and malformed refused.
+            st, body = _c("POST", "/conversations/rename",
+                          {"id": first_id, "title": " Retry\u2066 loop\n notes "})
+            assert st == 200 and body["conversation"]["title"] == "Retry loop notes", body
+            st, body = _c("POST", "/conversations/rename", {"id": first_id, "title": " \u200b "})
+            assert st == 400, (st, body)
+            st, body = _c("POST", "/conversations/rename", {"id": first_id, "title": 5})
+            assert st == 400, (st, body)
+            st, body = _c("POST", "/conversations/rename",
+                          {"id": conversations_mod_t.new_id(), "title": "x"})
+            assert st == 404, (st, body)
+            for bad in ("../../etc/passwd", None, 3, "A" * 32):
+                for route in ("open", "rename", "delete"):
+                    st, body = _c("POST", "/conversations/" + route, {"id": bad, "title": "t"})
+                    assert st == 400, (route, bad, st, body)
+            st, body = _c("POST", "/conversations/open", {"id": conversations_mod_t.new_id()})
+            assert st == 404, (st, body)
+
+            # While a turn runs, switching, starting and deleting the open
+            # chat are all refused -- and nothing changes.
+            st, body = _c("POST", "/conversations/new", {})
+            other_id = body["active_id"]
+            conv_state.get_session().submit_prompt("not empty any more")
+            _idle(conv_state.get_session())
+            st, body = _c("POST", "/conversations/open", {"id": first_id})
+            assert st == 200
+            busy = conv_state.get_session()
+            busy.submit_prompt("hold")
+            for route, payload in (("open", {"id": other_id}), ("new", {}),
+                                   ("delete", {"id": first_id})):
+                st, body = _c("POST", "/conversations/" + route, payload)
+                assert st == 409, (route, st, body)
+                assert conv_state.get_session() is busy, route
+            # Renaming and deleting a DIFFERENT chat is fine while it runs.
+            st, body = _c("POST", "/conversations/rename", {"id": other_id, "title": "other"})
+            assert st == 200, (st, body)
+            conv_gate.set()
+            _idle(busy)
+
+            # Delete a chat that is not open.
+            st, body = _c("POST", "/conversations/delete", {"id": other_id})
+            assert st == 200 and body == {"deleted": other_id, "cleared_session": False,
+                                          "active_id": first_id}, body
+            assert conv_store.get(other_id) is None
+            st, body = _c("POST", "/conversations/delete", {"id": other_id})
+            assert st == 404, (st, body)
+
+            # A planted bypass-mode file is refused on open (422), and the
+            # live session is left alone.
+            planted = conversations_mod_t.new_id()
+            assert conv_store.save(planted, {
+                "version": session_state_mod.STATE_VERSION, "saved_at": time.time(),
+                "workspace": "C:\\", "model": "m", "mode": "bypass",
+                "engine_state": None, "recent_events": []})
+            st, body = _c("POST", "/conversations/open", {"id": planted})
+            assert st == 422, (st, body)
+            assert conv_state.get_session() is busy
+            # A file corrupted after it was listed is a 422 too, not a 500.
+            with open(os.path.join(conv_store.root(), planted + ".json"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("{torn")
+            st, body = _c("POST", "/conversations/open", {"id": planted})
+            assert st in (404, 422), (st, body)
+
+            # Deleting the OPEN chat ends the live session.
+            st, body = _c("POST", "/conversations/delete", {"id": first_id})
+            assert st == 200 and body["cleared_session"] is True and body["active_id"] is None
+            st, _ = _c("GET", "/session")
+            assert st == 404, st
+            st, listing = _c("GET", "/conversations")
+            assert listing["active_id"] is None and first_id not in {
+                i["id"] for i in listing["items"]}, listing
+            assert not os.path.exists(os.path.join(conv_store.root(), first_id + ".json"))
+
+            # A turn left running by restarting into ANOTHER workspace (which
+            # is allowed) keeps its chat and its folder off limits until it
+            # is done: reopening that chat, or starting a session in that
+            # folder, would put a second worker there.
+            st, _ = _c("POST", "/session", {"workspace": "/tmp/ws-left", "model": "m"})
+            left = conv_state.get_session()
+            left_id = left.conversation_id
+            st, _ = _c("POST", "/prompt", {"message": "hold2"})
+            assert st == 200
+            st, _ = _c("POST", "/session", {"workspace": "/tmp/ws-elsewhere", "model": "m"})
+            assert st == 200, "a different workspace may still be started"
+            elsewhere = conv_state.get_session()
+            assert left.is_workspace_busy(), "sanity: the left-behind turn is still running"
+            assert conv_store.get(left_id) is not None, "a chat with a running turn is not pruned"
+            st, body = _c("POST", "/conversations/open", {"id": left_id})
+            assert st == 409, ("reopening a chat whose turn still runs", st, body)
+            st, body = _c("POST", "/session", {"workspace": "/tmp/ws-left", "model": "m"})
+            assert st == 409, ("a new session in that turn's workspace", st, body)
+            assert conv_state.get_session() is elsewhere
+            # The left-behind turn still shares the MCP registry, so it counts
+            # as busy for restarting it even though the session on screen is
+            # idle.
+            assert not elsewhere.is_workspace_busy()
+            assert conv_state.any_turn_running(), "a replaced session's turn is still running"
+            # It finishes on its own, and its answer is saved into ITS chat
+            # even though it is no longer the live session.
+            conv_gate2.set()
+            deadline = time.monotonic() + 5
+            while not SidecarState._settled(left) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert not conv_state.any_turn_running(), "nothing runs once it settles"
+            saved_left = conv_store.load(left_id)
+            assert saved_left["status_at_save"] == "idle", saved_left["status_at_save"]
+            assert [e["kind"] for e in saved_left["recent_events"]][-2:] == ["delta", "done"],                 saved_left["recent_events"]
+            st, body = _c("POST", "/conversations/open", {"id": left_id})
+            assert st == 200, (st, body)
+            replayed = [e["kind"] for e in conv_state.get_session().events_after(0, timeout=1)]
+            assert "done" in replayed and "turn_interrupted" not in replayed, replayed
+            assert conv_store.get(elsewhere.conversation_id) is None,                 "the unused chat it switched away from is still tidied away"
+
+            # Pruning is decided from the live session, not its file: a turn
+            # whose first event exists but has not been saved yet still
+            # counts as something having happened.
+            st, _ = _c("POST", "/session", {"workspace": "/tmp/ws-fresh", "model": "m"})
+            fresh = conv_state.get_session()
+            fresh._emit("t", "user_prompt", {"text": "just sent"})  # not persisted yet
+            st, _ = _c("POST", "/session", {"workspace": "/tmp/ws-next", "model": "m"})
+            assert st == 200 and conv_store.get(fresh.conversation_id) is not None
+
+            # A delete the disk refuses is an error, and the open chat and its
+            # session are both left exactly as they were.
+            open_now = conv_state.get_session()
+            open_id = open_now.conversation_id
+            real_delete = conv_store.delete
+
+            def _refusing_delete(cid):
+                raise PermissionError(13, "held open by another process")
+
+            conv_store.delete = _refusing_delete
+            try:
+                st, body = _c("POST", "/conversations/delete", {"id": open_id})
+            finally:
+                conv_store.delete = real_delete
+            assert st == 500 and "could not be deleted" in body["error"], (st, body)
+            assert conv_state.get_session() is open_now
+            assert conv_state.active_conversation_id == open_id
+            st, body = _c("GET", "/session")
+            assert st == 200, (st, body)
+
+            # Malformed JSON, and history-off states answer cleanly.
+            st, _ = _raw_request(cport, "POST", "/conversations/open", headers=ch, body="{nope")
+            assert st == 400, st
+            st, listing = _raw_request(port, "GET", "/conversations", headers=auth_headers)
+            assert st == 200 and json.loads(listing)["enabled"] is False, listing
+            st, body = _raw_request(port, "POST", "/conversations/new", headers=auth_headers,
+                                    body="{}")
+            assert st == 409, (st, body)
+        finally:
+            conv_gate.set()
+            conv_gate2.set()
+            conv_server.shutdown()
+            conv_server.server_close()
+            shutil.rmtree(conv_tmp, ignore_errors=True)
 
         # === restart survival wiring: SidecarState only ever persists on ===
         # === behalf of whichever session is CURRENTLY self.session -- a ===
@@ -2937,6 +4115,221 @@ def _self_test():
             server_eng.shutdown()
             server_eng.server_close()
 
+        # === GET /model, POST /model/unload, POST /model/autounload ======
+        # The model chip's surface, driven over real HTTP against a REAL
+        # ResidencyManager (real prefs file, real busy rule, real timer
+        # arithmetic) wired to a scripted backend and an injected clock, so
+        # nothing here loads a model or depends on what is installed.
+        mdl_tmp = tempfile.mkdtemp(prefix="hearth-app-model-")
+        mdl_prev_data = os.environ.get("HEARTH_DATA_DIR")
+        os.environ["HEARTH_DATA_DIR"] = mdl_tmp
+
+        class _MdlBackend:
+            def __init__(self):
+                self.state = {"backend": "llama", "managed_by": "hearth",
+                              "loaded": True, "loading": False,
+                              "ref": "gguf:C:/m/qwen.gguf", "model": "qwen.gguf",
+                              "inflight": 0, "inflight_total": 0,
+                              "last_used_at": 5000.0,
+                              "memory": {"vram_bytes": 4 * 1024 ** 3,
+                                         "rss_bytes": 512 * 1024 ** 2,
+                                         "approximate": True},
+                              "note": None}
+                self.unloads = 0
+
+            def residency_snapshot(self, probe=True):
+                return dict(self.state)
+
+            def unload_all(self, only_if_idle=True, backends=None):
+                # The sidecar always names its target (the chip's backend,
+                # or only the bundled engine for the timer); never all.
+                assert backends is not None, "unload_all must name its backends"
+                if self.state["backend"] not in backends:
+                    return {"unloaded": False, "busy": False,
+                            "reason": "nothing is loaded"}
+                if self.state["inflight_total"] or self.state["loading"]:
+                    return {"unloaded": False, "busy": True,
+                            "reason": "the model is answering a request"}
+                if not self.state["loaded"]:
+                    return {"unloaded": False, "busy": False,
+                            "reason": "nothing is loaded"}
+                self.unloads += 1
+                self.state["loaded"] = False
+                return {"unloaded": True, "busy": False, "reason": None}
+
+        class _MdlSession:
+            """Just enough of a Session for model_busy_reason."""
+
+            def __init__(self, busy, status, kind=None):
+                self._busy, self.status = busy, status
+                self.engine = type("E", (), {"ENGINE_KIND": kind})() if kind else object()
+
+            def is_workspace_busy(self):
+                return self._busy
+
+            def cancel(self):
+                pass
+
+        mdl_clock = {"now": 5000.0}
+        mdl_backend = _MdlBackend()
+        state_mdl = SidecarState("model-token")
+        state_mdl._residency = residency_mod.ResidencyManager(
+            state_busy_fn=state_mdl.model_busy_reason, backend=mdl_backend,
+            now_fn=lambda: mdl_clock["now"], poll_seconds=None)
+        server_mdl = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state_mdl))
+        state_mdl.port = server_mdl.server_address[1]
+        threading.Thread(target=server_mdl.serve_forever, kwargs={"poll_interval": 0.05},
+                         daemon=True).start()
+        port_m = state_mdl.port
+        headers_m = {"Host": "127.0.0.1:{}".format(port_m),
+                     "Authorization": "Bearer model-token",
+                     "Content-Type": "application/json"}
+        try:
+            # Every route is behind the same gate as everything else.
+            for method, route, body in (("GET", "/model", None),
+                                        ("POST", "/model/unload", "{}"),
+                                        ("POST", "/model/autounload", '{"minutes": 5}')):
+                status, _ = _raw_request(port_m, method, route, body=body, headers={
+                    "Host": "127.0.0.1:{}".format(port_m), "Authorization": "Bearer nope"})
+                assert status == 401, (route, status)
+                status, _ = _raw_request(port_m, method, route, body=body,
+                                         headers=dict(headers_m, Host="evil.example:1"))
+                assert status == 403, (route, status)
+            assert mdl_backend.unloads == 0 and not os.listdir(mdl_tmp), (
+                "a rejected request must not act")
+
+            # The status shape, with the default 15-minute delay.
+            status, data = _raw_request(port_m, "GET", "/model", headers=headers_m)
+            assert status == 200, (status, data)
+            snap = json.loads(data)
+            for key in ("backend", "model", "ref", "status", "loaded", "loading",
+                        "memory", "inflight", "busy", "busy_reason",
+                        "auto_unload_minutes", "auto_unload_options", "last_used_at",
+                        "unload_at", "managed_by"):
+                assert key in snap, (key, snap)
+            assert snap["status"] == "loaded" and snap["model"] == "qwen.gguf", snap
+            assert snap["memory"] == {"vram_bytes": 4 * 1024 ** 3,
+                                      "rss_bytes": 512 * 1024 ** 2,
+                                      "approximate": True}, snap
+            assert snap["auto_unload_minutes"] == 15, snap
+            assert snap["auto_unload_options"] == [5, 15, 30, 60, None], snap
+            assert snap["unload_at"] == 5000.0 + 15 * 60, snap
+            assert snap["busy"] is False and snap["managed_by"] == "hearth", snap
+
+            # Busy: each kind of work names itself, and unload is a 409 that
+            # carries that reason. Nothing is stopped.
+            for session, reason in (
+                    (_MdlSession(True, session_mod.STATUS_RUNNING), "a turn is running"),
+                    (_MdlSession(True, session_mod.STATUS_RUNNING, "loop"),
+                     "the work loop is running"),
+                    (_MdlSession(True, session_mod.STATUS_RUNNING, "swarm"),
+                     "an agent swarm is running"),
+                    (_MdlSession(True, session_mod.STATUS_IDLE),
+                     "a cancelled tool call is still finishing")):
+                state_mdl.session = session
+                status, data = _raw_request(port_m, "POST", "/model/unload",
+                                            headers=headers_m, body="{}")
+                assert status == 409 and json.loads(data) == {"error": reason}, (status, data)
+                status, data = _raw_request(port_m, "GET", "/model", headers=headers_m)
+                got = json.loads(data)
+                assert got["busy"] is True and got["busy_reason"] == reason, got
+                assert got["unload_at"] is None, got
+            assert mdl_backend.unloads == 0, "an unload ran while busy"
+            # An idle session is not a reason.
+            state_mdl.session = _MdlSession(False, session_mod.STATUS_IDLE)
+            assert state_mdl.model_busy_reason() is None
+            # A turn still running in a chat the person switched away from
+            # is: between its model calls nothing else holds the model, so
+            # neither the button nor the timer may free it.
+            state_mdl._retired["c" * 32] = _MdlSession(True, session_mod.STATUS_RUNNING)
+            status, data = _raw_request(port_m, "POST", "/model/unload",
+                                        headers=headers_m, body="{}")
+            assert status == 409 and json.loads(data) == {
+                "error": "a turn is running in another chat"}, (status, data)
+            assert mdl_backend.unloads == 0, "an unload ran under another chat's turn"
+            state_mdl._retired["c" * 32]._busy = False
+            assert state_mdl.model_busy_reason() is None
+            assert not state_mdl._retired, "a settled replaced session is pruned"
+            # A model call in flight on the backend is, with no session busy.
+            mdl_backend.state["inflight_total"] = 1
+            status, data = _raw_request(port_m, "POST", "/model/unload",
+                                        headers=headers_m, body="{}")
+            assert status == 409 and "answering" in json.loads(data)["error"], data
+            mdl_backend.state["inflight_total"] = 0
+            mdl_backend.state["loading"] = True
+            status, data = _raw_request(port_m, "POST", "/model/unload",
+                                        headers=headers_m, body="{}")
+            assert status == 409 and "loading" in json.loads(data)["error"], data
+            mdl_backend.state["loading"] = False
+
+            # Unload when idle: 200, the fresh snapshot, and it happened.
+            status, data = _raw_request(port_m, "POST", "/model/unload",
+                                        headers=headers_m, body="{}")
+            got = json.loads(data)
+            assert status == 200 and got["unloaded"] is True, (status, got)
+            assert got["status"] == "not_loaded" and mdl_backend.unloads == 1, got
+            status, data = _raw_request(port_m, "POST", "/model/unload",
+                                        headers=headers_m, body="{}")
+            got = json.loads(data)
+            assert status == 200 and got["unloaded"] is False, got
+            assert got["reason"] == "nothing is loaded", got
+            status, _ = _raw_request(port_m, "POST", "/model/unload",
+                                     headers=headers_m, body="{not json")
+            assert status == 400, status
+
+            # Autounload: validated and named, never clamped; persisted.
+            for bad in ('{"minutes": 0}', '{"minutes": 45}', '{"minutes": "15"}',
+                        '{"minutes": true}', '{"minutes": 15.5}', "{}", '{"min": 5}',
+                        "{not json", "[5]"):
+                status, data = _raw_request(port_m, "POST", "/model/autounload",
+                                            headers=headers_m, body=bad)
+                assert status == 400, (bad, status, data)
+                if bad not in ("{not json", "[5]"):
+                    assert "5, 15, 30, 60" in json.loads(data)["error"], (bad, data)
+            for good in (5, 30, 60, None):
+                status, data = _raw_request(port_m, "POST", "/model/autounload",
+                                            headers=headers_m,
+                                            body=json.dumps({"minutes": good}))
+                assert status == 200, (good, status, data)
+                assert json.loads(data)["auto_unload_minutes"] == good, data
+            with open(os.path.join(mdl_tmp, residency_mod.PREFS_FILENAME),
+                      encoding="utf-8") as fh:
+                assert json.load(fh) == {"schema": 1, "auto_unload_minutes": None}
+            # A fresh manager (a restarted sidecar) reads it back.
+            assert residency_mod.ResidencyManager(
+                backend=mdl_backend, poll_seconds=None).get_minutes() is None
+
+            # The timer, with the injected clock: deferred while busy, then
+            # fires once the delay has passed with nothing running.
+            mdl_backend.state.update(loaded=True, last_used_at=5000.0)
+            status, _ = _raw_request(port_m, "POST", "/model/autounload",
+                                     headers=headers_m, body='{"minutes": 5}')
+            assert status == 200
+            manager = state_mdl.get_residency()
+            mdl_clock["now"] = 5000.0 + 4 * 60
+            assert manager.tick() == "waiting" and mdl_backend.unloads == 1
+            state_mdl.session = _MdlSession(True, session_mod.STATUS_RUNNING)
+            mdl_clock["now"] = 5000.0 + 6 * 60
+            assert manager.tick() == "busy" and mdl_backend.unloads == 1
+            state_mdl.session = _MdlSession(False, session_mod.STATUS_IDLE)
+            mdl_clock["now"] += 4 * 60
+            assert manager.tick() == "waiting", "the delay restarts after busy"
+            mdl_clock["now"] += 60 + 1
+            assert manager.tick() == "unloaded" and mdl_backend.unloads == 2
+            status, data = _raw_request(port_m, "GET", "/model", headers=headers_m)
+            assert json.loads(data)["status"] == "not_loaded", data
+            # The injected manager has no thread, and get_residency did not
+            # replace it with one that does.
+            assert manager._thread is None and state_mdl._residency is manager
+        finally:
+            server_mdl.shutdown()
+            server_mdl.server_close()
+            if mdl_prev_data is None:
+                os.environ.pop("HEARTH_DATA_DIR", None)
+            else:
+                os.environ["HEARTH_DATA_DIR"] = mdl_prev_data
+            shutil.rmtree(mdl_tmp, ignore_errors=True)
+
         # === GET/POST /update and GET /update/events ===================
         # The updater has its own surface for the same reasons the engine
         # fetch does: it is a property of the installation, it needs no
@@ -3101,6 +4494,26 @@ def _self_test():
                                      body=json.dumps({"action": "auto_check",
                                                       "enabled": "yes"}))
             assert status == 400, "a non-boolean must not be accepted as a setting"
+
+            # A feed that cannot be reached is a failure the panel can word
+            # calmly: the snapshot says why ("offline") and whether it was the
+            # launch check or a click, and it is never "up to date".
+            class _UpdOffline:
+                def open(self, target, timeout=None):
+                    raise urllib.error.URLError(OSError(10061, "connection refused"))
+
+            updater._opener_fn = lambda _base: _UpdOffline()
+            status, _ = _raw_request(port_u, "POST", "/update", headers=headers_u,
+                                     body=json.dumps({"action": "check", "force": True}))
+            assert status == 200, status
+            updater.join(timeout=20)
+            status, data = _raw_request(port_u, "GET", "/update", headers=headers_u)
+            snap = json.loads(data)
+            assert snap["state"] == update_mod.STATE_FAILED, snap
+            assert snap["failure"] == "offline" and snap["background"] is False, snap
+            assert "could not check for updates" in snap["error"], snap["error"]
+            assert snap["layout"] == update_mod.LAYOUT_DIRECTORY, snap
+            updater._opener_fn = lambda _base: _UpdFeed()
 
             # An unknown action is a 400, and a malformed body is a 400 --
             # neither is a 500 and neither starts anything.
@@ -3574,6 +4987,115 @@ def _self_test():
                 os.environ["HEARTH_DATA_DIR"] = prev_data_dir
             shutil.rmtree(loop_tmp, ignore_errors=True)
 
+        # === the MCP panel's routes: GET /mcp and POST /mcp/* ==========
+        # mcp_admin's own self-test covers the rules exhaustively; this proves
+        # the wiring: auth, the acknowledgement surviving the transport, the
+        # 409 while a turn runs, and that a refusal is a status code rather
+        # than a 500. No MCP server is launched: the one enabled entry names
+        # a program that does not exist, and nothing here starts a turn that
+        # asks for tools.
+        mcp_tmp = tempfile.mkdtemp(prefix="hearth-app-mcp-")
+        prev_mcp_env = {k: os.environ.get(k) for k in ("HEARTH_MCP_CONFIG", "HEARTH_DATA_DIR")}
+        os.environ["HEARTH_MCP_CONFIG"] = os.path.join(mcp_tmp, "mcp.json")
+        os.environ["HEARTH_DATA_DIR"] = os.path.join(mcp_tmp, "data")
+        server_m, state_m = _start(engine_factory=lambda: _StubbornEngine())
+        try:
+            port_m = state_m.port
+            headers_m = {"Host": "127.0.0.1:{}".format(port_m),
+                         "Authorization": "Bearer " + state_m.token,
+                         "Content-Type": "application/json"}
+
+            def _mcp(method, path, body=None):
+                st, raw = _raw_request(port_m, method, path, headers=headers_m,
+                                       body=None if body is None else json.dumps(body))
+                return st, json.loads(raw or b"{}")
+
+            # auth applies, exactly as for every other route
+            st, _ = _raw_request(port_m, "GET", "/mcp",
+                                 headers={"Host": "127.0.0.1:{}".format(port_m)})
+            assert st == 401, st
+            st, _ = _raw_request(port_m, "POST", "/mcp/save", headers={
+                "Host": "127.0.0.1:{}".format(port_m), "Content-Type": "application/json"},
+                body=json.dumps({"create": True, "key": "x", "command": "npx",
+                                 "acknowledge": "runs-program"}))
+            assert st == 401, st
+            assert not os.path.exists(os.environ["HEARTH_MCP_CONFIG"])
+
+            st, body = _mcp("GET", "/mcp")
+            assert st == 200 and body["servers"] == [] and body["exists"] is False, body
+            assert body["acknowledge"] == "runs-program", body
+
+            ghost = os.path.join(mcp_tmp, "no-such-server.exe")
+            new = {"create": True, "key": "ghost", "command": ghost, "args": ["--stdio"],
+                   "env": {"API_TOKEN": "tok-" + "x9" * 12}, "enabled": True}
+            st, body = _mcp("POST", "/mcp/save", new)
+            assert st == 400 and body["needs_acknowledge"] is True, (st, body)
+            assert "x9x9" not in json.dumps(body), "a refusal must not echo a secret"
+            assert not os.path.exists(os.environ["HEARTH_MCP_CONFIG"]), \
+                "an unacknowledged save must write nothing"
+            st, body = _mcp("POST", "/mcp/save", dict(new, command="npx -y server",
+                                                      acknowledge="runs-program"))
+            assert st == 400 and body["field"] == "command", (st, body)
+            st, body = _mcp("POST", "/mcp/save", dict(new, acknowledge="runs-program"))
+            assert st == 200 and body["changed"] is True, (st, body)
+
+            st, body = _mcp("GET", "/mcp")
+            assert st == 200 and len(body["servers"]) == 1, body
+            srv = body["servers"][0]
+            assert srv["key"] == "ghost" and srv["enabled"] is True, srv
+            assert srv["status"] == "idle", "listing must never start a server"
+            assert srv["env"][0]["masked"] is True and "x9x9" not in json.dumps(body), srv
+
+            # a turn running makes a change to an enabled server a 409 ...
+            st, _ = _raw_request(port_m, "POST", "/session", headers=headers_m,
+                                 body=json.dumps({"workspace": mcp_tmp, "model": "m"}))
+            assert st == 200
+            st, _ = _raw_request(port_m, "POST", "/prompt", headers=headers_m,
+                                 body=json.dumps({"message": "hold"}))
+            assert st == 200
+            time.sleep(0.1)
+            st, body = _mcp("POST", "/mcp/toggle", {"key": "ghost", "enabled": False})
+            assert st == 409 and "turn is running" in body["error"], (st, body)
+            st, body = _mcp("POST", "/mcp/remove", {"key": "ghost"})
+            assert st == 409, (st, body)
+            # ... but adding a disabled one touches nothing live
+            st, body = _mcp("POST", "/mcp/save", {
+                "create": True, "key": "spare", "command": ghost,
+                "acknowledge": "runs-program"})
+            assert st == 200, (st, body)
+            st, _ = _raw_request(port_m, "POST", "/cancel", headers=headers_m)
+            assert st == 200
+            deadline_m = time.monotonic() + 5
+            while state_m.get_session().is_workspace_busy() and time.monotonic() < deadline_m:
+                time.sleep(0.02)
+
+            st, body = _mcp("POST", "/mcp/test", {"key": "spare"})
+            assert st == 409 and "disabled" in body["error"], (st, body)
+            st, body = _mcp("POST", "/mcp/toggle", {"key": "ghost", "enabled": "no"})
+            assert st == 400, (st, body)
+            st, body = _mcp("POST", "/mcp/toggle", {"key": "ghost", "enabled": False})
+            assert st == 200 and body["changed"] is True, (st, body)
+            st, body = _mcp("POST", "/mcp/remove", {"key": "nope"})
+            assert st == 404, (st, body)
+            st, body = _mcp("POST", "/mcp/remove", {"key": "ghost"})
+            assert st == 200 and body["removed"] is True, (st, body)
+            st, body = _mcp("GET", "/mcp")
+            assert [s["key"] for s in body["servers"]] == ["spare"], body
+            st, raw = _raw_request(port_m, "POST", "/mcp/save", headers=headers_m,
+                                   body="{not json")
+            assert st == 400, (st, raw)
+        finally:
+            server_m.shutdown()
+            server_m.server_close()
+            import hearth_mcp as _hearth_mcp  # noqa: PLC0415
+            _hearth_mcp.invalidate()
+            for k, v in prev_mcp_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            shutil.rmtree(mcp_tmp, ignore_errors=True)
+
         # === the four route allowlists agree ==========================
         # This router's table is duplicated, by necessity, in three other
         # places: the client (desktop/ui/js/api.js), the browser dev host
@@ -3624,6 +5146,157 @@ def _self_test():
                                                           sorted(missing)))
             assert not extra, ("{} allows {}, which this router does not "
                                "serve".format(os.path.basename(rel), sorted(extra)))
+
+        # === POST /attach* and POST /prompt with attachments ============
+        # Over real HTTP, end to end: a file is staged in chunks outside the
+        # workspace, lands in <workspace>/imports/ under a sanitised name,
+        # and a prompt that attaches it reaches the engine as the typed
+        # words with the file block carried alongside. The model's context
+        # size is pinned so this never probes the machine's GPU or a daemon.
+        import base64 as _b64
+
+        class _RecordingEngine:
+            def __init__(self):
+                self.messages = []
+
+            def run(self, ctx):
+                self.messages.append(ctx.message)
+                ctx.emit("done", {})
+
+        class _SwarmShapedEngine(_RecordingEngine):
+            ENGINE_KIND = "swarm"
+
+        att_data = _tempfile.mkdtemp(prefix="hearth-app-attach-data-")
+        att_ws = _tempfile.mkdtemp(prefix="hearth-app-attach-ws-")
+        prev_att_data = os.environ.get("HEARTH_DATA_DIR")
+        os.environ["HEARTH_DATA_DIR"] = att_data
+        real_ctx_tokens = attachments_mod.context_tokens
+        attachments_mod.context_tokens = lambda model: 4096
+        rec_engine = _RecordingEngine()
+        server_a, state_a = _start(token="attach-token", engine_factory=lambda: rec_engine)
+        try:
+            port_a = state_a.port
+            headers_a = {"Host": "127.0.0.1:{}".format(port_a),
+                         "Authorization": "Bearer attach-token",
+                         "Content-Type": "application/json"}
+
+            def _att(path, obj, raw_body=None):
+                status, data = _raw_request(port_a, "POST", path, headers=headers_a,
+                                            body=raw_body if raw_body is not None else json.dumps(obj))
+                return status, json.loads(data or b"{}")
+
+            # No session yet: refused, and cancel still answers.
+            status, out = _att("/attach", {"name": "a.txt", "size": 1})
+            assert status == 400 and out["error"] == "no_session", (status, out)
+            status, out = _att("/attach/cancel", {"id": "0" * 32})
+            assert status == 200 and out == {"cancelled": False}, (status, out)
+
+            status, out = _att("/session", {"workspace": att_ws, "model": "fake-model"})
+            assert status == 200, (status, out)
+
+            # A full-size chunk (1 MiB raw, ~1.4 MB of JSON) is accepted: under
+            # both the 4 MiB proxy cap and this server's own cap.
+            content = ("attached line\n" * 80000).encode("utf-8")[:attachments_mod.CHUNK_BYTES + 5000]
+            status, began = _att("/attach", {"name": "..\\CON.txt", "size": len(content)})
+            assert status == 200 and began["chunk_bytes"] == attachments_mod.CHUNK_BYTES, (status, began)
+            upload_id = began["id"]
+            first = content[:attachments_mod.CHUNK_BYTES]
+            status, out = _att("/attach/chunk", {"id": upload_id, "offset": 0,
+                                                 "data": _b64.b64encode(first).decode()})
+            assert status == 200 and out["received"] == len(first), (status, out)
+            assert not os.path.exists(os.path.join(att_ws, "imports")), \
+                "nothing reaches the workspace before the upload is complete"
+            # Out-of-order offset: a 409 naming the expected one.
+            status, out = _att("/attach/chunk", {"id": upload_id, "offset": 7, "data": "AAAA"})
+            assert status == 409 and out["expected"] == len(first), (status, out)
+            status, out = _att("/attach/finish", {"id": upload_id})
+            assert status == 409, (status, out)
+            status, out = _att("/attach/chunk", {"id": upload_id, "offset": len(first),
+                                                 "data": _b64.b64encode(content[len(first):]).decode()})
+            assert status == 200, (status, out)
+            status, rec = _att("/attach/finish", {"id": upload_id})
+            assert status == 200 and rec["path"] == "imports/_CON.txt", (status, rec)
+            assert rec["readable"] and rec["budget_chars"] == attachments_mod.budget_chars(4096), rec
+            assert rec["overhead_chars"] > 0, rec
+            with open(os.path.join(att_ws, "imports", "_CON.txt"), "rb") as fh:
+                assert fh.read() == content
+            # Over the per-file cap, and garbage bodies.
+            status, out = _att("/attach", {"name": "huge.bin",
+                                           "size": attachments_mod.MAX_FILE_BYTES + 1})
+            assert status == 413, (status, out)
+            status, out = _att("/attach/chunk", None, raw_body="{not json")
+            assert status == 400, (status, out)
+            status, out = _att("/attach/chunk", {"id": "nope", "offset": 0, "data": ""})
+            assert status == 400, (status, out)
+
+            # POST /prompt with the attachment: the engine sees the typed
+            # words as the message's value, and the file only alongside it.
+            status, out = _att("/prompt", {"message": "what is in it?",
+                                           "attachments": [rec["path"]]})
+            assert status == 200, (status, out)
+            deadline_a = time.monotonic() + 5
+            while not rec_engine.messages and time.monotonic() < deadline_a:
+                time.sleep(0.02)
+            got = rec_engine.messages[-1]
+            assert str(got) == "what is in it?", repr(str(got))
+            assert "<<<BEGIN ATTACHMENT " in got.attachment_text, got.attachment_text[:200]
+            assert "attached line" in got.attachment_text
+            assert got.attachment_meta[0]["path"] == "imports/_CON.txt", got.attachment_meta
+            # Without attachments the engine gets the plain str, exactly as before.
+            deadline_a = time.monotonic() + 5
+            while state_a.get_session().status != "idle" and time.monotonic() < deadline_a:
+                time.sleep(0.02)
+            status, out = _att("/prompt", {"message": "plain"})
+            assert status == 200, (status, out)
+            deadline_a = time.monotonic() + 5
+            while len(rec_engine.messages) < 2 and time.monotonic() < deadline_a:
+                time.sleep(0.02)
+            assert type(rec_engine.messages[-1]) is str and rec_engine.messages[-1] == "plain"
+            deadline_a = time.monotonic() + 5
+            while state_a.get_session().status != "idle" and time.monotonic() < deadline_a:
+                time.sleep(0.02)
+            # The typed words share the user message with the files, so they
+            # count against the budget: a pasted prompt that already fills
+            # the ceiling leaves no room for even the compact listing.
+            long_words = "w" * (int(4096 * attachments_mod.CHARS_PER_TOKEN
+                                    * attachments_mod.HISTORY_CEILING) - 100)
+            status, out = _att("/prompt", {"message": long_words, "attachments": [rec["path"]]})
+            assert status == 413 and "attach fewer files" in out["error"], (status, out)
+            assert rec["ceiling_chars"] == int(4096 * attachments_mod.CHARS_PER_TOKEN
+                                               * attachments_mod.HISTORY_CEILING), rec
+            # A path that is not an import, or escapes, is refused before a turn starts.
+            for bad in (["../outside.txt"], ["imports/missing.txt"], "imports/_CON.txt",
+                        ["imports/x"] * 11):
+                status, out = _att("/prompt", {"message": "m", "attachments": bad})
+                assert status == 400, (bad, status, out)
+            assert len(rec_engine.messages) == 2, "a refused prompt must not start a turn"
+
+            # Attachments are chat-only: a loop or swarm reads the message as a goal.
+            status, out = _att("/session", {"workspace": att_ws, "model": "fake-model"})
+            state_a.get_session().engine = _SwarmShapedEngine()
+            status, out = _att("/attach", {"name": "a.txt", "size": 1})
+            assert status == 400 and "chat session" in out["error"], (status, out)
+            status, out = _att("/prompt", {"message": "goal", "attachments": [rec["path"]]})
+            assert status == 400 and "chat session" in out["error"], (status, out)
+
+            # A session whose workspace folder has gone is refused, not created.
+            gone_ws = _tempfile.mkdtemp(prefix="hearth-app-attach-gone-")
+            status, out = _att("/session", {"workspace": gone_ws, "model": "fake-model"})
+            assert status == 200, (status, out)
+            shutil.rmtree(gone_ws)
+            status, out = _att("/attach", {"name": "a.txt", "size": 1})
+            assert status == 409, (status, out)
+            assert not os.path.exists(gone_ws)
+        finally:
+            server_a.shutdown()
+            server_a.server_close()
+            attachments_mod.context_tokens = real_ctx_tokens
+            if prev_att_data is None:
+                os.environ.pop("HEARTH_DATA_DIR", None)
+            else:
+                os.environ["HEARTH_DATA_DIR"] = prev_att_data
+            shutil.rmtree(att_data, ignore_errors=True)
+            shutil.rmtree(att_ws, ignore_errors=True)
 
         # === malformed JSON body is rejected, not a 500 ===
         status, data = _raw_request(port, "POST", "/session", headers=auth_headers, body="{not json")
